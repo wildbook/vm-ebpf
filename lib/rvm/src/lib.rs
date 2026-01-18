@@ -188,6 +188,7 @@ mod alu {
         let dst_reg = instr.dst_reg() as usize;
 
         let imm = instr.imm();
+        let offset = instr.offset();
 
         let d = match BITS {
             BITS_64 => ctx.regs[dst_reg],
@@ -200,12 +201,42 @@ mod alu {
             (Source::Reg, BITS_32) => ctx.regs[src_reg] & 0xFFFFFFFF,
         };
 
-        // TODO: handle overflow
         let result = match alu_opc {
             AluOpc::Add => d.wrapping_add(s),
             AluOpc::Sub => d.wrapping_sub(s),
             AluOpc::Mul => d.wrapping_mul(s),
-            AluOpc::Div => d.checked_div(s).unwrap_or(0),
+            // DIV (offset=0) or SDIV (offset=1)
+            AluOpc::Div => match (offset, BITS) {
+                (0, _) => {
+                    // Unsigned division: dst = (src != 0) ? (dst / src) : 0
+                    d.checked_div(s).unwrap_or(0)
+                }
+                (1, BITS_64) => {
+                    // SDIV 64-bit: handle div by zero and LLONG_MIN / -1
+                    let ds = d as i64;
+                    let ss = s as i64;
+                    if ss == 0 {
+                        0
+                    } else if ss == -1 && ds == i64::MIN {
+                        i64::MIN as u64
+                    } else {
+                        (ds / ss) as u64
+                    }
+                }
+                (1, BITS_32) => {
+                    // SDIV 32-bit: handle div by zero and INT_MIN / -1
+                    let ds = d as i32;
+                    let ss = s as i32;
+                    if ss == 0 {
+                        0
+                    } else if ss == -1 && ds == i32::MIN {
+                        i32::MIN as u64
+                    } else {
+                        (ds / ss) as u64
+                    }
+                }
+                _ => return Flow::FailCpu,
+            },
             AluOpc::Or => d.bitor(s),
             AluOpc::And => d.bitand(s),
             AluOpc::Lsh => match BITS {
@@ -217,7 +248,46 @@ mod alu {
                 BITS_32 => d >> (s & 31),
             },
             AluOpc::Neg => d.wrapping_neg(),
-            AluOpc::Mod => d.checked_rem(s).unwrap_or(d),
+            // MOD (offset=0) or SMOD (offset=1)
+            AluOpc::Mod => match (offset, BITS) {
+                (0, BITS_64) => {
+                    // Unsigned modulo: dst = (src != 0) ? (dst % src) : dst
+                    d.checked_rem(s).unwrap_or(d)
+                }
+                (0, BITS_32) => {
+                    // Unsigned modulo 32-bit: if src==0, upper 32 bits zeroed but lower preserved
+                    if s == 0 {
+                        d
+                    } else {
+                        d % s
+                    }
+                }
+                (1, BITS_64) => {
+                    // SMOD 64-bit: handle mod by zero and LLONG_MIN % -1
+                    let ds = d as i64;
+                    let ss = s as i64;
+                    if ss == 0 {
+                        d // unchanged
+                    } else if ss == -1 && ds == i64::MIN {
+                        0u64
+                    } else {
+                        (ds % ss) as u64
+                    }
+                }
+                (1, BITS_32) => {
+                    // SMOD 32-bit: handle mod by zero and INT_MIN % -1
+                    let ds = d as i32;
+                    let ss = s as i32;
+                    if ss == 0 {
+                        d // unchanged (but will be zero-extended later)
+                    } else if ss == -1 && ds == i32::MIN {
+                        0u64
+                    } else {
+                        (ds % ss) as u64
+                    }
+                }
+                _ => return Flow::FailCpu,
+            },
             AluOpc::Xor => d ^ s,
             AluOpc::Mov => s,
             AluOpc::Arsh => match BITS {
