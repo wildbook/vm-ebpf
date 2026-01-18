@@ -283,10 +283,10 @@ mod alu {
                 BITS_32 => (d as i32) <= (s as i32),
             },
 
-            JmpOpc::Call if src_reg == 0 => return Flow::Missing, // "call helper function by address...?",
-            JmpOpc::Call if src_reg == BPF_PSEUDO_CALL /*-*/ => return Flow::Call(i64::from(imm)),
-            JmpOpc::Call if src_reg == BPF_PSEUDO_KFUNC_CALL => return Flow::CallExt(d),
-            JmpOpc::Call => return Flow::Missing, // {instr:?}, s:{s:#x}, d:{d:#x}
+            JmpOpc::Call if src_reg == 0 => return Flow::CallExt(imm as u32 as u64), // helper function by static ID
+            JmpOpc::Call if src_reg == BPF_PSEUDO_CALL => return Flow::Call(i64::from(imm)), // program-local function
+            JmpOpc::Call if src_reg == BPF_PSEUDO_KFUNC_CALL => return Flow::CallExt(imm as u32 as u64), // helper by BTF ID
+            JmpOpc::Call => return Flow::Missing,
 
             JmpOpc::Exit => return Flow::Exit,
 
