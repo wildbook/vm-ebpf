@@ -249,65 +249,73 @@ fn elfin() -> anyhow::Result<()> {
 
         fn load_u8(&self, addr: u64) -> Result<u8, Self::Err> {
             let beg = addr as usize;
-            match self.data.get(beg..beg + 1) {
+            let end = beg.checked_add(1).ok_or(())?;
+            match self.data.get(beg..end) {
                 Some(s) => Ok(s[0]),
-                None => return Err(()),
+                None => Err(()),
             }
         }
 
         fn load_u16(&self, addr: u64) -> Result<u16, Self::Err> {
             let beg = addr as usize;
-            match self.data.get(beg..beg + 2) {
+            let end = beg.checked_add(2).ok_or(())?;
+            match self.data.get(beg..end) {
                 Some(s) => Ok(u16::from_ne_bytes([s[0], s[1]])),
-                None => return Err(()),
+                None => Err(()),
             }
         }
 
         fn load_u32(&self, addr: u64) -> Result<u32, Self::Err> {
             let beg = addr as usize;
-            match self.data.get(beg..beg + 4) {
+            let end = beg.checked_add(4).ok_or(())?;
+            match self.data.get(beg..end) {
                 Some(s) => Ok(u32::from_ne_bytes([s[0], s[1], s[2], s[3]])),
-                None => return Err(()),
+                None => Err(()),
             }
         }
 
         fn load_u64(&self, addr: u64) -> Result<u64, Self::Err> {
             let beg = addr as usize;
-            match self.data.get(beg..beg + 8) {
+            let end = beg.checked_add(8).ok_or(())?;
+            match self.data.get(beg..end) {
                 Some(s) => Ok(u64::from_ne_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])),
-                None => return Err(()),
+                None => Err(()),
             }
         }
 
         fn store_u8(&mut self, addr: u64, value: u8) -> Result<(), Self::Err> {
             let beg = addr as usize;
-            match self.data.get_mut(beg..beg + 1) {
+            let end = beg.checked_add(1).ok_or(())?;
+            match self.data.get_mut(beg..end) {
                 Some(slice) => Ok(slice.copy_from_slice(&value.to_ne_bytes())),
-                None => return Err(()),
+                None => Err(()),
             }
         }
 
         fn store_u16(&mut self, addr: u64, value: u16) -> Result<(), Self::Err> {
             let beg = addr as usize;
-            match self.data.get_mut(beg..beg + 2) {
+            let end = beg.checked_add(2).ok_or(())?;
+            match self.data.get_mut(beg..end) {
                 Some(slice) => Ok(slice.copy_from_slice(&value.to_ne_bytes())),
-                None => return Err(()),
+                None => Err(()),
             }
         }
 
         fn store_u32(&mut self, addr: u64, value: u32) -> Result<(), Self::Err> {
             let beg = addr as usize;
-            match self.data.get_mut(beg..beg + 4) {
+            let end = beg.checked_add(4).ok_or(())?;
+            match self.data.get_mut(beg..end) {
                 Some(slice) => Ok(slice.copy_from_slice(&value.to_ne_bytes())),
-                None => return Err(()),
+                None => Err(()),
             }
         }
 
         fn store_u64(&mut self, addr: u64, value: u64) -> Result<(), Self::Err> {
             let beg = addr as usize;
-            match self.data.get_mut(beg..beg + 8) {
+            let end = beg.checked_add(8).ok_or(())?;
+            match self.data.get_mut(beg..end) {
                 Some(slice) => Ok(slice.copy_from_slice(&value.to_ne_bytes())),
-                None => return Err(()),
+                None => Err(()),
             }
         }
     }
