@@ -209,9 +209,26 @@ fn elfin() -> anyhow::Result<()> {
 
                 match r_typ {
                     reloc::bpf::BPF_64_64 => {
-                        let diff = stv.wrapping_sub(beg as u64);
-                        let data = (diff as u32).to_ne_bytes();
-                        copy(&data, &mut flat, beg.wrapping_add(4) as usize);
+                        // Get the section where the symbol is defined
+                        let sym_sect_idx = symbol.st_shndx as usize;
+
+                        // Get the mapped address of that section
+                        let sym_sect_addr = match smap[sym_sect_idx] {
+                            Some(map_idx) => MAP[map_idx].addr,
+                            None => panic!("Symbol references unmapped section"),
+                        };
+
+                        // Final address = section base + symbol offset within section
+                        let sym_addr = sym_sect_addr + stv;
+
+                        // R_BPF_64_64 patches the imm32 fields of a LD_IMM64 instruction
+                        // Write lower 32 bits to imm of first instruction (offset +4)
+                        let lo = (sym_addr as u32).to_ne_bytes();
+                        copy(&lo, &mut flat, (beg + 4) as usize);
+
+                        // Write upper 32 bits to imm of second instruction (offset +12)
+                        let hi = ((sym_addr >> 32) as u32).to_ne_bytes();
+                        copy(&hi, &mut flat, (beg + 12) as usize);
                     }
                     _ => unimplemented!(),
                 }
