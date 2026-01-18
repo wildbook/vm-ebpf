@@ -173,10 +173,6 @@ mod alu {
     pub const BITS_32: bool = false;
     pub const BITS_64: bool = true;
 
-    fn sign_extend_32_to_64(value: u64) -> u64 {
-        value as u32 as i32 as i64 as u64
-    }
-
     fn zero_extend_32_to_64(value: u64) -> u64 {
         value & 0xFFFFFFFF
     }
@@ -250,13 +246,15 @@ mod alu {
         let imm = instr.imm();
         let opc = instr.opcode();
 
-        let d = ctx.regs[dst_reg];
-        let s = match opc.jmp_src() {
-            Source::Imm => imm as i64 as u64,
-            Source::Reg => match BITS {
-                BITS_64 => ctx.regs[src_reg],
-                BITS_32 => sign_extend_32_to_64(ctx.regs[src_reg]),
-            },
+        let d = match BITS {
+            BITS_64 => ctx.regs[dst_reg],
+            BITS_32 => ctx.regs[dst_reg] & 0xFFFFFFFF,
+        };
+        let s = match (opc.jmp_src(), BITS) {
+            (Source::Imm, BITS_64) => imm as i64 as u64,
+            (Source::Imm, BITS_32) => imm as u32 as u64,
+            (Source::Reg, BITS_64) => ctx.regs[src_reg],
+            (Source::Reg, BITS_32) => ctx.regs[src_reg] & 0xFFFFFFFF,
         };
 
         let cond = match opc.jmp_opc() {
@@ -266,12 +264,24 @@ mod alu {
             JmpOpc::Jge => d >= s,
             JmpOpc::Jset => d & s != 0,
             JmpOpc::Jne => d != s,
-            JmpOpc::Jsgt => (d as i64) > (s as i64),
-            JmpOpc::Jsge => (d as i64) >= (s as i64),
+            JmpOpc::Jsgt => match BITS {
+                BITS_64 => (d as i64) > (s as i64),
+                BITS_32 => (d as i32) > (s as i32),
+            },
+            JmpOpc::Jsge => match BITS {
+                BITS_64 => (d as i64) >= (s as i64),
+                BITS_32 => (d as i32) >= (s as i32),
+            },
             JmpOpc::Jlt => d < s,
             JmpOpc::Jle => d <= s,
-            JmpOpc::Jslt => (d as i64) < (s as i64),
-            JmpOpc::Jsle => (d as i64) <= (s as i64),
+            JmpOpc::Jslt => match BITS {
+                BITS_64 => (d as i64) < (s as i64),
+                BITS_32 => (d as i32) < (s as i32),
+            },
+            JmpOpc::Jsle => match BITS {
+                BITS_64 => (d as i64) <= (s as i64),
+                BITS_32 => (d as i32) <= (s as i32),
+            },
 
             JmpOpc::Call if src_reg == 0 => return Flow::Missing, // "call helper function by address...?",
             JmpOpc::Call if src_reg == BPF_PSEUDO_CALL /*-*/ => return Flow::Call(i64::from(imm)),
