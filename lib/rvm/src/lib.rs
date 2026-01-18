@@ -207,15 +207,21 @@ mod alu {
             AluOpc::Div => d.checked_div(s).unwrap_or(0),
             AluOpc::Or => d.bitor(s),
             AluOpc::And => d.bitand(s),
-            AluOpc::Lsh => d.checked_shl(s as u32).unwrap_or(0),
-            AluOpc::Rsh => d.checked_shr(s as u32).unwrap_or(0),
+            AluOpc::Lsh => match BITS {
+                BITS_64 => d << (s & 63),
+                BITS_32 => d << (s & 31),
+            },
+            AluOpc::Rsh => match BITS {
+                BITS_64 => d >> (s & 63),
+                BITS_32 => d >> (s & 31),
+            },
             AluOpc::Neg => d.wrapping_neg(),
             AluOpc::Mod => d.checked_rem(s).unwrap_or(d),
             AluOpc::Xor => d ^ s,
             AluOpc::Mov => s,
             AluOpc::Arsh => match BITS {
-                BITS_64 => (d as i64 >> s) as u64,
-                BITS_32 => (d as i32 >> s) as u64,
+                BITS_64 => ((d as i64) >> (s & 63)) as u64,
+                BITS_32 => ((d as i32) >> (s & 31)) as u64,
             },
             AluOpc::End => match (alu_end, imm) {
                 (AluEnd::ToLE, 16) => (d as u16).to_le() as u64,
