@@ -164,7 +164,7 @@ pub const BITS_32: bool = false;
 pub const BITS_64: bool = true;
 
 mod alu {
-    use std::ops::{BitAnd, BitOr, Not};
+    use std::ops::{BitAnd, BitOr};
 
     use crate::consts::jmp::{BPF_PSEUDO_CALL, BPF_PSEUDO_KFUNC_CALL};
     use crate::opcode::{AluEnd, AluOpc, JmpOpc, Source};
@@ -212,7 +212,7 @@ mod alu {
             AluOpc::And => d.bitand(s),
             AluOpc::Lsh => d.checked_shl(s as u32).unwrap_or(0),
             AluOpc::Rsh => d.checked_shr(s as u32).unwrap_or(0),
-            AluOpc::Neg => s.not(),
+            AluOpc::Neg => d.wrapping_neg(),
             AluOpc::Mod => d.checked_rem(s).unwrap_or(d),
             AluOpc::Xor => d ^ s,
             AluOpc::Mov => s,
