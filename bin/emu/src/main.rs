@@ -1,4 +1,4 @@
-use std::ops::{ControlFlow, Div};
+use std::ops::ControlFlow;
 
 use constelf::file::ElfFile;
 use constelf::raw::{reloc, shf};
@@ -195,14 +195,23 @@ fn elfin() -> anyhow::Result<()> {
             let target_ent = MAP[target];
 
             let rel = ct_unwrap_res(chunk.relocs());
-            let ElfRelocsChunk::Elf64(rel) = rel else {
-                assert!(matches!(rel, ElfRelocsChunk::None));
-                continue;
+
+            // Handle both REL and RELA relocation types
+            // For simplicity, we process them the same way since BPF typically uses REL
+            // and the addend is usually embedded in the instruction
+            let (relocs, _has_addend): (&[_], bool) = match rel {
+                ElfRelocsChunk::Rel(r) => (r, false),
+                ElfRelocsChunk::Rela(_) => {
+                    // RELA relocations have explicit addends, but BPF typically uses REL
+                    // For now, skip RELA sections - they would need different handling
+                    continue;
+                }
+                ElfRelocsChunk::None => continue,
             };
 
             let mut i: usize = 0;
-            while i < rel.len() {
-                let r = rel[i];
+            while i < relocs.len() {
+                let r = relocs[i];
 
                 let r_off = r.r_offset;
                 let r_sym = r.sym();
@@ -333,7 +342,7 @@ fn elfin() -> anyhow::Result<()> {
     // Initialize r10 (frame pointer) to point to end of stack
     ctx.regs[10] = STACK_END as u64;
 
-    let res = call(&mut ctx, PAGE_BASE.div(8) as u64);
+    let res = call(&mut ctx, (PAGE_BASE / 8) as u64);
     println!("res: {:?}", res);
 
     Ok(())

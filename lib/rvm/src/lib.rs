@@ -88,7 +88,8 @@ pub trait Memory {
     fn store_u8(&mut self, addr: u64, value: u8) -> Result<(), Self::Err>;
 
     fn load_pc(&self, pc: u64) -> Result<Instruction, Self::Err> {
-        self.load_u64(pc * 8).map(Instruction)
+        // Use wrapping_mul to avoid panic on overflow; invalid address will be caught by load_u64
+        self.load_u64(pc.wrapping_mul(8)).map(Instruction)
     }
 
     fn load_u16(&self, addr: u64) -> Result<u16, Self::Err> {
@@ -466,25 +467,6 @@ pub fn step_ld64<M: Memory>(ctx: &mut Context<M>, instr: Instruction, second: In
     }
 
     Flow::Next
-}
-
-#[no_mangle]
-#[inline(never)]
-pub fn call() -> u64 {
-    let mut ctx = Context::new(());
-
-    let x = [
-        Instruction(0x0000000001000001b7), //
-        Instruction(0x00000000000000101f), //
-        Instruction(0x000000000000000095), //
-    ];
-
-    dbg!(x);
-
-    alu::math::<_, { BITS_64 }>(&mut ctx, x[0]);
-    alu::math::<_, { BITS_64 }>(&mut ctx, x[1]);
-
-    ctx.regs[0]
 }
 
 #[cfg(test)]

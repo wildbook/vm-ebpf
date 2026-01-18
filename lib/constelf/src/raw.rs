@@ -132,6 +132,14 @@ pub struct Elf64Rel {
 
 #[repr(packed)]
 #[derive(Debug, Copy, Clone)]
+pub struct Elf64Rela {
+    pub r_offset: Elf64Addr,
+    pub r_info: Elf64Xword,
+    pub r_addend: i64,
+}
+
+#[repr(packed)]
+#[derive(Debug, Copy, Clone)]
 pub struct ElfIdent {
     pub ei_magic: [u8; 4],
     pub ei_class: u8,
