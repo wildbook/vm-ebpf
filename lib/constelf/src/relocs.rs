@@ -208,8 +208,8 @@ impl<'a> ElfRelocs<'a> {
                 continue;
             }
 
-            chunk_idx += 1;
             if chunk_idx != idx {
+                chunk_idx += 1;
                 continue;
             }
 
