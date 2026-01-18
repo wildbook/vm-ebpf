@@ -111,7 +111,7 @@ impl AluOpc {
     pub const fn mov_32(src: Source)   -> OpCode { OpCode(Class::Alu32 as u8 | AluOpc::Mov  as u8 | src as u8) }
     pub const fn arsh_32(src: Source)  -> OpCode { OpCode(Class::Alu32 as u8 | AluOpc::Arsh as u8 | src as u8) }
     pub const fn end_32(end: AluEnd)   -> OpCode { OpCode(Class::Alu32 as u8 | AluOpc::End  as u8 | end as u8) }
-    
+
     pub const fn add_64(src: Source)   -> OpCode { OpCode(Class::Alu64 as u8 | AluOpc::Add  as u8 | src as u8) }
     pub const fn sub_64(src: Source)   -> OpCode { OpCode(Class::Alu64 as u8 | AluOpc::Sub  as u8 | src as u8) }
     pub const fn mul_64(src: Source)   -> OpCode { OpCode(Class::Alu64 as u8 | AluOpc::Mul  as u8 | src as u8) }

@@ -264,7 +264,13 @@ mod alu {
         };
 
         let cond = match opc.jmp_opc() {
-            JmpOpc::Ja => true,
+            // JA uses offset field for JMP class, but imm field for JMP32 class
+            JmpOpc::Ja => {
+                return match BITS {
+                    BITS_64 => Flow::Jump(instr.offset() as i64),
+                    BITS_32 => Flow::Jump(imm as i64),
+                }
+            }
             JmpOpc::Jeq => d == s,
             JmpOpc::Jgt => d > s,
             JmpOpc::Jge => d >= s,
