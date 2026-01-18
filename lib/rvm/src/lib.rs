@@ -177,8 +177,8 @@ mod alu {
         value as u32 as i32 as i64 as u64
     }
 
-    fn sign_narrow_64_to_32(value: u64) -> u64 {
-        value as i64 as i32 as u32 as u64
+    fn zero_extend_32_to_64(value: u64) -> u64 {
+        value & 0xFFFFFFFF
     }
 
     pub fn math<M: Memory, const BITS: bool>(ctx: &mut Context<M>, instr: Instruction) -> Flow<M> {
@@ -237,7 +237,7 @@ mod alu {
 
         ctx.regs[dst_reg] = match BITS {
             BITS_64 => result,
-            BITS_32 => sign_narrow_64_to_32(result),
+            BITS_32 => zero_extend_32_to_64(result),
         };
 
         Flow::Next
