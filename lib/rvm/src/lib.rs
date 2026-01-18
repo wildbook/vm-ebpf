@@ -194,12 +194,13 @@ mod alu {
 
         let d = match BITS {
             BITS_64 => ctx.regs[dst_reg],
-            BITS_32 => sign_extend_32_to_64(ctx.regs[dst_reg]),
+            BITS_32 => ctx.regs[dst_reg] & 0xFFFFFFFF,
         };
 
-        let s = match alu_src {
-            Source::Imm => imm as i64 as u64,
-            Source::Reg => sign_extend_32_to_64(ctx.regs[src_reg]),
+        let s = match (alu_src, BITS) {
+            (Source::Imm, _) => imm as i64 as u64,
+            (Source::Reg, BITS_64) => ctx.regs[src_reg],
+            (Source::Reg, BITS_32) => ctx.regs[src_reg] & 0xFFFFFFFF,
         };
 
         // TODO: handle overflow
