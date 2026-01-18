@@ -137,6 +137,10 @@ impl Memory for () {
     }
 }
 
+/// Scratch register index for storing first half of LD_IMM64 instruction.
+/// This is beyond the eBPF-defined registers (r0-r10) and must not be used elsewhere.
+pub const REG_SCRATCH_LD64: usize = 11;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Context<M: Memory> {
     // There's actually just 10 registers, but we'll do 16 as it allows for optimizations (regs[idx & 0xF]).
@@ -145,7 +149,8 @@ pub struct Context<M: Memory> {
     // R1 - R5: arguments for function calls
     // R6 - R9: callee saved registers that function calls will preserve
     // R10: read-only frame pointer to access stack
-    pub regs: [u64; 16], // TODO: lower register count to 10
+    // R11: scratch register for LD_IMM64 (internal use only, see REG_SCRATCH_LD64)
+    pub regs: [u64; 16],
     pub data: M,
 }
 
@@ -382,13 +387,17 @@ mod mem {
         Flow::Next
     }
 
-    pub const fn ld64<M: Memory>(_ctx: &mut Context<M>, instr: Instruction) -> ControlFlow<Flow<M>, Instruction> {
+    pub fn ld64<M: Memory>(ctx: &mut Context<M>, instr: Instruction) -> ControlFlow<Flow<M>, Instruction> {
         let opc = instr.opcode();
         let size = opc.mem_size();
         let mode = opc.mem_mode();
 
         match (mode, size) {
-            (MemMode::Imm, MemSize::DWord) => ControlFlow::Continue(instr),
+            (MemMode::Imm, MemSize::DWord) => {
+                // Store first instruction's imm (low 32 bits) in scratch register
+                ctx.regs[crate::REG_SCRATCH_LD64] = instr.imm() as u32 as u64;
+                ControlFlow::Continue(instr)
+            }
             _ => ControlFlow::Break(Flow::Missing),
         }
     }
@@ -415,7 +424,7 @@ pub fn step<M: Memory>(ctx: &mut Context<M>, instr: Instruction) -> ControlFlow<
 }
 
 #[inline(always)]
-pub fn step_ld64<M: Memory>(ctx: &mut Context<M>, instr: Instruction, imm: u64) -> Flow<M> {
+pub fn step_ld64<M: Memory>(ctx: &mut Context<M>, instr: Instruction, second: Instruction) -> Flow<M> {
     use consts::class;
     use consts::mem::{mode, size};
 
@@ -423,8 +432,13 @@ pub fn step_ld64<M: Memory>(ctx: &mut Context<M>, instr: Instruction, imm: u64) 
 
     let dst = usize::from(instr.dst_reg());
 
+    // Combine low 32 bits (from scratch register, set by ld64) with high 32 bits (from second instruction)
+    let imm_lo = ctx.regs[REG_SCRATCH_LD64];
+    let imm_hi = second.imm() as u32 as u64;
+    let imm64 = imm_lo | (imm_hi << 32);
+
     match instr.src_reg() {
-        0 => ctx.regs[dst] = imm,
+        0 => ctx.regs[dst] = imm64,
         _ => return Flow::Missing,
     }
 

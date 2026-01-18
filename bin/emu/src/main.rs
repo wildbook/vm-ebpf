@@ -18,7 +18,7 @@ pub fn call<C: Memory>(ctx: &mut Context<C>, mut pc: u64) -> ControlFlow<()> {
             ControlFlow::Break(flow) => flow,
             ControlFlow::Continue(instr) => match ctx.data.load_pc(pc) {
                 Err(e) => Flow::FailMem(e),
-                Ok(value) => (pc += 1, rvm::step_ld64(ctx, instr, value.0)).1,
+                Ok(second) => (pc += 1, rvm::step_ld64(ctx, instr, second)).1,
             },
         };
 
@@ -118,6 +118,7 @@ fn elfin() -> anyhow::Result<()> {
 
     const PAGE_SIZE: usize = 8;
     const PAGE_BASE: usize = 8;
+    const STACK_SIZE: usize = 512; // eBPF stack size
 
     const RAW: &[u8; include_bytes!("../../../bpf.o").len()] = include_bytes!("../../../bpf.o");
 
@@ -136,8 +137,15 @@ fn elfin() -> anyhow::Result<()> {
             i += 1;
         }
 
+        // Add stack space at the end
+        s = s.next_multiple_of(PAGE_SIZE);
+        s += STACK_SIZE;
+
         s
     };
+
+    // Stack starts after all sections, r10 points to end of stack
+    const STACK_END: usize = LEN;
 
     const OUT: [u8; LEN] = {
         let mut flat = [0; LEN];
@@ -321,6 +329,9 @@ fn elfin() -> anyhow::Result<()> {
     }
 
     let mut ctx = Context::new(Mem { data: OUT });
+
+    // Initialize r10 (frame pointer) to point to end of stack
+    ctx.regs[10] = STACK_END as u64;
 
     let res = call(&mut ctx, PAGE_BASE.div(8) as u64);
     println!("res: {:?}", res);
