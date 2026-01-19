@@ -18,6 +18,24 @@ Sample eBPF program source code (C++) that gets compiled to ELF and executed by 
 
 ## Building
 
+This project uses [just](https://github.com/casey/just) as a command runner. Run `just --list` to see all available recipes.
+
+```bash
+# Build all Rust components
+just build
+
+# Build in release mode
+just build-release
+
+# Build BPF programs
+just bpf
+
+# Full rebuild (clean + bpf + build)
+just rebuild
+```
+
+### Manual Building
+
 ```bash
 # Build the entire workspace
 cargo build --release
@@ -26,29 +44,55 @@ cargo build --release
 cargo build -p rvm-core
 cargo build -p constelf  
 cargo build -p emu
+
+# Compile BPF program (requires clang/llvm)
+clang -target bpf -O2 -g -c bpf/example.c -o bpf/example.o
 ```
 
 ## Usage
 
-### Compile eBPF program
 ```bash
-# Compile the sample eBPF program (requires clang/llvm)
-clang -target bpf -c bpf/bpf.cpp -o bpf.o
+# Run the emulator (builds BPF first)
+just run-emu
+
+# Run the loader
+just run-loader
+
+# Run the demo
+just run-demo
 ```
 
-### Run the emulator
+### Manual Usage
+
 ```bash
 # Execute the compiled eBPF program
 cargo run --bin emu --release
 ```
 
-### Run examples
-```bash
-# ELF parsing demo
-cargo run --example demo -p constelf
+## Testing
 
-# VM execution demo  
-cargo run --example demo -p rvm-core
+```bash
+# Run all tests
+just test
+
+# Run tests with output
+just test-verbose
+
+# CI checks (format, clippy, test)
+just ci
+```
+
+## BPF Inspection
+
+```bash
+# Disassemble BPF object file
+just bpf-dump
+
+# Show sections
+just bpf-sections
+
+# Show symbols
+just bpf-symbols
 ```
 
 ## Architecture
