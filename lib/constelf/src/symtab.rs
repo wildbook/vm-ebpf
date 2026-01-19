@@ -14,11 +14,13 @@ pub struct ElfSymTab<'a> {
     pub raw: &'a [Elf64Sym],
 }
 
-impl ElfSymTab<'_> {
-    pub const fn new(raw: &[Elf64Sym]) -> ElfSymTab {
-        ElfSymTab { raw }
+impl<'a> ElfSymTab<'a> {
+    pub const fn new(raw: &'a [Elf64Sym]) -> Self {
+        Self { raw }
     }
+}
 
+impl ElfSymTab<'_> {
     pub const fn len(&self) -> usize {
         self.raw.len()
     }
