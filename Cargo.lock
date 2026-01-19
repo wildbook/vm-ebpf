@@ -9,10 +9,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37bf3594c4c988a53154954629820791dde498571819ae4ca50ca811e060cc95"
 
 [[package]]
+name = "btf"
+version = "0.1.0"
+
+[[package]]
 name = "constelf"
 version = "0.1.0"
 dependencies = [
  "hex",
+]
+
+[[package]]
+name = "demo"
+version = "0.1.0"
+dependencies = [
+ "btf",
+ "rvm-core",
 ]
 
 [[package]]
@@ -22,7 +34,7 @@ dependencies = [
  "anyhow",
  "constelf",
  "hex",
- "rvm",
+ "rvm-core",
 ]
 
 [[package]]
@@ -38,7 +50,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6fe2267d4ed49bc07b63801559be28c718ea06c4738b7a03c94df7386d2cde46"
 
 [[package]]
-name = "rvm"
+name = "loader"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "btf",
+ "constelf",
+ "rvm-core",
+]
+
+[[package]]
+name = "rvm-core"
 version = "0.1.0"
 dependencies = [
  "hex-literal",

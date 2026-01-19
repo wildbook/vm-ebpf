@@ -4,21 +4,21 @@ use constelf::file::ElfFile;
 use constelf::raw::{reloc, shf};
 use constelf::relocs::ElfRelocsChunk;
 use constelf::sections::ElfSections;
-use rvm::{Context, Flow, Memory};
+use rvm_core::{Context, Flow, Memory};
 
 #[inline(always)]
 pub fn call<C: Memory>(ctx: &mut Context<C>, mut pc: u64) -> ControlFlow<()> {
     loop {
         let flow = match ctx.data.load_pc(pc) {
             Err(e) => ControlFlow::Break(Flow::FailMem(e)),
-            Ok(instr) => (pc += 1, rvm::step(ctx, instr)).1,
+            Ok(instr) => (pc += 1, rvm_core::step(ctx, instr)).1,
         };
 
         let flow = match flow {
             ControlFlow::Break(flow) => flow,
             ControlFlow::Continue(instr) => match ctx.data.load_pc(pc) {
                 Err(e) => Flow::FailMem(e),
-                Ok(second) => (pc += 1, rvm::step_ld64(ctx, instr, second)).1,
+                Ok(second) => (pc += 1, rvm_core::step_ld64(ctx, instr, second)).1,
             },
         };
 

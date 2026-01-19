@@ -56,8 +56,8 @@ use std::ops::ControlFlow;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use btf::{apply_core_relocations, Btf, CoreRelo, CoreReloKind, TypeRegistry};
-use rvm::opcode::OpCode;
-use rvm::{Context, Flow, Instruction, Memory};
+use rvm_core::opcode::OpCode;
+use rvm_core::{Context, Flow, Instruction, Memory};
 
 // ============================================================================
 // Host Helper Function IDs
@@ -190,12 +190,12 @@ fn run_ebpf(ctx: &mut Context<DemoMemory>, mut pc: u64) -> Result<u64, &'static 
         let instr = ctx.data.load_pc(pc).map_err(|_| "load failed")?;
         pc += 1;
 
-        let flow = match rvm::step(ctx, instr) {
+        let flow = match rvm_core::step(ctx, instr) {
             ControlFlow::Break(f) => f,
             ControlFlow::Continue(instr) => {
                 let second = ctx.data.load_pc(pc).map_err(|_| "load failed")?;
                 pc += 1;
-                rvm::step_ld64(ctx, instr, second)
+                rvm_core::step_ld64(ctx, instr, second)
             }
         };
 

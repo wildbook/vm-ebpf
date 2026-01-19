@@ -5,5 +5,5 @@ edition = "2021"
 description = "Demo of embeddable eBPF VM with BTF/CO-RE and structured logging"
 
 [dependencies]
-rvm = { path = "../../lib/rvm" }
+rvm-core = { path = "../../lib/rvm-core" }
 btf = { path = "../../lib/btf" }
