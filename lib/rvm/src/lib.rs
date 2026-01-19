@@ -8,6 +8,9 @@ mod debug;
 
 pub mod opcode;
 
+#[cfg(test)]
+mod tests;
+
 // https://github.com/ietf-wg-bpf/ebpf-docs/blob/9fecd435d065094050cb6c14ddc11fffac313180/rst/instruction-set.rst
 // https://docs.kernel.org/6.4/bpf/instruction-set.html#bit-immediate-instructions
 
@@ -294,20 +297,27 @@ mod alu {
                 BITS_64 => ((d as i64) >> (s & 63)) as u64,
                 BITS_32 => ((d as i32) >> (s & 31)) as u64,
             },
-            AluOpc::End => match (alu_end, imm) {
-                (AluEnd::ToLE, 16) => (d as u16).to_le() as u64,
-                (AluEnd::ToLE, 32) => (d as u32).to_le() as u64,
-                (AluEnd::ToLE, 64) => (d as u64).to_le() as u64,
-                (AluEnd::ToBE, 16) => (d as u16).to_be() as u64,
-                (AluEnd::ToBE, 32) => (d as u32).to_be() as u64,
-                (AluEnd::ToBE, 64) => (d as u64).to_be() as u64,
-                _ => return Flow::FailCpu, // unimplemented!("undefined behavior for alu_end: {alu_end:?} {imm}"),
-            },
-
-            AluOpc::UndefE => return Flow::FailCpu,
-            AluOpc::UndefF => return Flow::FailCpu,
+            // END (byte swap) instructions have special handling:
+            // - Uses the full 64-bit register value regardless of ALU class
+            // - The result width is determined by imm (16, 32, 64), not by ALU class
+            // - Results should NOT be zero-extended based on ALU class
+            AluOpc::End => {
+                let full_d = ctx.regs[dst_reg]; // Use full 64-bit value
+                ctx.regs[dst_reg] = match (alu_end, imm) {
+                    (AluEnd::ToLE, 16) => (full_d as u16).to_le() as u64,
+                    (AluEnd::ToLE, 32) => (full_d as u32).to_le() as u64,
+                    (AluEnd::ToLE, 64) => full_d.to_le(),
+                    (AluEnd::ToBE, 16) => (full_d as u16).to_be() as u64,
+                    (AluEnd::ToBE, 32) => (full_d as u32).to_be() as u64,
+                    (AluEnd::ToBE, 64) => full_d.to_be(),
+                    _ => return Flow::FailCpu,
+                };
+                return Flow::Next;
+            }
+            AluOpc::UndefE | AluOpc::UndefF => return Flow::FailCpu,
         };
 
+        // For ALU32 operations, zero-extend the 32-bit result to 64 bits
         ctx.regs[dst_reg] = match BITS {
             BITS_64 => result,
             BITS_32 => zero_extend_32_to_64(result),
@@ -317,25 +327,28 @@ mod alu {
     }
 
     pub fn jump<M: Memory, const BITS: bool>(ctx: &mut Context<M>, instr: Instruction) -> Flow<M> {
+        let opc = instr.opcode();
+        let jmp_opc = opc.jmp_opc();
+        let jmp_src = opc.alu_src();
+
         let src_reg = instr.src_reg() as usize;
         let dst_reg = instr.dst_reg() as usize;
 
         let imm = instr.imm();
-        let opc = instr.opcode();
 
         let d = match BITS {
             BITS_64 => ctx.regs[dst_reg],
             BITS_32 => ctx.regs[dst_reg] & 0xFFFFFFFF,
         };
-        let s = match (opc.jmp_src(), BITS) {
-            (Source::Imm, BITS_64) => imm as i64 as u64,
-            (Source::Imm, BITS_32) => imm as u32 as u64,
+
+        let s = match (jmp_src, BITS) {
+            (Source::Imm, _) => imm as i64 as u64,
             (Source::Reg, BITS_64) => ctx.regs[src_reg],
             (Source::Reg, BITS_32) => ctx.regs[src_reg] & 0xFFFFFFFF,
         };
 
-        let cond = match opc.jmp_opc() {
-            // JA uses offset field for JMP class, but imm field for JMP32 class
+        let cond = match jmp_opc {
+            // JA in JMP64 class uses offset field, JA in JMP32 class uses imm field
             JmpOpc::Ja => {
                 return match BITS {
                     BITS_64 => Flow::Jump(instr.offset() as i64),
@@ -345,7 +358,7 @@ mod alu {
             JmpOpc::Jeq => d == s,
             JmpOpc::Jgt => d > s,
             JmpOpc::Jge => d >= s,
-            JmpOpc::Jset => d & s != 0,
+            JmpOpc::Jset => (d & s) != 0,
             JmpOpc::Jne => d != s,
             JmpOpc::Jsgt => match BITS {
                 BITS_64 => (d as i64) > (s as i64),
@@ -537,23 +550,4 @@ pub fn step_ld64<M: Memory>(ctx: &mut Context<M>, instr: Instruction, second: In
     }
 
     Flow::Next
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::{Context, Instruction};
-
-    #[test]
-    fn test_broken() {
-        let mut ctx = Context::new(());
-        ctx.regs[3] = 1;
-
-        // 67 03 00 00 20 00 00 00 | r3 <<= 0x20 (64-bit)
-        let instr = Instruction(0x0000002000000367);
-
-        crate::step(&mut ctx, instr);
-
-        assert_eq!(1_u64.checked_shl(32).unwrap_or(0), 1 << 32);
-        assert_eq!(ctx.regs[3], 1 << 32);
-    }
 }

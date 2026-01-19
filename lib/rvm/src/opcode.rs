@@ -106,7 +106,7 @@ impl AluOpc {
     pub const fn lsh_32(src: Source)   -> OpCode { OpCode(Class::Alu32 as u8 | AluOpc::Lsh  as u8 | src as u8) }
     pub const fn rsh_32(src: Source)   -> OpCode { OpCode(Class::Alu32 as u8 | AluOpc::Rsh  as u8 | src as u8) }
     pub const fn neg_32(src: Source)   -> OpCode { OpCode(Class::Alu32 as u8 | AluOpc::Neg  as u8 | src as u8) }
-    pub const fn r#mod_32(src: Source) -> OpCode { OpCode(Class::Alu32 as u8 | AluOpc::Mod  as u8 | src as u8) }
+    pub const fn mod_32(src: Source)   -> OpCode { OpCode(Class::Alu32 as u8 | AluOpc::Mod  as u8 | src as u8) }
     pub const fn xor_32(src: Source)   -> OpCode { OpCode(Class::Alu32 as u8 | AluOpc::Xor  as u8 | src as u8) }
     pub const fn mov_32(src: Source)   -> OpCode { OpCode(Class::Alu32 as u8 | AluOpc::Mov  as u8 | src as u8) }
     pub const fn arsh_32(src: Source)  -> OpCode { OpCode(Class::Alu32 as u8 | AluOpc::Arsh as u8 | src as u8) }
@@ -121,7 +121,7 @@ impl AluOpc {
     pub const fn lsh_64(src: Source)   -> OpCode { OpCode(Class::Alu64 as u8 | AluOpc::Lsh  as u8 | src as u8) }
     pub const fn rsh_64(src: Source)   -> OpCode { OpCode(Class::Alu64 as u8 | AluOpc::Rsh  as u8 | src as u8) }
     pub const fn neg_64(src: Source)   -> OpCode { OpCode(Class::Alu64 as u8 | AluOpc::Neg  as u8 | src as u8) }
-    pub const fn r#mod_64(src: Source) -> OpCode { OpCode(Class::Alu64 as u8 | AluOpc::Mod  as u8 | src as u8) }
+    pub const fn mod_64(src: Source)   -> OpCode { OpCode(Class::Alu64 as u8 | AluOpc::Mod  as u8 | src as u8) }
     pub const fn xor_64(src: Source)   -> OpCode { OpCode(Class::Alu64 as u8 | AluOpc::Xor  as u8 | src as u8) }
     pub const fn mov_64(src: Source)   -> OpCode { OpCode(Class::Alu64 as u8 | AluOpc::Mov  as u8 | src as u8) }
     pub const fn arsh_64(src: Source)  -> OpCode { OpCode(Class::Alu64 as u8 | AluOpc::Arsh as u8 | src as u8) }
