@@ -5,7 +5,7 @@
 
 use std::ops::ControlFlow;
 
-use rvm_core::{step, step_ld64, Context, Flow};
+use rvm_core::{step, step_ld64, Context, Flow, Memory};
 
 use crate::error::{ExecError, Result};
 use crate::helper::{HelperArgs, HelperContext, HelperRegistry};
@@ -62,164 +62,176 @@ impl<'a> Executor<'a> {
     ///
     /// The return value (r0) on success.
     pub fn call(&mut self, pc: u64, args: &[u64]) -> Result<u64> {
-        // Create execution context
-        let mut ctx = Context::new(());
-
-        // Set up initial registers
-        // r0: return value (initially 0)
-        ctx.regs[0] = 0;
-
-        // r1-r5: arguments
-        for (i, &arg) in args.iter().take(5).enumerate() {
-            ctx.regs[i + 1] = arg;
-        }
-
-        // r6-r9: callee-saved (initially 0)
-        // r10: frame pointer (stack top)
-        ctx.regs[10] = self.stack_top;
-
-        // Call stack for BPF-to-BPF calls
-        // Each frame stores: r6, r7, r8, r9, return_pc
-        let mut call_stack: Vec<[u64; FRAME_SIZE]> = Vec::with_capacity(MAX_CALL_DEPTH);
-
-        // Current program counter
-        let mut current_pc = pc;
-
-        // Instruction counter
-        let mut insn_count: u64 = 0;
-
-        loop {
-            // Check instruction limit
-            if self.instruction_limit > 0 && insn_count >= self.instruction_limit {
-                return Err(ExecError::InstructionLimit(insn_count).into());
-            }
-
-            // Fetch instruction
-            let insn = self
-                .memory
-                .load_pc(current_pc)
-                .map_err(|_| ExecError::InvalidPc(current_pc))?;
-
-            insn_count += 1;
-
-            // Execute instruction
-            match step(&mut ctx, insn) {
-                ControlFlow::Break(flow) => {
-                    match self.handle_flow(flow, &mut ctx, &mut current_pc, &mut call_stack)? {
-                        FlowResult::Continue => current_pc += 1,
-                        FlowResult::Jump(new_pc) => current_pc = new_pc,
-                        FlowResult::Exit => return Ok(ctx.regs[0]),
-                    }
-                }
-                ControlFlow::Continue(_first_insn) => {
-                    // LD_IMM64: need to fetch and process second instruction
-                    current_pc += 1;
-                    insn_count += 1;
-
-                    let second = self
-                        .memory
-                        .load_pc(current_pc)
-                        .map_err(|_| ExecError::InvalidPc(current_pc))?;
-
-                    match step_ld64(&mut ctx, insn, second) {
-                        Flow::Next => current_pc += 1,
-                        Flow::FailCpu => {
-                            return Err(ExecError::CpuFault("LD_IMM64 failed".to_string()).into());
-                        }
-                        Flow::FailMem(_) => {
-                            return Err(ExecError::MemoryFault("LD_IMM64 memory error".to_string()).into());
-                        }
-                        Flow::Missing => {
-                            return Err(ExecError::Unimplemented("LD_IMM64 variant".to_string()).into());
-                        }
-                        _ => {
-                            return Err(ExecError::CpuFault("unexpected flow from LD_IMM64".to_string()).into());
-                        }
-                    }
-                }
-            }
-        }
+        execute(self.memory, self.helpers, self.stack_top, pc, args, self.instruction_limit)
     }
+}
 
-    /// Handle a flow control result.
-    fn handle_flow(
-        &mut self,
-        flow: Flow<()>,
-        ctx: &mut Context<()>,
-        current_pc: &mut u64,
-        call_stack: &mut Vec<[u64; FRAME_SIZE]>,
-    ) -> Result<FlowResult> {
-        match flow {
-            Flow::Next => Ok(FlowResult::Continue),
+/// Execute a program with the given memory.
+///
+/// This is a standalone function that takes ownership of memory during execution.
+pub fn execute(
+    memory: &mut VmMemory,
+    helpers: &HelperRegistry,
+    stack_top: u64,
+    pc: u64,
+    args: &[u64],
+    instruction_limit: u64,
+) -> Result<u64> {
+    // Create execution context with the memory
+    // We need to temporarily take the memory data out
+    let mem_data = std::mem::take(memory);
+    let mut ctx = Context::new(mem_data);
 
-            Flow::Jump(offset) => {
-                // Relative jump from next instruction
-                let next_pc = (*current_pc as i64) + 1 + offset;
-                if next_pc < 0 {
-                    return Err(ExecError::InvalidPc(next_pc as u64).into());
-                }
-                Ok(FlowResult::Jump(next_pc as u64))
-            }
+    // Set up initial registers
+    ctx.regs[0] = 0;
+    for (i, &arg) in args.iter().take(5).enumerate() {
+        ctx.regs[i + 1] = arg;
+    }
+    ctx.regs[10] = stack_top;
 
-            Flow::Call(offset) => {
-                // BPF-to-BPF call
-                if call_stack.len() >= MAX_CALL_DEPTH {
-                    return Err(ExecError::StackOverflow.into());
-                }
+    // Call stack for BPF-to-BPF calls
+    let mut call_stack: Vec<[u64; FRAME_SIZE]> = Vec::with_capacity(MAX_CALL_DEPTH);
 
-                // Save callee-saved registers and return address
-                let frame = [
-                    ctx.regs[6],
-                    ctx.regs[7],
-                    ctx.regs[8],
-                    ctx.regs[9],
-                    *current_pc + 1, // return address
-                ];
-                call_stack.push(frame);
+    // Current program counter
+    let mut current_pc = pc;
 
-                // Calculate target PC (relative from next instruction)
-                let target_pc = (*current_pc as i64) + 1 + offset;
-                if target_pc < 0 {
-                    return Err(ExecError::InvalidPc(target_pc as u64).into());
-                }
+    // Instruction counter
+    let mut insn_count: u64 = 0;
 
-                Ok(FlowResult::Jump(target_pc as u64))
-            }
-
-            Flow::Exit => {
-                // Check if we're returning from a BPF-to-BPF call
-                if let Some(frame) = call_stack.pop() {
-                    // Restore callee-saved registers
-                    ctx.regs[6] = frame[0];
-                    ctx.regs[7] = frame[1];
-                    ctx.regs[8] = frame[2];
-                    ctx.regs[9] = frame[3];
-
-                    // Return to caller
-                    Ok(FlowResult::Jump(frame[4]))
-                } else {
-                    // Top-level exit
-                    Ok(FlowResult::Exit)
-                }
-            }
-
-            Flow::CallExt(helper_id) => {
-                // External helper call
-                let args = HelperArgs::from_regs(&ctx.regs);
-                let mut helper_ctx = HelperContext::with_memory(args, self.memory);
-
-                let result = self.helpers.call(helper_id as u32, &mut helper_ctx)?;
-                ctx.regs[0] = result;
-
-                Ok(FlowResult::Continue)
-            }
-
-            Flow::FailCpu => Err(ExecError::CpuFault("invalid instruction".to_string()).into()),
-
-            Flow::FailMem(_) => Err(ExecError::MemoryFault("memory access error".to_string()).into()),
-
-            Flow::Missing => Err(ExecError::Unimplemented("instruction not implemented".to_string()).into()),
+    let result = loop {
+        // Check instruction limit
+        if instruction_limit > 0 && insn_count >= instruction_limit {
+            break Err(ExecError::InstructionLimit(insn_count).into());
         }
+
+        // Fetch instruction
+        let insn = match ctx.data.load_u64(current_pc.wrapping_mul(8)) {
+            Ok(v) => rvm_core::Instruction(v),
+            Err(_) => break Err(ExecError::InvalidPc(current_pc).into()),
+        };
+
+        insn_count += 1;
+
+        // Execute instruction
+        match step(&mut ctx, insn) {
+            ControlFlow::Break(flow) => match handle_flow(flow, &mut ctx, &mut current_pc, &mut call_stack, helpers)? {
+                FlowResult::Continue => current_pc += 1,
+                FlowResult::Jump(new_pc) => current_pc = new_pc,
+                FlowResult::Exit => break Ok(ctx.regs[0]),
+            },
+            ControlFlow::Continue(_first_insn) => {
+                // LD_IMM64: need to fetch and process second instruction
+                current_pc += 1;
+                insn_count += 1;
+
+                let second = match ctx.data.load_u64(current_pc.wrapping_mul(8)) {
+                    Ok(v) => rvm_core::Instruction(v),
+                    Err(_) => break Err(ExecError::InvalidPc(current_pc).into()),
+                };
+
+                match step_ld64(&mut ctx, insn, second) {
+                    Flow::Next => current_pc += 1,
+                    Flow::FailCpu => {
+                        break Err(ExecError::CpuFault("LD_IMM64 failed".to_string()).into());
+                    }
+                    Flow::FailMem(_) => {
+                        break Err(ExecError::MemoryFault("LD_IMM64 memory error".to_string()).into());
+                    }
+                    Flow::Missing => {
+                        break Err(ExecError::Unimplemented("LD_IMM64 variant".to_string()).into());
+                    }
+                    _ => {
+                        break Err(ExecError::CpuFault("unexpected flow from LD_IMM64".to_string()).into());
+                    }
+                }
+            }
+        }
+    };
+
+    // Restore memory back
+    *memory = ctx.data;
+
+    result
+}
+
+/// Handle a flow control result.
+fn handle_flow(
+    flow: Flow<VmMemory>,
+    ctx: &mut Context<VmMemory>,
+    current_pc: &mut u64,
+    call_stack: &mut Vec<[u64; FRAME_SIZE]>,
+    helpers: &HelperRegistry,
+) -> Result<FlowResult> {
+    match flow {
+        Flow::Next => Ok(FlowResult::Continue),
+
+        Flow::Jump(offset) => {
+            // Relative jump from next instruction
+            let next_pc = (*current_pc as i64) + 1 + offset;
+            if next_pc < 0 {
+                return Err(ExecError::InvalidPc(next_pc as u64).into());
+            }
+            Ok(FlowResult::Jump(next_pc as u64))
+        }
+
+        Flow::Call(offset) => {
+            // BPF-to-BPF call
+            if call_stack.len() >= MAX_CALL_DEPTH {
+                return Err(ExecError::StackOverflow.into());
+            }
+
+            // Save callee-saved registers and return address
+            let frame = [
+                ctx.regs[6],
+                ctx.regs[7],
+                ctx.regs[8],
+                ctx.regs[9],
+                *current_pc + 1, // return address
+            ];
+            call_stack.push(frame);
+
+            // Calculate target PC (relative from next instruction)
+            let target_pc = (*current_pc as i64) + 1 + offset;
+            if target_pc < 0 {
+                return Err(ExecError::InvalidPc(target_pc as u64).into());
+            }
+
+            Ok(FlowResult::Jump(target_pc as u64))
+        }
+
+        Flow::Exit => {
+            // Check if we're returning from a BPF-to-BPF call
+            if let Some(frame) = call_stack.pop() {
+                // Restore callee-saved registers
+                ctx.regs[6] = frame[0];
+                ctx.regs[7] = frame[1];
+                ctx.regs[8] = frame[2];
+                ctx.regs[9] = frame[3];
+
+                // Return to caller
+                Ok(FlowResult::Jump(frame[4]))
+            } else {
+                // Top-level exit
+                Ok(FlowResult::Exit)
+            }
+        }
+
+        Flow::CallExt(helper_id) => {
+            // External helper call
+            let args = HelperArgs::from_regs(&ctx.regs);
+            let mut helper_ctx = HelperContext::with_memory(args, &mut ctx.data);
+
+            let result = helpers.call(helper_id as u32, &mut helper_ctx)?;
+            ctx.regs[0] = result;
+
+            Ok(FlowResult::Continue)
+        }
+
+        Flow::FailCpu => Err(ExecError::CpuFault("invalid instruction".to_string()).into()),
+
+        Flow::FailMem(_) => Err(ExecError::MemoryFault("memory access error".to_string()).into()),
+
+        Flow::Missing => Err(ExecError::Unimplemented("instruction not implemented".to_string()).into()),
     }
 }
 
@@ -233,24 +245,10 @@ enum FlowResult {
     Exit,
 }
 
-/// Extension trait to load instructions from VmMemory.
-trait LoadPc {
-    fn load_pc(&self, pc: u64) -> std::result::Result<rvm_core::Instruction, &'static str>;
-}
-
-impl LoadPc for VmMemory {
-    fn load_pc(&self, pc: u64) -> std::result::Result<rvm_core::Instruction, &'static str> {
-        use crate::memory::Memory;
-        let addr = pc.checked_mul(8).ok_or("PC overflow")?;
-        self.load_u64(addr).map(rvm_core::Instruction)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::VmError;
-    use crate::memory::Memory;
 
     #[test]
     fn test_simple_exit() {
