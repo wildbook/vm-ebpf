@@ -275,7 +275,7 @@ impl<'a> Linker<'a> {
             // Parse BTF
             let btf = match Btf::parse(btf_data) {
                 Ok(b) => b,
-                Err(_) => continue, // Skip if BTF parsing fails
+                Err(_) => continue,
             };
 
             // Parse BTF.ext for CO-RE relocations
@@ -289,13 +289,24 @@ impl<'a> Linker<'a> {
             };
 
             // Apply CO-RE relocations for each code section
-            for section in module.code_sections() {
-                let Some(&section_addr) = layout.section_addrs.get(&section.elf_index) else {
+            for (section_idx, section) in module.sections.iter().enumerate() {
+                if section.kind != SectionKind::Code {
+                    continue;
+                }
+
+                let Some(&section_addr) = layout.section_addrs.get(&section_idx) else {
                     continue;
                 };
 
                 // Get relocations for this section
-                let Some(relos) = btf_ext.relos_for_section(&section.name) else {
+                // BTF.ext uses section names like "prog" (from SEC("prog"))
+                // Our parsed sections may have a dot prefix
+                let section_name_without_dot = section.name.strip_prefix('.').unwrap_or(&section.name);
+                let relos = btf_ext
+                    .relos_for_section(&section.name)
+                    .or_else(|| btf_ext.relos_for_section(section_name_without_dot));
+
+                let Some(relos) = relos else {
                     continue;
                 };
 
@@ -315,7 +326,7 @@ impl<'a> Linker<'a> {
                 let insns: &mut [u64] =
                     unsafe { std::slice::from_raw_parts_mut(mem_slice.as_mut_ptr() as *mut u64, num_insns) };
 
-                // Apply relocations
+                // Apply relocations (errors are silently ignored - this matches kernel behavior)
                 let _ = apply_core_relocations(insns, &btf, self.types, relos);
             }
         }

@@ -407,7 +407,7 @@ fn apply_single_relocation(
 
 fn compute_relocation_value(
     btf_type: &BtfTypeInfo<'_>,
-    _btf: &Btf<'_>,
+    btf: &Btf<'_>,
     registry: &TypeRegistry,
     access_str: &str,
     kind: CoreReloKind,
@@ -416,9 +416,9 @@ fn compute_relocation_value(
 
     match kind {
         CoreReloKind::FieldByteOffset => {
-            let field_name = parse_field_access(access_str)?;
+            let field_name = resolve_field_access(btf_type, btf, access_str)?;
             let offset = registry
-                .field_offset(type_name, field_name)
+                .field_offset(type_name, &field_name)
                 .ok_or_else(|| CoreReloError::FieldNotFound {
                     type_name: type_name.to_string(),
                     field_name: field_name.to_string(),
@@ -430,9 +430,9 @@ fn compute_relocation_value(
         }
 
         CoreReloKind::FieldByteSize => {
-            let field_name = parse_field_access(access_str)?;
+            let field_name = resolve_field_access(btf_type, btf, access_str)?;
             let size = registry
-                .field_size(type_name, field_name)
+                .field_size(type_name, &field_name)
                 .ok_or_else(|| CoreReloError::FieldNotFound {
                     type_name: type_name.to_string(),
                     field_name: field_name.to_string(),
@@ -444,8 +444,8 @@ fn compute_relocation_value(
         }
 
         CoreReloKind::FieldExists => {
-            let field_name = parse_field_access(access_str)?;
-            let exists = registry.field_exists(type_name, field_name);
+            let field_name = resolve_field_access(btf_type, btf, access_str)?;
+            let exists = registry.field_exists(type_name, &field_name);
             Ok(ReloResult {
                 value: exists as u64,
                 success: exists,
@@ -505,9 +505,117 @@ fn compute_relocation_value(
     }
 }
 
+/// Resolve a field access string to a field name.
+///
+/// Access strings can be:
+/// - Simple field name: "my_field"
+/// - Numeric indices: "0:0", "0:1:2" (for nested access)
+///
+/// For numeric indices, we walk the BTF type hierarchy to find the field name.
+fn resolve_field_access<'a>(
+    btf_type: &BtfTypeInfo<'a>,
+    btf: &Btf<'a>,
+    access_str: &str,
+) -> Result<String, CoreReloError> {
+    if access_str.is_empty() {
+        return Err(CoreReloError::InvalidAccessString(access_str.to_string()));
+    }
+
+    // Check if it's an index-based access (all digits and colons)
+    if !access_str.chars().all(|c| c.is_ascii_digit() || c == ':') {
+        // Simple field name - return as-is
+        return Ok(access_str.to_string());
+    }
+
+    // Parse the index path
+    let indices: Vec<u32> = access_str.split(':').filter_map(|s| s.parse().ok()).collect();
+
+    if indices.is_empty() {
+        return Err(CoreReloError::InvalidAccessString(access_str.to_string()));
+    }
+
+    // Walk the type hierarchy to find the field name
+    // The first index (indices[0]) is typically 0 (the struct itself)
+    // Subsequent indices are field indices within nested structs
+    resolve_field_by_indices(btf_type, btf, &indices[1..])
+}
+
+/// Resolve field indices to a field name by walking the BTF type hierarchy.
+fn resolve_field_by_indices<'a>(
+    current_type: &BtfTypeInfo<'a>,
+    btf: &Btf<'a>,
+    indices: &[u32],
+) -> Result<String, CoreReloError> {
+    if indices.is_empty() {
+        // No more indices - this shouldn't happen for field access
+        return Err(CoreReloError::InvalidAccessString("empty index path".to_string()));
+    }
+
+    let field_idx = indices[0] as usize;
+
+    // Get the members from this type
+    let members = match current_type {
+        BtfTypeInfo::Struct { members, .. } => members,
+        BtfTypeInfo::Union { members, .. } => members,
+        _ => {
+            return Err(CoreReloError::InvalidAccessString(format!(
+                "expected struct/union for index access, got {:?}",
+                current_type.kind()
+            )));
+        }
+    };
+
+    // Get the member at the specified index
+    let member = members.get(field_idx).ok_or_else(|| {
+        CoreReloError::InvalidAccessString(format!(
+            "field index {} out of bounds (struct has {} members)",
+            field_idx,
+            members.len()
+        ))
+    })?;
+
+    if indices.len() == 1 {
+        // This is the final field - return its name
+        Ok(member.name.to_string())
+    } else {
+        // Need to recurse into nested struct/union
+        let nested_type = btf
+            .type_by_id(member.type_id)
+            .ok_or_else(|| CoreReloError::InvalidTypeId(member.type_id))?;
+
+        // Skip through pointer/typedef/const/volatile/restrict to get to the actual type
+        let resolved_type = skip_modifiers(btf, nested_type)?;
+
+        resolve_field_by_indices(resolved_type, btf, &indices[1..])
+    }
+}
+
+/// Skip through type modifiers (ptr, typedef, const, volatile, restrict) to get the base type.
+fn skip_modifiers<'a, 'b>(btf: &'b Btf<'a>, ty: &'b BtfTypeInfo<'a>) -> Result<&'b BtfTypeInfo<'a>, CoreReloError> {
+    match ty {
+        BtfTypeInfo::Ptr { pointee_type } => {
+            let inner = btf
+                .type_by_id(*pointee_type)
+                .ok_or_else(|| CoreReloError::InvalidTypeId(*pointee_type))?;
+            skip_modifiers(btf, inner)
+        }
+        BtfTypeInfo::Typedef { type_id, .. }
+        | BtfTypeInfo::Const { type_id }
+        | BtfTypeInfo::Volatile { type_id }
+        | BtfTypeInfo::Restrict { type_id } => {
+            let inner = btf
+                .type_by_id(*type_id)
+                .ok_or_else(|| CoreReloError::InvalidTypeId(*type_id))?;
+            skip_modifiers(btf, inner)
+        }
+        _ => Ok(ty),
+    }
+}
+
 /// Parse a field access string like "0:1:2" or just a field name.
 ///
 /// For simple cases, we just return the first component.
+#[allow(dead_code)]
 fn parse_field_access(access_str: &str) -> Result<&str, CoreReloError> {
     // Access strings can be:
     // - Simple field name: "my_field"
@@ -534,7 +642,10 @@ fn parse_field_access(access_str: &str) -> Result<&str, CoreReloError> {
     Ok(access_str)
 }
 
-/// Patch an instruction's immediate value.
+/// Patch an instruction's immediate or offset value based on relocation kind.
+///
+/// For FieldByteOffset relocations on load/store instructions, we patch the offset field.
+/// For other relocations, we patch the immediate field.
 fn patch_instruction(instructions: &mut [u64], insn_off: u32, value: u64) -> Result<(), CoreReloError> {
     // insn_off is in bytes, instructions are 8 bytes each
     let insn_idx = (insn_off / 8) as usize;
@@ -543,12 +654,34 @@ fn patch_instruction(instructions: &mut [u64], insn_off: u32, value: u64) -> Res
         return Err(CoreReloError::InstructionOutOfBounds(insn_off));
     }
 
-    // The immediate is in the upper 32 bits of the instruction
     let instr = &mut instructions[insn_idx];
 
-    // Clear old imm and set new one
-    // Instruction format: imm (32) | offset (16) | src (4) | dst (4) | opcode (8)
-    *instr = (*instr & 0x00000000FFFFFFFF) | ((value as u32 as u64) << 32);
+    // BPF instruction format (little-endian):
+    // Bits:  0-7    8-11   12-15  16-31   32-63
+    //        opcode dst    src    offset  imm
+    //
+    // For field offset relocations on LDX/STX instructions, we patch the offset field.
+    // For other cases (like LD_IMM64), we patch the imm field.
+
+    let opcode = (*instr & 0xFF) as u8;
+
+    // Check if this is a LDX/STX instruction (memory load/store)
+    // LDX: opcode class 0x61-0x79 (BPF_LDX | size | BPF_MEM)
+    // STX: opcode class 0x63-0x7B (BPF_STX | size | BPF_MEM)
+    // Memory operations have opcode & 0x07 == 0x01 (LDX) or 0x03 (STX)
+    let is_ldx = (opcode & 0x07) == 0x01; // BPF_LDX
+    let is_stx = (opcode & 0x07) == 0x03; // BPF_STX
+    let is_mem = (opcode & 0xE0) == 0x60; // BPF_MEM mode
+
+    if (is_ldx || is_stx) && is_mem {
+        // Patch the offset field (bits 16-31)
+        // offset is a signed 16-bit value
+        let offset_val = value as i16 as u16;
+        *instr = (*instr & 0xFFFFFFFF0000FFFF) | ((offset_val as u64) << 16);
+    } else {
+        // Patch the imm field (bits 32-63)
+        *instr = (*instr & 0x00000000FFFFFFFF) | ((value as u32 as u64) << 32);
+    }
 
     Ok(())
 }
