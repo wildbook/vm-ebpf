@@ -188,8 +188,8 @@ fn elfin() -> anyhow::Result<()> {
             };
 
             let Some(target) = smap[chunk.target_idx()] else {
-                // eprintln!("relocs for a section we don't have mapped...? {:?}", chunk.target_idx());
-                unimplemented!()
+                // Relocations for unmapped sections (e.g., debug info) - skip them
+                continue;
             };
 
             let target_ent = MAP[target];
