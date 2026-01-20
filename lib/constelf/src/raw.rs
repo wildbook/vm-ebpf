@@ -123,6 +123,34 @@ pub mod sht {
     pub const HIUSER:          u32 = 0x8fffffff; /* End of application-specific */
 }
 
+/// Symbol binding types (upper 4 bits of st_info).
+#[rustfmt::skip]
+pub mod stb {
+    pub const LOCAL:  u8 = 0;  /* Local symbol */
+    pub const GLOBAL: u8 = 1;  /* Global symbol */
+    pub const WEAK:   u8 = 2;  /* Weak symbol */
+    pub const LOOS:   u8 = 10; /* Start of OS-specific */
+    pub const HIOS:   u8 = 12; /* End of OS-specific */
+    pub const LOPROC: u8 = 13; /* Start of processor-specific */
+    pub const HIPROC: u8 = 15; /* End of processor-specific */
+}
+
+/// Symbol types (lower 4 bits of st_info).
+#[rustfmt::skip]
+pub mod stt {
+    pub const NOTYPE:  u8 = 0;  /* Symbol type is unspecified */
+    pub const OBJECT:  u8 = 1;  /* Symbol is a data object */
+    pub const FUNC:    u8 = 2;  /* Symbol is a code object */
+    pub const SECTION: u8 = 3;  /* Symbol associated with a section */
+    pub const FILE:    u8 = 4;  /* Symbol's name is file name */
+    pub const COMMON:  u8 = 5;  /* Symbol is a common data object */
+    pub const TLS:     u8 = 6;  /* Symbol is thread-local data object */
+    pub const LOOS:    u8 = 10; /* Start of OS-specific */
+    pub const HIOS:    u8 = 12; /* End of OS-specific */
+    pub const LOPROC:  u8 = 13; /* Start of processor-specific */
+    pub const HIPROC:  u8 = 15; /* End of processor-specific */
+}
+
 #[repr(packed)]
 #[derive(Debug, Copy, Clone)]
 pub struct Elf64Rel {

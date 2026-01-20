@@ -42,7 +42,7 @@ mod types;
 #[cfg(test)]
 mod integration_tests;
 
-pub use core_relo::{apply_core_relocations, BtfExt, CoreRelo, CoreReloKind};
+pub use core_relo::{apply_core_relocations, BtfExt, CoreRelo, CoreReloError, CoreReloKind};
 pub use parse::{Btf, BtfError};
 pub use raw::*;
 pub use registry::{EnumDef, EnumVariant, StructDef, StructField, TypeRegistry};

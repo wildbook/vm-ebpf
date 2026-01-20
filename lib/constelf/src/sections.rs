@@ -166,4 +166,26 @@ impl<'a> ElfSections<'a> {
     pub fn iter(self) -> impl Iterator<Item = ElfSection<'a>> {
         self.headers().iter().map(move |raw| ElfSection { all: self, raw })
     }
+
+    /// Get the symbol string table (.strtab section).
+    pub const fn sym_strtab(self) -> ElfResult<&'a [u8]> {
+        let headers = self.headers();
+
+        let mut i = 0;
+        while i < headers.len() {
+            let header = &headers[i];
+            i += 1;
+
+            if header.sh_type == raw::sht::STRTAB {
+                // Check if this is .strtab (not .shstrtab)
+                if let Ok(name) = self.name(header) {
+                    if util::slice_eq(name.to_bytes(), b".strtab") {
+                        return self.bytes(header);
+                    }
+                }
+            }
+        }
+
+        Err(err::ElfError::SectionMissing)
+    }
 }

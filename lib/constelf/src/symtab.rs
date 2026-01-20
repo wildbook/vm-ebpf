@@ -25,10 +25,19 @@ impl ElfSymTab<'_> {
         self.raw.len()
     }
 
+    pub const fn is_empty(&self) -> bool {
+        self.raw.is_empty()
+    }
+
     pub const fn get(&self, idx: usize) -> Option<&Elf64Sym> {
         match idx < self.len() {
             true => Some(&self.raw[idx]),
             false => None,
         }
+    }
+
+    /// Iterate over symbols with their indices.
+    pub fn iter(&self) -> impl Iterator<Item = &Elf64Sym> {
+        self.raw.iter()
     }
 }

@@ -1,12 +1,34 @@
 use crate::err::{ElfError, ErrHeader};
 use crate::{ensure, ensure_matches, raw, tryres, ElfResult};
 
+impl raw::Elf64Sym {
+    /// Get the symbol binding (upper 4 bits of st_info).
+    pub const fn bind(&self) -> u8 {
+        self.st_info >> 4
+    }
+
+    /// Get the symbol type (lower 4 bits of st_info).
+    pub const fn typ(&self) -> u8 {
+        self.st_info & 0xf
+    }
+}
+
 impl raw::Elf64Rel {
     pub const fn sym(self) -> u32 {
         (self.r_info >> 32) as u32
     }
 
     pub const fn typ(self) -> u32 {
+        self.r_info as u32
+    }
+}
+
+impl raw::Elf64Rela {
+    pub const fn sym(&self) -> u32 {
+        (self.r_info >> 32) as u32
+    }
+
+    pub const fn typ(&self) -> u32 {
         self.r_info as u32
     }
 }

@@ -1,0 +1,11 @@
+[package]
+name = "rvm"
+version = "0.1.0"
+edition = "2021"
+description = "Embeddable eBPF runtime with CO-RE support"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+rvm-core = { path = "../rvm-core" }
+constelf = { path = "../constelf" }
+btf = { path = "../btf" }

@@ -60,6 +60,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvm"
+version = "0.1.0"
+dependencies = [
+ "btf",
+ "constelf",
+ "rvm-core",
+]
+
+[[package]]
 name = "rvm-core"
 version = "0.1.0"
 dependencies = [
