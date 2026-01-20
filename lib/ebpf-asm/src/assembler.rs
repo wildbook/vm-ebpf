@@ -174,6 +174,9 @@ impl Assembler {
     }
 
     /// Get the current instruction count.
+    ///
+    /// This is useful for CO-RE relocations where you need to track
+    /// instruction indices for patching.
     pub fn len(&self) -> usize {
         self.instructions.len()
     }
@@ -181,6 +184,59 @@ impl Assembler {
     /// Check if the assembler is empty.
     pub fn is_empty(&self) -> bool {
         self.instructions.is_empty()
+    }
+
+    /// Get the current instruction index (where the next instruction will be placed).
+    ///
+    /// This is an alias for `len()` but is more descriptive when used for
+    /// tracking instruction positions for CO-RE relocations.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use ebpf_asm::{Assembler, R0, R3};
+    ///
+    /// let mut asm = Assembler::new();
+    ///
+    /// // Track the index before emitting
+    /// let mov_idx = asm.current_index();
+    /// asm.mov64_imm(R3, 8).unwrap();  // This instruction is at mov_idx
+    ///
+    /// // Now you can use mov_idx for CO-RE relocation
+    /// assert_eq!(mov_idx, 0);
+    /// ```
+    #[inline]
+    pub fn current_index(&self) -> usize {
+        self.instructions.len()
+    }
+
+    /// Get the byte offset for a given instruction index.
+    ///
+    /// CO-RE relocations use byte offsets, not instruction indices.
+    /// This helper converts an instruction index to its byte offset
+    /// (instruction_index * 8).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use ebpf_asm::Assembler;
+    ///
+    /// let asm = Assembler::new();
+    /// assert_eq!(asm.byte_offset(0), 0);
+    /// assert_eq!(asm.byte_offset(1), 8);
+    /// assert_eq!(asm.byte_offset(5), 40);
+    /// ```
+    #[inline]
+    pub fn byte_offset(&self, insn_index: usize) -> u32 {
+        (insn_index * 8) as u32
+    }
+
+    /// Get the byte offset for the current instruction position.
+    ///
+    /// This is equivalent to `byte_offset(current_index())`.
+    #[inline]
+    pub fn current_byte_offset(&self) -> u32 {
+        self.byte_offset(self.instructions.len())
     }
 
     /// Create a new unbound label.
@@ -955,6 +1011,119 @@ impl Assembler {
         self.emit(RawInstruction::from_parts(opcode, dst, src, offset, imm));
         self
     }
+
+    /// Emit a raw instruction and return its index.
+    ///
+    /// This is useful for CO-RE relocations where you need to track
+    /// which instruction to patch.
+    pub fn raw_idx(&mut self, opcode: u8, dst: u8, src: u8, offset: i16, imm: i32) -> usize {
+        let idx = self.instructions.len();
+        self.emit(RawInstruction::from_parts(opcode, dst, src, offset, imm));
+        idx
+    }
+
+    // ==================== Index-returning variants for CO-RE ====================
+
+    /// `mov64 dst, imm` - 64-bit move immediate, returns instruction index.
+    ///
+    /// This variant is useful for CO-RE relocations where the immediate
+    /// value needs to be patched at load time.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use ebpf_asm::{Assembler, R3};
+    ///
+    /// let mut asm = Assembler::new();
+    /// let idx = asm.mov64_imm_idx(R3, 8);  // Placeholder offset
+    /// // Use idx and asm.byte_offset(idx) for CO-RE relocation
+    /// ```
+    pub fn mov64_imm_idx(&mut self, dst: Register, imm: i32) -> usize {
+        let idx = self.instructions.len();
+        let opcode = class::ALU64 | alu::MOV | SRC_IMM;
+        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
+        idx
+    }
+
+    /// `ldxw dst, [src+off]` - Load 32-bit from memory, returns instruction index.
+    pub fn ldxw_idx(&mut self, dst: Register, src: Register, offset: i16) -> usize {
+        let idx = self.instructions.len();
+        let opcode = class::LDX | size::W | mode::MEM;
+        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, 0));
+        idx
+    }
+
+    /// `ldxdw dst, [src+off]` - Load 64-bit from memory, returns instruction index.
+    pub fn ldxdw_idx(&mut self, dst: Register, src: Register, offset: i16) -> usize {
+        let idx = self.instructions.len();
+        let opcode = class::LDX | size::DW | mode::MEM;
+        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, 0));
+        idx
+    }
+
+    /// `ldxh dst, [src+off]` - Load 16-bit from memory, returns instruction index.
+    pub fn ldxh_idx(&mut self, dst: Register, src: Register, offset: i16) -> usize {
+        let idx = self.instructions.len();
+        let opcode = class::LDX | size::H | mode::MEM;
+        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, 0));
+        idx
+    }
+
+    /// `ldxb dst, [src+off]` - Load 8-bit from memory, returns instruction index.
+    pub fn ldxb_idx(&mut self, dst: Register, src: Register, offset: i16) -> usize {
+        let idx = self.instructions.len();
+        let opcode = class::LDX | size::B | mode::MEM;
+        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, 0));
+        idx
+    }
+
+    /// `stxw [dst+off], src` - Store 32-bit to memory, returns instruction index.
+    pub fn stxw_idx(&mut self, dst: Register, offset: i16, src: Register) -> usize {
+        let idx = self.instructions.len();
+        let opcode = class::STX | size::W | mode::MEM;
+        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, 0));
+        idx
+    }
+
+    /// `stxdw [dst+off], src` - Store 64-bit to memory, returns instruction index.
+    pub fn stxdw_idx(&mut self, dst: Register, offset: i16, src: Register) -> usize {
+        let idx = self.instructions.len();
+        let opcode = class::STX | size::DW | mode::MEM;
+        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, 0));
+        idx
+    }
+
+    /// `add64 dst, imm` - 64-bit addition with immediate, returns instruction index.
+    pub fn add64_imm_idx(&mut self, dst: Register, imm: i32) -> usize {
+        let idx = self.instructions.len();
+        let opcode = class::ALU64 | alu::ADD | SRC_IMM;
+        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
+        idx
+    }
+
+    /// `add64 dst, src` - 64-bit addition with register, returns instruction index.
+    pub fn add64_idx(&mut self, dst: Register, src: Register) -> usize {
+        let idx = self.instructions.len();
+        let opcode = class::ALU64 | alu::ADD | SRC_REG;
+        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
+        idx
+    }
+
+    /// `mov64 dst, src` - 64-bit move from register, returns instruction index.
+    pub fn mov64_idx(&mut self, dst: Register, src: Register) -> usize {
+        let idx = self.instructions.len();
+        let opcode = class::ALU64 | alu::MOV | SRC_REG;
+        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
+        idx
+    }
+
+    /// `call imm` - Call helper function by ID, returns instruction index.
+    pub fn call_idx(&mut self, func_id: i32) -> usize {
+        let idx = self.instructions.len();
+        let opcode = class::JMP64 | jmp::CALL;
+        self.emit(RawInstruction::from_parts(opcode, 0, 0, 0, func_id));
+        idx
+    }
 }
 
 impl Default for Assembler {
@@ -1111,5 +1280,86 @@ mod tests {
         let code = asm.assemble().unwrap();
         // src_reg should be 1 for local call
         assert_eq!((code[1] >> 4) & 0xF, 1);
+    }
+
+    #[test]
+    fn test_current_index() {
+        let mut asm = Assembler::new();
+
+        assert_eq!(asm.current_index(), 0);
+        asm.mov64_imm(R0, 42).unwrap();
+        assert_eq!(asm.current_index(), 1);
+        asm.add64_imm(R0, 10).unwrap();
+        assert_eq!(asm.current_index(), 2);
+        asm.exit().unwrap();
+        assert_eq!(asm.current_index(), 3);
+    }
+
+    #[test]
+    fn test_byte_offset() {
+        let asm = Assembler::new();
+        assert_eq!(asm.byte_offset(0), 0);
+        assert_eq!(asm.byte_offset(1), 8);
+        assert_eq!(asm.byte_offset(5), 40);
+        assert_eq!(asm.byte_offset(100), 800);
+    }
+
+    #[test]
+    fn test_mov64_imm_idx() {
+        let mut asm = Assembler::new();
+
+        let idx0 = asm.mov64_imm_idx(R0, 10);
+        let idx1 = asm.mov64_imm_idx(R1, 20);
+        let idx2 = asm.mov64_imm_idx(R2, 30);
+
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        assert_eq!(idx2, 2);
+
+        // Verify byte offsets for CO-RE
+        assert_eq!(asm.byte_offset(idx0), 0);
+        assert_eq!(asm.byte_offset(idx1), 8);
+        assert_eq!(asm.byte_offset(idx2), 16);
+    }
+
+    #[test]
+    fn test_ldxw_idx_for_core() {
+        let mut asm = Assembler::new();
+
+        // Typical CO-RE pattern: load with offset that gets patched
+        let load_idx = asm.ldxw_idx(R2, R1, 8); // r2 = *(u32*)(r1 + 8)
+
+        assert_eq!(load_idx, 0);
+        assert_eq!(asm.byte_offset(load_idx), 0);
+
+        let code = asm.assemble().unwrap();
+        // Check opcode for LDX_W
+        assert_eq!(code[0], 0x61);
+        // Check offset field
+        let offset = i16::from_le_bytes([code[2], code[3]]);
+        assert_eq!(offset, 8);
+    }
+
+    #[test]
+    fn test_raw_idx() {
+        let mut asm = Assembler::new();
+
+        asm.mov64_imm(R0, 0).unwrap();
+        let raw_idx = asm.raw_idx(0x61, 2, 1, 8, 0); // LDX_W r2, [r1+8]
+        asm.exit().unwrap();
+
+        assert_eq!(raw_idx, 1);
+        assert_eq!(asm.byte_offset(raw_idx), 8);
+    }
+
+    #[test]
+    fn test_current_byte_offset() {
+        let mut asm = Assembler::new();
+
+        assert_eq!(asm.current_byte_offset(), 0);
+        asm.mov64_imm(R0, 42).unwrap();
+        assert_eq!(asm.current_byte_offset(), 8);
+        asm.add64_imm(R0, 10).unwrap();
+        assert_eq!(asm.current_byte_offset(), 16);
     }
 }

@@ -56,16 +56,16 @@ use std::ops::ControlFlow;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use btf::{apply_core_relocations, Btf, CoreRelo, CoreReloKind, TypeRegistry};
-use rvm_core::opcode::OpCode;
-use rvm_core::{Context, Flow, Instruction, Memory};
+use ebpf_asm::{Assembler, R0, R1, R2, R3};
+use rvm_core::{Context, Flow, Memory};
 
 // ============================================================================
 // Host Helper Function IDs
 // ============================================================================
 
 mod helper_id {
-    pub const PRINT_U64: u64 = 1;
-    pub const GET_TIME_NS: u64 = 2;
+    pub const PRINT_U64: i32 = 1;
+    pub const GET_TIME_NS: i32 = 2;
 }
 
 // ============================================================================
@@ -163,7 +163,7 @@ impl Memory for DemoMemory {
 // ============================================================================
 
 fn dispatch_helper(ctx: &mut Context<DemoMemory>, id: u64) -> Result<u64, &'static str> {
-    match id {
+    match id as i32 {
         helper_id::PRINT_U64 => {
             let val = ctx.regs[1];
             println!("  [eBPF] print_u64: {}", val);
@@ -219,36 +219,34 @@ fn run_ebpf(ctx: &mut Context<DemoMemory>, mut pc: u64) -> Result<u64, &'static 
 }
 
 // ============================================================================
-// eBPF Program + BTF Builder
+// eBPF Program + BTF Builder (using ebpf-asm)
 // ============================================================================
 
 /// Represents an eBPF program with its BTF metadata and CO-RE relocations.
 struct EbpfProgram {
-    /// Raw instructions as u64 values
+    /// The assembler used to build the program
+    assembler: Assembler,
+    /// Raw instructions as u64 values (populated after assemble)
     instructions: Vec<u64>,
     /// BTF data describing types the program expects
     btf_data: Vec<u8>,
     /// CO-RE relocations to apply
     relocations: Vec<CoreRelo>,
-    /// Data section (appended after code)
-    data: Vec<u8>,
 }
 
 impl EbpfProgram {
     fn new() -> Self {
         Self {
+            assembler: Assembler::new(),
             instructions: Vec::new(),
             btf_data: Vec::new(),
             relocations: Vec::new(),
-            data: Vec::new(),
         }
     }
 
-    fn emit(&mut self, opc: u8, dst: u8, src: u8, off: i16, imm: i32) -> usize {
-        let idx = self.instructions.len();
-        self.instructions
-            .push(Instruction::from_parts(OpCode(opc), dst, src, off, imm).0);
-        idx
+    /// Get the assembler for building the program.
+    fn asm(&mut self) -> &mut Assembler {
+        &mut self.assembler
     }
 
     /// Add a CO-RE relocation for a field byte offset.
@@ -256,11 +254,37 @@ impl EbpfProgram {
     /// and `field_name_off` is the offset in BTF strings.
     fn add_field_offset_relo(&mut self, insn_idx: usize, type_id: u32, field_name_off: u32) {
         self.relocations.push(CoreRelo {
-            insn_off: (insn_idx * 8) as u32,
+            insn_off: self.assembler.byte_offset(insn_idx),
             type_id,
             access_str_off: field_name_off,
             kind: CoreReloKind::FieldByteOffset,
         });
+    }
+
+    /// Add a CO-RE relocation for field existence check.
+    fn add_field_exists_relo(&mut self, insn_idx: usize, type_id: u32, field_name_off: u32) {
+        self.relocations.push(CoreRelo {
+            insn_off: self.assembler.byte_offset(insn_idx),
+            type_id,
+            access_str_off: field_name_off,
+            kind: CoreReloKind::FieldExists,
+        });
+    }
+
+    /// Add a CO-RE relocation for type size.
+    fn add_type_size_relo(&mut self, insn_idx: usize, type_id: u32) {
+        self.relocations.push(CoreRelo {
+            insn_off: self.assembler.byte_offset(insn_idx),
+            type_id,
+            access_str_off: 0,
+            kind: CoreReloKind::TypeSize,
+        });
+    }
+
+    /// Finalize assembly and store instructions.
+    fn finalize(&mut self) -> Result<(), ebpf_asm::AsmError> {
+        self.instructions = self.assembler.assemble_to_u64()?;
+        Ok(())
     }
 
     /// Build minimal BTF for a struct type.
@@ -319,14 +343,12 @@ impl EbpfProgram {
     /// Convert to raw bytes (code + data + stack).
     fn to_bytes(&self, stack_size: usize) -> Vec<u8> {
         let code_size = self.instructions.len() * 8;
-        let data_start = code_size;
-        let total = data_start + self.data.len() + stack_size;
+        let total = code_size + stack_size;
 
         let mut bytes = Vec::with_capacity(total);
         for insn in &self.instructions {
             bytes.extend_from_slice(&insn.to_le_bytes());
         }
-        bytes.extend_from_slice(&self.data);
         bytes.resize(total, 0);
         bytes
     }
@@ -354,13 +376,6 @@ impl EbpfProgram {
 /// The instruction that reads `pid` will be patched by CO-RE to use
 /// whatever offset the host's TypeRegistry says.
 fn build_core_demo_program() -> EbpfProgram {
-    // Opcodes
-    const MOV64_IMM: u8 = 0xb7; // dst = imm
-    const LDX_W: u8 = 0x61; // dst = *(u32*)(src + off)
-    const ADD64_IMM: u8 = 0x07; // dst += imm
-    const CALL: u8 = 0x85;
-    const EXIT: u8 = 0x95;
-
     let mut prog = EbpfProgram::new();
 
     // Build BTF: program expects struct event { timestamp(8), pid(4) }
@@ -380,25 +395,25 @@ fn build_core_demo_program() -> EbpfProgram {
 
     // Instruction 0: r2 = *(u32*)(r1 + OFFSET)
     // The offset here (8) is what BPF *expects*, but CO-RE will patch it
-    let load_idx = prog.emit(LDX_W, 2, 1, 8, 0); // <-- This offset gets patched!
+    let load_idx = prog.asm().ldxw_idx(R2, R1, 8); // <-- This offset gets patched!
 
     // Add CO-RE relocation: patch instruction 0's offset to actual pid offset
     prog.add_field_offset_relo(load_idx, 1, pid_str_off);
 
-    // Instruction 1: r1 = r2 (move pid to arg1 for helper)
-    prog.emit(MOV64_IMM, 1, 0, 0, 0);
-    prog.emit(ADD64_IMM, 1, 0, 0, 0); // r1 = 0
-    prog.emit(0x0f, 1, 2, 0, 0); // r1 += r2 (ALU64 ADD reg)
+    // Move pid to arg1 for helper: r1 = r2
+    prog.asm().mov64_imm(R1, 0).unwrap();
+    prog.asm().add64(R1, R2).unwrap();
 
-    // Instruction 4: call print_u64(r1)
-    prog.emit(CALL, 0, 0, 0, helper_id::PRINT_U64 as i32);
+    // Call print_u64(r1)
+    prog.asm().call(helper_id::PRINT_U64).unwrap();
 
-    // Instruction 5: r0 = r2 (return the pid value)
-    prog.emit(0xbf, 0, 2, 0, 0); // mov64 r0, r2
+    // r0 = r2 (return the pid value)
+    prog.asm().mov64(R0, R2).unwrap();
 
-    // Instruction 6: exit
-    prog.emit(EXIT, 0, 0, 0, 0);
+    // exit
+    prog.asm().exit().unwrap();
 
+    prog.finalize().unwrap();
     prog
 }
 
@@ -435,14 +450,6 @@ fn demo_core_relocation() {
         let applied =
             apply_core_relocations(&mut prog_copy, &btf, &registry, &prog.relocations).expect("relocation failed");
 
-        // For LDX, the offset is in bits 16-31, not the imm field
-        // Actually, looking at the relocation code, it patches the imm (upper 32 bits)
-        // But for LDX, the offset should be in the offset field...
-        // Let me check: the CO-RE relocation patches the imm field, but for memory
-        // instructions the offset might need different handling.
-
-        // Actually, the standard CO-RE approach patches the immediate which is then
-        // used to compute the address. Let's verify what we patched.
         let patched_imm = (prog_copy[0] >> 32) as i32;
         println!("  Host layout: event {{ timestamp: 0, pid: 8 }}");
         println!("  Applied {} relocation(s)", applied);
@@ -469,13 +476,7 @@ fn demo_core_relocation() {
         println!("  Applied {} relocation(s)", applied);
         println!("  Patched imm = {} (should be 12!)", patched_imm);
 
-        // Actually run the patched program
         println!("\n  Running patched program...");
-
-        // We need to fix the instruction to use the patched offset.
-        // The CO-RE patching puts the value in imm, but LDX uses the offset field.
-        // In real CO-RE, the compiler generates code that uses the imm.
-        // Let's create a program that works with imm-based addressing.
     }
 
     println!();
@@ -486,12 +487,6 @@ fn demo_core_relocation() {
 /// Instead of: LDX r2, [r1 + offset]    (offset in instruction)
 /// We do:      r3 = CO-RE_OFFSET; LDX r2, [r1 + r3]  (offset from imm)
 fn build_correct_core_program() -> EbpfProgram {
-    const MOV64_IMM: u8 = 0xb7; // dst = imm
-    const ADD64_REG: u8 = 0x0f; // dst += src
-    const LDX_W: u8 = 0x61; // dst = *(u32*)(src + off)
-    const CALL: u8 = 0x85;
-    const EXIT: u8 = 0x95;
-
     let mut prog = EbpfProgram::new();
 
     // BTF: program expects pid at offset 8
@@ -502,30 +497,31 @@ fn build_correct_core_program() -> EbpfProgram {
     // Input: r1 = pointer to event struct
 
     // Instruction 0: r3 = OFFSET (will be patched by CO-RE)
-    let mov_idx = prog.emit(MOV64_IMM, 3, 0, 0, 8); // r3 = 8 (placeholder)
+    let mov_idx = prog.asm().mov64_imm_idx(R3, 8); // r3 = 8 (placeholder)
     prog.add_field_offset_relo(mov_idx, 1, pid_str_off);
 
     // Instruction 1: r2 = r1 (copy base pointer)
-    prog.emit(0xbf, 2, 1, 0, 0); // mov64 r2, r1
+    prog.asm().mov64(R2, R1).unwrap();
 
     // Instruction 2: r2 += r3 (add offset)
-    prog.emit(ADD64_REG, 2, 3, 0, 0); // r2 = r1 + offset
+    prog.asm().add64(R2, R3).unwrap();
 
     // Instruction 3: r2 = *(u32*)(r2 + 0)
-    prog.emit(LDX_W, 2, 2, 0, 0); // load from computed address
+    prog.asm().ldxw(R2, R2, 0).unwrap();
 
     // Instruction 4: r1 = r2 (for print helper)
-    prog.emit(0xbf, 1, 2, 0, 0);
+    prog.asm().mov64(R1, R2).unwrap();
 
     // Instruction 5: call print_u64
-    prog.emit(CALL, 0, 0, 0, helper_id::PRINT_U64 as i32);
+    prog.asm().call(helper_id::PRINT_U64).unwrap();
 
     // Instruction 6: r0 = r2 (return pid)
-    prog.emit(0xbf, 0, 2, 0, 0);
+    prog.asm().mov64(R0, R2).unwrap();
 
     // Instruction 7: exit
-    prog.emit(EXIT, 0, 0, 0, 0);
+    prog.asm().exit().unwrap();
 
+    prog.finalize().unwrap();
     prog
 }
 
@@ -568,8 +564,8 @@ fn demo_full_core_execution() {
 
     // Build memory with event struct at a known location
     let stack_size = 512;
-    let mut mem_bytes = prog.to_bytes(stack_size);
     let code_size = prog.instructions.len() * 8;
+    let mut mem_bytes = prog.to_bytes(stack_size);
 
     // Place event struct in data area
     let event_ptr = code_size as u64;
@@ -594,7 +590,7 @@ fn demo_full_core_execution() {
     println!("  [0x{:x}] flags     = 0x{:08x}", event_ptr + 8, flags);
     println!("  [0x{:x}] pid       = {}", event_ptr + 12, pid);
 
-    // Rebuild instructions into memory
+    // Rebuild instructions into memory (they were patched)
     for (i, insn) in prog.instructions.iter().enumerate() {
         let off = i * 8;
         mem_bytes[off..off + 8].copy_from_slice(&insn.to_le_bytes());
@@ -631,10 +627,6 @@ fn demo_full_core_execution() {
 fn demo_field_exists() {
     println!("=== Demo: CO-RE Field Existence Check ===\n");
 
-    const MOV64_IMM: u8 = 0xb7;
-    const JEQ_IMM: u8 = 0x15; // if dst == imm goto +off
-    const EXIT: u8 = 0x95;
-
     let mut prog = EbpfProgram::new();
 
     // BTF: program checks for optional "debug_flags" field
@@ -643,28 +635,25 @@ fn demo_field_exists() {
     let debug_flags_off = 21u32;
 
     // Instruction 0: r1 = FIELD_EXISTS (1 or 0)
-    let check_idx = prog.emit(MOV64_IMM, 1, 0, 0, 1); // placeholder: assume exists
-    prog.relocations.push(CoreRelo {
-        insn_off: (check_idx * 8) as u32,
-        type_id: 1,
-        access_str_off: debug_flags_off,
-        kind: CoreReloKind::FieldExists,
-    });
+    let check_idx = prog.asm().mov64_imm_idx(R1, 1); // placeholder: assume exists
+    prog.add_field_exists_relo(check_idx, 1, debug_flags_off);
 
     // Instruction 1: if r1 == 0 goto +2 (skip to return 0)
-    prog.emit(JEQ_IMM, 1, 0, 2, 0);
+    prog.asm().raw(0x15, 1, 0, 2, 0); // jeq_imm r1, 0, +2
 
     // Instruction 2: r0 = 1 (field exists path)
-    prog.emit(MOV64_IMM, 0, 0, 0, 1);
+    prog.asm().mov64_imm(R0, 1).unwrap();
 
     // Instruction 3: exit
-    prog.emit(EXIT, 0, 0, 0, 0);
+    prog.asm().exit().unwrap();
 
     // Instruction 4: r0 = 0 (field missing path)
-    prog.emit(MOV64_IMM, 0, 0, 0, 0);
+    prog.asm().mov64_imm(R0, 0).unwrap();
 
     // Instruction 5: exit
-    prog.emit(EXIT, 0, 0, 0, 0);
+    prog.asm().exit().unwrap();
+
+    prog.finalize().unwrap();
 
     let btf = Btf::parse(&prog.btf_data).expect("BTF parse failed");
 
@@ -711,22 +700,15 @@ fn demo_field_exists() {
 fn demo_type_size() {
     println!("=== Demo: CO-RE Type Size Query ===\n");
 
-    const MOV64_IMM: u8 = 0xb7;
-    const EXIT: u8 = 0x95;
-
     let mut prog = EbpfProgram::new();
     prog.build_btf("event", &[("timestamp", 8), ("pid", 4)]);
 
     // Instruction 0: r0 = sizeof(event) -- will be patched
-    let size_idx = prog.emit(MOV64_IMM, 0, 0, 0, 12); // BPF expects 12
-    prog.relocations.push(CoreRelo {
-        insn_off: (size_idx * 8) as u32,
-        type_id: 1,
-        access_str_off: 0, // not used for type size
-        kind: CoreReloKind::TypeSize,
-    });
+    let size_idx = prog.asm().mov64_imm_idx(R0, 12); // BPF expects 12
+    prog.add_type_size_relo(size_idx, 1);
 
-    prog.emit(EXIT, 0, 0, 0, 0);
+    prog.asm().exit().unwrap();
+    prog.finalize().unwrap();
 
     let btf = Btf::parse(&prog.btf_data).expect("BTF parse failed");
 
