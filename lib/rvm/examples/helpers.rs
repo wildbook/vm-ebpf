@@ -5,6 +5,7 @@
 //!
 //! Run with: cargo run --example helpers
 
+use ebpf_asm::{Assembler, R0, R1, R2};
 use rvm::{HelperRegistry, VmMemory};
 
 fn main() {
@@ -38,14 +39,15 @@ fn main() {
     //   r2 = 8
     //   r0 = helper_2(r1, r2) ; r0 = 50
     //   exit
-    let program = build_program(&[
-        insn_mov_imm(1, 21), // r1 = 21
-        insn_call(1),        // r0 = helper_1(r1)
-        insn_mov_reg(1, 0),  // r1 = r0
-        insn_mov_imm(2, 8),  // r2 = 8
-        insn_call(2),        // r0 = helper_2(r1, r2)
-        insn_exit(),         // return r0
-    ]);
+    let mut asm = Assembler::new();
+    asm.mov64_imm(R1, 21).unwrap(); // r1 = 21
+    asm.call(1).unwrap(); // r0 = helper_1(r1)
+    asm.mov64(R1, R0).unwrap(); // r1 = r0
+    asm.mov64_imm(R2, 8).unwrap(); // r2 = 8
+    asm.call(2).unwrap(); // r0 = helper_2(r1, r2)
+    asm.exit().unwrap(); // return r0
+
+    let program = asm.assemble().unwrap();
 
     // Create memory and load program
     let mut memory = VmMemory::new(program.len() + 512);
@@ -63,11 +65,11 @@ fn main() {
 
     // Test helper 3 (no args)
     println!("\n--- Testing helper with no args ---\n");
-    let program2 = build_program(&[
-        insn_call(3), // r0 = helper_3()
-        insn_exit(),
-    ]);
+    let mut asm2 = Assembler::new();
+    asm2.call(3).unwrap(); // r0 = helper_3()
+    asm2.exit().unwrap();
 
+    let program2 = asm2.assemble().unwrap();
     let mut memory2 = VmMemory::new(program2.len() + 512);
     memory2.write_bytes(0, &program2).unwrap();
 
@@ -78,37 +80,4 @@ fn main() {
     assert_eq!(result2, 0xCAFEBABE);
 
     println!("\nSuccess!");
-}
-
-// ============================================================================
-// Instruction builders
-// ============================================================================
-
-fn insn_mov_imm(dst: u8, imm: i32) -> u64 {
-    let opc = 0xb7u64; // ALU64 | MOV | SRC_IMM
-    let dst = (dst as u64) << 8;
-    let imm = ((imm as u32) as u64) << 32;
-    opc | dst | imm
-}
-
-fn insn_mov_reg(dst: u8, src: u8) -> u64 {
-    let opc = 0xbfu64;
-    let dst = (dst as u64) << 8;
-    let src = (src as u64) << 12;
-    opc | dst | src
-}
-
-fn insn_call(helper_id: i32) -> u64 {
-    // opcode 0x85 = JMP | CALL
-    let opc = 0x85u64;
-    let imm = ((helper_id as u32) as u64) << 32;
-    opc | imm
-}
-
-fn insn_exit() -> u64 {
-    0x95
-}
-
-fn build_program(insns: &[u64]) -> Vec<u8> {
-    insns.iter().flat_map(|i| i.to_le_bytes()).collect()
 }

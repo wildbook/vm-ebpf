@@ -247,23 +247,28 @@ enum FlowResult {
 
 #[cfg(test)]
 mod tests {
+    use ebpf_asm::{Assembler, R0, R1};
+
     use super::*;
     use crate::error::VmError;
+
+    /// Helper to load assembled instructions into memory.
+    fn load_program(memory: &mut VmMemory, asm: &mut Assembler) {
+        let instructions = asm.assemble_to_u64().unwrap();
+        for (i, insn) in instructions.iter().enumerate() {
+            memory.store_u64((i * 8) as u64, *insn).unwrap();
+        }
+    }
 
     #[test]
     fn test_simple_exit() {
         // Create a simple program that just exits with r0 = 42
         let mut memory = VmMemory::new(64);
 
-        // MOV r0, 42: opcode 0xb7 (ALU64 | MOV | IMM), dst=0, src=0, off=0, imm=42
-        // Format: imm(32) | off(16) | src(4) | dst(4) | opc(8)
-        // = (42 << 32) | 0xb7
-        let mov_insn: u64 = (42u64 << 32) | 0xb7;
-        memory.store_u64(0, mov_insn).unwrap();
-
-        // EXIT: opcode 0x95
-        let exit_insn: u64 = 0x95;
-        memory.store_u64(8, exit_insn).unwrap();
+        let mut asm = Assembler::new();
+        asm.mov64_imm(R0, 42).unwrap();
+        asm.exit().unwrap();
+        load_program(&mut memory, &mut asm);
 
         let helpers = HelperRegistry::new();
         let mut executor = Executor::new(&mut memory, &helpers, 64);
@@ -276,15 +281,10 @@ mod tests {
     fn test_with_arguments() {
         let mut memory = VmMemory::new(64);
 
-        // MOV r0, r1: opcode 0xbf (ALU64 | MOV | REG), dst=0, src=1
-        // Format: imm(32) | off(16) | src(4) | dst(4) | opc(8)
-        // = (1 << 12) | 0xbf
-        let mov_insn: u64 = (1u64 << 12) | 0xbf;
-        memory.store_u64(0, mov_insn).unwrap();
-
-        // EXIT
-        let exit_insn: u64 = 0x95;
-        memory.store_u64(8, exit_insn).unwrap();
+        let mut asm = Assembler::new();
+        asm.mov64(R0, R1).unwrap(); // r0 = r1 (first argument)
+        asm.exit().unwrap();
+        load_program(&mut memory, &mut asm);
 
         let helpers = HelperRegistry::new();
         let mut executor = Executor::new(&mut memory, &helpers, 64);
@@ -297,11 +297,12 @@ mod tests {
     fn test_instruction_limit() {
         let mut memory = VmMemory::new(64);
 
-        // JA -1: infinite loop (opcode 0x05, offset = -1)
-        // Format: imm(32) | off(16) | src(4) | dst(4) | opc(8)
-        // offset = -1 = 0xFFFF
-        let ja_insn: u64 = (0xFFFFu64 << 16) | 0x05;
-        memory.store_u64(0, ja_insn).unwrap();
+        // JA -1: infinite loop
+        let mut asm = Assembler::new();
+        let mut loop_label = asm.create_label();
+        asm.set_label(&mut loop_label).unwrap();
+        asm.ja(&loop_label).unwrap(); // Jump back to itself
+        load_program(&mut memory, &mut asm);
 
         let helpers = HelperRegistry::new();
         let mut executor = Executor::new(&mut memory, &helpers, 64);

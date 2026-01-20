@@ -5,6 +5,7 @@
 //!
 //! Run with: cargo run --example bpf_to_bpf
 
+use ebpf_asm::{Assembler, R0, R1, R6, R7};
 use rvm::VmMemory;
 
 fn main() {
@@ -28,20 +29,20 @@ fn test_simple_call() {
     // double:        ; PC=3
     //   r0 = r1 + r1
     //   exit
-    let result = run_with_args(
-        &[
-            // main: PC=0
-            insn_call(2), // call PC+1+2 = PC=3 (double)
-            insn_exit(),  // PC=1
-            // padding
-            insn_mov_imm(0, 0), // PC=2 (unused)
-            // double: PC=3
-            insn_mov_reg(0, 1), // r0 = r1
-            insn_add_reg(0, 1), // r0 += r1 (double)
-            insn_exit(),
-        ],
-        &[21],
-    );
+    let mut asm = Assembler::new();
+    let mut double_fn = asm.create_label();
+
+    // main:
+    asm.call_local(&double_fn).unwrap(); // call double
+    asm.exit().unwrap();
+
+    // double:
+    asm.set_label(&mut double_fn).unwrap();
+    asm.mov64(R0, R1).unwrap(); // r0 = r1
+    asm.add64(R0, R1).unwrap(); // r0 += r1 (double)
+    asm.exit().unwrap();
+
+    let result = run_with_args(&mut asm, &[21]);
     println!("Simple call: double(21) = {} (expected: 42)", result);
     assert_eq!(result, 42);
 }
@@ -61,24 +62,27 @@ fn test_nested_calls() {
     // inc:       ; PC=7
     //   r0 = r1 + 1
     //   exit
-    let result = run_with_args(
-        &[
-            // main: PC=0
-            insn_call(2),       // call PC=3 (add)
-            insn_exit(),        // PC=1
-            insn_mov_imm(0, 0), // PC=2 (padding)
-            // add: PC=3
-            insn_call(3),       // call PC=7 (inc)
-            insn_add_reg(0, 1), // r0 = r0 + r1 (add result of inc to r1)
-            insn_exit(),        // PC=5
-            insn_mov_imm(0, 0), // PC=6 (padding)
-            // inc: PC=7
-            insn_mov_reg(0, 1), // r0 = r1
-            insn_add_imm(0, 1), // r0 += 1
-            insn_exit(),
-        ],
-        &[10],
-    );
+    let mut asm = Assembler::new();
+    let mut add_fn = asm.create_label();
+    let mut inc_fn = asm.create_label();
+
+    // main:
+    asm.call_local(&add_fn).unwrap(); // call add
+    asm.exit().unwrap();
+
+    // add:
+    asm.set_label(&mut add_fn).unwrap();
+    asm.call_local(&inc_fn).unwrap(); // call inc
+    asm.add64(R0, R1).unwrap(); // r0 = r0 + r1
+    asm.exit().unwrap();
+
+    // inc:
+    asm.set_label(&mut inc_fn).unwrap();
+    asm.mov64(R0, R1).unwrap(); // r0 = r1
+    asm.add64_imm(R0, 1).unwrap(); // r0 += 1
+    asm.exit().unwrap();
+
+    let result = run_with_args(&mut asm, &[10]);
     // inc(10) = 11, add returns inc(10) + 10 = 21
     println!("Nested calls: add(10) where add calls inc = {} (expected: 21)", result);
     assert_eq!(result, 21);
@@ -90,30 +94,31 @@ fn test_recursive_factorial() {
     // factorial(n):
     //   if n <= 1: return 1
     //   else: return n * factorial(n-1)
-    //
-    // Layout:
-    //   PC=0: entry - jump to factorial
-    //   PC=1: factorial function
-    let result = run_with_args(
-        &[
-            // entry: PC=0
-            insn_call(1), // call factorial at PC=2
-            insn_exit(),  // PC=1
-            // factorial: PC=2
-            // Check if r1 <= 1
-            insn_jle_imm(1, 1, 5), // if r1 <= 1, jump to base case (PC+1+5 = PC=8)
-            // Recursive case: n * factorial(n-1)
-            insn_mov_reg(6, 1),  // save r1 to r6 (callee-saved)
-            insn_add_imm(1, -1), // r1 = n - 1
-            insn_call(-4),       // call factorial (PC+1-4 = PC=2)
-            insn_mul_reg(0, 6),  // r0 = r0 * r6 (result * n)
-            insn_exit(),         // PC=7
-            // Base case: return 1
-            insn_mov_imm(0, 1), // r0 = 1
-            insn_exit(),
-        ],
-        &[5], // factorial(5)
-    );
+    let mut asm = Assembler::new();
+    let mut factorial_fn = asm.create_label();
+    let mut base_case = asm.create_label();
+
+    // entry:
+    asm.call_local(&factorial_fn).unwrap(); // call factorial
+    asm.exit().unwrap();
+
+    // factorial:
+    asm.set_label(&mut factorial_fn).unwrap();
+    asm.jle_imm(R1, 1, &base_case).unwrap(); // if r1 <= 1, jump to base case
+
+    // Recursive case: n * factorial(n-1)
+    asm.mov64(R6, R1).unwrap(); // save r1 to r6 (callee-saved)
+    asm.add64_imm(R1, -1).unwrap(); // r1 = n - 1
+    asm.call_local(&factorial_fn).unwrap(); // call factorial
+    asm.mul64(R0, R6).unwrap(); // r0 = r0 * r6 (result * n)
+    asm.exit().unwrap();
+
+    // Base case: return 1
+    asm.set_label(&mut base_case).unwrap();
+    asm.mov64_imm(R0, 1).unwrap(); // r0 = 1
+    asm.exit().unwrap();
+
+    let result = run_with_args(&mut asm, &[5]); // factorial(5)
     println!("Recursive: factorial(5) = {} (expected: 120)", result);
     assert_eq!(result, 120);
 }
@@ -132,22 +137,24 @@ fn test_callee_saved_registers() {
     //   r6 = 0
     //   r7 = 0
     //   exit
-    let result = run_with_args(
-        &[
-            // main: PC=0
-            insn_mov_imm(6, 100), // r6 = 100
-            insn_mov_imm(7, 200), // r7 = 200
-            insn_call(3),         // call modify at PC=6
-            insn_mov_reg(0, 6),   // r0 = r6
-            insn_add_reg(0, 7),   // r0 += r7
-            insn_exit(),          // PC=5
-            // modify_r6_r7: PC=6
-            insn_mov_imm(6, 0), // r6 = 0 (modified in callee)
-            insn_mov_imm(7, 0), // r7 = 0
-            insn_exit(),
-        ],
-        &[],
-    );
+    let mut asm = Assembler::new();
+    let mut modify_fn = asm.create_label();
+
+    // main:
+    asm.mov64_imm(R6, 100).unwrap(); // r6 = 100
+    asm.mov64_imm(R7, 200).unwrap(); // r7 = 200
+    asm.call_local(&modify_fn).unwrap(); // call modify
+    asm.mov64(R0, R6).unwrap(); // r0 = r6
+    asm.add64(R0, R7).unwrap(); // r0 += r7
+    asm.exit().unwrap();
+
+    // modify_r6_r7:
+    asm.set_label(&mut modify_fn).unwrap();
+    asm.mov64_imm(R6, 0).unwrap(); // r6 = 0 (modified in callee)
+    asm.mov64_imm(R7, 0).unwrap(); // r7 = 0
+    asm.exit().unwrap();
+
+    let result = run_with_args(&mut asm, &[]);
     println!("Callee-saved: r6=100, r7=200 after call = {} (expected: 300)", result);
     assert_eq!(result, 300);
 }
@@ -156,8 +163,8 @@ fn test_callee_saved_registers() {
 // Runner
 // ============================================================================
 
-fn run_with_args(insns: &[u64], args: &[u64]) -> u64 {
-    let program: Vec<u8> = insns.iter().flat_map(|i| i.to_le_bytes()).collect();
+fn run_with_args(asm: &mut Assembler, args: &[u64]) -> u64 {
+    let program = asm.assemble().unwrap();
 
     let code_size = program.len();
     let stack_size = 4096; // Larger stack for recursive calls
@@ -171,65 +178,4 @@ fn run_with_args(insns: &[u64], args: &[u64]) -> u64 {
     let mut executor = rvm::Executor::new(&mut memory, &helpers, stack_top);
 
     executor.call(0, args).unwrap()
-}
-
-// ============================================================================
-// Instruction builders
-// ============================================================================
-
-fn insn_mov_imm(dst: u8, imm: i32) -> u64 {
-    let opc = 0xb7u64; // ALU64 | MOV | IMM
-    let dst = (dst as u64) << 8;
-    let imm = ((imm as u32) as u64) << 32;
-    opc | dst | imm
-}
-
-fn insn_mov_reg(dst: u8, src: u8) -> u64 {
-    let opc = 0xbfu64; // ALU64 | MOV | REG
-    let dst = (dst as u64) << 8;
-    let src = (src as u64) << 12;
-    opc | dst | src
-}
-
-fn insn_add_reg(dst: u8, src: u8) -> u64 {
-    let opc = 0x0fu64; // ALU64 | ADD | REG
-    let dst = (dst as u64) << 8;
-    let src = (src as u64) << 12;
-    opc | dst | src
-}
-
-fn insn_add_imm(dst: u8, imm: i32) -> u64 {
-    let opc = 0x07u64; // ALU64 | ADD | IMM
-    let dst = (dst as u64) << 8;
-    let imm = ((imm as u32) as u64) << 32;
-    opc | dst | imm
-}
-
-fn insn_mul_reg(dst: u8, src: u8) -> u64 {
-    let opc = 0x2fu64; // ALU64 | MUL | REG
-    let dst = (dst as u64) << 8;
-    let src = (src as u64) << 12;
-    opc | dst | src
-}
-
-fn insn_exit() -> u64 {
-    0x95 // EXIT
-}
-
-// BPF-to-BPF call (pseudo-call with relative offset)
-fn insn_call(off: i32) -> u64 {
-    // CALL instruction with src=BPF_PSEUDO_CALL (1)
-    // Offset is in imm field for BPF_PSEUDO_CALL
-    let opc = 0x85u64; // JMP | CALL
-    let src = 1u64 << 12; // BPF_PSEUDO_CALL = 1
-    let imm = ((off as u32) as u64) << 32;
-    opc | src | imm
-}
-
-fn insn_jle_imm(dst: u8, imm: i32, off: i16) -> u64 {
-    let opc = 0xb5u64; // JMP | JLE | IMM
-    let dst = (dst as u64) << 8;
-    let off = ((off as u16) as u64) << 16;
-    let imm = ((imm as u32) as u64) << 32;
-    opc | dst | off | imm
 }

@@ -28,6 +28,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ebpf-asm"
+version = "0.1.0"
+
+[[package]]
 name = "emu"
 version = "0.1.0"
 dependencies = [
@@ -65,6 +69,7 @@ version = "0.1.0"
 dependencies = [
  "btf",
  "constelf",
+ "ebpf-asm",
  "rvm-core",
 ]
 

@@ -9,3 +9,6 @@ license = "MIT OR Apache-2.0"
 rvm-core = { path = "../rvm-core" }
 constelf = { path = "../constelf" }
 btf = { path = "../btf" }
+
+[dev-dependencies]
+ebpf-asm = { path = "../ebpf-asm" }
