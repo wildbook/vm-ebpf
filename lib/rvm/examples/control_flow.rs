@@ -31,11 +31,11 @@ fn test_unconditional_jump() {
     // EXIT
     let mut asm = Assembler::new();
     let mut skip_target = asm.create_label();
-    asm.ja(&skip_target).unwrap(); // jump over next instruction
-    asm.mov64_imm(R0, 99).unwrap(); // skipped
+    asm.ja(&skip_target); // jump over next instruction
+    asm.mov64_imm(R0, 99); // skipped
     asm.set_label(&mut skip_target).unwrap();
-    asm.mov64_imm(R0, 42).unwrap();
-    asm.exit().unwrap();
+    asm.mov64_imm(R0, 42);
+    asm.exit();
 
     let result = run(&mut asm);
     println!("JA: skip instruction, r0 = {} (expected: 42)", result);
@@ -49,11 +49,11 @@ fn test_jeq() {
     // EXIT
     let mut asm = Assembler::new();
     let mut skip = asm.create_label();
-    asm.jeq_imm(R1, 10, &skip).unwrap(); // if r1 == 10, skip next
-    asm.mov64_imm(R0, 0).unwrap(); // not taken
+    asm.jeq_imm(R1, 10, &skip); // if r1 == 10, skip next
+    asm.mov64_imm(R0, 0); // not taken
     asm.set_label(&mut skip).unwrap();
-    asm.mov64_imm(R0, 1).unwrap();
-    asm.exit().unwrap();
+    asm.mov64_imm(R0, 1);
+    asm.exit();
 
     let result = run_with_args(&mut asm, &[10]);
     println!("JEQ (true): r1=10, r0 = {} (expected: 1)", result);
@@ -61,11 +61,11 @@ fn test_jeq() {
 
     let mut asm = Assembler::new();
     let mut skip = asm.create_label();
-    asm.jeq_imm(R1, 10, &skip).unwrap();
-    asm.mov64_imm(R0, 0).unwrap();
+    asm.jeq_imm(R1, 10, &skip);
+    asm.mov64_imm(R0, 0);
     asm.set_label(&mut skip).unwrap();
-    asm.mov64_imm(R0, 1).unwrap();
-    asm.exit().unwrap();
+    asm.mov64_imm(R0, 1);
+    asm.exit();
 
     let result = run_with_args(&mut asm, &[5]);
     println!("JEQ (false): r1=5, r0 = {} (expected: 1)", result);
@@ -76,11 +76,11 @@ fn test_jne() {
     // JNE r1, 10, +1
     let mut asm = Assembler::new();
     let mut skip = asm.create_label();
-    asm.jne_imm(R1, 10, &skip).unwrap();
-    asm.mov64_imm(R0, 0).unwrap();
+    asm.jne_imm(R1, 10, &skip);
+    asm.mov64_imm(R0, 0);
     asm.set_label(&mut skip).unwrap();
-    asm.mov64_imm(R0, 1).unwrap();
-    asm.exit().unwrap();
+    asm.mov64_imm(R0, 1);
+    asm.exit();
 
     let result = run_with_args(&mut asm, &[5]);
     println!("JNE (true): r1=5 != 10, r0 = {} (expected: 1)", result);
@@ -91,11 +91,11 @@ fn test_jgt() {
     // JGT r1, 5, +1 (unsigned greater than)
     let mut asm = Assembler::new();
     let mut skip = asm.create_label();
-    asm.jgt_imm(R1, 5, &skip).unwrap();
-    asm.mov64_imm(R0, 0).unwrap();
+    asm.jgt_imm(R1, 5, &skip);
+    asm.mov64_imm(R0, 0);
     asm.set_label(&mut skip).unwrap();
-    asm.mov64_imm(R0, 1).unwrap();
-    asm.exit().unwrap();
+    asm.mov64_imm(R0, 1);
+    asm.exit();
 
     let result = run_with_args(&mut asm, &[10]);
     println!("JGT (true): 10 > 5, r0 = {} (expected: 1)", result);
@@ -106,11 +106,11 @@ fn test_jge() {
     // JGE r1, 10, +1 (unsigned greater or equal)
     let mut asm = Assembler::new();
     let mut skip = asm.create_label();
-    asm.jge_imm(R1, 10, &skip).unwrap();
-    asm.mov64_imm(R0, 0).unwrap();
+    asm.jge_imm(R1, 10, &skip);
+    asm.mov64_imm(R0, 0);
     asm.set_label(&mut skip).unwrap();
-    asm.mov64_imm(R0, 1).unwrap();
-    asm.exit().unwrap();
+    asm.mov64_imm(R0, 1);
+    asm.exit();
 
     let result = run_with_args(&mut asm, &[10]);
     println!("JGE (equal): 10 >= 10, r0 = {} (expected: 1)", result);
@@ -121,11 +121,11 @@ fn test_jlt() {
     // JLT r1, 10, +1 (unsigned less than)
     let mut asm = Assembler::new();
     let mut skip = asm.create_label();
-    asm.jlt_imm(R1, 10, &skip).unwrap();
-    asm.mov64_imm(R0, 0).unwrap();
+    asm.jlt_imm(R1, 10, &skip);
+    asm.mov64_imm(R0, 0);
     asm.set_label(&mut skip).unwrap();
-    asm.mov64_imm(R0, 1).unwrap();
-    asm.exit().unwrap();
+    asm.mov64_imm(R0, 1);
+    asm.exit();
 
     let result = run_with_args(&mut asm, &[5]);
     println!("JLT (true): 5 < 10, r0 = {} (expected: 1)", result);
@@ -136,11 +136,11 @@ fn test_jle() {
     // JLE r1, 10, +1 (unsigned less or equal)
     let mut asm = Assembler::new();
     let mut skip = asm.create_label();
-    asm.jle_imm(R1, 10, &skip).unwrap();
-    asm.mov64_imm(R0, 0).unwrap();
+    asm.jle_imm(R1, 10, &skip);
+    asm.mov64_imm(R0, 0);
     asm.set_label(&mut skip).unwrap();
-    asm.mov64_imm(R0, 1).unwrap();
-    asm.exit().unwrap();
+    asm.mov64_imm(R0, 1);
+    asm.exit();
 
     let result = run_with_args(&mut asm, &[10]);
     println!("JLE (equal): 10 <= 10, r0 = {} (expected: 1)", result);
@@ -151,11 +151,11 @@ fn test_jset() {
     // JSET r1, 0x10, +1 (if r1 & 0x10 != 0)
     let mut asm = Assembler::new();
     let mut skip = asm.create_label();
-    asm.jset_imm(R1, 0x10, &skip).unwrap();
-    asm.mov64_imm(R0, 0).unwrap();
+    asm.jset_imm(R1, 0x10, &skip);
+    asm.mov64_imm(R0, 0);
     asm.set_label(&mut skip).unwrap();
-    asm.mov64_imm(R0, 1).unwrap();
-    asm.exit().unwrap();
+    asm.mov64_imm(R0, 1);
+    asm.exit();
 
     let result = run_with_args(&mut asm, &[0x1F]);
     println!("JSET (true): 0x1F & 0x10 != 0, r0 = {} (expected: 1)", result);
@@ -175,12 +175,12 @@ fn test_loop() {
     let mut asm = Assembler::new();
     let mut loop_start = asm.create_label();
 
-    asm.mov64_imm(R0, 0).unwrap(); // r0 = 0 (accumulator)
+    asm.mov64_imm(R0, 0); // r0 = 0 (accumulator)
     asm.set_label(&mut loop_start).unwrap(); // loop:
-    asm.add64(R0, R1).unwrap(); // r0 += r1
-    asm.add64_imm(R1, -1).unwrap(); // r1 -= 1
-    asm.jne_imm(R1, 0, &loop_start).unwrap(); // if r1 != 0, goto loop
-    asm.exit().unwrap();
+    asm.add64(R0, R1); // r0 += r1
+    asm.add64_imm(R1, -1); // r1 -= 1
+    asm.jne_imm(R1, 0, &loop_start); // if r1 != 0, goto loop
+    asm.exit();
 
     let result = run_with_args(&mut asm, &[10]);
     println!("LOOP: sum(1..10) = {} (expected: 55)", result);

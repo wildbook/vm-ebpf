@@ -33,11 +33,11 @@
 //! // Create a countdown loop
 //! let mut loop_start = asm.create_label();
 //!
-//! asm.mov64_imm(R0, 10).unwrap();       // r0 = 10
+//! asm.mov64_imm(R0, 10);       // r0 = 10
 //! asm.set_label(&mut loop_start).unwrap();
-//! asm.sub64_imm(R0, 1).unwrap();         // r0--
-//! asm.jne_imm(R0, 0, &loop_start).unwrap(); // if r0 != 0 goto loop_start
-//! asm.exit().unwrap();
+//! asm.sub64_imm(R0, 1);         // r0--
+//! asm.jne_imm(R0, 0, &loop_start); // if r0 != 0 goto loop_start
+//! asm.exit();
 //!
 //! let bytecode = asm.assemble().unwrap();
 //! assert_eq!(bytecode.len(), 32); // 4 instructions * 8 bytes
@@ -50,8 +50,8 @@
 //!
 //! // Assemble
 //! let mut asm = Assembler::new();
-//! asm.mov64_imm(R0, 42).unwrap();
-//! asm.exit().unwrap();
+//! asm.mov64_imm(R0, 42);
+//! asm.exit();
 //! let code = asm.assemble().unwrap();
 //!
 //! // Disassemble
@@ -73,7 +73,7 @@ mod operand;
 mod register;
 
 // Re-export main types
-pub use assembler::{AsmError, Assembler, Label};
+pub use assembler::{AsmError, AssembledProgram, Assembler, CoreRelo, CoreReloKind, Label};
 pub use decoder::{decode_all, decode_one, Decoder};
 pub use formatter::{DefaultFormatter, Formatter, FormatterOutput, IntelFormatter, StringOutput};
 pub use instruction::{Instruction, RawInstruction};
@@ -94,9 +94,9 @@ mod tests {
     fn test_round_trip_simple() {
         // Assemble
         let mut asm = Assembler::new();
-        asm.mov64_imm(R0, 42).unwrap();
-        asm.add64_imm(R0, 8).unwrap();
-        asm.exit().unwrap();
+        asm.mov64_imm(R0, 42);
+        asm.add64_imm(R0, 8);
+        asm.exit();
         let code = asm.assemble().unwrap();
 
         // Disassemble
@@ -114,13 +114,13 @@ mod tests {
         let mut loop_label = asm.create_label();
         let mut end_label = asm.create_label();
 
-        asm.mov64_imm(R0, 5).unwrap(); // insn 0
+        asm.mov64_imm(R0, 5); // insn 0
         asm.set_label(&mut loop_label).unwrap(); // label points to insn 1
-        asm.sub64_imm(R0, 1).unwrap(); // insn 1
-        asm.jeq_imm(R0, 0, &end_label).unwrap(); // insn 2
-        asm.ja(&loop_label).unwrap(); // insn 3
+        asm.sub64_imm(R0, 1); // insn 1
+        asm.jeq_imm(R0, 0, &end_label); // insn 2
+        asm.ja(&loop_label); // insn 3
         asm.set_label(&mut end_label).unwrap(); // label points to insn 4
-        asm.exit().unwrap(); // insn 4
+        asm.exit(); // insn 4
 
         let code = asm.assemble().unwrap();
 
@@ -144,8 +144,8 @@ mod tests {
     #[test]
     fn test_round_trip_lddw() {
         let mut asm = Assembler::new();
-        asm.lddw(R0, 0xDEADBEEFCAFEBABEu64 as i64).unwrap();
-        asm.exit().unwrap();
+        asm.lddw(R0, 0xDEADBEEFCAFEBABEu64 as i64);
+        asm.exit();
 
         let code = asm.assemble().unwrap();
 
@@ -164,11 +164,11 @@ mod tests {
     #[test]
     fn test_round_trip_memory() {
         let mut asm = Assembler::new();
-        asm.ldxdw(R0, R10, -8).unwrap();
-        asm.stxdw(R10, -16, R0).unwrap();
-        asm.ldxw(R1, R0, 0).unwrap();
-        asm.stxb(R0, 4, R1).unwrap();
-        asm.exit().unwrap();
+        asm.ldxdw(R0, R10, -8);
+        asm.stxdw(R10, -16, R0);
+        asm.ldxw(R1, R0, 0);
+        asm.stxb(R0, 4, R1);
+        asm.exit();
 
         let code = asm.assemble().unwrap();
 
@@ -183,10 +183,10 @@ mod tests {
     #[test]
     fn test_formatter_output() {
         let mut asm = Assembler::new();
-        asm.mov64_imm(R0, 42).unwrap();
-        asm.add64(R0, R1).unwrap();
-        asm.ldxdw(R2, R10, -8).unwrap();
-        asm.exit().unwrap();
+        asm.mov64_imm(R0, 42);
+        asm.add64(R0, R1);
+        asm.ldxdw(R2, R10, -8);
+        asm.exit();
 
         let code = asm.assemble().unwrap();
         let insns = decode_all(&code);
@@ -201,20 +201,20 @@ mod tests {
     #[test]
     fn test_all_alu64_operations() {
         let mut asm = Assembler::new();
-        asm.add64(R0, R1).unwrap();
-        asm.sub64(R0, R1).unwrap();
-        asm.mul64(R0, R1).unwrap();
-        asm.div64(R0, R1).unwrap();
-        asm.or64(R0, R1).unwrap();
-        asm.and64(R0, R1).unwrap();
-        asm.lsh64(R0, R1).unwrap();
-        asm.rsh64(R0, R1).unwrap();
-        asm.neg64(R0).unwrap();
-        asm.mod64(R0, R1).unwrap();
-        asm.xor64(R0, R1).unwrap();
-        asm.mov64(R0, R1).unwrap();
-        asm.arsh64(R0, R1).unwrap();
-        asm.exit().unwrap();
+        asm.add64(R0, R1);
+        asm.sub64(R0, R1);
+        asm.mul64(R0, R1);
+        asm.div64(R0, R1);
+        asm.or64(R0, R1);
+        asm.and64(R0, R1);
+        asm.lsh64(R0, R1);
+        asm.rsh64(R0, R1);
+        asm.neg64(R0);
+        asm.mod64(R0, R1);
+        asm.xor64(R0, R1);
+        asm.mov64(R0, R1);
+        asm.arsh64(R0, R1);
+        asm.exit();
 
         let code = asm.assemble().unwrap();
         let insns = decode_all(&code);
@@ -245,17 +245,17 @@ mod tests {
         let mut l6 = asm.create_label();
 
         asm.set_label(&mut l1).unwrap();
-        asm.jeq_imm(R0, 0, &l2).unwrap();
+        asm.jeq_imm(R0, 0, &l2);
         asm.set_label(&mut l2).unwrap();
-        asm.jne_imm(R0, 0, &l3).unwrap();
+        asm.jne_imm(R0, 0, &l3);
         asm.set_label(&mut l3).unwrap();
-        asm.jgt_imm(R0, 0, &l4).unwrap();
+        asm.jgt_imm(R0, 0, &l4);
         asm.set_label(&mut l4).unwrap();
-        asm.jge_imm(R0, 0, &l5).unwrap();
+        asm.jge_imm(R0, 0, &l5);
         asm.set_label(&mut l5).unwrap();
-        asm.jlt_imm(R0, 0, &l6).unwrap();
+        asm.jlt_imm(R0, 0, &l6);
         asm.set_label(&mut l6).unwrap();
-        asm.exit().unwrap();
+        asm.exit();
 
         let code = asm.assemble().unwrap();
         let insns = decode_all(&code);
@@ -270,13 +270,13 @@ mod tests {
     #[test]
     fn test_endianness() {
         let mut asm = Assembler::new();
-        asm.le16(R0).unwrap();
-        asm.le32(R0).unwrap();
-        asm.le64(R0).unwrap();
-        asm.be16(R0).unwrap();
-        asm.be32(R0).unwrap();
-        asm.be64(R0).unwrap();
-        asm.exit().unwrap();
+        asm.le16(R0);
+        asm.le32(R0);
+        asm.le64(R0);
+        asm.be16(R0);
+        asm.be32(R0);
+        asm.be64(R0);
+        asm.exit();
 
         let code = asm.assemble().unwrap();
         let insns = decode_all(&code);

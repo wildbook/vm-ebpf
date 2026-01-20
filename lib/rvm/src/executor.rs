@@ -266,8 +266,8 @@ mod tests {
         let mut memory = VmMemory::new(64);
 
         let mut asm = Assembler::new();
-        asm.mov64_imm(R0, 42).unwrap();
-        asm.exit().unwrap();
+        asm.mov64_imm(R0, 42);
+        asm.exit();
         load_program(&mut memory, &mut asm);
 
         let helpers = HelperRegistry::new();
@@ -282,8 +282,8 @@ mod tests {
         let mut memory = VmMemory::new(64);
 
         let mut asm = Assembler::new();
-        asm.mov64(R0, R1).unwrap(); // r0 = r1 (first argument)
-        asm.exit().unwrap();
+        asm.mov64(R0, R1); // r0 = r1 (first argument)
+        asm.exit();
         load_program(&mut memory, &mut asm);
 
         let helpers = HelperRegistry::new();
@@ -301,7 +301,7 @@ mod tests {
         let mut asm = Assembler::new();
         let mut loop_label = asm.create_label();
         asm.set_label(&mut loop_label).unwrap();
-        asm.ja(&loop_label).unwrap(); // Jump back to itself
+        asm.ja(&loop_label); // Jump back to itself
         load_program(&mut memory, &mut asm);
 
         let helpers = HelperRegistry::new();

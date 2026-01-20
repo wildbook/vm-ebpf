@@ -18,9 +18,9 @@ fn main() {
     //   add r0, 10      ; r0 += 10
     //   exit            ; return r0
     let mut asm = Assembler::new();
-    asm.mov64(R0, R1).unwrap(); // r0 = r1
-    asm.add64_imm(R0, 10).unwrap(); // r0 += 10
-    asm.exit().unwrap(); // exit
+    asm.mov64(R0, R1); // r0 = r1
+    asm.add64_imm(R0, 10); // r0 += 10
+    asm.exit(); // exit
 
     let program = asm.assemble().unwrap();
 

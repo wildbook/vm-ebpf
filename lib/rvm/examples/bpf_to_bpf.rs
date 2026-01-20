@@ -33,14 +33,14 @@ fn test_simple_call() {
     let mut double_fn = asm.create_label();
 
     // main:
-    asm.call_local(&double_fn).unwrap(); // call double
-    asm.exit().unwrap();
+    asm.call_local(&double_fn); // call double
+    asm.exit();
 
     // double:
     asm.set_label(&mut double_fn).unwrap();
-    asm.mov64(R0, R1).unwrap(); // r0 = r1
-    asm.add64(R0, R1).unwrap(); // r0 += r1 (double)
-    asm.exit().unwrap();
+    asm.mov64(R0, R1); // r0 = r1
+    asm.add64(R0, R1); // r0 += r1 (double)
+    asm.exit();
 
     let result = run_with_args(&mut asm, &[21]);
     println!("Simple call: double(21) = {} (expected: 42)", result);
@@ -67,20 +67,20 @@ fn test_nested_calls() {
     let mut inc_fn = asm.create_label();
 
     // main:
-    asm.call_local(&add_fn).unwrap(); // call add
-    asm.exit().unwrap();
+    asm.call_local(&add_fn); // call add
+    asm.exit();
 
     // add:
     asm.set_label(&mut add_fn).unwrap();
-    asm.call_local(&inc_fn).unwrap(); // call inc
-    asm.add64(R0, R1).unwrap(); // r0 = r0 + r1
-    asm.exit().unwrap();
+    asm.call_local(&inc_fn); // call inc
+    asm.add64(R0, R1); // r0 = r0 + r1
+    asm.exit();
 
     // inc:
     asm.set_label(&mut inc_fn).unwrap();
-    asm.mov64(R0, R1).unwrap(); // r0 = r1
-    asm.add64_imm(R0, 1).unwrap(); // r0 += 1
-    asm.exit().unwrap();
+    asm.mov64(R0, R1); // r0 = r1
+    asm.add64_imm(R0, 1); // r0 += 1
+    asm.exit();
 
     let result = run_with_args(&mut asm, &[10]);
     // inc(10) = 11, add returns inc(10) + 10 = 21
@@ -99,24 +99,24 @@ fn test_recursive_factorial() {
     let mut base_case = asm.create_label();
 
     // entry:
-    asm.call_local(&factorial_fn).unwrap(); // call factorial
-    asm.exit().unwrap();
+    asm.call_local(&factorial_fn); // call factorial
+    asm.exit();
 
     // factorial:
     asm.set_label(&mut factorial_fn).unwrap();
-    asm.jle_imm(R1, 1, &base_case).unwrap(); // if r1 <= 1, jump to base case
+    asm.jle_imm(R1, 1, &base_case); // if r1 <= 1, jump to base case
 
     // Recursive case: n * factorial(n-1)
-    asm.mov64(R6, R1).unwrap(); // save r1 to r6 (callee-saved)
-    asm.add64_imm(R1, -1).unwrap(); // r1 = n - 1
-    asm.call_local(&factorial_fn).unwrap(); // call factorial
-    asm.mul64(R0, R6).unwrap(); // r0 = r0 * r6 (result * n)
-    asm.exit().unwrap();
+    asm.mov64(R6, R1); // save r1 to r6 (callee-saved)
+    asm.add64_imm(R1, -1); // r1 = n - 1
+    asm.call_local(&factorial_fn); // call factorial
+    asm.mul64(R0, R6); // r0 = r0 * r6 (result * n)
+    asm.exit();
 
     // Base case: return 1
     asm.set_label(&mut base_case).unwrap();
-    asm.mov64_imm(R0, 1).unwrap(); // r0 = 1
-    asm.exit().unwrap();
+    asm.mov64_imm(R0, 1); // r0 = 1
+    asm.exit();
 
     let result = run_with_args(&mut asm, &[5]); // factorial(5)
     println!("Recursive: factorial(5) = {} (expected: 120)", result);
@@ -141,18 +141,18 @@ fn test_callee_saved_registers() {
     let mut modify_fn = asm.create_label();
 
     // main:
-    asm.mov64_imm(R6, 100).unwrap(); // r6 = 100
-    asm.mov64_imm(R7, 200).unwrap(); // r7 = 200
-    asm.call_local(&modify_fn).unwrap(); // call modify
-    asm.mov64(R0, R6).unwrap(); // r0 = r6
-    asm.add64(R0, R7).unwrap(); // r0 += r7
-    asm.exit().unwrap();
+    asm.mov64_imm(R6, 100); // r6 = 100
+    asm.mov64_imm(R7, 200); // r7 = 200
+    asm.call_local(&modify_fn); // call modify
+    asm.mov64(R0, R6); // r0 = r6
+    asm.add64(R0, R7); // r0 += r7
+    asm.exit();
 
     // modify_r6_r7:
     asm.set_label(&mut modify_fn).unwrap();
-    asm.mov64_imm(R6, 0).unwrap(); // r6 = 0 (modified in callee)
-    asm.mov64_imm(R7, 0).unwrap(); // r7 = 0
-    asm.exit().unwrap();
+    asm.mov64_imm(R6, 0); // r6 = 0 (modified in callee)
+    asm.mov64_imm(R7, 0); // r7 = 0
+    asm.exit();
 
     let result = run_with_args(&mut asm, &[]);
     println!("Callee-saved: r6=100, r7=200 after call = {} (expected: 300)", result);
