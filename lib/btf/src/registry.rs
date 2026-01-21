@@ -396,11 +396,7 @@ impl Drop for EnumDefBuilder<'_> {
 /// CO-RE allows defining multiple versions of a type with different suffixes
 /// (e.g., `task_struct___old`). The suffix is stripped for matching.
 fn strip_core_suffix(name: &str) -> &str {
-    if let Some(idx) = name.find("___") {
-        &name[..idx]
-    } else {
-        name
-    }
+    name.split_once("___").map_or(name, |(prefix, _)| prefix)
 }
 
 #[cfg(test)]

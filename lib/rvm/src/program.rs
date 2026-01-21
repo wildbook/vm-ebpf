@@ -94,12 +94,7 @@ impl Program {
 
     /// Get the entry point (first function, or "main" if it exists).
     pub fn entry_point(&self) -> Option<&FunctionInfo> {
-        // Prefer "main" if it exists
-        if let Some(main) = self.functions.get("main") {
-            return Some(main);
-        }
-        // Otherwise return the first function
-        self.functions.values().next()
+        self.functions.get("main").or_else(|| self.functions.values().next())
     }
 
     /// Call a function by name with no helpers.

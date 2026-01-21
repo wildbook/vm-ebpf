@@ -80,10 +80,11 @@ impl<'a> ElfSections<'a> {
     }
 
     pub const fn header_by_index(self, index: usize) -> Option<&'a Elf64Shdr> {
-        let slice: &[Elf64Shdr] = self.headers();
-        match index < slice.len() {
-            true => Some(&slice[index]),
-            false => None,
+        let slice = self.headers();
+        if index < slice.len() {
+            Some(&slice[index])
+        } else {
+            None
         }
     }
 
