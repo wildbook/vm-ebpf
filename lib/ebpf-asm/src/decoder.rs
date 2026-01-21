@@ -2,7 +2,7 @@
 //!
 //! Decodes raw eBPF bytecode into structured `Instruction` representations.
 
-use crate::instruction::{alu, class, jmp, mode, size, Instruction, RawInstruction, SRC_IMM, SRC_REG};
+use crate::instruction::{alu, atomic, class, jmp, mode, size, Instruction, RawInstruction, SRC_IMM, SRC_REG};
 use crate::mnemonic::Mnemonic;
 use crate::operand::Operand;
 use crate::register::Register;
@@ -57,7 +57,7 @@ impl<'a> Decoder<'a> {
         let start_offset = self.offset;
 
         // Read first 8 bytes
-        let raw_bytes: [u8; 8] = self.bytes[self.offset..self.offset + 8].try_into().unwrap();
+        let raw_bytes: [u8; 8] = self.bytes[self.offset..][..8].try_into().unwrap();
         let raw = RawInstruction::from_le_bytes(raw_bytes);
         self.offset += 8;
 
@@ -74,7 +74,7 @@ impl<'a> Decoder<'a> {
             class::JMP64 => decode_jmp(opcode, dst_reg, src_reg, offset, imm, true),
             class::JMP32 => decode_jmp(opcode, dst_reg, src_reg, offset, imm, false),
             class::LDX => decode_ldx(opcode, dst_reg, src_reg, offset),
-            class::STX => decode_stx(opcode, dst_reg, src_reg, offset),
+            class::STX => decode_stx(opcode, dst_reg, src_reg, offset, imm),
             class::ST => decode_st(opcode, dst_reg, offset, imm),
             class::LD => {
                 // LD class includes LDDW (64-bit immediate load)
@@ -86,7 +86,7 @@ impl<'a> Decoder<'a> {
                     if self.offset + 8 > self.bytes.len() {
                         (Mnemonic::Unknown, Operand::None, Operand::None, 8, None)
                     } else {
-                        let raw2_bytes: [u8; 8] = self.bytes[self.offset..self.offset + 8].try_into().unwrap();
+                        let raw2_bytes: [u8; 8] = self.bytes[self.offset..][..8].try_into().unwrap();
                         let raw2 = RawInstruction::from_le_bytes(raw2_bytes);
                         self.offset += 8;
 
@@ -303,15 +303,19 @@ fn decode_ldx(opcode: u8, dst: Register, src: Register, offset: i16) -> (Mnemoni
 }
 
 /// Decode a STX (store to memory from register) instruction.
-fn decode_stx(opcode: u8, dst: Register, src: Register, offset: i16) -> (Mnemonic, Operand, Operand, u8, Option<u64>) {
+fn decode_stx(
+    opcode: u8,
+    dst: Register,
+    src: Register,
+    offset: i16,
+    imm: i32,
+) -> (Mnemonic, Operand, Operand, u8, Option<u64>) {
     let mem_size = opcode & 0x18;
     let mem_mode = opcode & 0xE0;
 
     // Check for atomic operations
     if mem_mode == mode::ATOMIC {
-        // Atomic operations - imm field specifies the operation
-        // For now, return Unknown; full atomic support would need imm decoding
-        return (Mnemonic::Unknown, Operand::None, Operand::None, 8, None);
+        return decode_atomic(mem_size, dst, src, offset, imm);
     }
 
     let mnemonic = match mem_size {
@@ -319,6 +323,51 @@ fn decode_stx(opcode: u8, dst: Register, src: Register, offset: i16) -> (Mnemoni
         size::W => Mnemonic::Stxw,
         size::H => Mnemonic::Stxh,
         size::B => Mnemonic::Stxb,
+        _ => Mnemonic::Unknown,
+    };
+
+    (mnemonic, Operand::Mem { base: dst, offset }, Operand::Reg(src), 8, None)
+}
+
+/// Decode an atomic operation.
+fn decode_atomic(
+    mem_size: u8,
+    dst: Register,
+    src: Register,
+    offset: i16,
+    imm: i32,
+) -> (Mnemonic, Operand, Operand, u8, Option<u64>) {
+    let is_64 = mem_size == size::DW;
+    let is_fetch = (imm & atomic::FETCH) != 0 && imm != atomic::XCHG && imm != atomic::CMPXCHG;
+
+    // Mask out the fetch bit for comparison (except for XCHG/CMPXCHG which include it)
+    let op = if imm == atomic::XCHG || imm == atomic::CMPXCHG {
+        imm
+    } else {
+        imm & !atomic::FETCH
+    };
+
+    let mnemonic = match (op, is_64, is_fetch) {
+        (atomic::ADD, true, false) => Mnemonic::AtomicAdd64,
+        (atomic::ADD, false, false) => Mnemonic::AtomicAdd32,
+        (atomic::ADD, true, true) => Mnemonic::AtomicFetchAdd64,
+        (atomic::ADD, false, true) => Mnemonic::AtomicFetchAdd32,
+        (atomic::OR, true, false) => Mnemonic::AtomicOr64,
+        (atomic::OR, false, false) => Mnemonic::AtomicOr32,
+        (atomic::OR, true, true) => Mnemonic::AtomicFetchOr64,
+        (atomic::OR, false, true) => Mnemonic::AtomicFetchOr32,
+        (atomic::AND, true, false) => Mnemonic::AtomicAnd64,
+        (atomic::AND, false, false) => Mnemonic::AtomicAnd32,
+        (atomic::AND, true, true) => Mnemonic::AtomicFetchAnd64,
+        (atomic::AND, false, true) => Mnemonic::AtomicFetchAnd32,
+        (atomic::XOR, true, false) => Mnemonic::AtomicXor64,
+        (atomic::XOR, false, false) => Mnemonic::AtomicXor32,
+        (atomic::XOR, true, true) => Mnemonic::AtomicFetchXor64,
+        (atomic::XOR, false, true) => Mnemonic::AtomicFetchXor32,
+        (atomic::XCHG, true, _) => Mnemonic::AtomicXchg64,
+        (atomic::XCHG, false, _) => Mnemonic::AtomicXchg32,
+        (atomic::CMPXCHG, true, _) => Mnemonic::AtomicCmpxchg64,
+        (atomic::CMPXCHG, false, _) => Mnemonic::AtomicCmpxchg32,
         _ => Mnemonic::Unknown,
     };
 
@@ -428,5 +477,87 @@ mod tests {
         assert_eq!(insns.len(), 2);
         assert_eq!(insns[0].mnemonic, Mnemonic::Mov64);
         assert_eq!(insns[1].mnemonic, Mnemonic::Exit);
+    }
+
+    #[test]
+    fn test_decode_atomic_add64() {
+        // lock *(u64 *)(r1 + 0) += r2
+        // opcode = STX class (0x03) | DW size (0x18) | ATOMIC mode (0xC0) = 0xDB
+        // imm = 0x00 (ADD)
+        let bytes = [0xdb, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let insn = decode_one(&bytes).unwrap();
+        assert_eq!(insn.mnemonic, Mnemonic::AtomicAdd64);
+        assert_eq!(
+            insn.dst,
+            Operand::Mem {
+                base: Register::R1,
+                offset: 0
+            }
+        );
+        assert_eq!(insn.src, Operand::Reg(Register::R2));
+    }
+
+    #[test]
+    fn test_decode_atomic_add32() {
+        // lock *(u32 *)(r1 + 0) += r2
+        // opcode = STX class (0x03) | W size (0x00) | ATOMIC mode (0xC0) = 0xC3
+        // imm = 0x00 (ADD)
+        let bytes = [0xc3, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let insn = decode_one(&bytes).unwrap();
+        assert_eq!(insn.mnemonic, Mnemonic::AtomicAdd32);
+    }
+
+    #[test]
+    fn test_decode_atomic_fetch_add64() {
+        // r2 = atomic_fetch_add((u64 *)(r1 + 0), r2)
+        // opcode = 0xDB, imm = 0x01 (ADD | FETCH)
+        let bytes = [0xdb, 0x21, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00];
+        let insn = decode_one(&bytes).unwrap();
+        assert_eq!(insn.mnemonic, Mnemonic::AtomicFetchAdd64);
+    }
+
+    #[test]
+    fn test_decode_atomic_or64() {
+        // lock *(u64 *)(r1 + 0) |= r2
+        // opcode = 0xDB, imm = 0x40 (OR)
+        let bytes = [0xdb, 0x21, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00];
+        let insn = decode_one(&bytes).unwrap();
+        assert_eq!(insn.mnemonic, Mnemonic::AtomicOr64);
+    }
+
+    #[test]
+    fn test_decode_atomic_and64() {
+        // lock *(u64 *)(r1 + 0) &= r2
+        // opcode = 0xDB, imm = 0x50 (AND)
+        let bytes = [0xdb, 0x21, 0x00, 0x00, 0x50, 0x00, 0x00, 0x00];
+        let insn = decode_one(&bytes).unwrap();
+        assert_eq!(insn.mnemonic, Mnemonic::AtomicAnd64);
+    }
+
+    #[test]
+    fn test_decode_atomic_xor64() {
+        // lock *(u64 *)(r1 + 0) ^= r2
+        // opcode = 0xDB, imm = 0xa0 (XOR)
+        let bytes = [0xdb, 0x21, 0x00, 0x00, 0xa0, 0x00, 0x00, 0x00];
+        let insn = decode_one(&bytes).unwrap();
+        assert_eq!(insn.mnemonic, Mnemonic::AtomicXor64);
+    }
+
+    #[test]
+    fn test_decode_atomic_xchg64() {
+        // r2 = xchg((u64 *)(r1 + 0), r2)
+        // opcode = 0xDB, imm = 0xe1 (XCHG)
+        let bytes = [0xdb, 0x21, 0x00, 0x00, 0xe1, 0x00, 0x00, 0x00];
+        let insn = decode_one(&bytes).unwrap();
+        assert_eq!(insn.mnemonic, Mnemonic::AtomicXchg64);
+    }
+
+    #[test]
+    fn test_decode_atomic_cmpxchg64() {
+        // r0 = cmpxchg((u64 *)(r1 + 0), r0, r2)
+        // opcode = 0xDB, imm = 0xf1 (CMPXCHG)
+        let bytes = [0xdb, 0x21, 0x00, 0x00, 0xf1, 0x00, 0x00, 0x00];
+        let insn = decode_one(&bytes).unwrap();
+        assert_eq!(insn.mnemonic, Mnemonic::AtomicCmpxchg64);
     }
 }

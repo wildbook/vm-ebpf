@@ -6,5 +6,4 @@ edition = "2021"
 [dependencies]
 rvm-core = { path = "../../lib/rvm-core" }
 constelf = { path = "../../lib/constelf" }
-btf      = { path = "../../lib/btf" }
 anyhow   = "1.0"

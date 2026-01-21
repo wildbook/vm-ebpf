@@ -117,7 +117,7 @@ impl Memory for VmMemory {
         if i + 2 > self.data.len() {
             return Err("store_u16: out of bounds");
         }
-        self.data[i..i + 2].copy_from_slice(&value.to_le_bytes());
+        self.data[i..][..2].copy_from_slice(&value.to_le_bytes());
         Ok(())
     }
 
@@ -126,7 +126,7 @@ impl Memory for VmMemory {
         if i + 4 > self.data.len() {
             return Err("store_u32: out of bounds");
         }
-        self.data[i..i + 4].copy_from_slice(&value.to_le_bytes());
+        self.data[i..][..4].copy_from_slice(&value.to_le_bytes());
         Ok(())
     }
 
@@ -135,7 +135,7 @@ impl Memory for VmMemory {
         if i + 8 > self.data.len() {
             return Err("store_u64: out of bounds");
         }
-        self.data[i..i + 8].copy_from_slice(&value.to_le_bytes());
+        self.data[i..][..8].copy_from_slice(&value.to_le_bytes());
         Ok(())
     }
 }
@@ -294,7 +294,16 @@ fn load_elf(elf_bytes: &[u8]) -> Result<LoadedProgram> {
 
         let relocs = match chunk.relocs().map_err(|e| anyhow!("Failed to get relocs: {:?}", e))? {
             ElfRelocsChunk::Rel(r) => r,
-            ElfRelocsChunk::Rela(_) => continue, // TODO: Handle RELA
+            ElfRelocsChunk::Rela(r) => {
+                // RELA relocations have explicit addends which require different handling
+                // than REL relocations where the addend is embedded in the instruction
+                eprintln!(
+                    "  Warning: Skipping {} RELA relocations for section {} - RELA support not implemented",
+                    r.len(),
+                    target_info.name
+                );
+                continue;
+            }
             ElfRelocsChunk::None => continue,
         };
 

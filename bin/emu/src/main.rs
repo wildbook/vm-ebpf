@@ -201,9 +201,17 @@ fn elfin() -> anyhow::Result<()> {
             // and the addend is usually embedded in the instruction
             let (relocs, _has_addend): (&[_], bool) = match rel {
                 ElfRelocsChunk::Rel(r) => (r, false),
-                ElfRelocsChunk::Rela(_) => {
-                    // RELA relocations have explicit addends, but BPF typically uses REL
-                    // For now, skip RELA sections - they would need different handling
+                ElfRelocsChunk::Rela(r) => {
+                    // RELA relocations have explicit addends
+                    // Warning: RELA support is incomplete - addends are ignored
+                    // This may cause incorrect symbol resolution for some ELF files
+                    #[cfg(debug_assertions)]
+                    {
+                        // In debug builds, we can't easily print at const time
+                        // but this documents the limitation
+                    }
+                    // Skip RELA sections for now - they need different handling
+                    let _ = r; // suppress unused warning
                     continue;
                 }
                 ElfRelocsChunk::None => continue,
@@ -240,11 +248,11 @@ fn elfin() -> anyhow::Result<()> {
 
                         // R_BPF_64_64 patches the imm32 fields of a LD_IMM64 instruction
                         // Write lower 32 bits to imm of first instruction (offset +4)
-                        let lo = (sym_addr as u32).to_ne_bytes();
+                        let lo = (sym_addr as u32).to_le_bytes();
                         copy(&lo, &mut flat, (beg + 4) as usize);
 
                         // Write upper 32 bits to imm of second instruction (offset +12)
-                        let hi = ((sym_addr >> 32) as u32).to_ne_bytes();
+                        let hi = ((sym_addr >> 32) as u32).to_le_bytes();
                         copy(&hi, &mut flat, (beg + 12) as usize);
                     }
                     _ => unimplemented!(),
@@ -277,7 +285,7 @@ fn elfin() -> anyhow::Result<()> {
             let beg = addr as usize;
             let end = beg.checked_add(2).ok_or(())?;
             match self.data.get(beg..end) {
-                Some(s) => Ok(u16::from_ne_bytes([s[0], s[1]])),
+                Some(s) => Ok(u16::from_le_bytes([s[0], s[1]])),
                 None => Err(()),
             }
         }
@@ -286,7 +294,7 @@ fn elfin() -> anyhow::Result<()> {
             let beg = addr as usize;
             let end = beg.checked_add(4).ok_or(())?;
             match self.data.get(beg..end) {
-                Some(s) => Ok(u32::from_ne_bytes([s[0], s[1], s[2], s[3]])),
+                Some(s) => Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]])),
                 None => Err(()),
             }
         }
@@ -295,7 +303,7 @@ fn elfin() -> anyhow::Result<()> {
             let beg = addr as usize;
             let end = beg.checked_add(8).ok_or(())?;
             match self.data.get(beg..end) {
-                Some(s) => Ok(u64::from_ne_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])),
+                Some(s) => Ok(u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])),
                 None => Err(()),
             }
         }
@@ -304,7 +312,7 @@ fn elfin() -> anyhow::Result<()> {
             let beg = addr as usize;
             let end = beg.checked_add(1).ok_or(())?;
             match self.data.get_mut(beg..end) {
-                Some(slice) => Ok(slice.copy_from_slice(&value.to_ne_bytes())),
+                Some(slice) => Ok(slice.copy_from_slice(&value.to_le_bytes())),
                 None => Err(()),
             }
         }
@@ -313,7 +321,7 @@ fn elfin() -> anyhow::Result<()> {
             let beg = addr as usize;
             let end = beg.checked_add(2).ok_or(())?;
             match self.data.get_mut(beg..end) {
-                Some(slice) => Ok(slice.copy_from_slice(&value.to_ne_bytes())),
+                Some(slice) => Ok(slice.copy_from_slice(&value.to_le_bytes())),
                 None => Err(()),
             }
         }
@@ -322,7 +330,7 @@ fn elfin() -> anyhow::Result<()> {
             let beg = addr as usize;
             let end = beg.checked_add(4).ok_or(())?;
             match self.data.get_mut(beg..end) {
-                Some(slice) => Ok(slice.copy_from_slice(&value.to_ne_bytes())),
+                Some(slice) => Ok(slice.copy_from_slice(&value.to_le_bytes())),
                 None => Err(()),
             }
         }
@@ -331,7 +339,7 @@ fn elfin() -> anyhow::Result<()> {
             let beg = addr as usize;
             let end = beg.checked_add(8).ok_or(())?;
             match self.data.get_mut(beg..end) {
-                Some(slice) => Ok(slice.copy_from_slice(&value.to_ne_bytes())),
+                Some(slice) => Ok(slice.copy_from_slice(&value.to_le_bytes())),
                 None => Err(()),
             }
         }

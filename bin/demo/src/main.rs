@@ -135,7 +135,7 @@ impl Memory for DemoMemory {
         if i + 2 > self.data.len() {
             return Err("oob");
         }
-        self.data[i..i + 2].copy_from_slice(&value.to_le_bytes());
+        self.data[i..][..2].copy_from_slice(&value.to_le_bytes());
         Ok(())
     }
 
@@ -144,7 +144,7 @@ impl Memory for DemoMemory {
         if i + 4 > self.data.len() {
             return Err("oob");
         }
-        self.data[i..i + 4].copy_from_slice(&value.to_le_bytes());
+        self.data[i..][..4].copy_from_slice(&value.to_le_bytes());
         Ok(())
     }
 
@@ -153,7 +153,7 @@ impl Memory for DemoMemory {
         if i + 8 > self.data.len() {
             return Err("oob");
         }
-        self.data[i..i + 8].copy_from_slice(&value.to_le_bytes());
+        self.data[i..][..8].copy_from_slice(&value.to_le_bytes());
         Ok(())
     }
 }

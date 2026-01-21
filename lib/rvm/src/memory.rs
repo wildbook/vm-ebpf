@@ -157,7 +157,8 @@ impl Memory for VmMemory {
 
     fn load_u16(&self, addr: u64) -> Result<u16, Self::Err> {
         let i = addr as usize;
-        if i + 2 > self.data.len() {
+        let end = i.checked_add(2).ok_or("load_u16: address overflow")?;
+        if end > self.data.len() {
             return Err("load_u16: out of bounds");
         }
         Ok(u16::from_le_bytes([self.data[i], self.data[i + 1]]))
@@ -165,7 +166,8 @@ impl Memory for VmMemory {
 
     fn load_u32(&self, addr: u64) -> Result<u32, Self::Err> {
         let i = addr as usize;
-        if i + 4 > self.data.len() {
+        let end = i.checked_add(4).ok_or("load_u32: address overflow")?;
+        if end > self.data.len() {
             return Err("load_u32: out of bounds");
         }
         Ok(u32::from_le_bytes([self.data[i], self.data[i + 1], self.data[i + 2], self.data[i + 3]]))
@@ -173,7 +175,8 @@ impl Memory for VmMemory {
 
     fn load_u64(&self, addr: u64) -> Result<u64, Self::Err> {
         let i = addr as usize;
-        if i + 8 > self.data.len() {
+        let end = i.checked_add(8).ok_or("load_u64: address overflow")?;
+        if end > self.data.len() {
             return Err("load_u64: out of bounds");
         }
         Ok(u64::from_le_bytes([
@@ -190,28 +193,31 @@ impl Memory for VmMemory {
 
     fn store_u16(&mut self, addr: u64, value: u16) -> Result<(), Self::Err> {
         let i = addr as usize;
-        if i + 2 > self.data.len() {
+        let end = i.checked_add(2).ok_or("store_u16: address overflow")?;
+        if end > self.data.len() {
             return Err("store_u16: out of bounds");
         }
-        self.data[i..i + 2].copy_from_slice(&value.to_le_bytes());
+        self.data[i..][..2].copy_from_slice(&value.to_le_bytes());
         Ok(())
     }
 
     fn store_u32(&mut self, addr: u64, value: u32) -> Result<(), Self::Err> {
         let i = addr as usize;
-        if i + 4 > self.data.len() {
+        let end = i.checked_add(4).ok_or("store_u32: address overflow")?;
+        if end > self.data.len() {
             return Err("store_u32: out of bounds");
         }
-        self.data[i..i + 4].copy_from_slice(&value.to_le_bytes());
+        self.data[i..][..4].copy_from_slice(&value.to_le_bytes());
         Ok(())
     }
 
     fn store_u64(&mut self, addr: u64, value: u64) -> Result<(), Self::Err> {
         let i = addr as usize;
-        if i + 8 > self.data.len() {
+        let end = i.checked_add(8).ok_or("store_u64: address overflow")?;
+        if end > self.data.len() {
             return Err("store_u64: out of bounds");
         }
-        self.data[i..i + 8].copy_from_slice(&value.to_le_bytes());
+        self.data[i..][..8].copy_from_slice(&value.to_le_bytes());
         Ok(())
     }
 }
