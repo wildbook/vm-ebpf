@@ -1,0 +1,143 @@
+//! Basic eBPF Assembly Example
+//!
+//! Demonstrates how to use the assembler to create simple eBPF bytecode.
+//! Shows ALU operations, memory access, and immediate loading.
+//!
+//! Run with: cargo run --example basic_assembly
+
+use ebpf_asm::{Assembler, R0, R1, R10, R2, R3};
+
+fn main() {
+    println!("=== Basic eBPF Assembly Example ===\n");
+
+    // Example 1: Simple arithmetic - compute (10 + 5) * 2
+    simple_arithmetic();
+
+    // Example 2: Memory operations - stack manipulation
+    memory_operations();
+
+    // Example 3: 64-bit immediate loading
+    load_immediate();
+
+    // Example 4: Bitwise operations
+    bitwise_operations();
+}
+
+/// Compute (10 + 5) * 2 = 30
+fn simple_arithmetic() {
+    println!("--- Example 1: Simple Arithmetic ---");
+    println!("Computing (10 + 5) * 2 = 30\n");
+
+    let mut asm = Assembler::new();
+
+    // r0 = 10
+    asm.mov64_imm(R0, 10);
+
+    // r0 = r0 + 5 = 15
+    asm.add64_imm(R0, 5);
+
+    // r0 = r0 * 2 = 30
+    asm.mul64_imm(R0, 2);
+
+    // return r0
+    asm.exit();
+
+    let bytecode = asm.assemble().unwrap();
+
+    println!("Generated {} bytes of bytecode:", bytecode.len());
+    print_bytecode(&bytecode);
+    println!();
+}
+
+/// Demonstrate stack operations
+fn memory_operations() {
+    println!("--- Example 2: Memory Operations ---");
+    println!("Store value to stack and load it back\n");
+
+    let mut asm = Assembler::new();
+
+    // r1 = 0x12345678
+    asm.mov64_imm(R1, 0x12345678);
+
+    // Store r1 to stack at [r10 - 8]
+    // r10 is the frame pointer (stack top)
+    asm.stxdw(R10, -8, R1);
+
+    // Load the value back into r0
+    asm.ldxdw(R0, R10, -8);
+
+    // return r0
+    asm.exit();
+
+    let bytecode = asm.assemble().unwrap();
+
+    println!("Generated {} bytes of bytecode:", bytecode.len());
+    print_bytecode(&bytecode);
+    println!();
+}
+
+/// Load a full 64-bit immediate value
+fn load_immediate() {
+    println!("--- Example 3: 64-bit Immediate Loading ---");
+    println!("Loading 0xDEADBEEFCAFEBABE into r0\n");
+
+    let mut asm = Assembler::new();
+
+    // lddw is a 16-byte instruction that loads a 64-bit immediate
+    asm.lddw(R0, 0xDEADBEEFCAFEBABEu64 as i64);
+
+    // return r0
+    asm.exit();
+
+    let bytecode = asm.assemble().unwrap();
+
+    println!("Generated {} bytes of bytecode:", bytecode.len());
+    println!("(Note: lddw is a 16-byte wide instruction)\n");
+    print_bytecode(&bytecode);
+    println!();
+}
+
+/// Demonstrate bitwise operations
+fn bitwise_operations() {
+    println!("--- Example 4: Bitwise Operations ---");
+    println!("Extract bits using AND, shift with LSH/RSH\n");
+
+    let mut asm = Assembler::new();
+
+    // r0 = 0xFF00FF00
+    asm.mov64_imm(R0, 0xFF00FF00u32 as i32);
+
+    // r1 = 0x00FF00FF
+    asm.mov64_imm(R1, 0x00FF00FF);
+
+    // r2 = r0 & r1 = 0x00000000
+    asm.mov64(R2, R0);
+    asm.and64(R2, R1);
+
+    // r3 = r0 | r1 = 0xFFFFFFFF
+    asm.mov64(R3, R0);
+    asm.or64(R3, R1);
+
+    // r0 = r0 >> 8 (logical right shift)
+    asm.rsh64_imm(R0, 8);
+
+    // return r0
+    asm.exit();
+
+    let bytecode = asm.assemble().unwrap();
+
+    println!("Generated {} bytes of bytecode:", bytecode.len());
+    print_bytecode(&bytecode);
+    println!();
+}
+
+/// Helper to print bytecode in a readable format
+fn print_bytecode(bytecode: &[u8]) {
+    for (i, chunk) in bytecode.chunks(8).enumerate() {
+        print!("  {:04x}: ", i * 8);
+        for byte in chunk {
+            print!("{:02x} ", byte);
+        }
+        println!();
+    }
+}
