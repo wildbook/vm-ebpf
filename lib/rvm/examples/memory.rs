@@ -98,7 +98,7 @@ fn run_with_data(asm: &mut Assembler) -> u64 {
 
     // Layout: [code][gap][data area][stack]
     let code_size = program.len();
-    let data_offset = ((code_size + 7) / 8) * 8 + 64; // Align and add gap
+    let data_offset = code_size.div_ceil(8) * 8 + 64; // Align and add gap
     let data_size = 128;
     let stack_size = 512;
     let total_size = data_offset + data_size + stack_size;

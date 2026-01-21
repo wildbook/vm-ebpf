@@ -312,7 +312,10 @@ fn elfin() -> anyhow::Result<()> {
             let beg = addr as usize;
             let end = beg.checked_add(1).ok_or(())?;
             match self.data.get_mut(beg..end) {
-                Some(slice) => Ok(slice.copy_from_slice(&value.to_le_bytes())),
+                Some(slice) => {
+                    slice.copy_from_slice(&value.to_le_bytes());
+                    Ok(())
+                }
                 None => Err(()),
             }
         }
@@ -321,7 +324,10 @@ fn elfin() -> anyhow::Result<()> {
             let beg = addr as usize;
             let end = beg.checked_add(2).ok_or(())?;
             match self.data.get_mut(beg..end) {
-                Some(slice) => Ok(slice.copy_from_slice(&value.to_le_bytes())),
+                Some(slice) => {
+                    slice.copy_from_slice(&value.to_le_bytes());
+                    Ok(())
+                }
                 None => Err(()),
             }
         }
@@ -330,7 +336,10 @@ fn elfin() -> anyhow::Result<()> {
             let beg = addr as usize;
             let end = beg.checked_add(4).ok_or(())?;
             match self.data.get_mut(beg..end) {
-                Some(slice) => Ok(slice.copy_from_slice(&value.to_le_bytes())),
+                Some(slice) => {
+                    slice.copy_from_slice(&value.to_le_bytes());
+                    Ok(())
+                }
                 None => Err(()),
             }
         }
@@ -339,7 +348,10 @@ fn elfin() -> anyhow::Result<()> {
             let beg = addr as usize;
             let end = beg.checked_add(8).ok_or(())?;
             match self.data.get_mut(beg..end) {
-                Some(slice) => Ok(slice.copy_from_slice(&value.to_le_bytes())),
+                Some(slice) => {
+                    slice.copy_from_slice(&value.to_le_bytes());
+                    Ok(())
+                }
                 None => Err(()),
             }
         }

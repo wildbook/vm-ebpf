@@ -57,7 +57,7 @@ impl StructField {
         Self {
             name: name.into(),
             offset,
-            size: ((bit_offset as u32 + bit_size as u32) + 7) / 8,
+            size: (bit_offset as u32 + bit_size as u32).div_ceil(8),
             bit_offset,
             bit_size,
         }

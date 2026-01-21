@@ -59,7 +59,6 @@ name = "loader"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "btf",
  "constelf",
  "rvm-core",
 ]

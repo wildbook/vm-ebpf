@@ -581,7 +581,7 @@ fn resolve_field_by_indices<'a>(
         // Need to recurse into nested struct/union
         let nested_type = btf
             .type_by_id(member.type_id)
-            .ok_or_else(|| CoreReloError::InvalidTypeId(member.type_id))?;
+            .ok_or(CoreReloError::InvalidTypeId(member.type_id))?;
 
         // Skip through pointer/typedef/const/volatile/restrict to get to the actual type
         let resolved_type = skip_modifiers(btf, nested_type)?;
@@ -596,16 +596,14 @@ fn skip_modifiers<'a, 'b>(btf: &'b Btf<'a>, ty: &'b BtfTypeInfo<'a>) -> Result<&
         BtfTypeInfo::Ptr { pointee_type } => {
             let inner = btf
                 .type_by_id(*pointee_type)
-                .ok_or_else(|| CoreReloError::InvalidTypeId(*pointee_type))?;
+                .ok_or(CoreReloError::InvalidTypeId(*pointee_type))?;
             skip_modifiers(btf, inner)
         }
         BtfTypeInfo::Typedef { type_id, .. }
         | BtfTypeInfo::Const { type_id }
         | BtfTypeInfo::Volatile { type_id }
         | BtfTypeInfo::Restrict { type_id } => {
-            let inner = btf
-                .type_by_id(*type_id)
-                .ok_or_else(|| CoreReloError::InvalidTypeId(*type_id))?;
+            let inner = btf.type_by_id(*type_id).ok_or(CoreReloError::InvalidTypeId(*type_id))?;
             skip_modifiers(btf, inner)
         }
         _ => Ok(ty),

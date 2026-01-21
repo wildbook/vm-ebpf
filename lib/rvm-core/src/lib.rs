@@ -420,7 +420,7 @@ mod mem {
             MemSize::Byte => mem.load_u8(addr).map(u64::from),
             MemSize::Half => mem.load_u16(addr).map(u64::from),
             MemSize::Word => mem.load_u32(addr).map(u64::from),
-            MemSize::DWord => mem.load_u64(addr).map(u64::from),
+            MemSize::DWord => mem.load_u64(addr),
         }
     }
 

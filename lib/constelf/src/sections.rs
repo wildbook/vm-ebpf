@@ -67,6 +67,10 @@ impl<'a> ElfSections<'a> {
         self.ehdr.e_shnum as usize
     }
 
+    pub const fn is_empty(self) -> bool {
+        self.ehdr.e_shnum == 0
+    }
+
     pub const fn headers(self) -> &'a [Elf64Shdr] {
         let beg = self.ehdr.e_shoff as usize;
         let len = self.ehdr.e_shnum as usize;

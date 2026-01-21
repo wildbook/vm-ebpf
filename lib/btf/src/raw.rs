@@ -3,7 +3,7 @@
 //! These structures are parsed directly from the BTF section bytes.
 
 /// BTF magic number (little-endian).
-pub const BTF_MAGIC: u16 = 0xeB9F;
+pub const BTF_MAGIC: u16 = 0xEB9F;
 
 /// BTF version we support.
 pub const BTF_VERSION: u8 = 1;

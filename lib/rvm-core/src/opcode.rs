@@ -180,7 +180,7 @@ pub enum MemMode {
 
 impl Class {
     pub const fn from_u8(x: u8) -> Self {
-        debug_assert!((x & !0b00000_111) == 0);
+        debug_assert!((x & !0b0000_0111) == 0);
         match x {
             x if x == Class::LdImm as u8 => Class::LdImm,
             x if x == Class::LdReg as u8 => Class::LdReg,
@@ -197,7 +197,7 @@ impl Class {
 
 impl Source {
     pub const fn from_u8(x: u8) -> Self {
-        debug_assert!((x & !0b0000_1_000) == 0);
+        debug_assert!((x & !0b0000_1000) == 0);
         match x {
             x if x == Source::Imm as u8 => Source::Imm,
             x if x == Source::Reg as u8 => Source::Reg,
@@ -208,7 +208,7 @@ impl Source {
 
 impl AluOpc {
     pub const fn from_u8(x: u8) -> Self {
-        debug_assert!((x & !0b1111_0_000) == 0);
+        debug_assert!((x & !0b1111_0000) == 0);
         match x {
             x if x == AluOpc::Add as u8 => AluOpc::Add,
             x if x == AluOpc::Sub as u8 => AluOpc::Sub,
@@ -234,7 +234,7 @@ impl AluOpc {
 
 impl AluEnd {
     pub const fn from_u8(x: u8) -> Self {
-        debug_assert!((x & !0b0000_1_000) == 0);
+        debug_assert!((x & !0b0000_1000) == 0);
         match x {
             x if x == AluEnd::ToLE as u8 => AluEnd::ToLE,
             x if x == AluEnd::ToBE as u8 => AluEnd::ToBE,
@@ -245,7 +245,7 @@ impl AluEnd {
 
 impl JmpOpc {
     pub const fn from_u8(x: u8) -> Self {
-        debug_assert!((x & !0b1111_0_000) == 0);
+        debug_assert!((x & !0b1111_0000) == 0);
         match x {
             x if x == JmpOpc::Ja as u8 => JmpOpc::Ja,
             x if x == JmpOpc::Jeq as u8 => JmpOpc::Jeq,
@@ -271,7 +271,7 @@ impl JmpOpc {
 
 impl MemSize {
     pub const fn from_u8(x: u8) -> Self {
-        debug_assert!((x & !0b000_11_000) == 0);
+        debug_assert!((x & !0b0001_1000) == 0);
         match x {
             x if x == MemSize::Word as u8 => MemSize::Word,
             x if x == MemSize::Half as u8 => MemSize::Half,
@@ -284,7 +284,7 @@ impl MemSize {
 
 impl MemMode {
     pub const fn from_u8(x: u8) -> Self {
-        debug_assert!((x & !0b111_00_000) == 0);
+        debug_assert!((x & !0b1110_0000) == 0);
         match x {
             x if x == MemMode::Imm as u8 => MemMode::Imm,
             x if x == MemMode::Abs as u8 => MemMode::Abs,

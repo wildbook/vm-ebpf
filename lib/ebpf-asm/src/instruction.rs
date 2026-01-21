@@ -337,6 +337,19 @@ pub mod mode {
     pub const ATOMIC: u8 = 0xC0;
 }
 
+/// Atomic operation codes (encoded in the imm field for ATOMIC mode).
+#[allow(missing_docs)]
+pub mod atomic {
+    pub const ADD: i32 = 0x00;
+    pub const OR: i32 = 0x40;
+    pub const AND: i32 = 0x50;
+    pub const XOR: i32 = 0xa0;
+    pub const XCHG: i32 = 0xe1;
+    pub const CMPXCHG: i32 = 0xf1;
+    /// Flag indicating fetch variant (returns old value).
+    pub const FETCH: i32 = 0x01;
+}
+
 /// Source is immediate value (K).
 pub const SRC_IMM: u8 = 0x00;
 /// Source is register (X).

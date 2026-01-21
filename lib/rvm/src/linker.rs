@@ -129,7 +129,7 @@ impl<'a> Linker<'a> {
                     if !section.data.is_empty() {
                         memory
                             .write_bytes(vaddr as usize, &section.data)
-                            .map_err(|e| VmError::Memory(e))?;
+                            .map_err(VmError::Memory)?;
                     }
                 }
             }
@@ -227,10 +227,10 @@ impl<'a> Linker<'a> {
 
                 memory
                     .write_bytes((patch_addr + 4) as usize, &lo)
-                    .map_err(|e| VmError::Memory(e))?;
+                    .map_err(VmError::Memory)?;
                 memory
                     .write_bytes((patch_addr + 12) as usize, &hi)
-                    .map_err(|e| VmError::Memory(e))?;
+                    .map_err(VmError::Memory)?;
             }
             reloc::bpf::BPF_64_32 => {
                 // 32-bit relative call - patch the imm32 field
@@ -249,7 +249,7 @@ impl<'a> Linker<'a> {
                 let imm_bytes = rel_offset.to_le_bytes();
                 memory
                     .write_bytes((patch_addr + 4) as usize, &imm_bytes)
-                    .map_err(|e| VmError::Memory(e))?;
+                    .map_err(VmError::Memory)?;
             }
             _ => {
                 // Unknown relocation type - skip for now
@@ -312,14 +312,14 @@ impl<'a> Linker<'a> {
 
                 // Convert memory region to instruction slice
                 let section_size = section.size as usize;
-                if section_size == 0 || section_size % 8 != 0 {
+                if section_size == 0 || !section_size.is_multiple_of(8) {
                     continue;
                 }
 
                 let num_insns = section_size / 8;
                 let mem_slice = memory
                     .bytes_mut(section_addr as usize, section_size)
-                    .map_err(|e| VmError::Memory(e))?;
+                    .map_err(VmError::Memory)?;
 
                 // Convert to u64 slice for patching
                 // Safety: We've verified alignment and size

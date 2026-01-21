@@ -200,7 +200,7 @@ fn run_with_args(asm: &mut Assembler, args: &[u64]) -> u64 {
 
     let code_size = program.len();
     let stack_size = 512;
-    let total_size = ((code_size + 7) / 8) * 8 + stack_size;
+    let total_size = code_size.div_ceil(8) * 8 + stack_size;
 
     let mut memory = VmMemory::new(total_size);
     memory.write_bytes(0, &program).unwrap();

@@ -246,7 +246,7 @@ fn write_event_to_memory(program: &mut rvm::Program, event: &CompileTimeEvent) -
     }
 
     // Write fields at compile-time offsets
-    let _ = mem.store_u64(event_addr + 0, event.timestamp);
+    let _ = mem.store_u64(event_addr, event.timestamp);
     let _ = mem.store_u32(event_addr + 8, event.pid);
     let _ = mem.store_u32(event_addr + 12, event.uid);
     let _ = mem.store_u32(event_addr + 16, event.flags);
@@ -267,7 +267,7 @@ fn write_runtime_event_to_memory(program: &mut rvm::Program, event: &RuntimeEven
     }
 
     // Write fields at RUNTIME offsets (different from compile-time!)
-    let _ = mem.store_u32(event_addr + 0, event.flags); // flags first
+    let _ = mem.store_u32(event_addr, event.flags); // flags first
     let _ = mem.store_u32(event_addr + 4, event.pid);
     let _ = mem.store_u32(event_addr + 8, event.uid);
     let _ = mem.store_u32(event_addr + 12, event._pad);

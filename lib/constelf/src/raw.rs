@@ -151,14 +151,14 @@ pub mod stt {
     pub const HIPROC:  u8 = 15; /* End of processor-specific */
 }
 
-#[repr(packed)]
+#[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
 pub struct Elf64Rel {
     pub r_offset: Elf64Addr,
     pub r_info: Elf64Xword,
 }
 
-#[repr(packed)]
+#[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
 pub struct Elf64Rela {
     pub r_offset: Elf64Addr,
@@ -166,7 +166,7 @@ pub struct Elf64Rela {
     pub r_addend: i64,
 }
 
-#[repr(packed)]
+#[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
 pub struct ElfIdent {
     pub ei_magic: [u8; 4],
@@ -178,7 +178,7 @@ pub struct ElfIdent {
     pub ei_pad: [u8; 7],
 }
 
-#[repr(packed)]
+#[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
 pub struct Elf64Ehdr {
     pub e_ident: ElfIdent,
@@ -197,7 +197,7 @@ pub struct Elf64Ehdr {
     pub e_shstrndx: Elf64Half,
 }
 
-#[repr(packed)]
+#[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
 pub struct Elf64Shdr {
     pub sh_name: Elf64Word,
@@ -212,7 +212,7 @@ pub struct Elf64Shdr {
     pub sh_entsize: Elf64Xword,
 }
 
-#[repr(packed)]
+#[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
 pub struct Elf64Sym {
     pub st_name: Elf64Word,
