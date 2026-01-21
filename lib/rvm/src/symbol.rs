@@ -160,7 +160,7 @@ impl Import {
     /// Create a new helper function import.
     pub fn helper(id: u32) -> Self {
         Self {
-            name: format!("__helper_{}", id),
+            name: format!("__helper_{id}"),
             is_helper: true,
             helper_id: Some(id),
         }

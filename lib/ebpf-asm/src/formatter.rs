@@ -161,7 +161,7 @@ impl DefaultFormatter {
     fn format_operand(&self, operand: &Operand, output: &mut dyn FormatterOutput) {
         match operand {
             Operand::Reg(r) => {
-                output.write_register(&format!("{}", r));
+                output.write_register(&format!("{r}"));
             }
             Operand::Imm(v) => {
                 let s = if *v < 0 {
@@ -181,7 +181,7 @@ impl DefaultFormatter {
             }
             Operand::Mem { base, offset } => {
                 output.write_punctuation("[");
-                output.write_register(&format!("{}", base));
+                output.write_register(&format!("{base}"));
                 if *offset >= 0 {
                     output.write_punctuation("+");
                     output.write_immediate(&format!("{:#x}", *offset as u16));
@@ -192,11 +192,7 @@ impl DefaultFormatter {
                 output.write_punctuation("]");
             }
             Operand::Off(off) => {
-                let s = if *off >= 0 {
-                    format!("+{}", off)
-                } else {
-                    format!("{}", off)
-                };
+                let s = if *off >= 0 { format!("+{off}") } else { format!("{off}") };
                 output.write_offset(&s);
             }
             Operand::None => {}
@@ -263,9 +259,9 @@ impl Formatter for DefaultFormatter {
                 output.write_punctuation(",");
                 output.write_whitespace(" ");
                 let off_str = if offset >= 0 {
-                    format!("+{}", offset)
+                    format!("+{offset}")
                 } else {
-                    format!("{}", offset)
+                    format!("{offset}")
                 };
                 output.write_offset(&off_str);
             }

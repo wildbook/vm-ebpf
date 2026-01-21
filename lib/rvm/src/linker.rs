@@ -189,15 +189,16 @@ impl<'a> Linker<'a> {
         memory: &mut VmMemory,
     ) -> Result<()> {
         // Get the symbol being referenced
-        let symbol = module
-            .symbol_by_idx(reloc.symbol_idx)
-            .ok_or_else(|| LinkError::InvalidReference(format!("symbol index {}", reloc.symbol_idx)))?;
+        let symbol = module.symbol_by_idx(reloc.symbol_idx).ok_or_else(|| {
+            let idx = reloc.symbol_idx;
+            LinkError::InvalidReference(format!("symbol index {idx}"))
+        })?;
 
         // Get the address where we're patching
-        let section_addr = layout
-            .section_addrs
-            .get(&reloc.section_idx)
-            .ok_or_else(|| LinkError::InvalidReference(format!("section index {}", reloc.section_idx)))?;
+        let section_addr = layout.section_addrs.get(&reloc.section_idx).ok_or_else(|| {
+            let idx = reloc.section_idx;
+            LinkError::InvalidReference(format!("section index {idx}"))
+        })?;
         let patch_addr = *section_addr + reloc.offset;
 
         // Calculate the symbol's resolved address
@@ -207,7 +208,7 @@ impl<'a> Linker<'a> {
             let sym_section_addr = layout
                 .section_addrs
                 .get(&sym_section_idx)
-                .ok_or_else(|| LinkError::InvalidReference(format!("symbol section {}", sym_section_idx)))?;
+                .ok_or_else(|| LinkError::InvalidReference(format!("symbol section {sym_section_idx}")))?;
             *sym_section_addr + symbol.value
         } else if let Some(&addr) = global_symbols.get(&symbol.name) {
             // Symbol is defined in another module

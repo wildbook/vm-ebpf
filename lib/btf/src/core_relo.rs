@@ -393,10 +393,10 @@ fn apply_single_relocation(
         .ok_or(CoreReloError::InvalidTypeId(relo.type_id))?;
 
     // Get the access string
-    let access_str = btf
-        .strings()
-        .get(relo.access_str_off)
-        .ok_or_else(|| CoreReloError::InvalidAccessString(format!("offset {}", relo.access_str_off)))?;
+    let access_str = btf.strings().get(relo.access_str_off).ok_or_else(|| {
+        let off = relo.access_str_off;
+        CoreReloError::InvalidAccessString(format!("offset {off}"))
+    })?;
 
     let result = compute_relocation_value(btf_type, btf, registry, access_str, relo.kind)?;
 

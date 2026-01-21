@@ -83,11 +83,11 @@ impl Module {
     /// Parse a module from ELF bytes.
     pub fn from_elf(name: impl Into<String>, elf_bytes: &[u8]) -> Result<Self> {
         let name = name.into();
-        let elf = ElfFile::new(elf_bytes).map_err(|e| ElfError::InvalidFormat(format!("{:?}", e)))?;
+        let elf = ElfFile::new(elf_bytes).map_err(|e| ElfError::InvalidFormat(format!("{e:?}")))?;
 
         let elf_sections = elf
             .sections()
-            .map_err(|e| ElfError::InvalidFormat(format!("failed to get sections: {:?}", e)))?;
+            .map_err(|e| ElfError::InvalidFormat(format!("failed to get sections: {e:?}")))?;
 
         let mut module = Self::new(&name);
 
@@ -95,7 +95,7 @@ impl Module {
         for (idx, header) in elf_sections.headers().iter().enumerate() {
             let section_name = elf_sections
                 .name(header)
-                .map_err(|e| ElfError::InvalidFormat(format!("failed to get section name: {:?}", e)))?;
+                .map_err(|e| ElfError::InvalidFormat(format!("failed to get section name: {e:?}")))?;
             let name_str = section_name.to_str().unwrap_or("");
 
             // Determine section kind
@@ -129,7 +129,7 @@ impl Module {
                 Vec::new() // .bss has no data
             } else if let Some(sect) = elf_sections.by_index(idx) {
                 sect.bytes()
-                    .map_err(|e| ElfError::InvalidFormat(format!("failed to get section bytes: {:?}", e)))?
+                    .map_err(|e| ElfError::InvalidFormat(format!("failed to get section bytes: {e:?}")))?
                     .to_vec()
             } else {
                 Vec::new()
@@ -224,7 +224,7 @@ impl Module {
         let mut reloc_iter = elf
             .relocs()
             .iter()
-            .map_err(|e| ElfError::InvalidFormat(format!("failed to get relocations: {:?}", e)))?;
+            .map_err(|e| ElfError::InvalidFormat(format!("failed to get relocations: {e:?}")))?;
 
         loop {
             let (next, chunk) = reloc_iter.into_next();
@@ -244,7 +244,7 @@ impl Module {
             use constelf::relocs::ElfRelocsChunk;
             match chunk
                 .relocs()
-                .map_err(|e| ElfError::InvalidFormat(format!("failed to get relocs: {:?}", e)))?
+                .map_err(|e| ElfError::InvalidFormat(format!("failed to get relocs: {e:?}")))?
             {
                 ElfRelocsChunk::Rel(relocs) => {
                     for r in relocs {

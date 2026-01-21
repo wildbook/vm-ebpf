@@ -155,8 +155,8 @@ mod tests {
 
     #[test]
     fn test_register_display() {
-        assert_eq!(format!("{}", R0), "r0");
-        assert_eq!(format!("{}", R10), "r10");
+        assert_eq!(format!("{R0}"), "r0");
+        assert_eq!(format!("{R10}"), "r10");
     }
 
     #[test]
