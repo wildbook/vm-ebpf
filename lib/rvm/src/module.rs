@@ -108,17 +108,13 @@ impl Module {
             // Handle BTF sections specially
             if name_str == ".BTF" {
                 if let Some(sect) = elf_sections.by_index(idx) {
-                    if let Ok(bytes) = sect.bytes() {
-                        module.btf_data = Some(bytes.to_vec());
-                    }
+                    module.btf_data = sect.bytes().ok().map(|b| b.to_vec());
                 }
                 continue;
             }
             if name_str == ".BTF.ext" {
                 if let Some(sect) = elf_sections.by_index(idx) {
-                    if let Ok(bytes) = sect.bytes() {
-                        module.btf_ext_data = Some(bytes.to_vec());
-                    }
+                    module.btf_ext_data = sect.bytes().ok().map(|b| b.to_vec());
                 }
                 continue;
             }
@@ -157,14 +153,9 @@ impl Module {
 
             for (sym_idx, sym) in symtab.iter().enumerate() {
                 // Get symbol name from string table
-                let sym_name = if sym.st_name != 0 {
-                    if let Some(strtab) = strtab {
-                        get_string_from_table(strtab, sym.st_name as usize)
-                    } else {
-                        String::new()
-                    }
-                } else {
-                    String::new()
+                let sym_name = match (sym.st_name != 0, strtab) {
+                    (true, Some(strtab)) => get_string_from_table(strtab, sym.st_name as usize),
+                    _ => String::new(),
                 };
 
                 if sym_name.is_empty() && sym.st_shndx == 0 {
@@ -204,11 +195,7 @@ impl Module {
                     .with_value(sym.st_value)
                     .with_size(sym.st_size);
 
-                let symbol = if let Some(idx) = section_idx {
-                    symbol.with_section(idx)
-                } else {
-                    symbol
-                };
+                let symbol = section_idx.map_or(symbol.clone(), |idx| symbol.with_section(idx));
 
                 if !sym_name.is_empty() {
                     module.symbol_by_name.insert(sym_name.clone(), sym_idx);
@@ -249,9 +236,8 @@ impl Module {
 
             // Find the target section in our list
             let target_elf_idx = chunk.target_idx();
-            let section_idx = match module.sections.iter().position(|s| s.elf_index == target_elf_idx) {
-                Some(idx) => idx,
-                None => continue, // Relocations for non-ALLOC sections
+            let Some(section_idx) = module.sections.iter().position(|s| s.elf_index == target_elf_idx) else {
+                continue; // Relocations for non-ALLOC sections
             };
 
             // Get relocations

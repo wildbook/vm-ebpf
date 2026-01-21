@@ -125,12 +125,13 @@ impl<'a> Linker<'a> {
     fn copy_sections(&self, modules: &[&Module], layouts: &[ModuleLayout], memory: &mut VmMemory) -> Result<()> {
         for (module, layout) in modules.iter().zip(layouts.iter()) {
             for (idx, section) in module.sections.iter().enumerate() {
-                if let Some(&vaddr) = layout.section_addrs.get(&idx) {
-                    if !section.data.is_empty() {
-                        memory
-                            .write_bytes(vaddr as usize, &section.data)
-                            .map_err(VmError::Memory)?;
-                    }
+                let Some(&vaddr) = layout.section_addrs.get(&idx) else {
+                    continue;
+                };
+                if !section.data.is_empty() {
+                    memory
+                        .write_bytes(vaddr as usize, &section.data)
+                        .map_err(VmError::Memory)?;
                 }
             }
         }
@@ -143,18 +144,19 @@ impl<'a> Linker<'a> {
 
         for (module, layout) in modules.iter().zip(layouts.iter()) {
             for (name, export) in &module.exports {
-                if let Some(&section_addr) = layout.section_addrs.get(&export.section_idx) {
-                    let addr = section_addr + export.offset;
+                let Some(&section_addr) = layout.section_addrs.get(&export.section_idx) else {
+                    continue;
+                };
+                let addr = section_addr + export.offset;
 
-                    // Check for duplicates
-                    if let Some(&existing) = symbols.get(name) {
-                        if existing != addr {
-                            return Err(LinkError::DuplicateSymbol(name.clone()).into());
-                        }
+                // Check for duplicates
+                if let Some(&existing) = symbols.get(name) {
+                    if existing != addr {
+                        return Err(LinkError::DuplicateSymbol(name.clone()).into());
                     }
-
-                    symbols.insert(name.clone(), addr);
                 }
+
+                symbols.insert(name.clone(), addr);
             }
         }
 
@@ -370,19 +372,21 @@ impl<'a> Linker<'a> {
         if functions.is_empty() {
             for (module, layout) in modules.iter().zip(layouts.iter()) {
                 for (idx, section) in module.sections.iter().enumerate() {
-                    if section.kind == SectionKind::Code {
-                        if let Some(&addr) = layout.section_addrs.get(&idx) {
-                            let pc = addr / 8;
-                            functions.insert(
-                                section.name.clone(),
-                                FunctionInfo {
-                                    name: section.name.clone(),
-                                    pc,
-                                    size: section.size,
-                                },
-                            );
-                        }
+                    if section.kind != SectionKind::Code {
+                        continue;
                     }
+                    let Some(&addr) = layout.section_addrs.get(&idx) else {
+                        continue;
+                    };
+                    let pc = addr / 8;
+                    functions.insert(
+                        section.name.clone(),
+                        FunctionInfo {
+                            name: section.name.clone(),
+                            pc,
+                            size: section.size,
+                        },
+                    );
                 }
             }
         }
