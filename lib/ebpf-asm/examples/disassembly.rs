@@ -49,7 +49,7 @@ fn basic_disassembly() {
     println!();
 }
 
-/// Use Intel-style syntax
+/// Use Intel-style syntax (with raw bytes)
 fn intel_style() {
     println!("--- Example 2: Intel-Style Formatting ---\n");
 
@@ -61,16 +61,16 @@ fn intel_style() {
 
     let bytecode = asm.assemble().unwrap();
 
-    // Compare default vs Intel style
+    // Compare default vs Intel style (with bytes enabled)
     let default_fmt = DefaultFormatter::new();
-    let intel_fmt = IntelFormatter::new();
+    let intel_fmt = IntelFormatter::new().with_bytes();
 
     println!("Default style:");
     for insn in Decoder::new(&bytecode) {
         println!("  {}", default_fmt.format_to_string(&insn));
     }
 
-    println!("\nIntel style:");
+    println!("\nIntel style (with raw bytes):");
     for insn in Decoder::new(&bytecode) {
         println!("  {}", intel_fmt.format_to_string(&insn));
     }
