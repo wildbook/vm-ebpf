@@ -49,17 +49,20 @@ impl VmMemory {
 
     /// Write a slice of bytes to memory at the given offset
     pub fn write_bytes(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
-        if offset + bytes.len() > self.data.len() {
-            bail!("write out of bounds: offset={}, len={}, capacity={}", offset, bytes.len(), self.data.len());
+        let len = bytes.len();
+        let capacity = self.data.len();
+        if offset + len > capacity {
+            bail!("write out of bounds: offset={offset}, len={len}, capacity={capacity}");
         }
-        self.data[offset..offset + bytes.len()].copy_from_slice(bytes);
+        self.data[offset..offset + len].copy_from_slice(bytes);
         Ok(())
     }
 
     /// Read bytes from memory
     pub fn read_bytes(&self, offset: usize, len: usize) -> Result<&[u8]> {
-        if offset + len > self.data.len() {
-            bail!("read out of bounds: offset={}, len={}, capacity={}", offset, len, self.data.len());
+        let capacity = self.data.len();
+        if offset + len > capacity {
+            bail!("read out of bounds: offset={offset}, len={len}, capacity={capacity}");
         }
         Ok(&self.data[offset..offset + len])
     }
@@ -170,8 +173,8 @@ struct LoadedProgram {
 /// Load an eBPF ELF file into memory
 fn load_elf(elf_bytes: &[u8]) -> Result<LoadedProgram> {
     // Parse ELF
-    let elf = ElfFile::new(elf_bytes).map_err(|e| anyhow!("Failed to parse ELF file: {:?}", e))?;
-    let sections = elf.sections().map_err(|e| anyhow!("Failed to get sections: {:?}", e))?;
+    let elf = ElfFile::new(elf_bytes).map_err(|e| anyhow!("Failed to parse ELF file: {e:?}"))?;
+    let sections = elf.sections().map_err(|e| anyhow!("Failed to get sections: {e:?}"))?;
 
     // First pass: calculate total memory needed
     const PAGE_SIZE: usize = 8; // Align to 8 bytes (instruction size)
@@ -193,7 +196,7 @@ fn load_elf(elf_bytes: &[u8]) -> Result<LoadedProgram> {
 
         let name = sections
             .name(header)
-            .map_err(|e| anyhow!("Failed to get section name: {:?}", e))?;
+            .map_err(|e| anyhow!("Failed to get section name: {e:?}"))?;
         let name_str = name.to_str().unwrap_or("<invalid>");
 
         // Align to PAGE_SIZE
@@ -217,9 +220,7 @@ fn load_elf(elf_bytes: &[u8]) -> Result<LoadedProgram> {
         }
 
         println!(
-            "  Section [{}]: {} @ 0x{:x} ({} bytes){}",
-            idx,
-            name_str,
+            "  Section [{idx}]: {name_str} @ 0x{:x} ({} bytes){}",
             section_info.vaddr,
             section_info.size,
             if section_info.executable { " [EXEC]" } else { "" }
@@ -246,8 +247,8 @@ fn load_elf(elf_bytes: &[u8]) -> Result<LoadedProgram> {
     total_size += STACK_SIZE;
     let stack_end = total_size;
 
-    println!("  Stack: 0x{:x} - 0x{:x} ({} bytes)", stack_start, stack_end, STACK_SIZE);
-    println!("  Total memory: {} bytes", total_size);
+    println!("  Stack: 0x{stack_start:x} - 0x{stack_end:x} ({STACK_SIZE} bytes)");
+    println!("  Total memory: {total_size} bytes");
 
     // Allocate memory
     let mut memory = VmMemory::new(total_size);
@@ -259,10 +260,10 @@ fn load_elf(elf_bytes: &[u8]) -> Result<LoadedProgram> {
                 // Copy section data (not for .bss which is NOBITS)
                 let section = sections
                     .by_index(idx)
-                    .ok_or_else(|| anyhow!("Section {} not found", idx))?;
+                    .ok_or_else(|| anyhow!("Section {idx} not found"))?;
                 let bytes = section
                     .bytes()
-                    .map_err(|e| anyhow!("Failed to get section bytes: {:?}", e))?;
+                    .map_err(|e| anyhow!("Failed to get section bytes: {e:?}"))?;
                 memory.write_bytes(info.vaddr as usize, bytes)?;
             }
         }
@@ -272,11 +273,11 @@ fn load_elf(elf_bytes: &[u8]) -> Result<LoadedProgram> {
     let mut reloc_iter = elf
         .relocs()
         .iter()
-        .map_err(|e| anyhow!("Failed to get relocations: {:?}", e))?;
+        .map_err(|e| anyhow!("Failed to get relocations: {e:?}"))?;
 
     let symtab = sections
         .symtab()
-        .map_err(|e| anyhow!("Failed to get symbol table: {:?}", e))?;
+        .map_err(|e| anyhow!("Failed to get symbol table: {e:?}"))?;
 
     loop {
         let (next, chunk) = reloc_iter.into_next();
@@ -292,15 +293,15 @@ fn load_elf(elf_bytes: &[u8]) -> Result<LoadedProgram> {
             continue; // Relocations for non-ALLOC sections, skip
         };
 
-        let relocs = match chunk.relocs().map_err(|e| anyhow!("Failed to get relocs: {:?}", e))? {
+        let relocs = match chunk.relocs().map_err(|e| anyhow!("Failed to get relocs: {e:?}"))? {
             ElfRelocsChunk::Rel(r) => r,
             ElfRelocsChunk::Rela(r) => {
                 // RELA relocations have explicit addends which require different handling
                 // than REL relocations where the addend is embedded in the instruction
+                let name = &target_info.name;
+                let len = r.len();
                 eprintln!(
-                    "  Warning: Skipping {} RELA relocations for section {} - RELA support not implemented",
-                    r.len(),
-                    target_info.name
+                    "  Warning: Skipping {len} RELA relocations for section {name} - RELA support not implemented"
                 );
                 continue;
             }
@@ -314,7 +315,7 @@ fn load_elf(elf_bytes: &[u8]) -> Result<LoadedProgram> {
 
             let symbol = symtab
                 .get(r_sym as usize)
-                .ok_or_else(|| anyhow!("Symbol {} not found", r_sym))?;
+                .ok_or_else(|| anyhow!("Symbol {r_sym} not found"))?;
 
             match r_typ {
                 reloc::bpf::BPF_64_64 => {
@@ -322,7 +323,7 @@ fn load_elf(elf_bytes: &[u8]) -> Result<LoadedProgram> {
                     let sym_sect_idx = symbol.st_shndx as usize;
                     let sym_sect_info = section_map
                         .get(&sym_sect_idx)
-                        .ok_or_else(|| anyhow!("Symbol section {} not mapped", sym_sect_idx))?;
+                        .ok_or_else(|| anyhow!("Symbol section {sym_sect_idx} not mapped"))?;
 
                     // Calculate final address: section base + symbol offset
                     let sym_addr = sym_sect_info.vaddr + symbol.st_value;
@@ -339,10 +340,10 @@ fn load_elf(elf_bytes: &[u8]) -> Result<LoadedProgram> {
                     let hi = ((sym_addr >> 32) as u32).to_le_bytes();
                     memory.write_bytes((insn_addr + 12) as usize, &hi)?;
 
-                    println!("  Relocation: R_BPF_64_64 at 0x{:x} -> 0x{:x}", insn_addr, sym_addr);
+                    println!("  Relocation: R_BPF_64_64 at 0x{insn_addr:x} -> 0x{sym_addr:x}");
                 }
                 _ => {
-                    println!("  Warning: Unsupported relocation type {}", r_typ);
+                    println!("  Warning: Unsupported relocation type {r_typ}");
                 }
             }
         }
@@ -375,10 +376,14 @@ fn run_program(prog: &mut LoadedProgram, args: &[u64]) -> Result<u64> {
     let mut pc = prog.entry_pc;
 
     println!("\n=== Executing eBPF program ===");
-    println!("Entry PC: {} (byte offset: 0x{:x})", pc, pc * 8);
-    println!("Stack pointer (r10): 0x{:x}", ctx.regs[10]);
+    let entry = pc;
+    let byte_offset = pc * 8;
+    let sp = ctx.regs[10];
+    println!("Entry PC: {entry} (byte offset: 0x{byte_offset:x})");
+    println!("Stack pointer (r10): 0x{sp:x}");
     for (i, &arg) in args.iter().take(5).enumerate() {
-        println!("Argument r{}: 0x{:x} ({})", i + 1, arg, arg);
+        let reg = i + 1;
+        println!("Argument r{reg}: 0x{arg:x} ({arg})");
     }
     println!();
 
@@ -394,7 +399,7 @@ fn run_program(prog: &mut LoadedProgram, args: &[u64]) -> Result<u64> {
         let instr = ctx
             .data
             .load_pc(pc)
-            .map_err(|e| anyhow!("Failed to load instruction at PC {}: {}", pc, e))?;
+            .map_err(|e| anyhow!("Failed to load instruction at PC {pc}: {e}"))?;
         pc += 1;
 
         let flow = match rvm_core::step(&mut ctx, instr) {
@@ -404,7 +409,7 @@ fn run_program(prog: &mut LoadedProgram, args: &[u64]) -> Result<u64> {
                 let second = ctx
                     .data
                     .load_pc(pc)
-                    .map_err(|e| anyhow!("Failed to load second instruction at PC {}: {}", pc, e))?;
+                    .map_err(|e| anyhow!("Failed to load second instruction at PC {pc}: {e}"))?;
                 pc += 1;
                 rvm_core::step_ld64(&mut ctx, instr, second)
             }
@@ -413,19 +418,22 @@ fn run_program(prog: &mut LoadedProgram, args: &[u64]) -> Result<u64> {
         match flow {
             Flow::Next => continue,
             Flow::Exit => {
-                println!("Program exited after {} instructions", instruction_count);
-                println!("Return value (r0): {} (0x{:x})", ctx.regs[0], ctx.regs[0]);
+                let r0 = ctx.regs[0];
+                println!("Program exited after {instruction_count} instructions");
+                println!("Return value (r0): {r0} (0x{r0:x})");
 
                 // Return memory to the program struct for inspection
                 prog.memory = ctx.data;
-                return Ok(ctx.regs[0]);
+                return Ok(r0);
             }
             Flow::Jump(offset) => pc = pc.wrapping_add_signed(offset),
             Flow::Call(offset) => {
                 // BPF-to-BPF call: save return address and jump
                 // For simplicity, we use a recursive approach here
                 // A production implementation would maintain a call stack
-                println!("  [Call] PC {} -> offset {} (target {})", pc - 1, offset, pc.wrapping_add_signed(offset));
+                let prev_pc = pc - 1;
+                let target = pc.wrapping_add_signed(offset);
+                println!("  [Call] PC {prev_pc} -> offset {offset} (target {target})");
 
                 // Push return address conceptually
                 // The called function will use the same context
@@ -437,13 +445,14 @@ fn run_program(prog: &mut LoadedProgram, args: &[u64]) -> Result<u64> {
             Flow::CallExt(helper_id) => {
                 // External helper function call
                 // In a real implementation, this would dispatch to helper functions
-                println!("  [Helper] ID {} called", helper_id);
+                println!("  [Helper] ID {helper_id} called");
 
                 // Simple helper stubs
                 match helper_id {
                     1 => {
                         // bpf_trace_printk style: just print r1
-                        println!("    -> trace: {}", ctx.regs[1]);
+                        let r1 = ctx.regs[1];
+                        println!("    -> trace: {r1}");
                         ctx.regs[0] = 0;
                     }
                     _ => {
@@ -452,9 +461,18 @@ fn run_program(prog: &mut LoadedProgram, args: &[u64]) -> Result<u64> {
                     }
                 }
             }
-            Flow::FailCpu => bail!("CPU fault at PC {}", pc - 1),
-            Flow::FailMem(e) => bail!("Memory fault at PC {}: {}", pc - 1, e),
-            Flow::Missing => bail!("Unimplemented instruction at PC {}", pc - 1),
+            Flow::FailCpu => {
+                let failed_pc = pc - 1;
+                bail!("CPU fault at PC {failed_pc}");
+            }
+            Flow::FailMem(e) => {
+                let failed_pc = pc - 1;
+                bail!("Memory fault at PC {failed_pc}: {e}");
+            }
+            Flow::Missing => {
+                let failed_pc = pc - 1;
+                bail!("Unimplemented instruction at PC {failed_pc}");
+            }
         }
     }
 }
@@ -465,12 +483,12 @@ fn main() -> Result<()> {
     // Try to load the example.o file
     let elf_path = "bpf/example.o";
 
-    println!("Attempting to load: {}", elf_path);
+    println!("Attempting to load: {elf_path}");
 
     let elf_bytes = match std::fs::read(elf_path) {
         Ok(bytes) => bytes,
         Err(e) => {
-            println!("Failed to read {}: {}", elf_path, e);
+            println!("Failed to read {elf_path}: {e}");
             println!("\nTo compile the eBPF program, run:");
             println!("  clang -target bpf -O2 -c bpf/example.c -o bpf/example.o");
             println!("\nOr use the Makefile:");
@@ -482,7 +500,8 @@ fn main() -> Result<()> {
         }
     };
 
-    println!("Loaded {} bytes\n", elf_bytes.len());
+    let len = elf_bytes.len();
+    println!("Loaded {len} bytes\n");
 
     // Load the ELF file
     println!("=== Loading ELF sections ===");
@@ -493,14 +512,12 @@ fn main() -> Result<()> {
     let mut sorted_sections: Vec<_> = prog.sections.values().collect();
     sorted_sections.sort_by_key(|s| s.vaddr);
     for section in sorted_sections {
-        println!(
-            "  {:20} @ 0x{:04x} - 0x{:04x} ({:4} bytes){}",
-            section.name,
-            section.vaddr,
-            section.vaddr + section.size,
-            section.size,
-            if section.executable { " [EXEC]" } else { "" }
-        );
+        let name = &section.name;
+        let vaddr = section.vaddr;
+        let end = section.vaddr + section.size;
+        let size = section.size;
+        let exec = if section.executable { " [EXEC]" } else { "" };
+        println!("  {name:20} @ 0x{vaddr:04x} - 0x{end:04x} ({size:4} bytes){exec}");
     }
 
     // Demonstrate running different entry points
@@ -517,12 +534,12 @@ fn main() -> Result<()> {
         };
         match run_program(&mut prog_copy, &[100, 200, 0, 0, 0]) {
             Ok(result) => {
-                println!("simple_add(100, 200) = {}", result);
+                println!("simple_add(100, 200) = {result}");
                 if result == 300 {
                     println!("Correct! 100 + 200 = 300");
                 }
             }
-            Err(e) => println!("Error: {}", e),
+            Err(e) => println!("Error: {e}"),
         }
     } else {
         println!("'simple' section not found");
@@ -540,12 +557,12 @@ fn main() -> Result<()> {
         };
         match run_program(&mut prog_copy, &[]) {
             Ok(result) => {
-                println!("return_magic() = 0x{:016X}", result);
+                println!("return_magic() = 0x{result:016X}");
                 if result == 0xDEADBEEFCAFEBABE {
                     println!("Correct! Got the magic value.");
                 }
             }
-            Err(e) => println!("Error: {}", e),
+            Err(e) => println!("Error: {e}"),
         }
     } else {
         println!("'const' section not found");
@@ -556,7 +573,7 @@ fn main() -> Result<()> {
     let result = run_program(&mut prog, &[10, 20, 0, 0])?;
 
     println!("\n=== All tests complete ===");
-    println!("Final result from bpf_main: {}", result);
+    println!("Final result from bpf_main: {result}");
 
     Ok(())
 }

@@ -42,7 +42,8 @@ fn basic_disassembly() {
     println!("Offset  Instruction");
     println!("------  -----------");
     for insn in Decoder::new(&bytecode) {
-        println!("{:04x}    {}", insn.offset(), formatter.format_to_string(&insn));
+        let offset = insn.offset();
+        println!("{offset:04x}    {}", formatter.format_to_string(&insn));
     }
     println!();
 }
@@ -91,27 +92,29 @@ fn inspect_instructions() {
     let instructions = decode_all(&bytecode);
 
     for (i, insn) in instructions.iter().enumerate() {
-        println!("Instruction {}:", i);
+        println!("Instruction {i}:");
         println!("  Mnemonic: {:?}", insn.mnemonic);
-        println!("  Size: {} bytes", insn.size);
-        println!("  Offset: 0x{:04x}", insn.offset());
+        let size = insn.size;
+        let offset = insn.offset();
+        println!("  Size: {size} bytes");
+        println!("  Offset: 0x{offset:04x}");
 
         // Inspect destination operand
         match &insn.dst {
-            Operand::Reg(r) => println!("  Destination: register {}", r),
+            Operand::Reg(r) => println!("  Destination: register {r}"),
             Operand::None => println!("  Destination: none"),
             _ => println!("  Destination: {:?}", insn.dst),
         }
 
         // Inspect source operand
         match &insn.src {
-            Operand::Reg(r) => println!("  Source: register {}", r),
-            Operand::Imm(v) => println!("  Source: immediate 0x{:x}", v),
-            Operand::Imm64(v) => println!("  Source: immediate64 0x{:x}", v),
+            Operand::Reg(r) => println!("  Source: register {r}"),
+            Operand::Imm(v) => println!("  Source: immediate 0x{v:x}"),
+            Operand::Imm64(v) => println!("  Source: immediate64 0x{v:x}"),
             Operand::Mem { base, offset } => {
-                println!("  Source: memory [{}{:+}]", base, offset)
+                println!("  Source: memory [{base}{offset:+}]")
             }
-            Operand::Off(off) => println!("  Source: offset {:+}", off),
+            Operand::Off(off) => println!("  Source: offset {off:+}"),
             Operand::None => println!("  Source: none"),
         }
 
@@ -137,9 +140,9 @@ fn disassemble_raw() {
     println!("Raw bytecode:");
     for (i, byte) in raw_bytecode.iter().enumerate() {
         if i % 8 == 0 {
-            print!("  {:04x}: ", i);
+            print!("  {i:04x}: ");
         }
-        print!("{:02x} ", byte);
+        print!("{byte:02x} ");
         if i % 8 == 7 {
             println!();
         }
@@ -148,7 +151,8 @@ fn disassemble_raw() {
     println!("\nDisassembled:");
     let formatter = DefaultFormatter::new();
     for insn in Decoder::new(&raw_bytecode) {
-        println!("  {:04x}: {}", insn.offset(), formatter.format_to_string(&insn));
+        let offset = insn.offset();
+        println!("  {offset:04x}: {}", formatter.format_to_string(&insn));
     }
     println!();
 }

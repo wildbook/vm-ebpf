@@ -79,33 +79,39 @@ impl Operand {
 impl fmt::Display for Operand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Operand::Reg(r) => write!(f, "{}", r),
+            Operand::Reg(r) => write!(f, "{r}"),
             Operand::Imm(v) => {
                 if *v < 0 {
-                    write!(f, "-{:#x}", (-*v) as u32)
+                    let abs = (-*v) as u32;
+                    write!(f, "-{abs:#x}")
                 } else {
-                    write!(f, "{:#x}", *v as u32)
+                    let val = *v as u32;
+                    write!(f, "{val:#x}")
                 }
             }
             Operand::Imm64(v) => {
                 if *v < 0 {
-                    write!(f, "-{:#x}", (-*v) as u64)
+                    let abs = (-*v) as u64;
+                    write!(f, "-{abs:#x}")
                 } else {
-                    write!(f, "{:#x}", *v as u64)
+                    let val = *v as u64;
+                    write!(f, "{val:#x}")
                 }
             }
             Operand::Mem { base, offset } => {
                 if *offset >= 0 {
-                    write!(f, "[{}+{:#x}]", base, *offset as u16)
+                    let off = *offset as u16;
+                    write!(f, "[{base}+{off:#x}]")
                 } else {
-                    write!(f, "[{}-{:#x}]", base, (-*offset) as u16)
+                    let off = (-*offset) as u16;
+                    write!(f, "[{base}-{off:#x}]")
                 }
             }
             Operand::Off(off) => {
                 if *off >= 0 {
-                    write!(f, "+{}", off)
+                    write!(f, "+{off}")
                 } else {
-                    write!(f, "{}", off)
+                    write!(f, "{off}")
                 }
             }
             Operand::None => Ok(()),

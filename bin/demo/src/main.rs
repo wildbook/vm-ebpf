@@ -166,7 +166,7 @@ fn dispatch_helper(ctx: &mut Context<DemoMemory>, id: u64) -> Result<u64, &'stat
     match id as i32 {
         helper_id::PRINT_U64 => {
             let val = ctx.regs[1];
-            println!("  [eBPF] print_u64: {}", val);
+            println!("  [eBPF] print_u64: {val}");
             ctx.data.print_log.push(val);
             Ok(0)
         }
@@ -431,7 +431,7 @@ fn demo_core_relocation() {
     let orig_insn = prog.instructions[0];
     let orig_offset = ((orig_insn >> 16) & 0xFFFF) as i16;
     println!("Before CO-RE relocation:");
-    println!("  LDX instruction offset = {} (expects pid at 8)\n", orig_offset);
+    println!("  LDX instruction offset = {orig_offset} (expects pid at 8)\n");
 
     // === Scenario 1: Host has SAME layout ===
     println!("--- Scenario 1: Host has same layout ---");
@@ -449,8 +449,8 @@ fn demo_core_relocation() {
 
         let patched_imm = (prog_copy[0] >> 32) as i32;
         println!("  Host layout: event {{ timestamp: 0, pid: 8 }}");
-        println!("  Applied {} relocation(s)", applied);
-        println!("  Patched imm = {} (should be 8)", patched_imm);
+        println!("  Applied {applied} relocation(s)");
+        println!("  Patched imm = {patched_imm} (should be 8)");
     }
 
     // === Scenario 2: Host has DIFFERENT layout ===
@@ -470,8 +470,8 @@ fn demo_core_relocation() {
 
         let patched_imm = (prog_copy[0] >> 32) as i32;
         println!("  Host layout: event {{ timestamp: 0, flags: 8, pid: 12 }}");
-        println!("  Applied {} relocation(s)", applied);
-        println!("  Patched imm = {} (should be 12!)", patched_imm);
+        println!("  Applied {applied} relocation(s)");
+        println!("  Patched imm = {patched_imm} (should be 12!)");
 
         println!("\n  Running patched program...");
     }
@@ -552,12 +552,12 @@ fn demo_full_core_execution() {
     let applied =
         apply_core_relocations(prog.instructions_mut(), &btf, &registry, &relocations).expect("relocation failed");
 
-    println!("Applied {} CO-RE relocation(s)", applied);
+    println!("Applied {applied} CO-RE relocation(s)");
 
     // Check what got patched
     let patched_insn = prog.instructions[0];
     let patched_imm = (patched_insn >> 32) as i32;
-    println!("Instruction 0 (MOV r3, imm): imm = {} (pid offset)", patched_imm);
+    println!("Instruction 0 (MOV r3, imm): imm = {patched_imm} (pid offset)");
 
     // Build memory with event struct at a known location
     let stack_size = 512;
@@ -582,10 +582,12 @@ fn demo_full_core_execution() {
     mem_bytes[code_size + 8..code_size + 12].copy_from_slice(&flags.to_le_bytes());
     mem_bytes[code_size + 12..code_size + 16].copy_from_slice(&pid.to_le_bytes());
 
-    println!("\nMemory layout at 0x{:x}:", event_ptr);
-    println!("  [0x{:x}] timestamp = 0x{:016x}", event_ptr, timestamp);
-    println!("  [0x{:x}] flags     = 0x{:08x}", event_ptr + 8, flags);
-    println!("  [0x{:x}] pid       = {}", event_ptr + 12, pid);
+    println!("\nMemory layout at 0x{event_ptr:x}:");
+    println!("  [0x{event_ptr:x}] timestamp = 0x{timestamp:016x}");
+    let flags_addr = event_ptr + 8;
+    let pid_addr = event_ptr + 12;
+    println!("  [0x{flags_addr:x}] flags     = 0x{flags:08x}");
+    println!("  [0x{pid_addr:x}] pid       = {pid}");
 
     // Rebuild instructions into memory (they were patched)
     for (i, insn) in prog.instructions.iter().enumerate() {
@@ -607,14 +609,15 @@ fn demo_full_core_execution() {
 
     match result {
         Ok(ret) => {
-            println!("\nProgram returned: {}", ret);
-            if ret == pid as u64 {
+            println!("\nProgram returned: {ret}");
+            let pid_u64 = pid as u64;
+            if ret == pid_u64 {
                 println!("SUCCESS: CO-RE correctly relocated pid offset from 8 to 12!");
             } else {
-                println!("UNEXPECTED: Got {} but expected {}", ret, pid);
+                println!("UNEXPECTED: Got {ret} but expected {pid}");
             }
         }
-        Err(e) => println!("Error: {}", e),
+        Err(e) => println!("Error: {e}"),
     }
 
     println!();
@@ -669,7 +672,7 @@ fn demo_field_exists() {
         apply_core_relocations(&mut instrs, &btf, &registry, &prog.relocations).expect("relo failed");
 
         let exists_val = (instrs[0] >> 32) as i32;
-        println!("  CO-RE patched FIELD_EXISTS = {}", exists_val);
+        println!("  CO-RE patched FIELD_EXISTS = {exists_val}");
         println!("  Program would take 'field exists' path\n");
     }
 
@@ -688,7 +691,7 @@ fn demo_field_exists() {
         apply_core_relocations(&mut instrs, &btf, &registry, &prog.relocations).expect("relo failed");
 
         let exists_val = (instrs[0] >> 32) as i32;
-        println!("  CO-RE patched FIELD_EXISTS = {}", exists_val);
+        println!("  CO-RE patched FIELD_EXISTS = {exists_val}");
         println!("  Program would take 'field missing' path\n");
     }
 }
@@ -725,7 +728,7 @@ fn demo_type_size() {
     let size_val = (instrs[0] >> 32) as i32;
     println!("BPF program expected: sizeof(event) = 12");
     println!("Host actually has:    sizeof(event) = 24");
-    println!("CO-RE patched:        r0 = {}\n", size_val);
+    println!("CO-RE patched:        r0 = {size_val}\n");
 }
 
 // ============================================================================

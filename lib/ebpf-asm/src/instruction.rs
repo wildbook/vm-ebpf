@@ -156,13 +156,14 @@ impl Instruction {
 
 impl fmt::Display for Instruction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.mnemonic)?;
+        let mnemonic = &self.mnemonic;
+        write!(f, "{mnemonic}")?;
 
         match (&self.dst, &self.src) {
             (Operand::None, Operand::None) => {}
-            (dst, Operand::None) => write!(f, " {}", dst)?,
-            (Operand::None, src) => write!(f, " {}", src)?,
-            (dst, src) => write!(f, " {}, {}", dst, src)?,
+            (dst, Operand::None) => write!(f, " {dst}")?,
+            (Operand::None, src) => write!(f, " {src}")?,
+            (dst, src) => write!(f, " {dst}, {src}")?,
         }
 
         Ok(())

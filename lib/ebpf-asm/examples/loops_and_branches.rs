@@ -173,7 +173,8 @@ fn sum_to_n() {
     let instructions = decode_all(&bytecode);
     let formatter = DefaultFormatter::new();
     for (idx, insn) in instructions.iter().enumerate() {
-        println!("  [{:2}] {:04x}: {}", idx, insn.offset(), formatter.format_to_string(insn));
+        let offset = insn.offset();
+        println!("  [{idx:2}] {offset:04x}: {}", formatter.format_to_string(insn));
     }
     println!();
 }
@@ -181,9 +182,10 @@ fn sum_to_n() {
 /// Helper to print disassembly
 fn print_disassembly(name: &str, bytecode: &[u8]) {
     let formatter = DefaultFormatter::new();
-    println!("{}:", name);
+    println!("{name}:");
     for insn in ebpf_asm::Decoder::new(bytecode) {
-        println!("  {:04x}: {}", insn.offset(), formatter.format_to_string(&insn));
+        let offset = insn.offset();
+        println!("  {offset:04x}: {}", formatter.format_to_string(&insn));
     }
     println!();
 }

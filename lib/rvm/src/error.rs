@@ -45,17 +45,17 @@ pub enum VmError {
 impl fmt::Display for VmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Elf(e) => write!(f, "ELF error: {}", e),
-            Self::Btf(e) => write!(f, "BTF error: {}", e),
-            Self::CoreRelo(e) => write!(f, "CO-RE relocation error: {}", e),
-            Self::Link(e) => write!(f, "link error: {}", e),
-            Self::Exec(e) => write!(f, "execution error: {}", e),
-            Self::Helper(e) => write!(f, "helper error: {}", e),
-            Self::Memory(e) => write!(f, "memory error: {}", e),
-            Self::ModuleNotFound(name) => write!(f, "module not found: {}", name),
-            Self::FunctionNotFound(name) => write!(f, "function not found: {}", name),
-            Self::SymbolNotFound(name) => write!(f, "symbol not found: {}", name),
-            Self::InvalidArgument(msg) => write!(f, "invalid argument: {}", msg),
+            Self::Elf(e) => write!(f, "ELF error: {e}"),
+            Self::Btf(e) => write!(f, "BTF error: {e}"),
+            Self::CoreRelo(e) => write!(f, "CO-RE relocation error: {e}"),
+            Self::Link(e) => write!(f, "link error: {e}"),
+            Self::Exec(e) => write!(f, "execution error: {e}"),
+            Self::Helper(e) => write!(f, "helper error: {e}"),
+            Self::Memory(e) => write!(f, "memory error: {e}"),
+            Self::ModuleNotFound(name) => write!(f, "module not found: {name}"),
+            Self::FunctionNotFound(name) => write!(f, "function not found: {name}"),
+            Self::SymbolNotFound(name) => write!(f, "symbol not found: {name}"),
+            Self::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
         }
     }
 }
@@ -128,10 +128,10 @@ pub enum ElfError {
 impl fmt::Display for ElfError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidFormat(msg) => write!(f, "invalid ELF format: {}", msg),
-            Self::SectionNotFound(name) => write!(f, "section not found: {}", name),
-            Self::InvalidRelocation(msg) => write!(f, "invalid relocation: {}", msg),
-            Self::Unsupported(msg) => write!(f, "unsupported: {}", msg),
+            Self::InvalidFormat(msg) => write!(f, "invalid ELF format: {msg}"),
+            Self::SectionNotFound(name) => write!(f, "section not found: {name}"),
+            Self::InvalidRelocation(msg) => write!(f, "invalid relocation: {msg}"),
+            Self::Unsupported(msg) => write!(f, "unsupported: {msg}"),
         }
     }
 }
@@ -154,10 +154,10 @@ pub enum LinkError {
 impl fmt::Display for LinkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnresolvedSymbol(name) => write!(f, "unresolved symbol: {}", name),
-            Self::DuplicateSymbol(name) => write!(f, "duplicate symbol: {}", name),
-            Self::CircularDependency(msg) => write!(f, "circular dependency: {}", msg),
-            Self::InvalidReference(msg) => write!(f, "invalid reference: {}", msg),
+            Self::UnresolvedSymbol(name) => write!(f, "unresolved symbol: {name}"),
+            Self::DuplicateSymbol(name) => write!(f, "duplicate symbol: {name}"),
+            Self::CircularDependency(msg) => write!(f, "circular dependency: {msg}"),
+            Self::InvalidReference(msg) => write!(f, "invalid reference: {msg}"),
         }
     }
 }
@@ -184,12 +184,12 @@ pub enum ExecError {
 impl fmt::Display for ExecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CpuFault(msg) => write!(f, "CPU fault: {}", msg),
-            Self::MemoryFault(msg) => write!(f, "memory fault: {}", msg),
-            Self::Unimplemented(msg) => write!(f, "unimplemented: {}", msg),
-            Self::InstructionLimit(count) => write!(f, "instruction limit exceeded: {}", count),
+            Self::CpuFault(msg) => write!(f, "CPU fault: {msg}"),
+            Self::MemoryFault(msg) => write!(f, "memory fault: {msg}"),
+            Self::Unimplemented(msg) => write!(f, "unimplemented: {msg}"),
+            Self::InstructionLimit(count) => write!(f, "instruction limit exceeded: {count}"),
             Self::StackOverflow => write!(f, "stack overflow"),
-            Self::InvalidPc(pc) => write!(f, "invalid program counter: {}", pc),
+            Self::InvalidPc(pc) => write!(f, "invalid program counter: {pc}"),
         }
     }
 }
@@ -210,9 +210,9 @@ pub enum HelperError {
 impl fmt::Display for HelperError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnknownHelper(id) => write!(f, "unknown helper: {}", id),
-            Self::Failed(msg) => write!(f, "helper failed: {}", msg),
-            Self::InvalidArgs(msg) => write!(f, "invalid arguments: {}", msg),
+            Self::UnknownHelper(id) => write!(f, "unknown helper: {id}"),
+            Self::Failed(msg) => write!(f, "helper failed: {msg}"),
+            Self::InvalidArgs(msg) => write!(f, "invalid arguments: {msg}"),
         }
     }
 }
@@ -236,13 +236,13 @@ impl fmt::Display for MemoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::OutOfBounds { addr, size } => {
-                write!(f, "out of bounds: addr=0x{:x}, size={}", addr, size)
+                write!(f, "out of bounds: addr=0x{addr:x}, size={size}")
             }
             Self::Alignment { addr, required } => {
-                write!(f, "alignment error: addr=0x{:x}, required={}", addr, required)
+                write!(f, "alignment error: addr=0x{addr:x}, required={required}")
             }
-            Self::ReadOnly { addr } => write!(f, "read-only memory: addr=0x{:x}", addr),
-            Self::AllocationFailed { size } => write!(f, "allocation failed: size={}", size),
+            Self::ReadOnly { addr } => write!(f, "read-only memory: addr=0x{addr:x}"),
+            Self::AllocationFailed { size } => write!(f, "allocation failed: size={size}"),
         }
     }
 }

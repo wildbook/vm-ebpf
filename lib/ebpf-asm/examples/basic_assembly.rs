@@ -44,7 +44,8 @@ fn simple_arithmetic() {
 
     let bytecode = asm.assemble().unwrap();
 
-    println!("Generated {} bytes of bytecode:", bytecode.len());
+    let len = bytecode.len();
+    println!("Generated {len} bytes of bytecode:");
     print_bytecode(&bytecode);
     println!();
 }
@@ -71,7 +72,8 @@ fn memory_operations() {
 
     let bytecode = asm.assemble().unwrap();
 
-    println!("Generated {} bytes of bytecode:", bytecode.len());
+    let len = bytecode.len();
+    println!("Generated {len} bytes of bytecode:");
     print_bytecode(&bytecode);
     println!();
 }
@@ -91,7 +93,8 @@ fn load_immediate() {
 
     let bytecode = asm.assemble().unwrap();
 
-    println!("Generated {} bytes of bytecode:", bytecode.len());
+    let len = bytecode.len();
+    println!("Generated {len} bytes of bytecode:");
     println!("(Note: lddw is a 16-byte wide instruction)\n");
     print_bytecode(&bytecode);
     println!();
@@ -126,7 +129,8 @@ fn bitwise_operations() {
 
     let bytecode = asm.assemble().unwrap();
 
-    println!("Generated {} bytes of bytecode:", bytecode.len());
+    let len = bytecode.len();
+    println!("Generated {len} bytes of bytecode:");
     print_bytecode(&bytecode);
     println!();
 }
@@ -134,9 +138,10 @@ fn bitwise_operations() {
 /// Helper to print bytecode in a readable format
 fn print_bytecode(bytecode: &[u8]) {
     for (i, chunk) in bytecode.chunks(8).enumerate() {
-        print!("  {:04x}: ", i * 8);
+        let offset = i * 8;
+        print!("  {offset:04x}: ");
         for byte in chunk {
-            print!("{:02x} ", byte);
+            print!("{byte:02x} ");
         }
         println!();
     }

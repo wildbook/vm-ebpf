@@ -22,14 +22,15 @@ fn main() {
     let elf_bytes = match std::fs::read("bpf/example.o") {
         Ok(bytes) => bytes,
         Err(e) => {
-            eprintln!("Error: Could not read bpf/example.o: {}", e);
+            eprintln!("Error: Could not read bpf/example.o: {e}");
             eprintln!("\nMake sure to compile the BPF program first:");
             eprintln!("  clang -target bpf -O2 -c bpf/example.c -o bpf/example.o");
             return;
         }
     };
 
-    println!("Loaded ELF file: {} bytes\n", elf_bytes.len());
+    let len = elf_bytes.len();
+    println!("Loaded ELF file: {len} bytes\n");
 
     // Create a VM and load the ELF
     let vm = Vm::new();
@@ -37,7 +38,7 @@ fn main() {
     let mut program = match vm.load_elf(&elf_bytes) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("Error loading ELF: {:?}", e);
+            eprintln!("Error loading ELF: {e:?}");
             return;
         }
     };
@@ -46,7 +47,9 @@ fn main() {
     println!("Available functions:");
     for name in program.function_names() {
         if let Some(info) = program.function(name) {
-            println!("  {} @ PC={} (size={})", name, info.pc, info.size);
+            let pc = info.pc;
+            let size = info.size;
+            println!("  {name} @ PC={pc} (size={size})");
         }
     }
     println!();
@@ -75,13 +78,13 @@ fn test_simple_add(program: &mut rvm::Program) {
         match program.call("simple_add", &[*a, *b]) {
             Ok(result) => {
                 let status = if result == *expected { "OK" } else { "FAIL" };
-                println!("  simple_add({}, {}) = {} (expected: {}) [{}]", a, b, result, expected, status);
+                println!("  simple_add({a}, {b}) = {result} (expected: {expected}) [{status}]");
                 if result != *expected {
                     eprintln!("    ERROR: Result mismatch!");
                 }
             }
             Err(e) => {
-                eprintln!("  simple_add({}, {}) = ERROR: {:?}", a, b, e);
+                eprintln!("  simple_add({a}, {b}) = ERROR: {e:?}");
             }
         }
     }
@@ -94,13 +97,13 @@ fn test_return_magic(program: &mut rvm::Program) {
     match program.call("return_magic", &[]) {
         Ok(result) => {
             let status = if result == MAGIC { "OK" } else { "FAIL" };
-            println!("  return_magic() = 0x{:016X} (expected: 0x{:016X}) [{}]", result, MAGIC, status);
+            println!("  return_magic() = 0x{result:016X} (expected: 0x{MAGIC:016X}) [{status}]");
             if result != MAGIC {
                 eprintln!("    ERROR: Result mismatch!");
             }
         }
         Err(e) => {
-            eprintln!("  return_magic() = ERROR: {:?}", e);
+            eprintln!("  return_magic() = ERROR: {e:?}");
         }
     }
 }

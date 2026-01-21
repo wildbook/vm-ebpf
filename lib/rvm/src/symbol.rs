@@ -129,10 +129,13 @@ impl fmt::Display for Symbol {
             SymbolKind::File => "file",
         };
         let section = match self.section_idx {
-            Some(idx) => format!("sect[{}]", idx),
+            Some(idx) => format!("sect[{idx}]"),
             None => "UND".to_string(),
         };
-        write!(f, "{} {} {} {} value=0x{:x} size={}", self.name, binding, kind, section, self.value, self.size)
+        let name = &self.name;
+        let value = self.value;
+        let size = self.size;
+        write!(f, "{name} {binding} {kind} {section} value=0x{value:x} size={size}")
     }
 }
 

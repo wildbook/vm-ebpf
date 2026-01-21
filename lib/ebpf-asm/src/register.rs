@@ -90,7 +90,7 @@ impl Register {
 
 impl fmt::Display for Register {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "r{}", self.number())
+        write!(f, "r{}", self.number()) // number() not a simple variable
     }
 }
 
@@ -108,7 +108,8 @@ pub struct InvalidRegister(pub u8);
 
 impl fmt::Display for InvalidRegister {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid register: {}", self.0)
+        let n = self.0;
+        write!(f, "invalid register: {n}")
     }
 }
 

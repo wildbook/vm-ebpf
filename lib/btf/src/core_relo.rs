@@ -309,20 +309,20 @@ pub enum CoreReloError {
 impl core::fmt::Display for CoreReloError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::TypeNotFound(name) => write!(f, "type not found: {}", name),
+            Self::TypeNotFound(name) => write!(f, "type not found: {name}"),
             Self::FieldNotFound { type_name, field_name } => {
-                write!(f, "field '{}' not found in type '{}'", field_name, type_name)
+                write!(f, "field '{field_name}' not found in type '{type_name}'")
             }
             Self::EnumVariantNotFound {
                 enum_name,
                 variant_name,
             } => {
-                write!(f, "enum variant '{}' not found in '{}'", variant_name, enum_name)
+                write!(f, "enum variant '{variant_name}' not found in '{enum_name}'")
             }
-            Self::InvalidAccessString(s) => write!(f, "invalid access string: {}", s),
-            Self::InstructionOutOfBounds(off) => write!(f, "instruction offset out of bounds: {}", off),
-            Self::InvalidTypeId(id) => write!(f, "invalid BTF type ID: {}", id),
-            Self::UnsupportedRelo(kind) => write!(f, "unsupported relocation kind: {:?}", kind),
+            Self::InvalidAccessString(s) => write!(f, "invalid access string: {s}"),
+            Self::InstructionOutOfBounds(off) => write!(f, "instruction offset out of bounds: {off}"),
+            Self::InvalidTypeId(id) => write!(f, "invalid BTF type ID: {id}"),
+            Self::UnsupportedRelo(kind) => write!(f, "unsupported relocation kind: {kind:?}"),
         }
     }
 }

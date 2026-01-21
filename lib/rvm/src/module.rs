@@ -334,28 +334,31 @@ impl Module {
 
 impl std::fmt::Display for Module {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "Module: {}", self.name)?;
-        writeln!(f, "  Sections: {}", self.sections.len())?;
+        let module_name = &self.name;
+        let section_count = self.sections.len();
+        writeln!(f, "Module: {module_name}")?;
+        writeln!(f, "  Sections: {section_count}")?;
         for section in &self.sections {
-            writeln!(f, "    {}", section)?;
+            writeln!(f, "    {section}")?;
         }
-        writeln!(f, "  Exports: {}", self.exports.len())?;
+        let export_count = self.exports.len();
+        writeln!(f, "  Exports: {export_count}")?;
         for (name, export) in &self.exports {
-            writeln!(
-                f,
-                "    {} @ section[{}]+0x{:x}{}",
-                name,
-                export.section_idx,
-                export.offset,
-                if export.is_function { " (func)" } else { "" }
-            )?;
+            let section_idx = export.section_idx;
+            let offset = export.offset;
+            let suffix = if export.is_function { " (func)" } else { "" };
+            writeln!(f, "    {name} @ section[{section_idx}]+0x{offset:x}{suffix}")?;
         }
-        writeln!(f, "  Imports: {}", self.imports.len())?;
+        let import_count = self.imports.len();
+        writeln!(f, "  Imports: {import_count}")?;
         for import in &self.imports {
-            writeln!(f, "    {}", import.name)?;
+            let name = &import.name;
+            writeln!(f, "    {name}")?;
         }
-        writeln!(f, "  Relocations: {}", self.relocations.len())?;
-        writeln!(f, "  BTF: {}", self.btf_data.as_ref().map(|d| d.len()).unwrap_or(0))?;
+        let relo_count = self.relocations.len();
+        let btf_size = self.btf_data.as_ref().map(|d| d.len()).unwrap_or(0);
+        writeln!(f, "  Relocations: {relo_count}")?;
+        writeln!(f, "  BTF: {btf_size}")?;
         Ok(())
     }
 }

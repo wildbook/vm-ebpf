@@ -73,14 +73,15 @@ fn main() {
     let elf_bytes = match std::fs::read("bpf/core_example.o") {
         Ok(bytes) => bytes,
         Err(e) => {
-            eprintln!("Error: Could not read bpf/core_example.o: {}", e);
+            eprintln!("Error: Could not read bpf/core_example.o: {e}");
             eprintln!("\nCompile with:");
             eprintln!("  clang -target bpf -O2 -g -c bpf/core_example.c -o bpf/core_example.o");
             return;
         }
     };
 
-    println!("Loaded ELF file: {} bytes\n", elf_bytes.len());
+    let len = elf_bytes.len();
+    println!("Loaded ELF file: {len} bytes\n");
 
     // First, test WITHOUT CO-RE (using compile-time layout)
     println!("--- Test 1: Without CO-RE (compile-time layout) ---\n");
@@ -100,7 +101,7 @@ fn test_without_core(elf_bytes: &[u8]) {
     let mut program = match vm.load_elf(elf_bytes) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("Error loading ELF: {:?}", e);
+            eprintln!("Error loading ELF: {e:?}");
             return;
         }
     };
@@ -116,14 +117,18 @@ fn test_without_core(elf_bytes: &[u8]) {
     };
 
     println!("Compile-time layout:");
-    println!("  timestamp @ offset 0:  0x{:016X}", event.timestamp);
-    println!("  pid       @ offset 8:  {}", event.pid);
-    println!("  flags     @ offset 16: 0x{:04X}", event.flags);
-    println!("  data      @ offset 24: 0x{:08X}", event.data);
+    let ts = event.timestamp;
+    let pid = event.pid;
+    let flags = event.flags;
+    let data = event.data;
+    println!("  timestamp @ offset 0:  0x{ts:016X}");
+    println!("  pid       @ offset 8:  {pid}");
+    println!("  flags     @ offset 16: 0x{flags:04X}");
+    println!("  data      @ offset 24: 0x{data:08X}");
 
     // Write event to program memory at a known location
     let event_ptr = write_event_to_memory(&mut program, &event);
-    println!("\n  Event written to memory at address 0x{:X}\n", event_ptr);
+    println!("\n  Event written to memory at address 0x{event_ptr:X}\n");
 
     // Call the functions
     test_function(&mut program, "no_core_add", &[10, 32], Some(42), "10 + 32");
@@ -157,7 +162,7 @@ fn test_with_core(elf_bytes: &[u8]) {
     let mut program = match vm.load_elf(elf_bytes) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("Error loading ELF: {:?}", e);
+            eprintln!("Error loading ELF: {e:?}");
             return;
         }
     };
@@ -173,15 +178,20 @@ fn test_with_core(elf_bytes: &[u8]) {
     };
 
     println!("Runtime layout (different from compile-time!):");
-    println!("  flags     @ offset 0:  0x{:04X}", event.flags);
-    println!("  pid       @ offset 4:  {}", event.pid);
-    println!("  uid       @ offset 8:  {}", event.uid);
-    println!("  timestamp @ offset 16: 0x{:016X}", event.timestamp);
-    println!("  data      @ offset 24: 0x{:08X}", event.data);
+    let flags = event.flags;
+    let pid = event.pid;
+    let uid = event.uid;
+    let timestamp = event.timestamp;
+    let data = event.data;
+    println!("  flags     @ offset 0:  0x{flags:04X}");
+    println!("  pid       @ offset 4:  {pid}");
+    println!("  uid       @ offset 8:  {uid}");
+    println!("  timestamp @ offset 16: 0x{timestamp:016X}");
+    println!("  data      @ offset 24: 0x{data:08X}");
 
     // Write event to program memory
     let event_ptr = write_runtime_event_to_memory(&mut program, &event);
-    println!("\n  Event written to memory at address 0x{:X}\n", event_ptr);
+    println!("\n  Event written to memory at address 0x{event_ptr:X}\n");
 
     // If CO-RE worked, the relocated program should read correct values
     // from the new offsets!
@@ -220,15 +230,15 @@ fn test_function(program: &mut rvm::Program, name: &str, args: &[u64], expected:
                 Some(_) => "MISMATCH",
                 None => "?",
             };
-            println!("  {}({}) = 0x{:X} [{}]", name, desc, result, status);
+            println!("  {name}({desc}) = 0x{result:X} [{status}]");
             if let Some(exp) = expected {
                 if result != exp {
-                    println!("    Expected: 0x{:X}", exp);
+                    println!("    Expected: 0x{exp:X}");
                 }
             }
         }
         Err(e) => {
-            println!("  {}({}) = ERROR: {:?}", name, desc, e);
+            println!("  {name}({desc}) = ERROR: {e:?}");
         }
     }
 }

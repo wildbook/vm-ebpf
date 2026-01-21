@@ -27,12 +27,12 @@ impl core::fmt::Display for BtfError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::TooShort => write!(f, "BTF data too short"),
-            Self::BadMagic(m) => write!(f, "invalid BTF magic: {:#06x}", m),
-            Self::BadVersion(v) => write!(f, "unsupported BTF version: {}", v),
+            Self::BadMagic(m) => write!(f, "invalid BTF magic: {m:#06x}"),
+            Self::BadVersion(v) => write!(f, "unsupported BTF version: {v}"),
             Self::SectionOverflow => write!(f, "BTF section extends beyond data"),
-            Self::InvalidType(id) => write!(f, "invalid BTF type at id {}", id),
-            Self::UnknownKind(k) => write!(f, "unknown BTF kind: {}", k),
-            Self::InvalidString(off) => write!(f, "invalid string offset: {}", off),
+            Self::InvalidType(id) => write!(f, "invalid BTF type at id {id}"),
+            Self::UnknownKind(k) => write!(f, "unknown BTF kind: {k}"),
+            Self::InvalidString(off) => write!(f, "invalid string offset: {off}"),
         }
     }
 }

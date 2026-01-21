@@ -183,9 +183,10 @@ fn function_with_stack() {
 /// Helper to print disassembly
 fn print_disassembly(name: &str, bytecode: &[u8]) {
     let formatter = DefaultFormatter::new();
-    println!("{}:", name);
+    println!("{name}:");
     for insn in Decoder::new(bytecode) {
-        println!("  {:04x}: {}", insn.offset(), formatter.format_to_string(&insn));
+        let offset = insn.offset();
+        println!("  {offset:04x}: {}", formatter.format_to_string(&insn));
     }
     println!();
 }

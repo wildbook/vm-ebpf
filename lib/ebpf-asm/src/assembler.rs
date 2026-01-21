@@ -76,12 +76,12 @@ pub enum AsmError {
 impl fmt::Display for AsmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AsmError::UndefinedLabel(name) => write!(f, "undefined label: {}", name),
-            AsmError::DuplicateLabel(name) => write!(f, "duplicate label: {}", name),
+            AsmError::UndefinedLabel(name) => write!(f, "undefined label: {name}"),
+            AsmError::DuplicateLabel(name) => write!(f, "duplicate label: {name}"),
             AsmError::OffsetOutOfRange { from, to } => {
-                write!(f, "jump offset out of range: {} -> {}", from, to)
+                write!(f, "jump offset out of range: {from} -> {to}")
             }
-            AsmError::ImmediateOutOfRange(v) => write!(f, "immediate out of range: {}", v),
+            AsmError::ImmediateOutOfRange(v) => write!(f, "immediate out of range: {v}"),
             AsmError::InvalidLabel => write!(f, "invalid label reference"),
         }
     }
