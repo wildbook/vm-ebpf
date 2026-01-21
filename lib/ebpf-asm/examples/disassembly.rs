@@ -5,9 +5,7 @@
 //!
 //! Run with: cargo run --example disassembly
 
-use ebpf_asm::{
-    decode_all, Assembler, Decoder, DefaultFormatter, Formatter, IntelFormatter, Mnemonic, Operand, R0, R1, R10,
-};
+use ebpf_asm::{decode_all, Assembler, Decoder, DefaultFormatter, Formatter, Mnemonic, Operand, R0, R1, R10};
 
 fn main() {
     println!("=== eBPF Disassembly Example ===\n");
@@ -15,8 +13,8 @@ fn main() {
     // Example 1: Basic disassembly with default formatter
     basic_disassembly();
 
-    // Example 2: Intel-style formatter
-    intel_style();
+    // Example 2: Formatter with raw bytes
+    with_raw_bytes();
 
     // Example 3: Inspect instruction details
     inspect_instructions();
@@ -49,9 +47,9 @@ fn basic_disassembly() {
     println!();
 }
 
-/// Use Intel-style syntax (with raw bytes)
-fn intel_style() {
-    println!("--- Example 2: Intel-Style Formatting ---\n");
+/// Show formatter with raw bytes enabled
+fn with_raw_bytes() {
+    println!("--- Example 2: Formatter with Raw Bytes ---\n");
 
     let mut asm = Assembler::new();
     asm.mov64_imm(R0, 0x100);
@@ -61,18 +59,18 @@ fn intel_style() {
 
     let bytecode = asm.assemble().unwrap();
 
-    // Compare default vs Intel style (with bytes enabled)
+    // Compare default vs with bytes enabled
     let default_fmt = DefaultFormatter::new();
-    let intel_fmt = IntelFormatter::new().with_bytes();
+    let bytes_fmt = DefaultFormatter::new().with_bytes();
 
-    println!("Default style:");
+    println!("Default:");
     for insn in Decoder::new(&bytecode) {
         println!("  {}", default_fmt.format_to_string(&insn));
     }
 
-    println!("\nIntel style (with raw bytes):");
+    println!("\nWith raw bytes:");
     for insn in Decoder::new(&bytecode) {
-        println!("  {}", intel_fmt.format_to_string(&insn));
+        println!("  {}", bytes_fmt.format_to_string(&insn));
     }
     println!();
 }

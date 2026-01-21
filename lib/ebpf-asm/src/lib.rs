@@ -75,7 +75,7 @@ mod register;
 // Re-export main types
 pub use assembler::{AsmError, AssembledProgram, Assembler, CoreRelo, CoreReloKind, Label};
 pub use decoder::{decode_all, decode_one, Decoder};
-pub use formatter::{DefaultFormatter, Formatter, FormatterOutput, IntelFormatter, StringOutput};
+pub use formatter::{DefaultFormatter, Formatter, FormatterOutput, StringOutput};
 pub use instruction::{Instruction, RawInstruction};
 pub use mnemonic::Mnemonic;
 pub use operand::{MemSize, Operand};

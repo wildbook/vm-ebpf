@@ -108,13 +108,16 @@ impl FormatterOutput for StringOutput {
     }
 }
 
-/// Default eBPF instruction formatter.
+/// eBPF instruction formatter.
 ///
 /// Produces output like:
 /// - `mov64 r0, 0x2a`
 /// - `add64 r0, r1`
 /// - `ldxdw r0, [r1+0x10]`
 /// - `jeq r0, 0x0, +5`
+///
+/// With `show_bytes` enabled:
+/// - `b7 00 00 00 2a 00 00 00  mov64 r0, 0x2a`
 pub struct DefaultFormatter {
     /// Use uppercase for hex values.
     pub uppercase_hex: bool,
@@ -122,6 +125,8 @@ pub struct DefaultFormatter {
     pub show_offset: bool,
     /// Minimum mnemonic width for alignment.
     pub mnemonic_width: usize,
+    /// Show raw instruction bytes before disassembly.
+    pub show_bytes: bool,
 }
 
 impl DefaultFormatter {
@@ -131,6 +136,7 @@ impl DefaultFormatter {
             uppercase_hex: false,
             show_offset: false,
             mnemonic_width: 0,
+            show_bytes: false,
         }
     }
 
@@ -143,6 +149,12 @@ impl DefaultFormatter {
     /// Set minimum mnemonic width for alignment.
     pub fn with_mnemonic_width(mut self, width: usize) -> Self {
         self.mnemonic_width = width;
+        self
+    }
+
+    /// Enable raw bytes display before the instruction.
+    pub fn with_bytes(mut self) -> Self {
+        self.show_bytes = true;
         self
     }
 
@@ -200,6 +212,15 @@ impl Default for DefaultFormatter {
 
 impl Formatter for DefaultFormatter {
     fn format(&self, insn: &Instruction, output: &mut dyn FormatterOutput) {
+        // Show raw bytes if enabled
+        if self.show_bytes {
+            let bytes = insn.raw.to_le_bytes();
+            for b in &bytes {
+                output.write_punctuation(&format!("{:02x} ", b));
+            }
+            output.write_whitespace(" ");
+        }
+
         // Offset prefix
         if self.show_offset {
             output.write_offset(&format!("{:04x}: ", insn.offset()));
@@ -272,48 +293,6 @@ impl Formatter for DefaultFormatter {
                 }
             }
         }
-    }
-}
-
-/// Intel-style formatter (similar to objdump).
-pub struct IntelFormatter {
-    /// Show raw bytes.
-    pub show_bytes: bool,
-}
-
-impl IntelFormatter {
-    /// Create a new Intel-style formatter.
-    pub fn new() -> Self {
-        Self { show_bytes: false }
-    }
-
-    /// Enable raw bytes display.
-    pub fn with_bytes(mut self) -> Self {
-        self.show_bytes = true;
-        self
-    }
-}
-
-impl Default for IntelFormatter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Formatter for IntelFormatter {
-    fn format(&self, insn: &Instruction, output: &mut dyn FormatterOutput) {
-        // Show raw bytes if enabled
-        if self.show_bytes {
-            let bytes = insn.raw.to_le_bytes();
-            for b in &bytes {
-                output.write_punctuation(&format!("{:02x} ", b));
-            }
-            output.write_whitespace(" ");
-        }
-
-        // Use default formatter for the rest
-        let default = DefaultFormatter::new();
-        default.format(insn, output);
     }
 }
 
