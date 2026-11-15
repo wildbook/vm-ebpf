@@ -75,11 +75,25 @@ lock.
 
 `Vm::load_plugin` links a program behind a lock, and `Vm::export(&plugin, "f")`
 publishes its function `f` as a named extern that programs linked afterwards can
-import. The call runs in the exporting plugin with its own memory and maps;
-arguments and the result are plain values, since a pointer means nothing in
-another plugin's memory. `Plugin::replace` swaps in a new build, and importers
-use it from their next call. A call into a plugin that is already running fails
-with `VmError::PluginBusy` instead of deadlocking.
+import. The call runs in the exporting plugin with its own memory and maps, so
+plain pointers mean nothing on the other side. `Plugin::replace` swaps in a new
+build, and importers use it from their next call. A call into a plugin that is
+already running fails with `VmError::PluginBusy` instead of deadlocking.
+
+An exported function can borrow a buffer from its caller for one call by
+tagging the pointer parameter with the index of its length parameter:
+
+```c
+#define BORROW(len_arg) __attribute__((btf_decl_tag("borrow:" #len_arg)))
+#define BORROW_RO(len_arg) __attribute__((btf_decl_tag("borrow_ro:" #len_arg)))
+
+u64 sum(const u64 *buf BORROW_RO(1), u64 len);
+```
+
+The runtime maps the caller's bytes into the callee at a `BORROW_FIRST_REGION`
+slot, passes that address instead, and unmaps it when the call returns. A
+length that runs past the caller's memory fails the call before the callee
+runs.
 
 ## Linking
 
@@ -104,7 +118,8 @@ A guest address is `(region << 32) | offset`. `rvm::VmMemory` holds
 | `RODATA_REGION` (2) | `.rodata*` | R |
 | `DATA_REGION` (3) | `.data*`, `.bss*` | RW |
 | `MAPS_REGION` (4) | map values | RW |
-| `FIRST_FREE_REGION` (5) to 31 | free for the host | - |
+| `FIRST_FREE_REGION` (5) to 26 | free for the host, `Vm::share_region` | - |
+| `BORROW_FIRST_REGION` (27) to 31 | buffers borrowed during a plugin call | per tag |
 | `SHARED_MAPS_FIRST_REGION` (32) to 63 | shared maps, one region each | RW |
 
 Host code maps its own regions with `VmMemory::map` (zeroed) or
@@ -147,7 +162,7 @@ line. The call is `unsafe`: programs running on different threads at the same
 time may only touch shared values with atomics.
 
 `Vm::share_region(region, len, perms)` allocates a buffer and maps it at region
-`region` (between `FIRST_FREE_REGION` and `SHARED_MAPS_FIRST_REGION`) into every
+`region` (between `FIRST_FREE_REGION` and `BORROW_FIRST_REGION`) into every
 program linked afterwards, so plugins can pass plain pointers into it. The host
 reaches the same bytes through `SharedRegion::buffer`. It has the same `unsafe`
 contract as `share_map`.

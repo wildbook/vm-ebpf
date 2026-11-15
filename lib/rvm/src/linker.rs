@@ -30,7 +30,7 @@ use crate::helper::{HelperRegistry, SharedHelpers};
 use crate::maps::{self, map_defs, MapDef, Maps, SharedMaps, MAPS_REGION};
 use crate::memory::{region_base, Perms, SharedRegion, VmMemory};
 use crate::module::{Module, Relocation};
-use crate::program::{FunctionInfo, Program};
+use crate::program::{Borrow, FunctionInfo, Program};
 use crate::section::{Section, SectionKind};
 use crate::types::TypeRegistry;
 use crate::vm::VmConfig;
@@ -155,7 +155,7 @@ impl<'a> Linker<'a> {
         Self::bind_helper_calls(&helpers, &mut image)?;
         self.apply_core_relocations(modules, &layouts, &mut image);
 
-        let functions = Self::build_function_table(modules, &layouts);
+        let functions = Self::build_function_table(modules, &layouts)?;
 
         let mut memory = VmMemory::new();
         let stack_len = self.config.stack_size * (MAX_CALL_DEPTH + 1);
@@ -432,46 +432,83 @@ impl<'a> Linker<'a> {
     }
 
     /// Build the function table.
-    fn build_function_table(modules: &[&Module], layouts: &[ModuleLayout]) -> HashMap<String, FunctionInfo> {
-        let function = |name: &str, at: u64, size: u64| {
-            (
-                name.to_string(),
-                FunctionInfo {
-                    name: name.to_string(),
+    fn build_function_table(modules: &[&Module], layouts: &[ModuleLayout]) -> Result<HashMap<String, FunctionInfo>> {
+        let mut functions = HashMap::new();
+        for (module, layout) in modules.iter().zip(layouts) {
+            let borrows = Self::borrows(module)?;
+            for (name, export) in module.exports.iter().filter(|(_, e)| e.is_function) {
+                let Some(Addr::Code(at)) = layout
+                    .sections
+                    .get(&export.section_idx)
+                    .map(|a| a.offset(export.offset))
+                else {
+                    continue;
+                };
+                let info = FunctionInfo {
+                    name: name.clone(),
                     pc: at / 8,
-                    size,
-                },
-            )
-        };
-
-        let mut functions: HashMap<String, FunctionInfo> = modules
-            .iter()
-            .zip(layouts)
-            .flat_map(|(module, layout)| {
-                module
-                    .exports
-                    .iter()
-                    .filter(|(_, e)| e.is_function)
-                    .filter_map(|(name, export)| {
-                        let Addr::Code(at) = layout.sections.get(&export.section_idx)?.offset(export.offset) else {
-                            return None;
-                        };
-                        Some(function(name, at, export.size))
-                    })
-            })
-            .collect();
+                    size: export.size,
+                    borrows: borrows.get(name.as_str()).cloned().unwrap_or_default(),
+                };
+                functions.insert(name.clone(), info);
+            }
+        }
 
         // If no named functions, use code sections as entry points.
         if functions.is_empty() {
             for (module, layout) in modules.iter().zip(layouts) {
                 for (idx, section) in module.sections.iter().enumerate() {
                     if let Some(&Addr::Code(at)) = layout.sections.get(&idx) {
-                        functions.extend([function(&section.name, at, section.size)]);
+                        let info = FunctionInfo {
+                            name: section.name.clone(),
+                            pc: at / 8,
+                            size: section.size,
+                            borrows: Vec::new(),
+                        };
+                        functions.insert(section.name.clone(), info);
                     }
                 }
             }
         }
 
-        functions
+        Ok(functions)
+    }
+
+    /// `borrow:N` / `borrow_ro:N` decl tags on function parameters, by function name.
+    fn borrows(module: &Module) -> Result<HashMap<String, Vec<Borrow>>> {
+        let mut borrows: HashMap<String, Vec<Borrow>> = HashMap::new();
+        let Some(btf) = module.btf_data.as_deref().and_then(|data| Btf::parse(data).ok()) else {
+            return Ok(borrows);
+        };
+        for (_, ty) in btf.types() {
+            let BtfTypeInfo::DeclTag {
+                name: tag,
+                type_id,
+                component_idx,
+            } = ty
+            else {
+                continue;
+            };
+            let (writable, len_arg) = match tag.split_once(':') {
+                Some(("borrow", n)) => (true, n),
+                Some(("borrow_ro", n)) => (false, n),
+                _ => continue,
+            };
+            let Some(BtfTypeInfo::Func { name, .. }) = btf.type_by_id(*type_id) else {
+                continue;
+            };
+            let bad = || LinkError::InvalidReference(format!("{name}: bad tag {tag} on parameter {component_idx}"));
+            let arg = u8::try_from(*component_idx).ok().filter(|&a| a < 5).ok_or_else(bad)?;
+            let len_arg = len_arg
+                .parse::<u8>()
+                .ok()
+                .filter(|&a| a < 5 && a != arg)
+                .ok_or_else(bad)?;
+            borrows
+                .entry(name.to_string())
+                .or_default()
+                .push(Borrow { arg, len_arg, writable });
+        }
+        Ok(borrows)
     }
 }

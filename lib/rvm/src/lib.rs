@@ -134,9 +134,9 @@ pub use memory::{
 };
 // Module loading
 pub use module::Module;
-pub use plugin::Plugin;
+pub use plugin::{Plugin, BORROW_FIRST_REGION};
 // Program and execution
-pub use program::{FunctionInfo, Program};
+pub use program::{Borrow, FunctionInfo, Program};
 pub use rvm_core::{instructions_from_bytes, AtomicOp, Instruction};
 pub use section::{Section, SectionKind};
 pub use std_helpers::{BPF_FUNC_GET_PRANDOM_U32, BPF_FUNC_KTIME_GET_NS, BPF_FUNC_TRACE_PRINTK};

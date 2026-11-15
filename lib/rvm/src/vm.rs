@@ -38,10 +38,10 @@ use hashbrown::HashMap;
 use crate::error::{Result, VmError};
 use crate::helper::{DynHelper, FromArgs, IntoReturn, SharedHelpers};
 use crate::linker::{Linker, FIRST_FREE_REGION};
-use crate::maps::{SharedMaps, SHARED_MAPS_FIRST_REGION};
+use crate::maps::SharedMaps;
 use crate::memory::{Perms, SharedBuffer, SharedRegion, MAX_REGION_LEN};
 use crate::module::Module;
-use crate::plugin::Plugin;
+use crate::plugin::{Plugin, BORROW_FIRST_REGION};
 use crate::program::Program;
 use crate::types::TypeRegistry;
 use crate::{maps, std_helpers};
@@ -214,7 +214,7 @@ impl Vm {
 
     /// Allocate `len` zeroed bytes and map them as region `region` into every program
     /// linked afterwards, so plugins can exchange data through plain pointers.
-    /// `region` must lie in `FIRST_FREE_REGION..SHARED_MAPS_FIRST_REGION` and not be
+    /// `region` must lie in `FIRST_FREE_REGION..BORROW_FIRST_REGION` and not be
     /// shared already.
     ///
     /// # Safety
@@ -223,7 +223,7 @@ impl Vm {
     /// region with atomic instructions where another thread writes concurrently.
     pub unsafe fn share_region(&self, region: usize, len: usize, perms: Perms) -> Result<SharedRegion> {
         let mut regions = self.shared_regions.lock().unwrap_or_else(|e| e.into_inner());
-        let usable = (FIRST_FREE_REGION..SHARED_MAPS_FIRST_REGION).contains(&region);
+        let usable = (FIRST_FREE_REGION..BORROW_FIRST_REGION).contains(&region);
         if !usable || regions.iter().any(|r| r.region() == region) || len == 0 || len > MAX_REGION_LEN {
             return Err(VmError::InvalidArgument(format!("cannot share region {region} with {len} bytes")));
         }

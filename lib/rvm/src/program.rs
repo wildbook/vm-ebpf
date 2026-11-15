@@ -23,6 +23,17 @@ pub struct FunctionInfo {
     pub pc: u64,
     /// Size of the function in bytes.
     pub size: u64,
+    /// Pointer parameters that callers in other plugins lend for one call.
+    pub borrows: Vec<Borrow>,
+}
+
+/// A pointer parameter tagged `borrow:N` (writable) or `borrow_ro:N` in BTF, where
+/// parameter `N` holds the buffer's length in bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Borrow {
+    pub arg: u8,
+    pub len_arg: u8,
+    pub writable: bool,
 }
 
 /// A linked eBPF program ready for execution.

@@ -331,6 +331,30 @@ mod plugins {
 
         assert!(matches!(x.call("put", &[ro.base(), 1]).unwrap_err(), VmError::Exec(rvm::ExecError::MemoryFault(_))));
     }
+
+    /// Buffers tagged `borrow`/`borrow_ro` cross plugins for the duration of a call.
+    #[test]
+    fn borrowed_buffers() {
+        let vm = Vm::new();
+        let callee = vm.load_plugin("callee", &read("borrow_callee.o")).unwrap();
+        for func in ["sum", "fill", "poke"] {
+            vm.export(&callee, func).unwrap();
+        }
+        let caller = vm.load_plugin("caller", &read("borrow_caller.o")).unwrap();
+
+        // sum reads the caller's array, fill writes it back: 10 * 1000 + 7 + 7
+        assert_eq!(caller.call("run", &[]).unwrap(), 10_014);
+
+        // a length past the caller's memory fails before the callee runs
+        let err = caller.call("overrun", &[]).unwrap_err().to_string();
+        assert!(err.contains("callee::sum") && err.contains("out of bounds"), "{err}");
+
+        // a read-only borrow faults on write, and the slot is unmapped afterwards
+        let err = caller.call("write_ro", &[]).unwrap_err().to_string();
+        assert!(err.contains("callee::poke") && err.contains("memory fault"), "{err}");
+        let slot = rvm::region_base(rvm::BORROW_FIRST_REGION);
+        assert!(callee.lock().unwrap().memory().bytes(slot, 1).is_err());
+    }
 }
 
 /// Every atomic form clang emits (bpf/atomics.c), with the expected values worked
