@@ -23,12 +23,12 @@
 //!     x * 2
 //! });
 //!
-//! // Register types for CO-RE
-//! vm.types()
-//!     .register_struct("event")
-//!     .field("timestamp", 0, 8)
-//!     .field("pid", 8, 4)
-//!     .size(12);
+//! // Describe the host's types, as BTF, for CO-RE
+//! let event = vm.types().add_struct("event", 12);
+//! let u64_t = vm.types().int("u64", 8, false);
+//! let u32_t = vm.types().int("u32", 4, false);
+//! vm.types().member(event, "timestamp", 0, u64_t);
+//! vm.types().member(event, "pid", 8, u32_t);
 //!
 //! // Load and execute an eBPF program
 //! let program = vm.load_elf(&elf_bytes)?;
@@ -44,7 +44,7 @@
 //!   function table.
 //! - [`Plugin`]: a linked program that other programs can call into.
 //! - [`HelperRegistry`]: the extern table of host functions callable from eBPF.
-//! - [`TypeRegistry`]: type information for CO-RE relocations.
+//! - [`BtfBuilder`]: the host's types, as BTF, for CO-RE relocations.
 
 mod error;
 mod executor;
@@ -63,7 +63,7 @@ mod vm;
 
 // Public API re-exports
 
-pub use btf::TypeRegistry;
+pub use btf::BtfBuilder;
 pub use error::{ExecError, HelperError, LinkError, MemoryError, Result, VmError};
 pub use executor::{Executor, DEFAULT_FRAME_SIZE, MAX_CALL_DEPTH};
 pub use helper::{FromArgs, HelperArgs, HelperContext, HelperRegistry, IntoReturn, SharedHelpers};

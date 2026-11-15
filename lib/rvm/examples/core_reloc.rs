@@ -20,14 +20,14 @@
 //!    };
 //!    ```
 //!
-//! 2. **Load time**: The host registers its actual layout:
+//! 2. **Load time**: the host describes its actual layout as BTF:
 //!    ```rust
-//!    vm.types()
-//!        .register_struct("event")
-//!        .field("flags", 0, 4)      // flags moved to offset 0!
-//!        .field("pid", 4, 4)        // pid at offset 4
-//!        .field("timestamp", 16, 8) // timestamp at offset 16!
-//!        ...
+//!    let event = vm.types().add_struct("event", 32);
+//!    let u32_t = vm.types().int("u32", 4, false);
+//!    let u64_t = vm.types().int("u64", 8, false);
+//!    vm.types().member(event, "flags", 0, u32_t);      // flags moved to offset 0!
+//!    vm.types().member(event, "pid", 4, u32_t);         // pid at offset 4
+//!    vm.types().member(event, "timestamp", 16, u64_t); // timestamp moved!
 //!    ```
 //!
 //! 3. **Relocation**: The loader patches instructions to use the new offsets.
@@ -141,18 +141,17 @@ fn test_with_core(elf_bytes: &[u8]) {
     // Create VM and register the RUNTIME struct layout
     let mut vm = Vm::new();
 
-    // Register the runtime layout - fields are in different positions!
-    vm.types()
-        .register_struct("event")
-        .field("flags", 0, 4) // flags at offset 0 (was 16)
-        .field("pid", 4, 4) // pid at offset 4 (was 8)
-        .field("uid", 8, 4) // uid at offset 8 (was 12)
-        .field("_pad", 12, 4)
-        .field("timestamp", 16, 8) // timestamp at offset 16 (was 0!)
-        .field("data", 24, 8)
-        .size(32);
+    // Describe the runtime layout as BTF - fields are in different positions!
+    let u32_t = vm.types().int("u32", 4, false);
+    let u64_t = vm.types().int("u64", 8, false);
+    let event = vm.types().add_struct("event", 32);
+    vm.types().member(event, "flags", 0, u32_t); // flags at offset 0 (was 16)
+    vm.types().member(event, "pid", 4, u32_t); // pid at offset 4 (was 8)
+    vm.types().member(event, "uid", 8, u32_t); // uid at offset 8 (was 12)
+    vm.types().member(event, "timestamp", 16, u64_t); // timestamp at offset 16 (was 0!)
+    vm.types().member(event, "data", 24, u64_t);
 
-    println!("Registered runtime layout in type registry:");
+    println!("Registered runtime layout as host BTF:");
     println!("  flags     @ offset 0");
     println!("  pid       @ offset 4");
     println!("  uid       @ offset 8");

@@ -1,418 +1,450 @@
-//! Integration tests demonstrating the full BTF/CO-RE workflow.
-//!
-//! These tests show how a host application can:
-//! 1. Register its struct layouts in a TypeRegistry
-//! 2. Parse BTF from an eBPF program
-//! 3. Apply CO-RE relocations to adjust field offsets
+//! End-to-end CO-RE relocation tests: a local (compile-time) BTF is relocated against a
+//! target (host) BTF, exactly like a BPF program's debug info gets relocated against the
+//! kernel's BTF. Both are hand-encoded with [`TestBtf`] so each test controls, and can
+//! hand-derive, the exact offsets/values the relocation must produce.
 
-use crate::core_relo::{apply_core_relocations, CoreRelo, CoreReloError, CoreReloKind};
+use crate::core_relo::{apply_core_relocations, CoreRelo, CoreReloError, CoreReloKind, Unresolved, CORE_POISON_HELPER};
 use crate::parse::Btf;
 use crate::raw::{BTF_MAGIC, BTF_VERSION};
-use crate::registry::TypeRegistry;
 
-/// Build a minimal BTF blob for testing.
-///
-/// This creates BTF with:
-/// - A string table
-/// - A struct type with fields
-fn build_test_btf(struct_name: &str, fields: &[(&str, u32)]) -> Vec<u8> {
-    // Build string table: "\0<struct_name>\0<field1>\0<field2>\0..."
-    let mut strings = vec![0u8]; // null string at offset 0
-    let struct_name_off = strings.len() as u32;
-    strings.extend_from_slice(struct_name.as_bytes());
-    strings.push(0);
+/// Minimal BTF encoder: each method appends one type and returns its ID (IDs start at 1,
+/// matching [`Btf::parse`]'s numbering).
+#[derive(Default)]
+struct TestBtf {
+    strings: Vec<u8>,
+    types: Vec<u32>,
+    next_id: u32,
+}
 
-    let mut field_name_offs = Vec::new();
-    for (name, _) in fields {
-        field_name_offs.push(strings.len() as u32);
-        strings.extend_from_slice(name.as_bytes());
-        strings.push(0);
+/// A struct/union member: name, member type ID, bit offset.
+type Field<'a> = (&'a str, u32, u32);
+/// A bitfield member: name, member type ID, bit offset, bit size.
+type Bitfield<'a> = (&'a str, u32, u32, u32);
+
+impl TestBtf {
+    fn new() -> Self {
+        Self { strings: vec![0], next_id: 1, types: Vec::new() }
     }
 
-    // Build type section
-    let mut types = Vec::new();
-
-    // Type 1: struct
-    // btf_type: name_off (4) + info (4) + size (4) = 12 bytes
-    let vlen = fields.len() as u32;
-    let info = (4 << 24) | vlen; // kind=4 (struct), vlen=field count
-    let struct_size = fields.iter().map(|(_, sz)| sz).sum::<u32>();
-
-    types.extend_from_slice(&struct_name_off.to_le_bytes());
-    types.extend_from_slice(&info.to_le_bytes());
-    types.extend_from_slice(&struct_size.to_le_bytes());
-
-    // btf_member for each field: name_off (4) + type_id (4) + offset (4) = 12 bytes each
-    let mut bit_offset = 0u32;
-    for (i, (_, size)) in fields.iter().enumerate() {
-        types.extend_from_slice(&field_name_offs[i].to_le_bytes());
-        types.extend_from_slice(&1u32.to_le_bytes()); // type_id (dummy)
-        types.extend_from_slice(&bit_offset.to_le_bytes()); // bit offset
-        bit_offset += size * 8;
+    fn name(&mut self, s: &str) -> u32 {
+        if s.is_empty() {
+            return 0;
+        }
+        let off = self.strings.len() as u32;
+        self.strings.extend_from_slice(s.as_bytes());
+        self.strings.push(0);
+        off
     }
 
-    // Build header
-    let hdr_len = 24u32;
-    let type_off = 0u32;
-    let type_len = types.len() as u32;
-    let str_off = type_len;
-    let str_len = strings.len() as u32;
+    fn push(&mut self, name_off: u32, info: u32, size_or_type: u32, extra: &[u32]) -> u32 {
+        self.types.push(name_off);
+        self.types.push(info);
+        self.types.push(size_or_type);
+        self.types.extend_from_slice(extra);
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
 
-    let mut btf = Vec::new();
-    btf.extend_from_slice(&BTF_MAGIC.to_le_bytes());
-    btf.push(BTF_VERSION);
-    btf.push(0); // flags
-    btf.extend_from_slice(&hdr_len.to_le_bytes());
-    btf.extend_from_slice(&type_off.to_le_bytes());
-    btf.extend_from_slice(&type_len.to_le_bytes());
-    btf.extend_from_slice(&str_off.to_le_bytes());
-    btf.extend_from_slice(&str_len.to_le_bytes());
+    fn int(&mut self, name: &str, size: u32, signed: bool) -> u32 {
+        let n = self.name(name);
+        let enc = u32::from(signed);
+        self.push(n, 1 << 24, size, &[(enc << 24) | (size * 8)])
+    }
 
-    // Append type and string sections
-    btf.extend_from_slice(&types);
-    btf.extend_from_slice(&strings);
+    fn array(&mut self, elem: u32, nelems: u32) -> u32 {
+        self.push(0, 3 << 24, 0, &[elem, 0, nelems])
+    }
 
-    btf
-}
+    fn composite(&mut self, kind: u32, kind_flag: bool, name: &str, size: u32, members: &[u32]) -> u32 {
+        let n = self.name(name);
+        let vlen = (members.len() / 3) as u32;
+        let info = (kind << 24) | (u32::from(kind_flag) << 31) | vlen;
+        self.push(n, info, size, members)
+    }
 
-#[test]
-fn test_btf_parsing() {
-    let btf_data = build_test_btf("my_event", &[("timestamp", 8), ("pid", 4), ("flags", 4)]);
+    fn struct_(&mut self, name: &str, size: u32, fields: &[Field<'_>]) -> u32 {
+        let mut members = Vec::new();
+        for (fname, ftype, boff) in fields {
+            let n = self.name(fname);
+            members.extend_from_slice(&[n, *ftype, *boff]);
+        }
+        self.composite(4, false, name, size, &members)
+    }
 
-    let btf = Btf::parse(&btf_data).expect("failed to parse BTF");
+    fn union_(&mut self, name: &str, size: u32, fields: &[Field<'_>]) -> u32 {
+        let mut members = Vec::new();
+        for (fname, ftype, boff) in fields {
+            let n = self.name(fname);
+            members.extend_from_slice(&[n, *ftype, *boff]);
+        }
+        self.composite(5, false, name, size, &members)
+    }
 
-    // Should have 2 types: void (id 0) and our struct (id 1)
-    assert_eq!(btf.type_count(), 2);
+    fn bitfield_struct(&mut self, name: &str, size: u32, fields: &[Bitfield<'_>]) -> u32 {
+        let mut members = Vec::new();
+        for (fname, ftype, boff, bsz) in fields {
+            let n = self.name(fname);
+            members.extend_from_slice(&[n, *ftype, (bsz << 24) | boff]);
+        }
+        self.composite(4, true, name, size, &members)
+    }
 
-    // Find our struct
-    let (type_id, ty) = btf.find_struct("my_event").expect("struct not found");
-    assert_eq!(type_id, 1);
+    fn enum_(&mut self, name: &str, variants: &[(&str, i32)]) -> u32 {
+        let n = self.name(name);
+        let mut extra = Vec::new();
+        for (vname, val) in variants {
+            let vn = self.name(vname);
+            extra.push(vn);
+            extra.push(*val as u32);
+        }
+        self.push(n, (6 << 24) | variants.len() as u32, 4, &extra)
+    }
 
-    if let crate::types::BtfTypeInfo::Struct { name, size, members } = ty {
-        assert_eq!(*name, "my_event");
-        assert_eq!(*size, 16); // 8 + 4 + 4
-        assert_eq!(members.len(), 3);
-        assert_eq!(members[0].name, "timestamp");
-        assert_eq!(members[0].byte_offset(), 0);
-        assert_eq!(members[1].name, "pid");
-        assert_eq!(members[1].byte_offset(), 8);
-        assert_eq!(members[2].name, "flags");
-        assert_eq!(members[2].byte_offset(), 12);
-    } else {
-        panic!("expected struct type");
+    fn encode(&self) -> Vec<u8> {
+        let types: Vec<u8> = self.types.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut btf = Vec::new();
+        btf.extend_from_slice(&BTF_MAGIC.to_le_bytes());
+        btf.extend_from_slice(&[BTF_VERSION, 0]);
+        for w in [24, 0, types.len() as u32, types.len() as u32, self.strings.len() as u32] {
+            btf.extend_from_slice(&w.to_le_bytes());
+        }
+        btf.extend_from_slice(&types);
+        btf.extend_from_slice(&self.strings);
+        btf
     }
 }
 
+/// Encode a single `CoreRelo` whose access string is appended to a scratch `TestBtf`'s
+/// string table (CO-RE access strings live in the *local* BTF's strings).
+fn relo(local: &mut TestBtf, type_id: u32, access_str: &str, kind: CoreReloKind) -> CoreRelo {
+    let access_str_off = local.name(access_str);
+    CoreRelo { insn_off: 0, type_id, access_str_off, kind }
+}
+
+fn insn(opcode: u8, dst: u8, src: u8, off: i16, imm: i32) -> u64 {
+    u64::from(opcode) | u64::from(dst) << 8 | u64::from(src) << 12 | u64::from(off as u16) << 16 | u64::from(imm as u32) << 32
+}
+
+fn off_of(i: u64) -> i16 {
+    (i >> 16) as u16 as i16
+}
+
+fn imm_of(i: u64) -> i32 {
+    (i >> 32) as u32 as i32
+}
+
+const LDX_W: u8 = 0x61; // BPF_LDX | BPF_MEM | BPF_W
+const ALU64_MOV_K: u8 = 0xb7; // BPF_ALU64 | BPF_MOV | BPF_K
+
+/// A field moving to a new offset in the target patches the instruction's `off`.
 #[test]
-fn test_core_relocation_field_offset() {
-    let mut registry = TypeRegistry::new();
+fn moved_field_offset() {
+    let mut local = TestBtf::new();
+    let int_ty = local.int("int", 4, true);
+    let event = local.struct_("event", 8, &[("ts", int_ty, 0), ("pid", int_ty, 32)]);
+    let r = relo(&mut local, event, "0:1", CoreReloKind::FieldByteOffset);
+    let local_bytes = local.encode();
+    let local_btf = Btf::parse(&local_bytes).unwrap();
 
-    // Host's struct layout has different offsets than the BPF program expects
-    registry
-        .register_struct("my_event")
-        .field("timestamp", 0, 8)
-        .field("pid", 16, 4) // Host has pid at offset 16
-        .field("flags", 20, 4)
-        .size(24);
+    let mut target = TestBtf::new();
+    let t_int = target.int("int", 4, true);
+    // Host's "event" has an extra field between ts and pid, pushing pid from byte 4 to byte 8.
+    target.struct_("event", 12, &[("ts", t_int, 0), ("extra", t_int, 32), ("pid", t_int, 64)]);
+    let target_bytes = target.encode();
+    let target_btf = Btf::parse(&target_bytes).unwrap();
 
-    // Build BTF where the BPF program expected pid right after timestamp
-    let btf_data = build_test_btf(
-        "my_event",
-        &[
-            ("timestamp", 8),
-            ("pid", 4), // BPF expected at offset 8
-            ("flags", 4),
-        ],
-    );
-    let btf = Btf::parse(&btf_data).unwrap();
-
-    // String table: "\0my_event\0timestamp\0pid\0flags\0"
-    // Offsets:       0  1        10         20   24
-    let relos = vec![
-        CoreRelo {
-            insn_off: 0,
-            type_id: 1,         // my_event struct
-            access_str_off: 20, // "pid"
-            kind: CoreReloKind::FieldByteOffset,
-        },
-        CoreRelo {
-            insn_off: 8,
-            type_id: 1,
-            access_str_off: 24, // "flags"
-            kind: CoreReloKind::FieldByteOffset,
-        },
-    ];
-
-    let mut instructions = vec![0x00000000_00000000u64; 2];
-
-    let unresolved = apply_core_relocations(&mut instructions, &btf, &registry, &relos).unwrap();
+    let mut insns = [insn(LDX_W, 0, 1, 4, 0)];
+    let unresolved = apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r]).unwrap();
     assert!(unresolved.is_empty());
-
-    // Both immediates (upper 32 bits) should now hold the host's actual offsets.
-    assert_eq!((instructions[0] >> 32) as u32, 16); // pid moved from 8 to 16
-    assert_eq!((instructions[1] >> 32) as u32, 20); // flags moved from 12 to 20
+    assert_eq!(off_of(insns[0]), 8);
 }
 
+/// A field nested inside a target-only anonymous union is still found by name, and its
+/// offset includes the anonymous union's own offset.
 #[test]
-fn test_core_relocation_field_exists() {
-    let mut registry = TypeRegistry::new();
+fn nested_anonymous_member() {
+    let mut local = TestBtf::new();
+    let int_ty = local.int("int", 4, true);
+    let s = local.struct_("anonish", 4, &[("val", int_ty, 0)]);
+    let r = relo(&mut local, s, "0:0", CoreReloKind::FieldByteOffset);
+    let local_bytes = local.encode();
+    let local_btf = Btf::parse(&local_bytes).unwrap();
 
-    // Host's struct doesn't have "old_field"
-    registry
-        .register_struct("my_event")
-        .field("timestamp", 0, 8)
-        .field("new_field", 8, 4) // Different field name
-        .size(12);
+    let mut target = TestBtf::new();
+    let t_int = target.int("int", 4, true);
+    // `val` lives inside an anonymous union starting at byte 4, alongside `padding`.
+    let anon_union = target.union_("", 4, &[("padding", t_int, 0), ("val", t_int, 0)]);
+    target.struct_("anonish", 8, &[("other", t_int, 0), ("", anon_union, 32)]);
+    let target_bytes = target.encode();
+    let target_btf = Btf::parse(&target_bytes).unwrap();
 
-    let btf_data = build_test_btf(
-        "my_event",
-        &[
-            ("timestamp", 8),
-            ("old_field", 4), // BPF program uses old field name
-        ],
-    );
-    let btf = Btf::parse(&btf_data).unwrap();
+    let mut insns = [insn(LDX_W, 0, 1, 0, 0)];
+    apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r]).unwrap();
+    assert_eq!(off_of(insns[0]), 4);
+}
 
-    // Check if "old_field" exists (it doesn't in host)
-    // String table: "\0my_event\0timestamp\0old_field\0"
-    // Offsets:       0  1        10         20
-    let relo = CoreRelo {
-        insn_off: 0,
-        type_id: 1,
-        access_str_off: 20, // "old_field"
-        kind: CoreReloKind::FieldExists,
-    };
+/// Array element access follows the target's own array offset and element size.
+#[test]
+fn array_element_offset() {
+    let mut local = TestBtf::new();
+    let int_ty = local.int("int", 4, true);
+    let arr = local.array(int_ty, 4);
+    let s = local.struct_("withArr", 20, &[("before", int_ty, 0), ("items", arr, 32)]);
+    let r = relo(&mut local, s, "0:1:2", CoreReloKind::FieldByteOffset);
+    let local_bytes = local.encode();
+    let local_btf = Btf::parse(&local_bytes).unwrap();
 
-    let mut instructions = vec![0xFFFFFFFF_00000000u64; 1]; // Start with imm=0xFFFFFFFF
+    let mut target = TestBtf::new();
+    let t_int = target.int("int", 4, true);
+    let t_arr = target.array(t_int, 4);
+    // Host inserted a padding field before the array, moving it from byte 4 to byte 8.
+    target.struct_("withArr", 24, &[("before", t_int, 0), ("pad", t_int, 32), ("items", t_arr, 64)]);
+    let target_bytes = target.encode();
+    let target_btf = Btf::parse(&target_bytes).unwrap();
 
-    let unresolved = apply_core_relocations(&mut instructions, &btf, &registry, &[relo]).unwrap();
+    let mut insns = [insn(LDX_W, 0, 1, 12, 0)];
+    apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r]).unwrap();
+    assert_eq!(off_of(insns[0]), 16); // 8 (array start) + 2 * 4 (element size)
+}
+
+/// Bitfield relocations extract the exact bits libbpf's formulas derive, not just the
+/// right byte offset.
+#[test]
+fn bitfield_signed_and_shifts() {
+    let mut local = TestBtf::new();
+    let int_ty = local.int("int", 4, true);
+    // `v` occupies bits [3, 8) of a 4-byte int: byte_sz=4, byte_off=0.
+    let s = local.bitfield_struct("flags", 4, &[("v", int_ty, 3, 5)]);
+    let r_signed = relo(&mut local, s, "0:0", CoreReloKind::FieldSigned);
+    let r_rshift = relo(&mut local, s, "0:0", CoreReloKind::FieldRShiftU64);
+    let r_lshift = relo(&mut local, s, "0:0", CoreReloKind::FieldLShiftU64);
+    let local_bytes = local.encode();
+    let local_btf = Btf::parse(&local_bytes).unwrap();
+
+    let mut target = TestBtf::new();
+    let t_int = target.int("int", 4, true);
+    // `v` occupies bits [20, 25) of a 4-byte int: byte_sz=4, byte_off=0.
+    target.bitfield_struct("flags", 4, &[("v", t_int, 20, 5)]);
+    let target_bytes = target.encode();
+    let target_btf = Btf::parse(&target_bytes).unwrap();
+
+    // FieldSigned: both local and target `v` are signed ints -> 1, same on both sides.
+    let mut insns = [insn(ALU64_MOV_K, 0, 0, 0, 1)];
+    apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r_signed]).unwrap();
+    assert_eq!(imm_of(insns[0]), 1);
+
+    // FieldRShiftU64 = 64 - bit_size, independent of bit_offset -> 59 on both sides.
+    let mut insns = [insn(ALU64_MOV_K, 0, 0, 0, 59)];
+    apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r_rshift]).unwrap();
+    assert_eq!(imm_of(insns[0]), 59);
+
+    // FieldLShiftU64 = 64 - (bit_off + bit_size - byte_off*8): 56 locally, 39 on the target;
+    // bitfields are never validated against the instruction's current value, so the
+    // starting imm is irrelevant here.
+    let mut insns = [insn(ALU64_MOV_K, 0, 0, 0, 0)];
+    apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r_lshift]).unwrap();
+    assert_eq!(imm_of(insns[0]), 39);
+}
+
+/// A field whose unsigned integer type widened gets its `LDX` memory access size adjusted;
+/// the same change on a signed field poisons rather than risk sign-extending wrongly.
+#[test]
+fn size_change_adjusts_or_poisons_memory_access() {
+    let mut local = TestBtf::new();
+    let u32_ty = local.int("unsigned int", 4, false);
+    let i32_ty = local.int("int", 4, true);
+    let safe = local.struct_("safe", 4, &[("count", u32_ty, 0)]);
+    let unsafe_ = local.struct_("unsafe", 4, &[("count", i32_ty, 0)]);
+    let r_safe = relo(&mut local, safe, "0:0", CoreReloKind::FieldByteOffset);
+    let r_unsafe = relo(&mut local, unsafe_, "0:0", CoreReloKind::FieldByteOffset);
+    let local_bytes = local.encode();
+    let local_btf = Btf::parse(&local_bytes).unwrap();
+
+    let mut target = TestBtf::new();
+    let u64_ty = target.int("unsigned long", 8, false);
+    let i64_ty = target.int("long", 8, true);
+    target.struct_("safe", 8, &[("count", u64_ty, 0)]);
+    target.struct_("unsafe", 8, &[("count", i64_ty, 0)]);
+    let target_bytes = target.encode();
+    let target_btf = Btf::parse(&target_bytes).unwrap();
+
+    let mut insns = [insn(LDX_W, 0, 1, 0, 0)];
+    let unresolved = apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r_safe]).unwrap();
     assert!(unresolved.is_empty());
+    assert_eq!(off_of(insns[0]), 0);
+    assert_eq!(insns[0] as u8 & 0x18, 0x18, "mem size should widen from W to DW");
 
-    // Should be patched to 0 (field doesn't exist)
-    let patched_imm = (instructions[0] >> 32) as u32;
-    assert_eq!(patched_imm, 0);
-}
-
-#[test]
-fn test_core_relocation_type_size() {
-    let mut registry = TypeRegistry::new();
-
-    // Host's struct is larger than BPF expected
-    registry
-        .register_struct("my_event")
-        .field("timestamp", 0, 8)
-        .field("pid", 8, 4)
-        .field("extra_data", 12, 64) // Extra field
-        .size(80);
-
-    let btf_data = build_test_btf("my_event", &[("timestamp", 8), ("pid", 4)]);
-    let btf = Btf::parse(&btf_data).unwrap();
-
-    // Get type size
-    let relo = CoreRelo {
-        insn_off: 0,
-        type_id: 1,
-        access_str_off: 0, // Not used for type size
-        kind: CoreReloKind::TypeSize,
-    };
-
-    let mut instructions = vec![0u64; 1];
-
-    let unresolved = apply_core_relocations(&mut instructions, &btf, &registry, &[relo]).unwrap();
-    assert!(unresolved.is_empty());
-
-    // Should return host's actual size: 80
-    let patched_imm = (instructions[0] >> 32) as u32;
-    assert_eq!(patched_imm, 80);
-}
-
-#[test]
-fn test_core_suffix_matching() {
-    let mut registry = TypeRegistry::new();
-
-    // Register base type
-    registry
-        .register_struct("task_struct")
-        .field("pid", 0, 4)
-        .field("tgid", 4, 4)
-        .field("state", 8, 8)
-        .size(16);
-
-    // CO-RE suffix variants should all match
-    assert!(registry.has_struct("task_struct"));
-    assert!(registry.has_struct("task_struct___old"));
-    assert!(registry.has_struct("task_struct___v2"));
-    assert!(registry.has_struct("task_struct___custom_suffix"));
-
-    // Field access with suffix should work
-    assert_eq!(registry.field_offset("task_struct___old", "pid"), Some(0));
-    assert_eq!(registry.field_offset("task_struct___v2", "state"), Some(8));
-}
-
-/// A field the host lacks poisons its instruction, like libbpf, instead of failing:
-/// the program still loads and only faults if it runs that instruction.
-#[test]
-fn test_missing_type_poisons_instruction() {
-    let registry = TypeRegistry::new();
-
-    let btf_data = build_test_btf("unknown_struct", &[("field", 4)]);
-    let btf = Btf::parse(&btf_data).unwrap();
-
-    let relo = CoreRelo {
-        insn_off: 8,
-        type_id: 1,
-        access_str_off: 1, // "unknown_struct"
-        kind: CoreReloKind::FieldByteOffset,
-    };
-
-    let mut instructions = vec![0u64; 2];
-
-    let unresolved = apply_core_relocations(&mut instructions, &btf, &registry, &[relo]).unwrap();
+    let mut insns = [insn(LDX_W, 0, 1, 0, 0)];
+    let unresolved = apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r_unsafe]).unwrap();
     assert_eq!(unresolved.len(), 1);
-    assert!(matches!(unresolved[0].error, CoreReloError::FieldNotFound { .. }));
-    assert_eq!(instructions, [0, 0x0bad2310_00000085]); // call 0xbad2310
+    assert_eq!(insns[0], 0x85 | u64::from(CORE_POISON_HELPER) << 32);
 }
 
+/// A target type with a `___flavor` suffix is still found by its essential name.
 #[test]
-fn test_unsupported_kind_is_an_error() {
-    let btf_data = build_test_btf("s", &[("field", 4)]);
-    let btf = Btf::parse(&btf_data).unwrap();
-    let relo = CoreRelo {
-        insn_off: 0,
-        type_id: 1,
-        access_str_off: 1,
-        kind: CoreReloKind::FieldSigned,
-    };
-    let result = apply_core_relocations(&mut [0], &btf, &TypeRegistry::new(), &[relo]);
-    assert_eq!(result, Err(CoreReloError::UnsupportedRelo(CoreReloKind::FieldSigned)));
+fn flavor_suffix_matching() {
+    let mut local = TestBtf::new();
+    let int_ty = local.int("int", 4, true);
+    let cfg = local.struct_("cfg", 4, &[("limit", int_ty, 0)]);
+    let r = relo(&mut local, cfg, "0:0", CoreReloKind::FieldByteOffset);
+    let local_bytes = local.encode();
+    let local_btf = Btf::parse(&local_bytes).unwrap();
+
+    let mut target = TestBtf::new();
+    let t_int = target.int("int", 4, true);
+    target.struct_("cfg___v2", 8, &[("pad", t_int, 0), ("limit", t_int, 32)]);
+    let target_bytes = target.encode();
+    let target_btf = Btf::parse(&target_bytes).unwrap();
+
+    let mut insns = [insn(LDX_W, 0, 1, 0, 0)];
+    apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r]).unwrap();
+    assert_eq!(off_of(insns[0]), 4);
 }
 
-// ==================== clang-style access strings ====================
-
-/// Raw BTF builder: `types` are pre-encoded `btf_type` records; `strings` starts with "\0".
-fn build_raw_btf(types: &[u32], strings: &[u8]) -> Vec<u8> {
-    let types: Vec<u8> = types.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let mut btf = Vec::new();
-    btf.extend_from_slice(&BTF_MAGIC.to_le_bytes());
-    btf.extend_from_slice(&[BTF_VERSION, 0]);
-    for w in [24, 0, types.len() as u32, types.len() as u32, strings.len() as u32] {
-        btf.extend_from_slice(&w.to_le_bytes());
-    }
-    btf.extend_from_slice(&types);
-    btf.extend_from_slice(strings);
-    btf
-}
-
-/// Local (compile-time) types:
-/// 1 int; 2 struct inner { int x; int y; }; 3 struct outer { int a; struct inner in; };
-/// 4 enum color { RED, GREEN, BLUE }; 5 typedef struct outer ev_t.
-/// Access strings live at: "0:1:1"=1, "2:1"=7, "0:1:0"=11, "2"=17.
-fn clang_style_btf() -> Vec<u8> {
-    let strings = b"\x000:1:1\x002:1\x000:1:0\x002\0int\0inner\0x\0y\0outer\0a\0in\0color\0RED\0GREEN\0BLUE\0ev_t\0";
-    let s = |name: &str| {
-        let needle = [name.as_bytes(), b"\0"].concat();
-        (1..strings.len())
-            .find(|&i| strings[i - 1] == 0 && strings[i..].starts_with(&needle))
-            .unwrap() as u32
-    };
-    #[rustfmt::skip]
-    let types = [
-        s("int"), 1 << 24, 4, 32,                                     // 1: int
-        s("inner"), 4 << 24 | 2, 8, s("x"), 1, 0, s("y"), 1, 32,      // 2: struct inner
-        s("outer"), 4 << 24 | 2, 12, s("a"), 1, 0, s("in"), 2, 32,    // 3: struct outer
-        s("color"), 6 << 24 | 3, 4, s("RED"), 0, s("GREEN"), 1, s("BLUE"), 2, // 4: enum color
-        s("ev_t"), 8 << 24, 3,                                        // 5: typedef
-    ];
-    build_raw_btf(&types, strings)
-}
-
-/// Host layout differs from the local one at every level.
-fn clang_style_registry() -> TypeRegistry {
-    let mut registry = TypeRegistry::new();
-    registry
-        .register_struct("inner")
-        .field("x", 0, 4)
-        .field("y", 8, 4)
-        .size(16);
-    registry
-        .register_struct("outer")
-        .field("a", 0, 4)
-        .field("in", 8, 16)
-        .size(24);
-    registry
-        .register_enum("color", 4, false)
-        .variant("RED", 0)
-        .variant("GREEN", 1)
-        .variant("BLUE", 7);
-    registry
-}
-
-fn relo(type_id: u32, access_str_off: u32, kind: CoreReloKind) -> CoreRelo {
-    CoreRelo {
-        insn_off: 0,
-        type_id,
-        access_str_off,
-        kind,
-    }
-}
-
-/// LDX_W r0, [r1 + off]
-const LDXW: u64 = 0x61 | 1 << 12;
-
-fn patched_off(insn: u64) -> i16 {
-    (insn >> 16) as i16
-}
-
+/// Two target flavors that disagree on where a field landed make the relocation ambiguous.
 #[test]
-fn test_core_nested_and_array_access() {
-    let btf_data = clang_style_btf();
-    let btf = Btf::parse(&btf_data).unwrap();
-    let registry = clang_style_registry();
+fn ambiguous_candidates_error() {
+    let mut local = TestBtf::new();
+    let int_ty = local.int("int", 4, true);
+    let cfg = local.struct_("cfg", 4, &[("limit", int_ty, 0)]);
+    let r = relo(&mut local, cfg, "0:0", CoreReloKind::FieldByteOffset);
+    let local_bytes = local.encode();
+    let local_btf = Btf::parse(&local_bytes).unwrap();
 
-    for (type_id, access, want) in [
-        (3, 1, 16), // outer.in.y = 8 + 8
-        (3, 7, 56), // p[2].in = 2 * 24 + 8
-        (5, 11, 8), // typedef root: ev_t.in.x = 8 + 0
-    ] {
-        let mut insns = [LDXW];
-        apply_core_relocations(&mut insns, &btf, &registry, &[relo(type_id, access, CoreReloKind::FieldByteOffset)])
-            .unwrap();
-        assert_eq!(patched_off(insns[0]), want, "type {type_id} access@{access}");
-    }
+    let mut target = TestBtf::new();
+    let t_int = target.int("int", 4, true);
+    target.struct_("cfg", 4, &[("limit", t_int, 0)]);
+    target.struct_("cfg___dup", 8, &[("pad", t_int, 0), ("limit", t_int, 32)]);
+    let target_bytes = target.encode();
+    let target_btf = Btf::parse(&target_bytes).unwrap();
 
-    let mut insns = [0u64];
-    apply_core_relocations(&mut insns, &btf, &registry, &[relo(3, 1, CoreReloKind::FieldByteSize)]).unwrap();
-    assert_eq!(insns[0] >> 32, 4);
+    let mut insns = [insn(LDX_W, 0, 1, 0, 0)];
+    let err = apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r]).unwrap_err();
+    assert!(matches!(err, CoreReloError::Ambiguous { .. }));
 }
 
+/// An enum value relocates to the target's value for the same (flavor-matched) variant.
 #[test]
-fn test_core_enum_value_by_index() {
-    let btf_data = clang_style_btf();
-    let btf = Btf::parse(&btf_data).unwrap();
-    let mut registry = clang_style_registry();
+fn enum_value_relocation() {
+    let mut local = TestBtf::new();
+    let color = local.enum_("color", &[("RED", 0), ("GREEN", 1), ("BLUE", 2)]);
+    let r = relo(&mut local, color, "1", CoreReloKind::EnumvalValue); // GREEN
+    let local_bytes = local.encode();
+    let local_btf = Btf::parse(&local_bytes).unwrap();
 
-    let mut insns = [0u64];
-    apply_core_relocations(&mut insns, &btf, &registry, &[relo(4, 17, CoreReloKind::EnumvalValue)]).unwrap();
-    assert_eq!(insns[0] >> 32, 7);
+    let mut target = TestBtf::new();
+    target.enum_("color___v2", &[("RED", 10), ("GREEN", 11), ("BLUE", 12)]);
+    let target_bytes = target.encode();
+    let target_btf = Btf::parse(&target_bytes).unwrap();
 
-    // LD_IMM64 receives the full 64-bit value across both slots.
-    registry.register_enum("color", 8, false).variant("BLUE", 0x1_0000_0007);
-    let mut insns = [0x18u64, 0];
-    apply_core_relocations(&mut insns, &btf, &registry, &[relo(4, 17, CoreReloKind::EnumvalValue)]).unwrap();
-    assert_eq!((insns[0] >> 32) | (insns[1] >> 32) << 32, 0x1_0000_0007);
+    let mut insns = [insn(ALU64_MOV_K, 0, 0, 0, 1)];
+    apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r]).unwrap();
+    assert_eq!(imm_of(insns[0]), 11);
 }
 
+/// `TYPE_ID_TARGET` resolves to the matched candidate's own type ID, not the local one.
 #[test]
-fn test_core_patches_off_for_all_memory_classes() {
-    let btf_data = clang_style_btf();
-    let btf = Btf::parse(&btf_data).unwrap();
-    let registry = clang_style_registry();
+fn type_id_target_relocation() {
+    let mut local = TestBtf::new();
+    let int_ty = local.int("int", 4, true);
+    let cfg = local.struct_("cfg", 4, &[("limit", int_ty, 0)]);
+    let r = relo(&mut local, cfg, "0", CoreReloKind::TypeIdTarget);
+    let local_bytes = local.encode();
+    let local_btf = Btf::parse(&local_bytes).unwrap();
 
-    // ST_W [r1 + off], 5 / LDXSW (MEMSX) / atomic ADD_W: `off` is patched, imm keeps its meaning.
-    for insn in [0x62 | 1 << 8 | 5 << 32, 0x81 | 1 << 12, 0xc3 | 1 << 8 | 2 << 12] {
-        let mut insns = [insn];
-        apply_core_relocations(&mut insns, &btf, &registry, &[relo(3, 1, CoreReloKind::FieldByteOffset)]).unwrap();
-        assert_eq!(patched_off(insns[0]), 16, "opcode {:#x}", insn as u8);
-        assert_eq!(insns[0] >> 32, insn >> 32, "imm changed for opcode {:#x}", insn as u8);
-    }
+    let mut target = TestBtf::new();
+    let t_int = target.int("int", 4, true);
+    let _padding = target.int("padding filler", 1, false);
+    let t_cfg = target.struct_("cfg", 4, &[("limit", t_int, 0)]);
+    let target_bytes = target.encode();
+    let target_btf = Btf::parse(&target_bytes).unwrap();
+
+    // TYPE_ID_TARGET is never validated against the instruction's current value.
+    let mut insns = [insn(ALU64_MOV_K, 0, 0, 0, 0xFFFF)];
+    apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r]).unwrap();
+    assert_eq!(imm_of(insns[0]) as u32, t_cfg);
+}
+
+/// `TYPE_MATCHES` structurally compares local and target: a superset of fields matches,
+/// a missing field doesn't (and, since it's an "exists"-family kind, resolves to 0 rather
+/// than poisoning).
+#[test]
+fn type_matches_true_and_false() {
+    let mut local = TestBtf::new();
+    let int_ty = local.int("int", 4, true);
+    let a = local.struct_("a", 4, &[("x", int_ty, 0)]);
+    let r_superset = relo(&mut local, a, "0", CoreReloKind::TypeMatches);
+    let r_mismatched = relo(&mut local, a, "0", CoreReloKind::TypeMatches);
+    let local_bytes = local.encode();
+    let local_btf = Btf::parse(&local_bytes).unwrap();
+
+    let mut superset = TestBtf::new();
+    let s_int = superset.int("int", 4, true);
+    superset.struct_("a", 8, &[("x", s_int, 0), ("y", s_int, 32)]);
+    let superset_bytes = superset.encode();
+    let superset_btf = Btf::parse(&superset_bytes).unwrap();
+
+    let mut insns = [insn(ALU64_MOV_K, 0, 0, 0, 1)];
+    apply_core_relocations(&mut insns, &local_btf, &superset_btf, &[r_superset]).unwrap();
+    assert_eq!(imm_of(insns[0]), 1);
+
+    let mut mismatched = TestBtf::new();
+    let m_int = mismatched.int("int", 4, true);
+    mismatched.struct_("a", 4, &[("z", m_int, 0)]);
+    let mismatched_bytes = mismatched.encode();
+    let mismatched_btf = Btf::parse(&mismatched_bytes).unwrap();
+
+    let mut insns = [insn(ALU64_MOV_K, 0, 0, 0, 1)];
+    apply_core_relocations(&mut insns, &local_btf, &mismatched_btf, &[r_mismatched]).unwrap();
+    assert_eq!(imm_of(insns[0]), 0);
+}
+
+/// A type absent from the target poisons a field relocation's instruction (it's returned
+/// as `Unresolved`), but a plain existence check patches to `0`, and so does every
+/// type-based kind (not just `TYPE_EXISTS`/`TYPE_MATCHES`): libbpf never poisons those.
+#[test]
+fn missing_type_poisons_or_reads_as_absent() {
+    let mut local = TestBtf::new();
+    let int_ty = local.int("int", 4, true);
+    let gone = local.struct_("gone", 4, &[("field", int_ty, 0)]);
+    let r_offset = relo(&mut local, gone, "0:0", CoreReloKind::FieldByteOffset);
+    let r_exists = relo(&mut local, gone, "0:0", CoreReloKind::FieldExists);
+    let r_size = relo(&mut local, gone, "0", CoreReloKind::TypeSize);
+    let r_id_target = relo(&mut local, gone, "0", CoreReloKind::TypeIdTarget);
+    let local_bytes = local.encode();
+    let local_btf = Btf::parse(&local_bytes).unwrap();
+
+    let target = TestBtf::new();
+    let target_bytes = target.encode();
+    let target_btf = Btf::parse(&target_bytes).unwrap();
+
+    let mut insns = [insn(LDX_W, 0, 1, 0, 0)];
+    let unresolved = apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r_offset]).unwrap();
+    assert_eq!(
+        unresolved,
+        vec![Unresolved {
+            insn_off: 0,
+            error: CoreReloError::NoMatchingTarget { type_name: "gone".to_string(), access_str: "0:0".to_string() },
+        }]
+    );
+    assert_eq!(insns[0], 0x85 | u64::from(CORE_POISON_HELPER) << 32);
+
+    let mut insns = [insn(ALU64_MOV_K, 0, 0, 0, 1)];
+    let unresolved = apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r_exists]).unwrap();
+    assert!(unresolved.is_empty());
+    assert_eq!(imm_of(insns[0]), 0);
+
+    // TYPE_SIZE's orig_val is the local type's own size (4), validated against the
+    // instruction; a missing target still patches 0 rather than poisoning.
+    let mut insns = [insn(ALU64_MOV_K, 0, 0, 0, 4)];
+    let unresolved = apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r_size]).unwrap();
+    assert!(unresolved.is_empty());
+    assert_eq!(imm_of(insns[0]), 0);
+
+    // TYPE_ID_TARGET is never validated, so the starting imm is irrelevant.
+    let mut insns = [insn(ALU64_MOV_K, 0, 0, 0, 0xFFFF)];
+    let unresolved = apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r_id_target]).unwrap();
+    assert!(unresolved.is_empty());
+    assert_eq!(imm_of(insns[0]), 0);
 }

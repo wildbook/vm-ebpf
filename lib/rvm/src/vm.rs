@@ -16,12 +16,12 @@
 //!     0u64
 //! });
 //!
-//! // Register types for CO-RE
-//! vm.types()
-//!     .register_struct("event")
-//!     .field("timestamp", 0, 8)
-//!     .field("pid", 8, 4)
-//!     .size(12);
+//! // Describe the host's types, as BTF, for CO-RE
+//! let event = vm.types().add_struct("event", 12);
+//! let u64_t = vm.types().int("u64", 8, false);
+//! let u32_t = vm.types().int("u32", 4, false);
+//! vm.types().member(event, "timestamp", 0, u64_t);
+//! vm.types().member(event, "pid", 8, u32_t);
 //!
 //! // Parse and link a module
 //! let module = vm.parse_module("main", elf_bytes)?;
@@ -33,7 +33,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use btf::TypeRegistry;
+use btf::BtfBuilder;
 
 use crate::error::{Result, VmError};
 use crate::executor::DEFAULT_FRAME_SIZE;
@@ -80,8 +80,8 @@ pub struct Vm {
     shared_maps: SharedMaps,
     /// Buffers mapped into every program this VM links.
     shared_regions: Mutex<Vec<SharedRegion>>,
-    /// Type registry for CO-RE.
-    types: TypeRegistry,
+    /// Host BTF the program's own BTF resolves CO-RE relocations against.
+    types: BtfBuilder,
     /// VM configuration.
     config: VmConfig,
 }
@@ -108,7 +108,7 @@ impl Vm {
             helpers,
             shared_maps: SharedMaps::default(),
             shared_regions: Mutex::default(),
-            types: TypeRegistry::new(),
+            types: BtfBuilder::new(),
             config,
         }
     }
@@ -210,18 +210,18 @@ impl Vm {
     // Type Registration (CO-RE)
     // =========================================================================
 
-    /// Get the type registry for CO-RE support.
+    /// Get the host's BTF builder, for describing its types to CO-RE.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// vm.types()
-    ///     .register_struct("event")
-    ///     .field("timestamp", 0, 8)
-    ///     .field("pid", 8, 4)
-    ///     .size(12);
+    /// let event = vm.types().add_struct("event", 12);
+    /// let u64_t = vm.types().int("u64", 8, false);
+    /// let u32_t = vm.types().int("u32", 4, false);
+    /// vm.types().member(event, "timestamp", 0, u64_t);
+    /// vm.types().member(event, "pid", 8, u32_t);
     /// ```
-    pub fn types(&mut self) -> &mut TypeRegistry {
+    pub fn types(&mut self) -> &mut BtfBuilder {
         &mut self.types
     }
 
@@ -320,7 +320,7 @@ impl std::fmt::Debug for Vm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Vm")
             .field("helpers", &self.helpers)
-            .field("types", &format_args!("<TypeRegistry>"))
+            .field("types", &format_args!("<BtfBuilder>"))
             .field("config", &self.config)
             .finish()
     }

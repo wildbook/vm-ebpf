@@ -3,7 +3,7 @@
 //! This demo shows the correct CO-RE (Compile Once - Run Everywhere) workflow:
 //!
 //! 1. eBPF program is compiled with BTF describing types it *expects*
-//! 2. Host application registers its *actual* struct layouts in TypeRegistry
+//! 2. Host application describes its *actual* struct layouts as BTF, with `BtfBuilder`
 //! 3. At load time, CO-RE relocations patch eBPF instructions to use host's offsets
 //! 4. The patched program runs correctly against host's memory layout
 //!
@@ -27,7 +27,7 @@
 //! ┌─────────────────────────────────────────────────────────────────────┐
 //! │                         LOAD TIME                                   │
 //! │  ┌──────────────────┐          ┌──────────────────┐                │
-//! │  │ eBPF Program     │          │ Host TypeRegistry │                │
+//! │  │ eBPF Program     │          │ Host BTF          │                │
 //! │  │ + BTF (expected) │──────────│ (actual layout)   │                │
 //! │  └────────┬─────────┘          └─────────┬────────┘                │
 //! │           │                              │                          │
@@ -52,9 +52,9 @@
 //! └─────────────────────────────────────────────────────────────────────┘
 //! ```
 
-use btf::{apply_core_relocations, Btf, CoreRelo, CoreReloKind};
+use btf::{apply_core_relocations, Btf, BtfBuilder, CoreRelo, CoreReloKind};
 use ebpf_asm::{Assembler, CoreReloKind as AsmReloKind, R0, R1, R2, R3, R6};
-use rvm::{Executor, HelperRegistry, TypeRegistry, VmMemory};
+use rvm::{Executor, HelperRegistry, VmMemory};
 
 // ============================================================================
 // Host Helper Function IDs
@@ -78,6 +78,19 @@ fn build_helpers() -> HelperRegistry {
     helpers
 }
 
+/// Build the target BTF for the host's actual `struct event` layout.
+///
+/// `fields` is `(name, byte offset, byte size)`; `size` is the struct's total size.
+fn host_event(fields: &[(&str, u32, u32)], size: u32) -> Vec<u8> {
+    let mut b = BtfBuilder::new();
+    let s = b.add_struct("event", size);
+    for &(name, offset, field_size) in fields {
+        let int_ty = b.int(name, field_size, false);
+        b.member(s, name, offset, int_ty);
+    }
+    b.encode()
+}
+
 // ============================================================================
 // eBPF Program + BTF Builder (using ebpf-asm)
 // ============================================================================
@@ -92,6 +105,12 @@ struct EbpfProgram {
     btf_data: Vec<u8>,
     /// CO-RE relocations to apply (converted from assembler output)
     relocations: Vec<CoreRelo>,
+    /// String table offset of each field's libbpf access string ("0:<index>"), by
+    /// the field's position in the `fields` list passed to `build_btf`.
+    access_offs: Vec<u32>,
+    /// String table offset of the libbpf access string for type-kind relocations
+    /// (always the literal `"0"`, meaning "the root type, no further path").
+    type_root_access: u32,
 }
 
 impl EbpfProgram {
@@ -101,6 +120,8 @@ impl EbpfProgram {
             instructions: Vec::new(),
             btf_data: Vec::new(),
             relocations: Vec::new(),
+            access_offs: Vec::new(),
+            type_root_access: 0,
         }
     }
 
@@ -146,22 +167,40 @@ impl EbpfProgram {
         Ok(())
     }
 
-    /// Build minimal BTF for a struct type.
+    /// Build minimal local BTF for a struct type: a single `BTF_KIND_STRUCT` with one
+    /// member per field, named so libbpf-style access strings resolve against it.
     fn build_btf(&mut self, struct_name: &str, fields: &[(&str, u32)]) {
-        // String table: "\0<struct>\0<field1>\0<field2>\0..."
-        let mut strings = vec![0u8];
-        let struct_name_off = strings.len() as u32;
-        strings.extend_from_slice(struct_name.as_bytes());
-        strings.push(0);
-
-        let mut field_offs = Vec::new();
-        for (name, _) in fields {
-            field_offs.push(strings.len() as u32);
-            strings.extend_from_slice(name.as_bytes());
+        fn intern(strings: &mut Vec<u8>, text: &str) -> u32 {
+            let off = strings.len() as u32;
+            strings.extend_from_slice(text.as_bytes());
             strings.push(0);
+            off
         }
 
-        // Type section: struct type + members
+        let mut strings = vec![0u8];
+        let struct_name_off = intern(&mut strings, struct_name);
+        let field_offs: Vec<u32> = fields.iter().map(|(name, _)| intern(&mut strings, name)).collect();
+        // Libbpf access strings are always numeric index paths ("0:1" = member 1 of
+        // the root), never bare field names, so a dedicated string for each is needed.
+        self.access_offs = (0..fields.len())
+            .map(|i| intern(&mut strings, &format!("0:{i}")))
+            .collect();
+        // Type-kind relocations (e.g. TYPE_SIZE) always use "0": the root type itself.
+        self.type_root_access = intern(&mut strings, "0");
+
+        // Type 1: the struct. Each member points to an unsigned int type of its own
+        // size, emitted afterward (forward references are fine in BTF) - CO-RE checks
+        // that a local field's type is structurally compatible with the target's.
+        let mut int_id_by_size: Vec<(u32, u32)> = Vec::new();
+        let mut next_id = 2u32;
+        for &(_, size) in fields {
+            if !int_id_by_size.iter().any(|&(s, _)| s == size) {
+                int_id_by_size.push((size, next_id));
+                next_id += 1;
+            }
+        }
+        let int_id_for = |size: u32| int_id_by_size.iter().find(|&&(s, _)| s == size).unwrap().1;
+
         let mut types = Vec::new();
         let vlen = fields.len() as u32;
         let info = (4 << 24) | vlen; // kind=4 (struct)
@@ -172,11 +211,19 @@ impl EbpfProgram {
         types.extend_from_slice(&struct_size.to_le_bytes());
 
         let mut bit_offset = 0u32;
-        for (i, (_, size)) in fields.iter().enumerate() {
+        for (i, &(_, size)) in fields.iter().enumerate() {
             types.extend_from_slice(&field_offs[i].to_le_bytes());
-            types.extend_from_slice(&1u32.to_le_bytes()); // type_id (dummy)
+            types.extend_from_slice(&int_id_for(size).to_le_bytes());
             types.extend_from_slice(&bit_offset.to_le_bytes());
             bit_offset += size * 8;
+        }
+
+        // The int leaf types the members above reference.
+        for &(size, _) in &int_id_by_size {
+            types.extend_from_slice(&0u32.to_le_bytes()); // anonymous
+            types.extend_from_slice(&(1u32 << 24).to_le_bytes()); // kind=1 (int), vlen=0
+            types.extend_from_slice(&size.to_le_bytes());
+            types.extend_from_slice(&(size * 8).to_le_bytes()); // encoding=0, offset=0, bits=size*8
         }
 
         // Header
@@ -197,6 +244,16 @@ impl EbpfProgram {
         btf.extend_from_slice(&strings);
 
         self.btf_data = btf;
+    }
+
+    /// String table offset of the `build_btf` field at `index`'s access string.
+    fn field_access(&self, index: usize) -> u32 {
+        self.access_offs[index]
+    }
+
+    /// String table offset of the literal `"0"` access string for type-kind relocations.
+    fn type_access(&self) -> u32 {
+        self.type_root_access
     }
 
     /// Convert the raw u64 instructions to rvm's `Instruction` code slice.
@@ -225,20 +282,14 @@ impl EbpfProgram {
 /// ```
 ///
 /// The instruction that reads `pid` will be patched by CO-RE to use
-/// whatever offset the host's TypeRegistry says.
+/// whatever offset the host's BTF says.
 fn build_core_demo_program() -> EbpfProgram {
     let mut prog = EbpfProgram::new();
 
     // Build BTF: program expects struct event { timestamp(8), pid(4) }
     // This means BPF code expects pid at offset 8
     prog.build_btf("event", &[("timestamp", 8), ("pid", 4)]);
-
-    // BTF string table after building:
-    // offset 0: ""
-    // offset 1: "event"
-    // offset 7: "timestamp"
-    // offset 17: "pid"
-    let pid_str_off = 17u32;
+    let pid_access = prog.field_access(1);
 
     // === Program ===
     // r1 = pointer to event struct (passed as input)
@@ -247,7 +298,7 @@ fn build_core_demo_program() -> EbpfProgram {
     // Instruction 0: r2 = *(u32*)(r1 + OFFSET)
     // The offset here (8) is what BPF *expects*, but CO-RE will patch it
     prog.asm().ldxw(R2, R1, 8); // <-- This offset gets patched!
-    prog.asm().mark_field_offset(1, pid_str_off);
+    prog.asm().mark_field_offset(1, pid_access);
 
     // Save pid in a callee-saved register because the helper call clobbers r1-r5.
     prog.asm().mov64(R6, R2);
@@ -267,8 +318,8 @@ fn build_core_demo_program() -> EbpfProgram {
 }
 
 /// Apply `relos`, failing if any target is missing from the host. Returns the count.
-fn relocate(insns: &mut [u64], btf: &Btf, registry: &TypeRegistry, relos: &[CoreRelo]) -> Result<usize, String> {
-    match apply_core_relocations(insns, btf, registry, relos)
+fn relocate(insns: &mut [u64], local: &Btf, target: &Btf, relos: &[CoreRelo]) -> Result<usize, String> {
+    match apply_core_relocations(insns, local, target, relos)
         .map_err(|e| e.to_string())?
         .first()
     {
@@ -299,15 +350,11 @@ fn demo_core_relocation() -> Result<(), String> {
     // === Scenario 1: Host has SAME layout ===
     println!("--- Scenario 1: Host has same layout ---");
     {
-        let mut registry = TypeRegistry::new();
-        registry
-            .register_struct("event")
-            .field("timestamp", 0, 8)
-            .field("pid", 8, 4) // Same offset as BPF expects
-            .size(12);
+        let host_bytes = host_event(&[("timestamp", 0, 8), ("pid", 8, 4)], 12);
+        let target = Btf::parse(&host_bytes).unwrap();
 
         let mut prog_copy = prog.instructions.clone();
-        let applied = relocate(&mut prog_copy, &btf, &registry, &prog.relocations)?;
+        let applied = relocate(&mut prog_copy, &btf, &target, &prog.relocations)?;
 
         // LDX/STX relocations patch the instruction's `off` field, not `imm`.
         let patched_off = ((prog_copy[0] >> 16) & 0xFFFF) as i16;
@@ -322,16 +369,11 @@ fn demo_core_relocation() -> Result<(), String> {
     // === Scenario 2: Host has DIFFERENT layout ===
     println!("\n--- Scenario 2: Host added a field, pid moved! ---");
     {
-        let mut registry = TypeRegistry::new();
-        registry
-            .register_struct("event")
-            .field("timestamp", 0, 8)
-            .field("flags", 8, 4) // New field inserted!
-            .field("pid", 12, 4) // pid moved to offset 12
-            .size(16);
+        let host_bytes = host_event(&[("timestamp", 0, 8), ("flags", 8, 4), ("pid", 12, 4)], 16);
+        let target = Btf::parse(&host_bytes).unwrap();
 
         let mut prog_copy = prog.instructions.clone();
-        let applied = relocate(&mut prog_copy, &btf, &registry, &prog.relocations)?;
+        let applied = relocate(&mut prog_copy, &btf, &target, &prog.relocations)?;
 
         let patched_off = ((prog_copy[0] >> 16) & 0xFFFF) as i16;
         println!("  Host layout: event {{ timestamp: 0, flags: 8, pid: 12 }}");
@@ -357,14 +399,14 @@ fn build_correct_core_program() -> EbpfProgram {
 
     // BTF: program expects pid at offset 8
     prog.build_btf("event", &[("timestamp", 8), ("pid", 4)]);
-    let pid_str_off = 17u32;
+    let pid_access = prog.field_access(1);
 
     // === Program ===
     // Input: r1 = pointer to event struct
 
     // Instruction 0: r3 = OFFSET (will be patched by CO-RE)
     prog.asm().mov64_imm(R3, 8); // r3 = 8 (placeholder)
-    prog.asm().mark_field_offset(1, pid_str_off);
+    prog.asm().mark_field_offset(1, pid_access);
 
     // Instruction 1: r2 = r1 (copy base pointer)
     prog.asm().mov64(R2, R1);
@@ -410,16 +452,11 @@ fn demo_full_core_execution() -> Result<(), String> {
     // === Test with host layout where pid is at offset 12 ===
     println!("--- Host has: struct event {{ timestamp(0), flags(8), pid(12) }} ---\n");
 
-    let mut registry = TypeRegistry::new();
-    registry
-        .register_struct("event")
-        .field("timestamp", 0, 8)
-        .field("flags", 8, 4)
-        .field("pid", 12, 4)
-        .size(16);
+    let host_bytes = host_event(&[("timestamp", 0, 8), ("flags", 8, 4), ("pid", 12, 4)], 16);
+    let target = Btf::parse(&host_bytes).unwrap();
 
     // Apply CO-RE relocations
-    let applied = relocate(prog.instructions_mut(), &btf, &registry, &relocations)?;
+    let applied = relocate(prog.instructions_mut(), &btf, &target, &relocations)?;
 
     println!("Applied {applied} CO-RE relocation(s)");
 
@@ -485,12 +522,11 @@ fn demo_field_exists() -> Result<(), String> {
 
     // BTF: program checks for optional "debug_flags" field
     prog.build_btf("event", &[("timestamp", 8), ("pid", 4), ("debug_flags", 4)]);
-    // String offsets: "" (0), "event" (1), "timestamp" (7), "pid" (17), "debug_flags" (21)
-    let debug_flags_off = 21u32;
+    let debug_flags_access = prog.field_access(2);
 
     // Instruction 0: r1 = FIELD_EXISTS (1 or 0)
     prog.asm().mov64_imm(R1, 1); // placeholder: assume exists
-    prog.asm().mark_field_exists(1, debug_flags_off);
+    prog.asm().mark_field_exists(1, debug_flags_access);
 
     // Instruction 1: if r1 == 0 goto +2 (skip to return 0)
     prog.asm().raw(0x15, 1, 0, 2, 0); // jeq_imm r1, 0, +2
@@ -514,16 +550,11 @@ fn demo_field_exists() -> Result<(), String> {
     // Test 1: Host HAS the field
     println!("--- Scenario: Host HAS debug_flags ---");
     {
-        let mut registry = TypeRegistry::new();
-        registry
-            .register_struct("event")
-            .field("timestamp", 0, 8)
-            .field("pid", 8, 4)
-            .field("debug_flags", 12, 4)
-            .size(16);
+        let host_bytes = host_event(&[("timestamp", 0, 8), ("pid", 8, 4), ("debug_flags", 12, 4)], 16);
+        let target = Btf::parse(&host_bytes).unwrap();
 
         let mut instrs = prog.instructions.clone();
-        relocate(&mut instrs, &btf, &registry, &prog.relocations)?;
+        relocate(&mut instrs, &btf, &target, &prog.relocations)?;
 
         let exists_val = (instrs[0] >> 32) as i32;
         println!("  CO-RE patched FIELD_EXISTS = {exists_val}");
@@ -536,16 +567,12 @@ fn demo_field_exists() -> Result<(), String> {
     // Test 2: Host does NOT have the field
     println!("--- Scenario: Host does NOT have debug_flags ---");
     {
-        let mut registry = TypeRegistry::new();
-        registry
-            .register_struct("event")
-            .field("timestamp", 0, 8)
-            .field("pid", 8, 4)
-            // No debug_flags!
-            .size(12);
+        // No debug_flags!
+        let host_bytes = host_event(&[("timestamp", 0, 8), ("pid", 8, 4)], 12);
+        let target = Btf::parse(&host_bytes).unwrap();
 
         let mut instrs = prog.instructions.clone();
-        relocate(&mut instrs, &btf, &registry, &prog.relocations)?;
+        relocate(&mut instrs, &btf, &target, &prog.relocations)?;
 
         let exists_val = (instrs[0] >> 32) as i32;
         println!("  CO-RE patched FIELD_EXISTS = {exists_val}");
@@ -564,10 +591,11 @@ fn demo_type_size() -> Result<(), String> {
 
     let mut prog = EbpfProgram::new();
     prog.build_btf("event", &[("timestamp", 8), ("pid", 4)]);
+    let type_access = prog.type_access();
 
     // Instruction 0: r0 = sizeof(event) -- will be patched
     prog.asm().mov64_imm(R0, 12); // BPF expects 12
-    prog.asm().mark_type_size(1);
+    prog.asm().mark_core_relo(AsmReloKind::TypeSize, 1, type_access);
 
     prog.asm().exit();
     prog.finalize().unwrap();
@@ -575,17 +603,11 @@ fn demo_type_size() -> Result<(), String> {
     let btf = Btf::parse(&prog.btf_data).expect("BTF parse failed");
 
     // Host has larger struct
-    let mut registry = TypeRegistry::new();
-    registry
-        .register_struct("event")
-        .field("timestamp", 0, 8)
-        .field("flags", 8, 4)
-        .field("pid", 12, 4)
-        .field("extra", 16, 8)
-        .size(24);
+    let host_bytes = host_event(&[("timestamp", 0, 8), ("flags", 8, 4), ("pid", 12, 4), ("extra", 16, 8)], 24);
+    let target = Btf::parse(&host_bytes).unwrap();
 
     let mut instrs = prog.instructions.clone();
-    relocate(&mut instrs, &btf, &registry, &prog.relocations)?;
+    relocate(&mut instrs, &btf, &target, &prog.relocations)?;
 
     let size_val = (instrs[0] >> 32) as i32;
     println!("BPF program expected: sizeof(event) = 12");

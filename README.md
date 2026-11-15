@@ -37,9 +37,10 @@ cargo run --bin emu      # loads an ELF passed on the command line
 - `lib/constelf`: a `const fn` ELF reader used by `rvm` and by `bin/emu`'s
   compile-time address resolution.
 - `lib/btf`: BTF (BPF Type Format) parsing and CO-RE (Compile Once, Run
-  Everywhere) relocations. The host registers its actual struct layouts in a
-  `TypeRegistry`; relocations patch field-access instructions compiled
-  against a different layout to match.
+  Everywhere) relocations. The host describes its actual struct layouts as BTF,
+  with `BtfBuilder`; relocations patch field-access instructions compiled
+  against a different layout to match, exactly as kernel CO-RE matches a BPF
+  program's BTF against the kernel's.
 - `lib/ebpf-asm`: an assembler and disassembler used by tests and benchmarks
   to build eBPF bytecode without a C toolchain.
 - `bin/loader`, `bin/demo`, `bin/emu`: example programs. `loader` shows the

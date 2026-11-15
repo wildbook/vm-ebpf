@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use btf::{apply_core_relocations, Btf, BtfTypeInfo, TypeRegistry};
+use btf::{apply_core_relocations, Btf, BtfBuilder, BtfTypeInfo};
 use constelf::raw::reloc;
 use hashbrown::HashMap;
 use rvm_core::instructions_from_bytes;
@@ -96,7 +96,7 @@ pub struct Linker<'a> {
     helpers: &'a Arc<SharedHelpers>,
     shared_maps: &'a SharedMaps,
     shared_regions: &'a [SharedRegion],
-    types: &'a TypeRegistry,
+    types: &'a BtfBuilder,
     config: &'a VmConfig,
 }
 
@@ -106,7 +106,7 @@ impl<'a> Linker<'a> {
         helpers: &'a Arc<SharedHelpers>,
         shared_maps: &'a SharedMaps,
         shared_regions: &'a [SharedRegion],
-        types: &'a TypeRegistry,
+        types: &'a BtfBuilder,
         config: &'a VmConfig,
     ) -> Self {
         Self {
@@ -133,6 +133,11 @@ impl<'a> Linker<'a> {
             .map(|m| m.btf_data.as_deref().map(Btf::parse).transpose())
             .collect::<std::result::Result<Vec<Option<Btf<'m>>>, _>>()?;
 
+        // The host's types, encoded once as standard BTF and shared by every
+        // CO-RE relocation below, the same way a second translation unit would be.
+        let target_bytes = self.types.encode();
+        let target = Btf::parse(&target_bytes)?;
+
         let (mut image, layouts) = Self::lay_out(modules);
         let global_symbols = Self::build_symbol_table(modules, &layouts)?;
         Self::check_extern_signatures(&helpers, &btfs)?;
@@ -155,7 +160,7 @@ impl<'a> Linker<'a> {
             }
         }
         Self::bind_helper_calls(&helpers, &mut image)?;
-        self.apply_core_relocations(modules, &layouts, &btfs, &mut image)?;
+        self.apply_core_relocations(modules, &layouts, &btfs, &target, &mut image)?;
 
         let functions = Self::build_function_table(modules, &layouts, &btfs)?;
 
@@ -391,6 +396,7 @@ impl<'a> Linker<'a> {
         modules: &[&Module],
         layouts: &[ModuleLayout],
         btfs: &[Option<Btf<'_>>],
+        target: &Btf<'_>,
         image: &mut Image,
     ) -> Result<()> {
         for ((module, layout), btf) in modules.iter().zip(layouts).zip(btfs) {
@@ -419,7 +425,7 @@ impl<'a> Linker<'a> {
                     .iter()
                     .map(|w| u64::from_le_bytes(*w))
                     .collect();
-                apply_core_relocations(&mut insns, btf, self.types, relos).map_err(LinkError::CoreRelo)?;
+                apply_core_relocations(&mut insns, btf, target, relos).map_err(LinkError::CoreRelo)?;
                 for (dst, insn) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(&insns) {
                     *dst = insn.to_le_bytes();
                 }

@@ -2,51 +2,55 @@
 //!
 //! This crate provides:
 //! - Parsing of BTF sections from eBPF ELF files
-//! - A type registry for host applications to register their struct layouts
+//! - A builder for host applications to describe their types as BTF
 //! - CO-RE (Compile Once - Run Everywhere) relocation support
 //!
 //! # Non-Kernel Use Case
 //!
 //! Unlike kernel eBPF, this library is designed for embedding eBPF in user applications.
-//! The host application defines "target" types (like a kernel would), and eBPF programs
-//! compiled with BTF have their field accesses relocated to match the host's actual layouts.
+//! The host application's types stand in for the kernel's: eBPF programs compiled with
+//! BTF have their field accesses relocated to match the host's actual layouts, exactly as
+//! kernel CO-RE relocates a program's accesses against the running kernel's BTF.
 //!
 //! # Example
 //!
 //! ```ignore
-//! use btf::{Btf, TypeRegistry};
+//! use btf::{Btf, BtfBuilder};
 //!
-//! // Host application registers its struct layout
-//! let mut registry = TypeRegistry::new();
-//! registry.register_struct("my_event", &[
-//!     ("timestamp", 0, 8),  // offset 0, size 8
-//!     ("pid", 8, 4),        // offset 8, size 4
-//!     ("data", 16, 64),     // offset 16, size 64
-//! ]);
+//! // Host application describes its struct layout as BTF
+//! let mut host = BtfBuilder::new();
+//! let u64_t = host.int("u64", 8, false);
+//! let u32_t = host.int("u32", 4, false);
+//! let event = host.add_struct("my_event", 24);
+//! host.member(event, "timestamp", 0, u64_t);
+//! host.member(event, "pid", 8, u32_t);
+//! host.member(event, "data", 16, u64_t);
+//! let target_bytes = host.encode();
+//! let target = Btf::parse(&target_bytes)?;
 //!
 //! // Parse BTF from eBPF program
-//! let btf = Btf::parse(btf_section_bytes)?;
+//! let local = Btf::parse(btf_section_bytes)?;
 //!
 //! // Apply CO-RE relocations
 //! let relocations = parse_btf_ext(btf_ext_bytes)?;
-//! apply_core_relocations(&mut instructions, &btf, &registry, &relocations)?;
+//! apply_core_relocations(&mut instructions, &local, &target, &relocations)?;
 //! ```
 
+mod builder;
 mod core_relo;
 mod parse;
 mod raw;
-mod registry;
 mod strings;
 mod types;
 
 #[cfg(test)]
 mod integration_tests;
 
+pub use builder::BtfBuilder;
 pub use core_relo::{
     apply_core_relocations, BtfExt, CoreRelo, CoreReloError, CoreReloKind, Unresolved, CORE_POISON_HELPER,
 };
 pub use parse::{Btf, BtfError};
 pub use raw::*;
-pub use registry::{EnumDef, EnumVariant, StructDef, StructField, TypeRegistry};
 pub use strings::BtfStrings;
 pub use types::*;
