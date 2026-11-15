@@ -364,3 +364,123 @@ fn test_multiple_relocations() {
     assert_eq!((instructions[1] >> 32) as u32, 4); // dst_ip at 4
     assert_eq!((instructions[2] >> 32) as u32, 8); // src_port at 8
 }
+
+// ==================== clang-style access strings ====================
+
+/// Raw BTF builder: `types` are pre-encoded `btf_type` records; `strings` starts with "\0".
+fn build_raw_btf(types: &[u32], strings: &[u8]) -> Vec<u8> {
+    let types: Vec<u8> = types.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let mut btf = Vec::new();
+    btf.extend_from_slice(&BTF_MAGIC.to_le_bytes());
+    btf.extend_from_slice(&[BTF_VERSION, 0]);
+    for w in [24, 0, types.len() as u32, types.len() as u32, strings.len() as u32] {
+        btf.extend_from_slice(&w.to_le_bytes());
+    }
+    btf.extend_from_slice(&types);
+    btf.extend_from_slice(strings);
+    btf
+}
+
+/// Local (compile-time) types:
+/// 1 int; 2 struct inner { int x; int y; }; 3 struct outer { int a; struct inner in; };
+/// 4 enum color { RED, GREEN, BLUE }; 5 typedef struct outer ev_t.
+/// Access strings live at: "0:1:1"=1, "2:1"=7, "0:1:0"=11, "2"=17.
+fn clang_style_btf() -> Vec<u8> {
+    let strings = b"\x000:1:1\x002:1\x000:1:0\x002\0int\0inner\0x\0y\0outer\0a\0in\0color\0RED\0GREEN\0BLUE\0ev_t\0";
+    let s = |name: &str| {
+        let needle = [name.as_bytes(), b"\0"].concat();
+        (1..strings.len()).find(|&i| strings[i - 1] == 0 && strings[i..].starts_with(&needle)).unwrap() as u32
+    };
+    #[rustfmt::skip]
+    let types = [
+        s("int"), 1 << 24, 4, 32,                                     // 1: int
+        s("inner"), 4 << 24 | 2, 8, s("x"), 1, 0, s("y"), 1, 32,      // 2: struct inner
+        s("outer"), 4 << 24 | 2, 12, s("a"), 1, 0, s("in"), 2, 32,    // 3: struct outer
+        s("color"), 6 << 24 | 3, 4, s("RED"), 0, s("GREEN"), 1, s("BLUE"), 2, // 4: enum color
+        s("ev_t"), 8 << 24, 3,                                        // 5: typedef
+    ];
+    build_raw_btf(&types, strings)
+}
+
+/// Host layout differs from the local one at every level.
+fn clang_style_registry() -> TypeRegistry {
+    let mut registry = TypeRegistry::new();
+    registry.register_struct("inner").field("x", 0, 4).field("y", 8, 4).size(16);
+    registry.register_struct("outer").field("a", 0, 4).field("in", 8, 16).size(24);
+    registry
+        .register_enum("color", 4, false)
+        .variant("RED", 0)
+        .variant("GREEN", 1)
+        .variant("BLUE", 7);
+    registry
+}
+
+fn relo(type_id: u32, access_str_off: u32, kind: CoreReloKind) -> CoreRelo {
+    CoreRelo {
+        insn_off: 0,
+        type_id,
+        access_str_off,
+        kind,
+    }
+}
+
+/// LDX_W r0, [r1 + off]
+const LDXW: u64 = 0x61 | 1 << 12;
+
+fn patched_off(insn: u64) -> i16 {
+    (insn >> 16) as i16
+}
+
+#[test]
+fn test_core_nested_and_array_access() {
+    let btf_data = clang_style_btf();
+    let btf = Btf::parse(&btf_data).unwrap();
+    let registry = clang_style_registry();
+
+    for (type_id, access, want) in [
+        (3, 1, 16),  // outer.in.y = 8 + 8
+        (3, 7, 56),  // p[2].in = 2 * 24 + 8
+        (5, 11, 8),  // typedef root: ev_t.in.x = 8 + 0
+    ] {
+        let mut insns = [LDXW];
+        apply_core_relocations(&mut insns, &btf, &registry, &[relo(type_id, access, CoreReloKind::FieldByteOffset)])
+            .unwrap();
+        assert_eq!(patched_off(insns[0]), want, "type {type_id} access@{access}");
+    }
+
+    let mut insns = [0u64];
+    apply_core_relocations(&mut insns, &btf, &registry, &[relo(3, 1, CoreReloKind::FieldByteSize)]).unwrap();
+    assert_eq!(insns[0] >> 32, 4);
+}
+
+#[test]
+fn test_core_enum_value_by_index() {
+    let btf_data = clang_style_btf();
+    let btf = Btf::parse(&btf_data).unwrap();
+    let mut registry = clang_style_registry();
+
+    let mut insns = [0u64];
+    apply_core_relocations(&mut insns, &btf, &registry, &[relo(4, 17, CoreReloKind::EnumvalValue)]).unwrap();
+    assert_eq!(insns[0] >> 32, 7);
+
+    // LD_IMM64 receives the full 64-bit value across both slots.
+    registry.register_enum("color", 8, false).variant("BLUE", 0x1_0000_0007);
+    let mut insns = [0x18u64, 0];
+    apply_core_relocations(&mut insns, &btf, &registry, &[relo(4, 17, CoreReloKind::EnumvalValue)]).unwrap();
+    assert_eq!((insns[0] >> 32) | (insns[1] >> 32) << 32, 0x1_0000_0007);
+}
+
+#[test]
+fn test_core_patches_off_for_all_memory_classes() {
+    let btf_data = clang_style_btf();
+    let btf = Btf::parse(&btf_data).unwrap();
+    let registry = clang_style_registry();
+
+    // ST_W [r1 + off], 5 / LDXSW (MEMSX) / atomic ADD_W: `off` is patched, imm keeps its meaning.
+    for insn in [0x62 | 1 << 8 | 5 << 32, 0x81 | 1 << 12, 0xc3 | 1 << 8 | 2 << 12] {
+        let mut insns = [insn];
+        apply_core_relocations(&mut insns, &btf, &registry, &[relo(3, 1, CoreReloKind::FieldByteOffset)]).unwrap();
+        assert_eq!(patched_off(insns[0]), 16, "opcode {:#x}", insn as u8);
+        assert_eq!(insns[0] >> 32, insn >> 32, "imm changed for opcode {:#x}", insn as u8);
+    }
+}

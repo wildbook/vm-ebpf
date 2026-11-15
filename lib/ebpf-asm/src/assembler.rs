@@ -177,13 +177,8 @@ pub struct AssembledProgram {
 impl AssembledProgram {
     /// Get the bytecode as u64 instruction words.
     pub fn instructions(&self) -> Vec<u64> {
-        self.bytecode
-            .chunks_exact(8)
-            .map(|chunk| {
-                let arr: [u8; 8] = chunk.try_into().unwrap();
-                u64::from_le_bytes(arr)
-            })
-            .collect()
+        let (words, _) = self.bytecode.as_chunks::<8>();
+        words.iter().map(|w| u64::from_le_bytes(*w)).collect()
     }
 }
 
@@ -335,8 +330,9 @@ impl Assembler {
     /// Get the byte offset for a given instruction index.
     ///
     /// CO-RE relocations use byte offsets, not instruction indices.
-    /// This helper converts an instruction index to its byte offset
-    /// (instruction_index * 8).
+    /// Wide instructions (LDDW) occupy 16 bytes.
+    ///
+    /// Indices past the end assume 8-byte instructions follow.
     ///
     /// # Example
     ///
@@ -350,7 +346,11 @@ impl Assembler {
     /// ```
     #[inline]
     pub fn byte_offset(&self, insn_index: usize) -> u32 {
-        (insn_index * 8) as u32
+        let wide_before = self.instructions[..insn_index.min(self.instructions.len())]
+            .iter()
+            .filter(|insn| insn.raw2.is_some())
+            .count();
+        ((insn_index + wide_before) * 8) as u32
     }
 
     /// Get the byte offset for the current instruction position.
@@ -359,6 +359,18 @@ impl Assembler {
     #[inline]
     pub fn current_byte_offset(&self) -> u32 {
         self.byte_offset(self.instructions.len())
+    }
+
+    /// Slot index (8-byte units) of each instruction entry, plus the total at the end.
+    fn slot_prefix(&self) -> Vec<usize> {
+        let mut slots = Vec::with_capacity(self.instructions.len() + 1);
+        let mut slot = 0;
+        slots.push(slot);
+        for insn in &self.instructions {
+            slot += if insn.raw2.is_some() { 2 } else { 1 };
+            slots.push(slot);
+        }
+        slots
     }
 
     /// Create a new unbound label.
@@ -413,6 +425,9 @@ impl Assembler {
     ///
     /// Resolves all label references and returns the final bytecode.
     pub fn assemble(&mut self) -> Result<Vec<u8>, AsmError> {
+        // Labels and refs hold entry indices; jumps count 8-byte slots (LDDW takes two).
+        let slot_of = self.slot_prefix();
+
         // Resolve all label references
         for i in 0..self.label_refs.len() {
             let label_ref = &self.label_refs[i];
@@ -422,9 +437,8 @@ impl Assembler {
                 .copied()
                 .ok_or_else(|| AsmError::UndefinedLabel(format!("L{}", label_ref.label_id)))?;
 
-            // Calculate offset (target - (source + 1))
-            // eBPF jumps are relative to the NEXT instruction
-            let offset = (target_pos as i64) - (label_ref.insn_index as i64 + 1);
+            // eBPF jumps are relative to the NEXT slot
+            let offset = (slot_of[target_pos] as i64) - (slot_of[label_ref.insn_index] as i64 + 1);
             let insn_index = label_ref.insn_index;
             let ref_type = label_ref.ref_type;
 
@@ -493,12 +507,8 @@ impl Assembler {
     /// ```
     pub fn assemble_to_u64(&mut self) -> Result<Vec<u64>, AsmError> {
         let bytes = self.assemble()?;
-        let mut instructions = Vec::with_capacity(bytes.len() / 8);
-        for chunk in bytes.chunks_exact(8) {
-            let arr: [u8; 8] = chunk.try_into().unwrap();
-            instructions.push(u64::from_le_bytes(arr));
-        }
-        Ok(instructions)
+        let (words, _) = bytes.as_chunks::<8>();
+        Ok(words.iter().map(|w| u64::from_le_bytes(*w)).collect())
     }
 
     /// Reset the assembler for reuse.
@@ -601,18 +611,7 @@ impl Assembler {
     /// Returns both the bytecode and the resolved CO-RE relocations.
     /// Each relocation's `insn_off` is set to the byte offset of its instruction.
     pub fn assemble_with_core(&mut self) -> Result<AssembledProgram, AsmError> {
-        // First, compute instruction byte offsets
-        // Wide instructions (LDDW) take 16 bytes, others take 8
-        let mut byte_offsets = Vec::with_capacity(self.instructions.len());
-        let mut current_offset = 0u32;
-
-        for insn in &self.instructions {
-            byte_offsets.push(current_offset);
-            current_offset += 8;
-            if insn.raw2.is_some() {
-                current_offset += 8;
-            }
-        }
+        let byte_offsets: Vec<u32> = self.slot_prefix().iter().map(|&s| (s * 8) as u32).collect();
 
         // Assemble the bytecode
         let bytecode = self.assemble()?;
@@ -2021,5 +2020,26 @@ mod tests {
         assert_eq!(code[0], 0x1e);
         // src register should be R1 (1) in upper nibble of byte 1
         assert_eq!((code[1] >> 4) & 0xF, 1);
+    }
+
+    #[test]
+    fn test_jump_offsets_count_lddw_slots() {
+        let mut asm = Assembler::new();
+        let mut fwd = asm.create_label();
+        let mut back = asm.create_label();
+
+        asm.set_label(&mut back).unwrap();
+        asm.ja(&fwd); // slot 0
+        asm.lddw(R0, 0x1_0000_0002); // slots 1-2
+        asm.ja(&back); // slot 3
+        asm.set_label(&mut fwd).unwrap();
+        asm.exit(); // slot 4
+        assert_eq!(asm.current_byte_offset(), 40);
+        assert_eq!(asm.byte_offset(2), 24);
+
+        let insns = asm.assemble_to_u64().unwrap();
+        let off = |i: usize| (insns[i] >> 16) as i16;
+        assert_eq!(off(0), 3); // 0 + 1 + 3 = 4 (exit)
+        assert_eq!(off(3), -4); // 3 + 1 - 4 = 0
     }
 }
