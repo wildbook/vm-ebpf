@@ -57,6 +57,16 @@ impl Plugin {
         self.program.clear_poison();
     }
 
+    /// A handle that doesn't keep the plugin alive. Host functions that call back into
+    /// a plugin should hold this: they live in the `Vm` that every plugin's program
+    /// refers to, so a strong handle would be a cycle that frees neither.
+    pub fn downgrade(&self) -> WeakPlugin {
+        WeakPlugin {
+            name: self.name.clone(),
+            program: Arc::downgrade(&self.program),
+        }
+    }
+
     /// The extern that calls `func` in this plugin.
     pub fn export_fn(
         &self,
@@ -106,6 +116,23 @@ impl Plugin {
             }
             result
         }
+    }
+}
+
+/// A [`Plugin`] handle that doesn't keep it alive; see [`Plugin::downgrade`].
+#[derive(Clone)]
+pub struct WeakPlugin {
+    name: Arc<str>,
+    program: Weak<Mutex<Program>>,
+}
+
+impl WeakPlugin {
+    /// The plugin, unless every [`Plugin`] handle to it was dropped.
+    pub fn upgrade(&self) -> Option<Plugin> {
+        Some(Plugin {
+            name: self.name.clone(),
+            program: self.program.upgrade()?,
+        })
     }
 }
 

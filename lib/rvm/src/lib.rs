@@ -79,7 +79,7 @@ pub use memory::{
     region_base, Memory, Perms, Scalar, SharedBuffer, SharedRegion, VmMemory, MAX_REGIONS, MAX_REGION_LEN, REGION_SHIFT,
 };
 pub use module::Module;
-pub use plugin::Plugin;
+pub use plugin::{Plugin, WeakPlugin};
 pub use program::{Borrow, FunctionInfo, Program};
 pub use rvm_core::{instructions_from_bytes, AtomicOp, Instruction};
 pub use section::{Section, SectionKind};

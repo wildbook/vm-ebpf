@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rvm::{LinkError, Plugin, Vm, VmError};
+use rvm::{LinkError, Vm, VmError, WeakPlugin};
 
 use crate::common::object;
 
@@ -33,16 +33,18 @@ fn reentrant_call_fails_instead_of_deadlocking() {
     let a = vm.load_plugin("a", &object("plugin_a.o")).unwrap();
     vm.export(&a, "a_scale").unwrap();
 
-    // host_reenter calls back into b while b is running.
-    let b_slot: Arc<OnceLock<Plugin>> = Arc::default();
+    // host_reenter calls back into b while b is running. It holds b weakly: a strong
+    // handle inside the Vm's own helper table would never be freed.
+    let b_slot: Arc<OnceLock<WeakPlugin>> = Arc::default();
     let reentrant_busy = Arc::new(Mutex::new(false));
     let (slot, busy) = (b_slot.clone(), reentrant_busy.clone());
     vm.register_fn("host_reenter", move |x: u64| {
-        let result = slot.get().unwrap().call("b_run", &[x]);
+        let result = slot.get().unwrap().upgrade().unwrap().call("b_run", &[x]);
         *busy.lock().unwrap() = matches!(&result, Err(VmError::PluginBusy(n)) if n == "b");
         result
     });
-    let b = b_slot.get_or_init(|| vm.load_plugin("b", &object("plugin_b.o")).unwrap());
+    let b = vm.load_plugin("b", &object("plugin_b.o")).unwrap();
+    b_slot.set(b.downgrade()).ok().unwrap();
 
     assert_eq!(b.call("b_reenter", &[5]).unwrap(), u64::MAX);
     assert!(*reentrant_busy.lock().unwrap());

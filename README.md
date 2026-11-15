@@ -143,6 +143,15 @@ call-heavy loops built with `ebpf-asm`.
 [bpf_conformance](https://github.com/Alan-Jowett/bpf_conformance) suite, vendored
 under `lib/rvm/tests/conformance/`, against the interpreter.
 
+Miri checks the `unsafe` memory code. The integration tests list fixture directories,
+which Miri only supports on Unix targets, so they run as Linux (about 8 minutes):
+
+```bash
+cargo miri test -p rvm-core
+cargo miri test -p rvm --lib
+MIRIFLAGS=-Zmiri-disable-isolation cargo miri test -p rvm --test integration --target x86_64-unknown-linux-gnu
+```
+
 ## Scope
 
 Not implemented: kfunc BTF ID resolution, and the legacy packet access modes
