@@ -521,15 +521,13 @@ fn resolve_field(
     // Plain field name on the root struct.
     if !access_str.bytes().all(|c| c.is_ascii_digit() || c == b':') {
         let owner = root.name().unwrap_or("");
-        return Ok(
-            match (registry.field_offset(owner, access_str), registry.field_size(owner, access_str)) {
-                (Some(offset), Some(size)) => Ok(HostField {
-                    offset: offset as u64,
-                    size: size as u64,
-                }),
-                _ => Err((owner.to_string(), access_str.to_string())),
-            },
-        );
+        return Ok(match (registry.field_offset(owner, access_str), registry.field_size(owner, access_str)) {
+            (Some(offset), Some(size)) => Ok(HostField {
+                offset: offset as u64,
+                size: size as u64,
+            }),
+            _ => Err((owner.to_string(), access_str.to_string())),
+        });
     }
 
     let mut indices = access_str.split(':').map(|s| s.parse::<u64>().map_err(|_| invalid()));
@@ -550,10 +548,9 @@ fn resolve_field(
         match cur {
             BtfTypeInfo::Struct { name, members, .. } | BtfTypeInfo::Union { name, members, .. } => {
                 let member = members.get(idx as usize).ok_or_else(invalid)?;
-                let (Some(field_off), Some(field_size)) = (
-                    registry.field_offset(name, member.name),
-                    registry.field_size(name, member.name),
-                ) else {
+                let (Some(field_off), Some(field_size)) =
+                    (registry.field_offset(name, member.name), registry.field_size(name, member.name))
+                else {
                     return Ok(Err((name.to_string(), member.name.to_string())));
                 };
                 offset += field_off as u64;
@@ -581,9 +578,7 @@ fn resolve_field(
 /// (ints, enums, pointers, arrays of those) keeps its local BTF size.
 fn host_size(ty: &BtfTypeInfo<'_>, btf: &Btf<'_>, registry: &TypeRegistry) -> Result<Option<u64>, CoreReloError> {
     Ok(match ty {
-        BtfTypeInfo::Struct { name, .. } | BtfTypeInfo::Union { name, .. } => {
-            registry.struct_size(name).map(u64::from)
-        }
+        BtfTypeInfo::Struct { name, .. } | BtfTypeInfo::Union { name, .. } => registry.struct_size(name).map(u64::from),
         BtfTypeInfo::Ptr { .. } => Some(8),
         BtfTypeInfo::Array { elem_type, nelems, .. } => {
             host_size(resolve_id(btf, *elem_type)?, btf, registry)?.map(|s| s * u64::from(*nelems))

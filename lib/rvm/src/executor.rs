@@ -127,10 +127,10 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
                 Flow::OutOfFuel => return Err(ExecError::InstructionLimit(limit).into()),
                 Flow::BadPc => return Err(ExecError::InvalidPc(pc).into()),
                 Flow::FailCpu => return Err(ExecError::CpuFault("invalid instruction".to_string()).into()),
-                Flow::FailMem(err) => return Err(ExecError::MemoryFault(format!("access at {err:#x?} (pc {pc})")).into()),
-                Flow::Missing => {
-                    return Err(ExecError::Unimplemented("instruction not implemented".to_string()).into())
+                Flow::FailMem(err) => {
+                    return Err(ExecError::MemoryFault(format!("access at {err:#x?} (pc {pc})")).into())
                 }
+                Flow::Missing => return Err(ExecError::Unimplemented("instruction not implemented".to_string()).into()),
                 // `run` handles these internally
                 Flow::Next | Flow::Jump(_) => unreachable!(),
             };

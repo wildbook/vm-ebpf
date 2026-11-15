@@ -202,14 +202,20 @@ mod linking {
         vm.register_fn("host_add", |x: u64| x);
         assert!(matches!(
             link(&vm).unwrap_err(),
-            VmError::Link(LinkError::SignatureMismatch { declared: 2, host: 1, .. })
+            VmError::Link(LinkError::SignatureMismatch {
+                declared: 2,
+                host: 1,
+                ..
+            })
         ));
     }
 
     #[test]
     fn replacing_extern_rebinds_linked_calls() {
         let mut program = link(&full_vm()).unwrap();
-        program.helpers_mut().register_fn("host_add", |(a, b): (u64, u64)| a * b);
+        program
+            .helpers_mut()
+            .register_fn("host_add", |(a, b): (u64, u64)| a * b);
         assert_eq!(program.call("run", &[7]).unwrap(), 21 * 14);
     }
 }

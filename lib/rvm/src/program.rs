@@ -5,11 +5,12 @@
 
 use std::collections::HashMap;
 
+use rvm_core::Instruction;
+
 use crate::error::{Result, VmError};
 use crate::executor::Executor;
 use crate::helper::HelperRegistry;
 use crate::memory::VmMemory;
-use rvm_core::Instruction;
 
 /// Information about an executable function.
 #[derive(Debug, Clone)]

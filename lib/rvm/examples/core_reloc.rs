@@ -273,4 +273,3 @@ fn write_runtime_event_to_memory(program: &mut rvm::Program, event: &RuntimeEven
 
     event_addr
 }
-

@@ -194,10 +194,19 @@ impl<'a> Linker<'a> {
                 continue;
             };
             for (_, ty) in btf.types() {
-                let BtfTypeInfo::Func { name, proto_type, linkage: BTF_FUNC_EXTERN } = ty else {
+                let BtfTypeInfo::Func {
+                    name,
+                    proto_type,
+                    linkage: BTF_FUNC_EXTERN,
+                } = ty
+                else {
                     continue;
                 };
-                let Some(host) = self.helpers.slot_of_name(name).and_then(|slot| self.helpers.arity(slot)) else {
+                let Some(host) = self
+                    .helpers
+                    .slot_of_name(name)
+                    .and_then(|slot| self.helpers.arity(slot))
+                else {
                     continue;
                 };
                 let Some(BtfTypeInfo::FuncProto { params, .. }) = btf.type_by_id(*proto_type) else {
@@ -209,7 +218,12 @@ impl<'a> Linker<'a> {
                 }
                 if params.len() != usize::from(host) {
                     let name = name.to_string();
-                    return Err(LinkError::SignatureMismatch { name, declared: params.len(), host }.into());
+                    return Err(LinkError::SignatureMismatch {
+                        name,
+                        declared: params.len(),
+                        host,
+                    }
+                    .into());
                 }
             }
         }
@@ -278,7 +292,8 @@ impl<'a> Linker<'a> {
             return Err(LinkError::UnresolvedSymbol(symbol.name.clone()).into());
         };
 
-        let bad_target = || LinkError::InvalidReference(format!("relocation type {} -> {}", reloc.rel_type, symbol.name));
+        let bad_target =
+            || LinkError::InvalidReference(format!("relocation type {} -> {}", reloc.rel_type, symbol.name));
 
         match (reloc.rel_type, sym_addr) {
             (reloc::bpf::BPF_64_64, Addr::Data(addr)) => {
@@ -354,7 +369,12 @@ impl<'a> Linker<'a> {
                 };
 
                 let bytes = &mut image.code[at as usize..(at + section.size) as usize];
-                let mut insns: Vec<u64> = bytes.as_chunks::<8>().0.iter().map(|w| u64::from_le_bytes(*w)).collect();
+                let mut insns: Vec<u64> = bytes
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|w| u64::from_le_bytes(*w))
+                    .collect();
                 let _ = apply_core_relocations(&mut insns, &btf, self.types, relos);
                 for (dst, insn) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(&insns) {
                     *dst = insn.to_le_bytes();
@@ -380,12 +400,16 @@ impl<'a> Linker<'a> {
             .iter()
             .zip(layouts)
             .flat_map(|(module, layout)| {
-                module.exports.iter().filter(|(_, e)| e.is_function).filter_map(|(name, export)| {
-                    let Addr::Code(at) = layout.sections.get(&export.section_idx)?.offset(export.offset) else {
-                        return None;
-                    };
-                    Some(function(name, at, export.size))
-                })
+                module
+                    .exports
+                    .iter()
+                    .filter(|(_, e)| e.is_function)
+                    .filter_map(|(name, export)| {
+                        let Addr::Code(at) = layout.sections.get(&export.section_idx)?.offset(export.offset) else {
+                            return None;
+                        };
+                        Some(function(name, at, export.size))
+                    })
             })
             .collect();
 

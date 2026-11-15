@@ -920,7 +920,11 @@ fn test_jmp32_unsigned_compare_negative_imm() {
 fn test_movsx() {
     let mut ctx = Context::new(TestMem::new());
     ctx.regs[2] = 0x1234_5678_8000_8080;
-    for (off, want) in [(8, 0xFFFF_FFFF_FFFF_FF80), (16, 0xFFFF_FFFF_FFFF_8080), (32, 0xFFFF_FFFF_8000_8080)] {
+    for (off, want) in [
+        (8, 0xFFFF_FFFF_FFFF_FF80),
+        (16, 0xFFFF_FFFF_FFFF_8080),
+        (32, 0xFFFF_FFFF_8000_8080),
+    ] {
         exec(&mut ctx, instr(AluOpc::mov_64(Source::Reg), 1, 2, off, 0));
         assert_eq!(ctx.regs[1], want, "movsx64 off={off}");
     }

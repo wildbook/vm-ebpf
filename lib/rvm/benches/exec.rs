@@ -24,7 +24,11 @@ fn alu_loop() -> Assembler {
     let mut top = asm.create_label();
     asm.mov64_imm(R0, 0).mov64_imm(R1, 0);
     asm.set_label(&mut top).unwrap();
-    asm.mov64(R2, R1).mul64_imm(R2, 3).xor64(R2, R1).add64(R0, R2).add64_imm(R1, 1);
+    asm.mov64(R2, R1)
+        .mul64_imm(R2, 3)
+        .xor64(R2, R1)
+        .add64(R0, R2)
+        .add64_imm(R1, 1);
     asm.jlt_imm(R1, N, &top);
     asm.exit();
     asm
@@ -83,7 +87,11 @@ fn bench(c: &mut Criterion) {
     ];
     for (name, (code, mut mem, stack_top)) in programs {
         group.bench_function(name, |b| {
-            b.iter(|| Executor::new(&code, &mut mem, &helpers, stack_top).call(0, black_box(&[])).unwrap())
+            b.iter(|| {
+                Executor::new(&code, &mut mem, &helpers, stack_top)
+                    .call(0, black_box(&[]))
+                    .unwrap()
+            })
         });
     }
     group.finish();

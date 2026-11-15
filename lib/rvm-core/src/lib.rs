@@ -19,7 +19,12 @@ pub struct Instruction(pub u64);
 
 /// Decode little-endian bytecode into instructions (a trailing partial word is ignored).
 pub fn instructions_from_bytes(bytes: &[u8]) -> Box<[Instruction]> {
-    bytes.as_chunks::<8>().0.iter().map(|w| Instruction(u64::from_le_bytes(*w))).collect()
+    bytes
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|w| Instruction(u64::from_le_bytes(*w)))
+        .collect()
 }
 
 impl Instruction {
@@ -152,14 +157,30 @@ impl Memory for () {
 impl<M: Memory + ?Sized> Memory for &mut M {
     type Err = M::Err;
 
-    fn load_u8(&self, addr: u64) -> Result<u8, Self::Err> { (**self).load_u8(addr) }
-    fn store_u8(&mut self, addr: u64, value: u8) -> Result<(), Self::Err> { (**self).store_u8(addr, value) }
-    fn load_u16(&self, addr: u64) -> Result<u16, Self::Err> { (**self).load_u16(addr) }
-    fn load_u32(&self, addr: u64) -> Result<u32, Self::Err> { (**self).load_u32(addr) }
-    fn load_u64(&self, addr: u64) -> Result<u64, Self::Err> { (**self).load_u64(addr) }
-    fn store_u16(&mut self, addr: u64, value: u16) -> Result<(), Self::Err> { (**self).store_u16(addr, value) }
-    fn store_u32(&mut self, addr: u64, value: u32) -> Result<(), Self::Err> { (**self).store_u32(addr, value) }
-    fn store_u64(&mut self, addr: u64, value: u64) -> Result<(), Self::Err> { (**self).store_u64(addr, value) }
+    fn load_u8(&self, addr: u64) -> Result<u8, Self::Err> {
+        (**self).load_u8(addr)
+    }
+    fn store_u8(&mut self, addr: u64, value: u8) -> Result<(), Self::Err> {
+        (**self).store_u8(addr, value)
+    }
+    fn load_u16(&self, addr: u64) -> Result<u16, Self::Err> {
+        (**self).load_u16(addr)
+    }
+    fn load_u32(&self, addr: u64) -> Result<u32, Self::Err> {
+        (**self).load_u32(addr)
+    }
+    fn load_u64(&self, addr: u64) -> Result<u64, Self::Err> {
+        (**self).load_u64(addr)
+    }
+    fn store_u16(&mut self, addr: u64, value: u16) -> Result<(), Self::Err> {
+        (**self).store_u16(addr, value)
+    }
+    fn store_u32(&mut self, addr: u64, value: u32) -> Result<(), Self::Err> {
+        (**self).store_u32(addr, value)
+    }
+    fn store_u64(&mut self, addr: u64, value: u64) -> Result<(), Self::Err> {
+        (**self).store_u64(addr, value)
+    }
 }
 
 /// Scratch register index for storing first half of LD_IMM64 instruction.

@@ -207,14 +207,18 @@ impl VmMemory {
 
     /// Borrow `len` bytes at guest address `addr` (host access, ignores perms).
     pub fn bytes(&self, addr: u64, len: usize) -> Result<&[u8], MemoryError> {
-        let ptr = self.resolve(addr, len, Perms::NONE).ok_or(MemoryError::OutOfBounds { addr, size: len })?;
+        let ptr = self
+            .resolve(addr, len, Perms::NONE)
+            .ok_or(MemoryError::OutOfBounds { addr, size: len })?;
         // SAFETY: `resolve` checked the range lies inside a live region.
         Ok(unsafe { std::slice::from_raw_parts(ptr.as_ptr(), len) })
     }
 
     /// Mutably borrow `len` bytes at guest address `addr` (host access, ignores perms).
     pub fn bytes_mut(&mut self, addr: u64, len: usize) -> Result<&mut [u8], MemoryError> {
-        let ptr = self.resolve(addr, len, Perms::NONE).ok_or(MemoryError::OutOfBounds { addr, size: len })?;
+        let ptr = self
+            .resolve(addr, len, Perms::NONE)
+            .ok_or(MemoryError::OutOfBounds { addr, size: len })?;
         // SAFETY: as `bytes`; `&mut self` guarantees exclusive access.
         Ok(unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), len) })
     }

@@ -63,7 +63,12 @@ fn linked_program_uses_host_mapped_structs() {
         reserved: u32,
     }
 
-    let input = Input { a: 6, b: 7, op: 2, flags: 0 }; // mul
+    let input = Input {
+        a: 6,
+        b: 7,
+        op: 2,
+        flags: 0,
+    }; // mul
     let mut output = Output::default();
     let mut program = example();
     let mem = program.memory_mut();

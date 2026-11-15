@@ -389,7 +389,9 @@ fn clang_style_btf() -> Vec<u8> {
     let strings = b"\x000:1:1\x002:1\x000:1:0\x002\0int\0inner\0x\0y\0outer\0a\0in\0color\0RED\0GREEN\0BLUE\0ev_t\0";
     let s = |name: &str| {
         let needle = [name.as_bytes(), b"\0"].concat();
-        (1..strings.len()).find(|&i| strings[i - 1] == 0 && strings[i..].starts_with(&needle)).unwrap() as u32
+        (1..strings.len())
+            .find(|&i| strings[i - 1] == 0 && strings[i..].starts_with(&needle))
+            .unwrap() as u32
     };
     #[rustfmt::skip]
     let types = [
@@ -405,8 +407,16 @@ fn clang_style_btf() -> Vec<u8> {
 /// Host layout differs from the local one at every level.
 fn clang_style_registry() -> TypeRegistry {
     let mut registry = TypeRegistry::new();
-    registry.register_struct("inner").field("x", 0, 4).field("y", 8, 4).size(16);
-    registry.register_struct("outer").field("a", 0, 4).field("in", 8, 16).size(24);
+    registry
+        .register_struct("inner")
+        .field("x", 0, 4)
+        .field("y", 8, 4)
+        .size(16);
+    registry
+        .register_struct("outer")
+        .field("a", 0, 4)
+        .field("in", 8, 16)
+        .size(24);
     registry
         .register_enum("color", 4, false)
         .variant("RED", 0)
@@ -438,9 +448,9 @@ fn test_core_nested_and_array_access() {
     let registry = clang_style_registry();
 
     for (type_id, access, want) in [
-        (3, 1, 16),  // outer.in.y = 8 + 8
-        (3, 7, 56),  // p[2].in = 2 * 24 + 8
-        (5, 11, 8),  // typedef root: ev_t.in.x = 8 + 0
+        (3, 1, 16), // outer.in.y = 8 + 8
+        (3, 7, 56), // p[2].in = 2 * 24 + 8
+        (5, 11, 8), // typedef root: ev_t.in.x = 8 + 0
     ] {
         let mut insns = [LDXW];
         apply_core_relocations(&mut insns, &btf, &registry, &[relo(type_id, access, CoreReloKind::FieldByteOffset)])
