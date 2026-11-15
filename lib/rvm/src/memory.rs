@@ -1,342 +1,314 @@
-//! Memory implementation for the eBPF VM.
+//! Guest memory for the eBPF VM.
 //!
-//! This module provides the default memory implementation used by the VM,
-//! as well as traits for custom memory implementations.
+//! Guest addresses are split into a region index (bits 32..) and an offset
+//! (bits 0..32): `addr = (region << 32) | offset`. Each of the [`MAX_REGIONS`]
+//! slots maps a byte range with its own permissions. Region 0 is never mapped,
+//! so null pointers (and small offsets from them) fault.
+//!
+//! A guest access costs one table index, a permission test and a bounds check.
+//! Host-side accessors ([`VmMemory::read`], [`VmMemory::bytes_mut`], ...) are
+//! trusted and ignore permissions.
+
+use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::ptr::NonNull;
 
 // Re-export the Memory trait from rvm-core
 pub use rvm_core::Memory;
 
 use crate::error::MemoryError;
 
-/// Default memory implementation for the eBPF VM.
-///
-/// Provides a flat byte array with bounds checking. The memory layout is:
-/// - Code sections (executable)
-/// - Data sections (.data, .rodata, .bss)
-/// - Stack space
+/// Number of region slots in a [`VmMemory`].
+pub const MAX_REGIONS: usize = 16;
+
+/// Bit position of the region index in a guest address.
+pub const REGION_SHIFT: u32 = 32;
+
+/// Largest region (offsets are 32 bits).
+pub const MAX_REGION_LEN: usize = 1 << REGION_SHIFT;
+
+/// Guest base address of region `idx`.
+pub const fn region_base(idx: usize) -> u64 {
+    (idx as u64) << REGION_SHIFT
+}
+
+/// Access permissions of a region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Perms(u8);
+
+impl Perms {
+    /// Not accessible from the guest.
+    pub const NONE: Self = Self(0);
+    /// Guest may read.
+    pub const R: Self = Self(1);
+    /// Guest may write.
+    pub const W: Self = Self(2);
+    /// Guest may read and write.
+    pub const RW: Self = Self(3);
+
+    #[inline(always)]
+    const fn allows(self, need: Self) -> bool {
+        self.0 & need.0 == need.0
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Region {
+    ptr: NonNull<u8>,
+    len: usize,
+    perms: Perms,
+    /// Allocated by this `VmMemory` (freed on unmap/drop) vs. borrowed host memory.
+    owned: bool,
+}
+
+impl Region {
+    const EMPTY: Self = Self {
+        ptr: NonNull::dangling(),
+        len: 0,
+        perms: Perms::NONE,
+        owned: false,
+    };
+}
+
+/// Region-mapped guest memory.
 ///
 /// # Example
 ///
 /// ```
-/// use rvm::VmMemory;
+/// use rvm::{region_base, Perms, VmMemory};
 ///
-/// let mut mem = VmMemory::new(4096);
-/// mem.write_bytes(0, &[1, 2, 3, 4]).unwrap();
-/// assert_eq!(mem.read_bytes(0, 4).unwrap(), &[1, 2, 3, 4]);
+/// let mut mem = VmMemory::new();
+/// let base = mem.map(1, 4096, Perms::RW);
+/// assert_eq!(base, region_base(1));
+/// mem.write(base + 8, 42u64).unwrap();
+/// assert_eq!(mem.read::<u64>(base + 8).unwrap(), 42);
+/// assert!(mem.read::<u8>(0).is_err()); // region 0 is never mapped
 /// ```
-#[derive(Clone)]
 pub struct VmMemory {
-    data: Vec<u8>,
+    regions: [Region; MAX_REGIONS],
 }
+
+// SAFETY: owned regions are plain heap allocations exclusively owned by this value.
+// Host regions are only created through `map_host`, whose contract requires the
+// memory to be usable from whichever thread uses this `VmMemory`.
+unsafe impl Send for VmMemory {}
+unsafe impl Sync for VmMemory {}
 
 impl Default for VmMemory {
     fn default() -> Self {
-        Self::new(0)
+        Self::new()
     }
 }
 
 impl VmMemory {
-    /// Create a new memory region of the given size.
-    pub fn new(size: usize) -> Self {
-        Self { data: vec![0u8; size] }
-    }
-
-    /// Create memory from existing data.
-    pub fn from_vec(data: Vec<u8>) -> Self {
-        Self { data }
-    }
-
-    /// Get the total size of the memory region.
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    /// Check if the memory is empty.
-    pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-
-    /// Resize the memory region.
-    pub fn resize(&mut self, new_size: usize) {
-        self.data.resize(new_size, 0);
-    }
-
-    /// Write a slice of bytes to memory at the given offset.
-    pub fn write_bytes(&mut self, offset: usize, bytes: &[u8]) -> Result<(), MemoryError> {
-        let end = offset.checked_add(bytes.len()).ok_or(MemoryError::OutOfBounds {
-            addr: offset as u64,
-            size: bytes.len(),
-        })?;
-
-        if end > self.data.len() {
-            return Err(MemoryError::OutOfBounds {
-                addr: offset as u64,
-                size: bytes.len(),
-            });
+    /// Create memory with no regions mapped.
+    pub const fn new() -> Self {
+        Self {
+            regions: [Region::EMPTY; MAX_REGIONS],
         }
+    }
 
-        self.data[offset..end].copy_from_slice(bytes);
+    /// Map `len` zeroed bytes as region `idx`, replacing any previous mapping.
+    /// Returns the region's guest base address.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `idx` is 0 or out of range, or `len` exceeds [`MAX_REGION_LEN`].
+    pub fn map(&mut self, idx: usize, len: usize, perms: Perms) -> u64 {
+        assert!(len <= MAX_REGION_LEN, "region too large: {len}");
+        let ptr = if len == 0 {
+            NonNull::dangling()
+        } else {
+            // SAFETY: non-zero size, align 8.
+            let raw = unsafe { alloc_zeroed(Self::layout(len)) };
+            NonNull::new(raw).unwrap_or_else(|| std::alloc::handle_alloc_error(Self::layout(len)))
+        };
+        self.set(
+            idx,
+            Region {
+                ptr,
+                len,
+                perms,
+                owned: true,
+            },
+        )
+    }
+
+    /// Map region `idx` with `len` bytes, initialized from `init` (rest zeroed).
+    ///
+    /// # Panics
+    ///
+    /// As [`map`](Self::map), and if `init` is longer than `len`.
+    pub fn map_bytes(&mut self, idx: usize, init: &[u8], len: usize, perms: Perms) -> u64 {
+        assert!(init.len() <= len, "init ({}) larger than region ({len})", init.len());
+        let base = self.map(idx, len, perms);
+        self.write_bytes(base, init).expect("freshly mapped region");
+        base
+    }
+
+    /// Expose host memory as region `idx`. Guest accesses go straight to `ptr`.
+    ///
+    /// # Safety
+    ///
+    /// `ptr..ptr+len` must stay valid (and writable if `perms` allows writes) until
+    /// the region is unmapped or this `VmMemory` is dropped, must not be accessed
+    /// through other references in ways that conflict with guest/helper accesses
+    /// while the VM runs, and must be usable from any thread that uses this memory.
+    pub unsafe fn map_host(&mut self, idx: usize, ptr: NonNull<u8>, len: usize, perms: Perms) -> u64 {
+        assert!(len <= MAX_REGION_LEN, "region too large: {len}");
+        self.set(
+            idx,
+            Region {
+                ptr,
+                len,
+                perms,
+                owned: false,
+            },
+        )
+    }
+
+    /// Unmap region `idx`, freeing it if it was allocated by [`map`](Self::map).
+    pub fn unmap(&mut self, idx: usize) {
+        self.set(idx, Region::EMPTY);
+    }
+
+    /// Length of region `idx` (0 if unmapped).
+    pub fn region_len(&self, idx: usize) -> usize {
+        self.regions.get(idx).map_or(0, |r| r.len)
+    }
+
+    fn set(&mut self, idx: usize, region: Region) -> u64 {
+        assert!(idx != 0 && idx < MAX_REGIONS, "invalid region index {idx}");
+        let old = std::mem::replace(&mut self.regions[idx], region);
+        Self::free(old);
+        region_base(idx)
+    }
+
+    fn free(region: Region) {
+        if region.owned && region.len != 0 {
+            // SAFETY: allocated in `map` with this exact layout and not freed since.
+            unsafe { dealloc(region.ptr.as_ptr(), Self::layout(region.len)) };
+        }
+    }
+
+    fn layout(len: usize) -> Layout {
+        Layout::from_size_align(len, 8).expect("region layout")
+    }
+
+    /// Resolve `addr..addr+len` to a host pointer if region perms include `need`.
+    #[inline(always)]
+    fn resolve(&self, addr: u64, len: usize, need: Perms) -> Option<NonNull<u8>> {
+        let region = self.regions.get((addr >> REGION_SHIFT) as usize)?;
+        let off = addr as u32 as usize;
+        // `off < 2^32` and `len` is small or a host length, so this can't overflow on 64-bit.
+        (region.perms.allows(need) && off + len <= region.len)
+            // SAFETY: in bounds of the region's allocation.
+            .then(|| unsafe { region.ptr.add(off) })
+    }
+
+    /// Borrow `len` bytes at guest address `addr` (host access, ignores perms).
+    pub fn bytes(&self, addr: u64, len: usize) -> Result<&[u8], MemoryError> {
+        let ptr = self.resolve(addr, len, Perms::NONE).ok_or(MemoryError::OutOfBounds { addr, size: len })?;
+        // SAFETY: `resolve` checked the range lies inside a live region.
+        Ok(unsafe { std::slice::from_raw_parts(ptr.as_ptr(), len) })
+    }
+
+    /// Mutably borrow `len` bytes at guest address `addr` (host access, ignores perms).
+    pub fn bytes_mut(&mut self, addr: u64, len: usize) -> Result<&mut [u8], MemoryError> {
+        let ptr = self.resolve(addr, len, Perms::NONE).ok_or(MemoryError::OutOfBounds { addr, size: len })?;
+        // SAFETY: as `bytes`; `&mut self` guarantees exclusive access.
+        Ok(unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), len) })
+    }
+
+    /// Copy `data` to guest address `addr` (host access).
+    pub fn write_bytes(&mut self, addr: u64, data: &[u8]) -> Result<(), MemoryError> {
+        self.bytes_mut(addr, data.len())?.copy_from_slice(data);
         Ok(())
     }
 
-    /// Read bytes from memory.
-    pub fn read_bytes(&self, offset: usize, len: usize) -> Result<&[u8], MemoryError> {
-        let end = offset.checked_add(len).ok_or(MemoryError::OutOfBounds {
-            addr: offset as u64,
-            size: len,
-        })?;
+    /// Read a little-endian scalar at guest address `addr` (host access).
+    pub fn read<T: Scalar>(&self, addr: u64) -> Result<T, MemoryError> {
+        Ok(T::read_le(self.bytes(addr, T::SIZE)?))
+    }
 
-        if end > self.data.len() {
-            return Err(MemoryError::OutOfBounds {
-                addr: offset as u64,
-                size: len,
-            });
+    /// Write a little-endian scalar at guest address `addr` (host access).
+    pub fn write<T: Scalar>(&mut self, addr: u64, value: T) -> Result<(), MemoryError> {
+        value.write_le(self.bytes_mut(addr, T::SIZE)?);
+        Ok(())
+    }
+}
+
+impl Drop for VmMemory {
+    fn drop(&mut self) {
+        for region in self.regions {
+            Self::free(region);
+        }
+    }
+}
+
+/// Guest access: the error is the faulting address.
+macro_rules! guest_access {
+    ($load:ident, $store:ident, $ty:ty) => {
+        #[inline(always)]
+        fn $load(&self, addr: u64) -> Result<$ty, u64> {
+            let ptr = self.resolve(addr, size_of::<$ty>(), Perms::R).ok_or(addr)?;
+            // SAFETY: `resolve` checked bounds; guest memory has no alignment guarantee.
+            Ok(<$ty>::from_le(unsafe { ptr.cast::<$ty>().read_unaligned() }))
         }
 
-        Ok(&self.data[offset..end])
-    }
-
-    /// Get a mutable slice of bytes from memory.
-    pub fn bytes_mut(&mut self, offset: usize, len: usize) -> Result<&mut [u8], MemoryError> {
-        let end = offset.checked_add(len).ok_or(MemoryError::OutOfBounds {
-            addr: offset as u64,
-            size: len,
-        })?;
-
-        if end > self.data.len() {
-            return Err(MemoryError::OutOfBounds {
-                addr: offset as u64,
-                size: len,
-            });
+        #[inline(always)]
+        fn $store(&mut self, addr: u64, value: $ty) -> Result<(), u64> {
+            let ptr = self.resolve(addr, size_of::<$ty>(), Perms::W).ok_or(addr)?;
+            // SAFETY: as above.
+            unsafe { ptr.cast::<$ty>().write_unaligned(value.to_le()) };
+            Ok(())
         }
-
-        Ok(&mut self.data[offset..end])
-    }
-
-    /// Read a value from memory.
-    pub fn read<T: FromBytes>(&self, offset: usize) -> Result<T, MemoryError> {
-        let bytes = self.read_bytes(offset, std::mem::size_of::<T>())?;
-        Ok(T::from_le_bytes(bytes))
-    }
-
-    /// Write a value to memory.
-    pub fn write<T: ToBytes>(&mut self, offset: usize, value: T) -> Result<(), MemoryError> {
-        let bytes = value.to_le_bytes_vec();
-        self.write_bytes(offset, &bytes)
-    }
-
-    /// Get direct access to the underlying data.
-    pub fn as_slice(&self) -> &[u8] {
-        &self.data
-    }
-
-    /// Get mutable direct access to the underlying data.
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.data
-    }
-
-    /// Consume and return the underlying data.
-    pub fn into_vec(self) -> Vec<u8> {
-        self.data
-    }
+    };
 }
 
 impl Memory for VmMemory {
-    type Err = &'static str;
+    type Err = u64;
 
-    fn load_u8(&self, addr: u64) -> Result<u8, Self::Err> {
-        self.data.get(addr as usize).copied().ok_or("load_u8: out of bounds")
-    }
+    guest_access!(load_u8, store_u8, u8);
+    guest_access!(load_u16, store_u16, u16);
+    guest_access!(load_u32, store_u32, u32);
+    guest_access!(load_u64, store_u64, u64);
+}
 
-    fn store_u8(&mut self, addr: u64, value: u8) -> Result<(), Self::Err> {
-        self.data
-            .get_mut(addr as usize)
-            .map(|b| *b = value)
-            .ok_or("store_u8: out of bounds")
-    }
+/// Fixed-size little-endian scalar for host-side [`VmMemory::read`]/[`VmMemory::write`].
+pub trait Scalar: Copy {
+    /// Size in bytes.
+    const SIZE: usize;
+    /// Decode from exactly `SIZE` bytes.
+    fn read_le(bytes: &[u8]) -> Self;
+    /// Encode into exactly `SIZE` bytes.
+    fn write_le(self, bytes: &mut [u8]);
+}
 
-    fn load_u16(&self, addr: u64) -> Result<u16, Self::Err> {
-        let i = addr as usize;
-        let end = i.checked_add(2).ok_or("load_u16: address overflow")?;
-        if end > self.data.len() {
-            return Err("load_u16: out of bounds");
+macro_rules! scalar {
+    ($($ty:ty),*) => {$(
+        impl Scalar for $ty {
+            const SIZE: usize = size_of::<$ty>();
+            fn read_le(bytes: &[u8]) -> Self {
+                <$ty>::from_le_bytes(bytes.try_into().unwrap())
+            }
+            fn write_le(self, bytes: &mut [u8]) {
+                bytes.copy_from_slice(&self.to_le_bytes());
+            }
         }
-        Ok(u16::from_le_bytes([self.data[i], self.data[i + 1]]))
-    }
-
-    fn load_u32(&self, addr: u64) -> Result<u32, Self::Err> {
-        let i = addr as usize;
-        let end = i.checked_add(4).ok_or("load_u32: address overflow")?;
-        if end > self.data.len() {
-            return Err("load_u32: out of bounds");
-        }
-        Ok(u32::from_le_bytes([self.data[i], self.data[i + 1], self.data[i + 2], self.data[i + 3]]))
-    }
-
-    fn load_u64(&self, addr: u64) -> Result<u64, Self::Err> {
-        let i = addr as usize;
-        let end = i.checked_add(8).ok_or("load_u64: address overflow")?;
-        if end > self.data.len() {
-            return Err("load_u64: out of bounds");
-        }
-        Ok(u64::from_le_bytes([
-            self.data[i],
-            self.data[i + 1],
-            self.data[i + 2],
-            self.data[i + 3],
-            self.data[i + 4],
-            self.data[i + 5],
-            self.data[i + 6],
-            self.data[i + 7],
-        ]))
-    }
-
-    fn store_u16(&mut self, addr: u64, value: u16) -> Result<(), Self::Err> {
-        let i = addr as usize;
-        let end = i.checked_add(2).ok_or("store_u16: address overflow")?;
-        if end > self.data.len() {
-            return Err("store_u16: out of bounds");
-        }
-        self.data[i..][..2].copy_from_slice(&value.to_le_bytes());
-        Ok(())
-    }
-
-    fn store_u32(&mut self, addr: u64, value: u32) -> Result<(), Self::Err> {
-        let i = addr as usize;
-        let end = i.checked_add(4).ok_or("store_u32: address overflow")?;
-        if end > self.data.len() {
-            return Err("store_u32: out of bounds");
-        }
-        self.data[i..][..4].copy_from_slice(&value.to_le_bytes());
-        Ok(())
-    }
-
-    fn store_u64(&mut self, addr: u64, value: u64) -> Result<(), Self::Err> {
-        let i = addr as usize;
-        let end = i.checked_add(8).ok_or("store_u64: address overflow")?;
-        if end > self.data.len() {
-            return Err("store_u64: out of bounds");
-        }
-        self.data[i..][..8].copy_from_slice(&value.to_le_bytes());
-        Ok(())
-    }
+    )*};
 }
 
-/// Trait for types that can be read from bytes.
-pub trait FromBytes: Sized {
-    fn from_le_bytes(bytes: &[u8]) -> Self;
-}
-
-/// Trait for types that can be written to bytes.
-pub trait ToBytes {
-    fn to_le_bytes_vec(&self) -> Vec<u8>;
-}
-
-// Implement FromBytes for common types
-impl FromBytes for u8 {
-    fn from_le_bytes(bytes: &[u8]) -> Self {
-        bytes[0]
-    }
-}
-
-impl FromBytes for u16 {
-    fn from_le_bytes(bytes: &[u8]) -> Self {
-        u16::from_le_bytes([bytes[0], bytes[1]])
-    }
-}
-
-impl FromBytes for u32 {
-    fn from_le_bytes(bytes: &[u8]) -> Self {
-        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-    }
-}
-
-impl FromBytes for u64 {
-    fn from_le_bytes(bytes: &[u8]) -> Self {
-        u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ])
-    }
-}
-
-impl FromBytes for i8 {
-    fn from_le_bytes(bytes: &[u8]) -> Self {
-        bytes[0] as i8
-    }
-}
-
-impl FromBytes for i16 {
-    fn from_le_bytes(bytes: &[u8]) -> Self {
-        i16::from_le_bytes([bytes[0], bytes[1]])
-    }
-}
-
-impl FromBytes for i32 {
-    fn from_le_bytes(bytes: &[u8]) -> Self {
-        i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-    }
-}
-
-impl FromBytes for i64 {
-    fn from_le_bytes(bytes: &[u8]) -> Self {
-        i64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ])
-    }
-}
-
-// Implement ToBytes for common types
-impl ToBytes for u8 {
-    fn to_le_bytes_vec(&self) -> Vec<u8> {
-        vec![*self]
-    }
-}
-
-impl ToBytes for u16 {
-    fn to_le_bytes_vec(&self) -> Vec<u8> {
-        self.to_le_bytes().to_vec()
-    }
-}
-
-impl ToBytes for u32 {
-    fn to_le_bytes_vec(&self) -> Vec<u8> {
-        self.to_le_bytes().to_vec()
-    }
-}
-
-impl ToBytes for u64 {
-    fn to_le_bytes_vec(&self) -> Vec<u8> {
-        self.to_le_bytes().to_vec()
-    }
-}
-
-impl ToBytes for i8 {
-    fn to_le_bytes_vec(&self) -> Vec<u8> {
-        vec![*self as u8]
-    }
-}
-
-impl ToBytes for i16 {
-    fn to_le_bytes_vec(&self) -> Vec<u8> {
-        self.to_le_bytes().to_vec()
-    }
-}
-
-impl ToBytes for i32 {
-    fn to_le_bytes_vec(&self) -> Vec<u8> {
-        self.to_le_bytes().to_vec()
-    }
-}
-
-impl ToBytes for i64 {
-    fn to_le_bytes_vec(&self) -> Vec<u8> {
-        self.to_le_bytes().to_vec()
-    }
-}
+scalar!(u8, u16, u32, u64, i8, i16, i32, i64);
 
 impl std::fmt::Debug for VmMemory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("VmMemory").field("len", &self.data.len()).finish()
+        let mapped = self
+            .regions
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.len != 0 || r.perms != Perms::NONE)
+            .map(|(i, r)| (i, r.len, r.perms));
+        f.debug_list().entries(mapped).finish()
     }
 }
 
@@ -345,38 +317,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_memory_read_write() {
-        let mut mem = VmMemory::new(64);
-
-        // Test u8
-        mem.write(0, 0x42u8).unwrap();
-        assert_eq!(mem.read::<u8>(0).unwrap(), 0x42);
-
-        // Test u64
-        mem.write(8, 0xDEADBEEFCAFEBABEu64).unwrap();
-        assert_eq!(mem.read::<u64>(8).unwrap(), 0xDEADBEEFCAFEBABE);
-
-        // Test bounds
-        assert!(mem.read::<u8>(100).is_err());
+    fn null_region_and_bounds_fault() {
+        let mut mem = VmMemory::new();
+        let base = mem.map(1, 16, Perms::RW);
+        assert_eq!(mem.load_u8(0), Err(0));
+        assert_eq!(mem.load_u8(7), Err(7));
+        assert!(mem.load_u64(base + 8).is_ok());
+        assert_eq!(mem.load_u64(base + 9), Err(base + 9)); // straddles the end
+        assert_eq!(mem.load_u8(region_base(MAX_REGIONS)), Err(region_base(MAX_REGIONS)));
+        assert_eq!(mem.load_u8(u64::MAX), Err(u64::MAX));
     }
 
     #[test]
-    fn test_memory_bytes() {
-        let mut mem = VmMemory::new(64);
-        let data = [1, 2, 3, 4, 5, 6, 7, 8];
+    fn perms_apply_to_guest_not_host() {
+        let mut mem = VmMemory::new();
+        let ro = mem.map_bytes(2, &[1, 2, 3, 4], 8, Perms::R);
+        assert_eq!(mem.load_u32(ro), Ok(0x0403_0201));
+        assert_eq!(mem.store_u8(ro, 9), Err(ro));
+        mem.write(ro, 9u8).unwrap(); // host may still patch read-only regions
+        assert_eq!(mem.load_u8(ro), Ok(9));
 
-        mem.write_bytes(0, &data).unwrap();
-        assert_eq!(mem.read_bytes(0, 8).unwrap(), &data);
+        let wo = mem.map(3, 8, Perms::W);
+        assert!(mem.store_u64(wo, 1).is_ok());
+        assert_eq!(mem.load_u64(wo), Err(wo));
     }
 
     #[test]
-    fn test_memory_trait() {
-        let mut mem = VmMemory::new(64);
+    fn unaligned_little_endian_access() {
+        let mut mem = VmMemory::new();
+        let base = mem.map(1, 16, Perms::RW);
+        mem.store_u64(base + 3, 0x1122_3344_5566_7788).unwrap();
+        assert_eq!(mem.bytes(base + 3, 2).unwrap(), &[0x88, 0x77]);
+        assert_eq!(mem.load_u16(base + 4), Ok(0x6677));
+    }
 
-        mem.store_u64(0, 0x123456789ABCDEF0).unwrap();
-        assert_eq!(mem.load_u64(0).unwrap(), 0x123456789ABCDEF0);
-        assert_eq!(mem.load_u32(0).unwrap(), 0x9ABCDEF0);
-        assert_eq!(mem.load_u16(0).unwrap(), 0xDEF0);
-        assert_eq!(mem.load_u8(0).unwrap(), 0xF0);
+    #[test]
+    fn host_region_aliases_host_buffer() {
+        let mut buf = [0u8; 8];
+        let mut mem = VmMemory::new();
+        // SAFETY: `buf` outlives `mem` and isn't touched while mapped.
+        let base = unsafe { mem.map_host(4, NonNull::from(&mut buf).cast(), buf.len(), Perms::RW) };
+        mem.store_u32(base + 4, 0xAABB_CCDD).unwrap();
+        mem.unmap(4);
+        assert_eq!(mem.load_u8(base), Err(base));
+        drop(mem);
+        assert_eq!(buf, [0, 0, 0, 0, 0xDD, 0xCC, 0xBB, 0xAA]);
     }
 }

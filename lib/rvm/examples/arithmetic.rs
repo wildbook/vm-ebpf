@@ -6,7 +6,7 @@
 //! Run with: cargo run --example arithmetic
 
 use ebpf_asm::{Assembler, R0};
-use rvm::VmMemory;
+use rvm::{Perms, VmMemory};
 
 fn main() {
     println!("=== Arithmetic Operations ===\n");
@@ -133,11 +133,12 @@ fn test_neg() {
 // ============================================================================
 
 fn run(asm: &mut Assembler) -> u64 {
-    let program = asm.assemble().unwrap();
-    let mut memory = VmMemory::new(program.len() + 512);
-    memory.write_bytes(0, &program).unwrap();
+    let bytes = asm.assemble().unwrap();
+    let code = rvm::instructions_from_bytes(&bytes);
+    let mut memory = VmMemory::new();
+    let stack_top = memory.map(rvm::STACK_REGION, 512, Perms::RW) + 512;
 
     let helpers = rvm::HelperRegistry::new();
-    let mut executor = rvm::Executor::new(&mut memory, &helpers, (program.len() + 512) as u64);
+    let mut executor = rvm::Executor::new(&code, &mut memory, &helpers, stack_top);
     executor.call(0, &[]).unwrap()
 }

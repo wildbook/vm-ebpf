@@ -630,8 +630,8 @@ fn test_jmp64_call_helper() {
     // Call helper function with static ID (src_reg = 0)
     let i = instr(OpCode::jmp64_from_parts(JmpOpc::Call, Source::Imm), 0, 0, 0, 1);
     match exec(&mut ctx, i) {
-        Flow::CallExt(id) => assert_eq!(id, 1),
-        other => panic!("Expected CallExt, got {:?}", other),
+        Flow::CallHelper(id) => assert_eq!(id, 1),
+        other => panic!("Expected CallHelper, got {:?}", other),
     }
 }
 
@@ -888,4 +888,65 @@ fn test_all_registers() {
         assert!(matches!(exec(&mut ctx, i), Flow::Next));
         assert_eq!(ctx.regs[reg as usize], 150, "Failed for register r{}", reg);
     }
+}
+
+// ============================================================================
+// Spec Edge Cases (RFC 9669)
+// ============================================================================
+
+#[test]
+fn test_alu32_imm_is_unsigned_32bit() {
+    let mut ctx = Context::new(TestMem::new());
+    ctx.regs[1] = 0xFFFF_FFFF;
+    exec(&mut ctx, instr(AluOpc::div_32(Source::Imm), 1, 0, 0, -1));
+    assert_eq!(ctx.regs[1], 1);
+
+    ctx.regs[1] = 0xFFFF_FFFF;
+    exec(&mut ctx, instr(AluOpc::mod_32(Source::Imm), 1, 0, 0, -1));
+    assert_eq!(ctx.regs[1], 0);
+}
+
+#[test]
+fn test_jmp32_unsigned_compare_negative_imm() {
+    let mut ctx = Context::new(TestMem::new());
+    ctx.regs[1] = 0xFFFF_FFFF;
+    let jeq = instr(OpCode::jmp32_from_parts(JmpOpc::Jeq, Source::Imm), 1, 0, 3, -1);
+    assert!(matches!(exec(&mut ctx, jeq), Flow::Jump(3)));
+    let jgt = instr(OpCode::jmp32_from_parts(JmpOpc::Jgt, Source::Imm), 1, 0, 3, -2);
+    assert!(matches!(exec(&mut ctx, jgt), Flow::Jump(3)));
+}
+
+#[test]
+fn test_movsx() {
+    let mut ctx = Context::new(TestMem::new());
+    ctx.regs[2] = 0x1234_5678_8000_8080;
+    for (off, want) in [(8, 0xFFFF_FFFF_FFFF_FF80), (16, 0xFFFF_FFFF_FFFF_8080), (32, 0xFFFF_FFFF_8000_8080)] {
+        exec(&mut ctx, instr(AluOpc::mov_64(Source::Reg), 1, 2, off, 0));
+        assert_eq!(ctx.regs[1], want, "movsx64 off={off}");
+    }
+    // ALU32: sign-extend to 32 bits, then zero-extend.
+    exec(&mut ctx, instr(AluOpc::mov_32(Source::Reg), 1, 2, 8, 0));
+    assert_eq!(ctx.regs[1], 0xFFFF_FF80);
+    // Reserved: ALU32 offset 32, immediate source.
+    assert!(matches!(exec(&mut ctx, instr(AluOpc::mov_32(Source::Reg), 1, 2, 32, 0)), Flow::FailCpu));
+    assert!(matches!(exec(&mut ctx, instr(AluOpc::mov_64(Source::Imm), 1, 0, 8, 1)), Flow::FailCpu));
+}
+
+#[test]
+fn test_bswap_and_endianness() {
+    let mut ctx = Context::new(TestMem::new());
+    let v = 0x1122_3344_5566_7788;
+    for (opc, imm, want) in [
+        (AluOpc::end_64(AluEnd::ToLE), 16, 0x8877),
+        (AluOpc::end_64(AluEnd::ToLE), 32, 0x8877_6655),
+        (AluOpc::end_64(AluEnd::ToLE), 64, 0x8877_6655_4433_2211),
+        (AluOpc::end_32(AluEnd::ToLE), 16, 0x7788),
+        (AluOpc::end_32(AluEnd::ToLE), 64, v),
+        (AluOpc::end_32(AluEnd::ToBE), 32, 0x8877_6655),
+    ] {
+        ctx.regs[1] = v;
+        exec(&mut ctx, instr(opc, 1, 0, 0, imm));
+        assert_eq!(ctx.regs[1], want, "{opc:?} imm={imm}");
+    }
+    assert!(matches!(exec(&mut ctx, instr(AluOpc::end_64(AluEnd::ToBE), 1, 0, 0, 16)), Flow::FailCpu));
 }

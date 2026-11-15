@@ -11,4 +11,9 @@ constelf = { path = "../constelf" }
 btf = { path = "../btf" }
 
 [dev-dependencies]
+criterion = "0.7"
 ebpf-asm = { path = "../ebpf-asm" }
+
+[[bench]]
+name = "exec"
+harness = false

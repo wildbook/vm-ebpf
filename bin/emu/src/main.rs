@@ -1,42 +1,8 @@
-use std::ops::ControlFlow;
-
 use constelf::file::ElfFile;
 use constelf::raw::{reloc, shf};
 use constelf::relocs::ElfRelocsChunk;
 use constelf::sections::ElfSections;
-use rvm_core::{Context, Flow, Memory};
-
-#[inline(always)]
-pub fn call<C: Memory>(ctx: &mut Context<C>, mut pc: u64) -> ControlFlow<()> {
-    loop {
-        let flow = match ctx.data.load_pc(pc) {
-            Err(e) => ControlFlow::Break(Flow::FailMem(e)),
-            Ok(instr) => (pc += 1, rvm_core::step(ctx, instr)).1,
-        };
-
-        let flow = match flow {
-            ControlFlow::Break(flow) => flow,
-            ControlFlow::Continue(instr) => match ctx.data.load_pc(pc) {
-                Err(e) => Flow::FailMem(e),
-                Ok(second) => (pc += 1, rvm_core::step_ld64(ctx, instr, second)).1,
-            },
-        };
-
-        match flow {
-            Flow::Next => continue,
-            Flow::Exit => break ControlFlow::Continue(()),
-
-            Flow::Missing => break ControlFlow::Break(()),
-            Flow::FailCpu => break ControlFlow::Break(()),
-            Flow::FailMem(_) => break ControlFlow::Break(()),
-
-            Flow::CallExt(_) => break ControlFlow::Break(()), // TODO: External functions - "syscalls"
-
-            Flow::Call(offset) => call(ctx, pc.wrapping_add_signed(offset))?,
-            Flow::Jump(offset) => pc = pc.wrapping_add_signed(offset),
-        }
-    }
-}
+use rvm::{Executor, HelperRegistry, Memory};
 
 const fn num_allocs(elf: ElfSections<'_>) -> usize {
     let mut num = 0;
@@ -52,6 +18,22 @@ const fn num_allocs(elf: ElfSections<'_>) -> usize {
     }
 
     num
+}
+
+/// Index into `MAP` (not the section index) of the first executable (`SHF_EXECINSTR`) section.
+const fn find_code_map_idx<const N: usize>(elf: ElfSections<'_>, map: &[AddrMapEnt; N]) -> usize {
+    let mut i = 0;
+    while i < map.len() {
+        let header = match elf.header_by_index(map[i].sect) {
+            Some(h) => h,
+            None => panic!(),
+        };
+        if (header.sh_flags & shf::EXECINSTR as u64) != 0 && map[i].size > 0 {
+            return i;
+        }
+        i += 1;
+    }
+    panic!("no executable section found")
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -118,13 +100,14 @@ fn elfin() -> anyhow::Result<()> {
 
     const PAGE_SIZE: usize = 8;
     const PAGE_BASE: usize = 8;
-    const STACK_SIZE: usize = 512; // eBPF stack size
+    const STACK_SIZE: usize = 512 * (rvm::MAX_CALL_DEPTH + 1); // one 512-byte eBPF frame per call level
 
     const RAW: &[u8; include_bytes!("../../../bpf.o").len()] = include_bytes!("../../../bpf.o");
 
     const ELF: ElfFile<'_> /* ----------- */ = ct_unwrap_res(ElfFile::new(RAW));
     const SCT: ElfSections<'_> /* ------- */ = ct_unwrap_res(ELF.sections());
     const MAP: [AddrMapEnt; num_allocs(SCT)] = gen_addrmap(SCT, PAGE_BASE as u64);
+    const CODE_ENT: AddrMapEnt = MAP[find_code_map_idx(SCT, &MAP)];
 
     const LEN: usize = {
         let mut s = PAGE_BASE;
@@ -243,8 +226,10 @@ fn elfin() -> anyhow::Result<()> {
                             None => panic!("Symbol references unmapped section"),
                         };
 
-                        // Final address = section base + symbol offset within section
-                        let sym_addr = sym_sect_addr + stv;
+                        // Final address = section base + symbol offset + REL addend (the existing imm)
+                        let at = (beg + 4) as usize;
+                        let imm = u32::from_le_bytes([flat[at], flat[at + 1], flat[at + 2], flat[at + 3]]);
+                        let sym_addr = sym_sect_addr + stv + imm as u64;
 
                         // R_BPF_64_64 patches the imm32 fields of a LD_IMM64 instruction
                         // Write lower 32 bits to imm of first instruction (offset +4)
@@ -357,13 +342,15 @@ fn elfin() -> anyhow::Result<()> {
         }
     }
 
-    let mut ctx = Context::new(Mem { data: OUT });
+    let code_beg = CODE_ENT.addr as usize;
+    let code_end = code_beg + CODE_ENT.size as usize;
+    let code = rvm::instructions_from_bytes(&OUT[code_beg..code_end]);
+    let mut mem = Mem { data: OUT };
+    let helpers = HelperRegistry::<Mem>::default();
 
-    // Initialize r10 (frame pointer) to point to end of stack
-    ctx.regs[10] = STACK_END as u64;
-
-    let res = call(&mut ctx, (PAGE_BASE / 8) as u64);
-    println!("res: {:?}", res);
+    // r10 (frame pointer) starts at the end of the stack.
+    let res = Executor::new(&code, &mut mem, &helpers, STACK_END as u64).call(0, &[]);
+    println!("res: {res:?}");
 
     Ok(())
 }

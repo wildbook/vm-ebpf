@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 
 use constelf::file::ElfFile;
-use constelf::raw::{shf, sht, stb, stt};
+use constelf::raw::{reloc, shf, sht, stb, stt};
 
 use crate::error::{ElfError, Result};
 use crate::section::{section_kind_from_name, Section, SectionKind};
@@ -25,7 +25,8 @@ pub struct Relocation {
     pub symbol_idx: usize,
     /// Relocation type.
     pub rel_type: u32,
-    /// Addend (for RELA relocations).
+    /// Byte offset added to the symbol address. For REL relocations this is
+    /// decoded from the instruction's `imm` at parse time.
     pub addend: i64,
 }
 
@@ -159,7 +160,9 @@ impl Module {
                 };
 
                 if sym_name.is_empty() && sym.st_shndx == 0 {
-                    continue; // Skip null symbols
+                    // Keep a placeholder so `symbols` stays indexed by ELF symbol index.
+                    module.symbols.push(Symbol::new(""));
+                    continue;
                 }
 
                 let binding = match sym.bind() {
@@ -247,13 +250,18 @@ impl Module {
                 .map_err(|e| ElfError::InvalidFormat(format!("failed to get relocs: {e:?}")))?
             {
                 ElfRelocsChunk::Rel(relocs) => {
+                    let data = &module.sections[section_idx].data;
                     for r in relocs {
+                        let addend = rel_implicit_addend(data, r.r_offset, r.typ()).ok_or_else(|| {
+                            let off = r.r_offset;
+                            ElfError::InvalidFormat(format!("relocation offset {off:#x} out of bounds"))
+                        })?;
                         module.relocations.push(Relocation {
                             section_idx,
                             offset: r.r_offset,
                             symbol_idx: r.sym() as usize,
                             rel_type: r.typ(),
-                            addend: 0,
+                            addend,
                         });
                     }
                 }
@@ -373,4 +381,17 @@ fn get_string_from_table(table: &[u8], offset: usize) -> String {
         Ok(cstr) => cstr.to_string_lossy().into_owned(),
         Err(_) => String::new(),
     }
+}
+
+/// Byte addend that a REL relocation stores in the patched instruction's `imm`.
+fn rel_implicit_addend(data: &[u8], offset: u64, typ: u32) -> Option<i64> {
+    let at = usize::try_from(offset).ok()?.checked_add(4)?;
+    let imm = i32::from_le_bytes(data.get(at..at.checked_add(4)?)?.try_into().ok()?);
+    Some(match typ {
+        // LD_IMM64: imm is a byte offset from the symbol.
+        reloc::bpf::BPF_64_64 => i64::from(imm as u32),
+        // Call: target = sym + (imm + 1) instructions (named functions use imm = -1).
+        reloc::bpf::BPF_64_32 => (i64::from(imm) + 1) * 8,
+        _ => 0,
+    })
 }

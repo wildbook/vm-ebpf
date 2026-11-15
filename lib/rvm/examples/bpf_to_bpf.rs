@@ -6,7 +6,7 @@
 //! Run with: cargo run --example bpf_to_bpf
 
 use ebpf_asm::{Assembler, R0, R1, R6, R7};
-use rvm::VmMemory;
+use rvm::{Perms, VmMemory};
 
 fn main() {
     println!("=== BPF-to-BPF Function Calls ===\n");
@@ -164,18 +164,15 @@ fn test_callee_saved_registers() {
 // ============================================================================
 
 fn run_with_args(asm: &mut Assembler, args: &[u64]) -> u64 {
-    let program = asm.assemble().unwrap();
+    let bytes = asm.assemble().unwrap();
+    let code = rvm::instructions_from_bytes(&bytes);
 
-    let code_size = program.len();
     let stack_size = 4096; // Larger stack for recursive calls
-    let total_size = code_size.div_ceil(8) * 8 + stack_size;
-
-    let mut memory = VmMemory::new(total_size);
-    memory.write_bytes(0, &program).unwrap();
+    let mut memory = VmMemory::new();
+    let stack_top = memory.map(rvm::STACK_REGION, stack_size, Perms::RW) + stack_size as u64;
 
     let helpers = rvm::HelperRegistry::new();
-    let stack_top = total_size as u64;
-    let mut executor = rvm::Executor::new(&mut memory, &helpers, stack_top);
+    let mut executor = rvm::Executor::new(&code, &mut memory, &helpers, stack_top);
 
     executor.call(0, args).unwrap()
 }

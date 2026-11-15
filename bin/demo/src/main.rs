@@ -52,170 +52,30 @@
 //! └─────────────────────────────────────────────────────────────────────┘
 //! ```
 
-use std::ops::ControlFlow;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use btf::{apply_core_relocations, Btf, CoreRelo, CoreReloKind, TypeRegistry};
-use ebpf_asm::{Assembler, CoreReloKind as AsmReloKind, R0, R1, R2, R3};
-use rvm_core::{Context, Flow, Memory};
+use btf::{apply_core_relocations, Btf, CoreRelo, CoreReloKind};
+use ebpf_asm::{Assembler, CoreReloKind as AsmReloKind, R0, R1, R2, R3, R6};
+use rvm::{Executor, HelperRegistry, TypeRegistry, VmMemory};
 
 // ============================================================================
 // Host Helper Function IDs
 // ============================================================================
 
 mod helper_id {
-    pub const PRINT_U64: i32 = 1;
-    pub const GET_TIME_NS: i32 = 2;
+    pub const PRINT_U64: u32 = 1;
 }
 
 // ============================================================================
-// Memory Implementation
+// Helper Registration
 // ============================================================================
 
-pub struct DemoMemory {
-    data: Vec<u8>,
-    pub print_log: Vec<u64>,
-}
-
-impl DemoMemory {
-    pub fn new(data: Vec<u8>) -> Self {
-        Self {
-            data,
-            print_log: Vec::new(),
-        }
-    }
-}
-
-impl Memory for DemoMemory {
-    type Err = &'static str;
-
-    fn load_u8(&self, addr: u64) -> Result<u8, Self::Err> {
-        self.data.get(addr as usize).copied().ok_or("oob")
-    }
-
-    fn store_u8(&mut self, addr: u64, value: u8) -> Result<(), Self::Err> {
-        self.data.get_mut(addr as usize).map(|b| *b = value).ok_or("oob")
-    }
-
-    fn load_u16(&self, addr: u64) -> Result<u16, Self::Err> {
-        let i = addr as usize;
-        if i + 2 > self.data.len() {
-            return Err("oob");
-        }
-        Ok(u16::from_le_bytes([self.data[i], self.data[i + 1]]))
-    }
-
-    fn load_u32(&self, addr: u64) -> Result<u32, Self::Err> {
-        let i = addr as usize;
-        if i + 4 > self.data.len() {
-            return Err("oob");
-        }
-        Ok(u32::from_le_bytes([self.data[i], self.data[i + 1], self.data[i + 2], self.data[i + 3]]))
-    }
-
-    fn load_u64(&self, addr: u64) -> Result<u64, Self::Err> {
-        let i = addr as usize;
-        if i + 8 > self.data.len() {
-            return Err("oob");
-        }
-        Ok(u64::from_le_bytes([
-            self.data[i],
-            self.data[i + 1],
-            self.data[i + 2],
-            self.data[i + 3],
-            self.data[i + 4],
-            self.data[i + 5],
-            self.data[i + 6],
-            self.data[i + 7],
-        ]))
-    }
-
-    fn store_u16(&mut self, addr: u64, value: u16) -> Result<(), Self::Err> {
-        let i = addr as usize;
-        if i + 2 > self.data.len() {
-            return Err("oob");
-        }
-        self.data[i..][..2].copy_from_slice(&value.to_le_bytes());
-        Ok(())
-    }
-
-    fn store_u32(&mut self, addr: u64, value: u32) -> Result<(), Self::Err> {
-        let i = addr as usize;
-        if i + 4 > self.data.len() {
-            return Err("oob");
-        }
-        self.data[i..][..4].copy_from_slice(&value.to_le_bytes());
-        Ok(())
-    }
-
-    fn store_u64(&mut self, addr: u64, value: u64) -> Result<(), Self::Err> {
-        let i = addr as usize;
-        if i + 8 > self.data.len() {
-            return Err("oob");
-        }
-        self.data[i..][..8].copy_from_slice(&value.to_le_bytes());
-        Ok(())
-    }
-}
-
-// ============================================================================
-// Helper Dispatch
-// ============================================================================
-
-fn dispatch_helper(ctx: &mut Context<DemoMemory>, id: u64) -> Result<u64, &'static str> {
-    match id as i32 {
-        helper_id::PRINT_U64 => {
-            let val = ctx.regs[1];
-            println!("  [eBPF] print_u64: {val}");
-            ctx.data.print_log.push(val);
-            Ok(0)
-        }
-        helper_id::GET_TIME_NS => {
-            let ns = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0);
-            Ok(ns)
-        }
-        _ => Err("unknown helper"),
-    }
-}
-
-// ============================================================================
-// VM Execution
-// ============================================================================
-
-fn run_ebpf(ctx: &mut Context<DemoMemory>, mut pc: u64) -> Result<u64, &'static str> {
-    loop {
-        let instr = ctx.data.load_pc(pc).map_err(|_| "load failed")?;
-        pc += 1;
-
-        let flow = match rvm_core::step(ctx, instr) {
-            ControlFlow::Break(f) => f,
-            ControlFlow::Continue(instr) => {
-                let second = ctx.data.load_pc(pc).map_err(|_| "load failed")?;
-                pc += 1;
-                rvm_core::step_ld64(ctx, instr, second)
-            }
-        };
-
-        match flow {
-            Flow::Next => continue,
-            Flow::Exit => return Ok(ctx.regs[0]),
-            Flow::Jump(off) => pc = pc.wrapping_add_signed(off),
-            Flow::Call(off) => {
-                let target = pc.wrapping_add_signed(off);
-                let ret = run_ebpf(ctx, target)?;
-                ctx.regs[0] = ret;
-            }
-            Flow::CallExt(id) => {
-                ctx.regs[0] = dispatch_helper(ctx, id)?;
-            }
-            Flow::FailCpu => return Err("cpu fault"),
-            Flow::FailMem(_) => return Err("mem fault"),
-            Flow::Missing => return Err("unimplemented"),
-        }
-    }
+/// Build the registry of host helper functions exposed to eBPF programs.
+fn build_helpers() -> HelperRegistry {
+    let mut helpers = HelperRegistry::new();
+    helpers.register(helper_id::PRINT_U64, |val: u64| {
+        println!("  [eBPF] print_u64: {val}");
+        0u64
+    });
+    helpers
 }
 
 // ============================================================================
@@ -339,17 +199,9 @@ impl EbpfProgram {
         self.btf_data = btf;
     }
 
-    /// Convert to raw bytes (code + data + stack).
-    fn to_bytes(&self, stack_size: usize) -> Vec<u8> {
-        let code_size = self.instructions.len() * 8;
-        let total = code_size + stack_size;
-
-        let mut bytes = Vec::with_capacity(total);
-        for insn in &self.instructions {
-            bytes.extend_from_slice(&insn.to_le_bytes());
-        }
-        bytes.resize(total, 0);
-        bytes
+    /// Convert the raw u64 instructions to rvm's `Instruction` code slice.
+    fn code(&self) -> Vec<rvm::Instruction> {
+        self.instructions.iter().map(|&i| rvm::Instruction(i)).collect()
     }
 
     /// Get mutable access to instructions for relocation patching.
@@ -397,15 +249,15 @@ fn build_core_demo_program() -> EbpfProgram {
     prog.asm().ldxw(R2, R1, 8); // <-- This offset gets patched!
     prog.asm().mark_field_offset(1, pid_str_off);
 
-    // Move pid to arg1 for helper: r1 = r2
-    prog.asm().mov64_imm(R1, 0);
-    prog.asm().add64(R1, R2);
+    // Save pid in a callee-saved register because the helper call clobbers r1-r5.
+    prog.asm().mov64(R6, R2);
 
-    // Call print_u64(r1)
-    prog.asm().call(helper_id::PRINT_U64);
+    // Call print_u64(pid)
+    prog.asm().mov64(R1, R6);
+    prog.asm().call(helper_id::PRINT_U64 as i32);
 
-    // r0 = r2 (return the pid value)
-    prog.asm().mov64(R0, R2);
+    // r0 = pid (read back from the callee-saved register)
+    prog.asm().mov64(R0, R6);
 
     // exit
     prog.asm().exit();
@@ -447,10 +299,11 @@ fn demo_core_relocation() {
         let applied =
             apply_core_relocations(&mut prog_copy, &btf, &registry, &prog.relocations).expect("relocation failed");
 
-        let patched_imm = (prog_copy[0] >> 32) as i32;
+        // LDX/STX relocations patch the instruction's `off` field, not `imm`.
+        let patched_off = ((prog_copy[0] >> 16) & 0xFFFF) as i16;
         println!("  Host layout: event {{ timestamp: 0, pid: 8 }}");
         println!("  Applied {applied} relocation(s)");
-        println!("  Patched imm = {patched_imm} (should be 8)");
+        println!("  Patched off = {patched_off} (should be 8)");
     }
 
     // === Scenario 2: Host has DIFFERENT layout ===
@@ -468,10 +321,10 @@ fn demo_core_relocation() {
         let applied =
             apply_core_relocations(&mut prog_copy, &btf, &registry, &prog.relocations).expect("relocation failed");
 
-        let patched_imm = (prog_copy[0] >> 32) as i32;
+        let patched_off = ((prog_copy[0] >> 16) & 0xFFFF) as i16;
         println!("  Host layout: event {{ timestamp: 0, flags: 8, pid: 12 }}");
         println!("  Applied {applied} relocation(s)");
-        println!("  Patched imm = {patched_imm} (should be 12!)");
+        println!("  Patched off = {patched_off} (should be 12!)");
 
         println!("\n  Running patched program...");
     }
@@ -506,16 +359,17 @@ fn build_correct_core_program() -> EbpfProgram {
     // Instruction 3: r2 = *(u32*)(r2 + 0)
     prog.asm().ldxw(R2, R2, 0);
 
-    // Instruction 4: r1 = r2 (for print helper)
-    prog.asm().mov64(R1, R2);
+    // Save pid in a callee-saved register before the helper call clobbers r2.
+    prog.asm().mov64(R6, R2);
 
-    // Instruction 5: call print_u64
-    prog.asm().call(helper_id::PRINT_U64);
+    // Call print_u64(pid)
+    prog.asm().mov64(R1, R6);
+    prog.asm().call(helper_id::PRINT_U64 as i32);
 
-    // Instruction 6: r0 = r2 (return pid)
-    prog.asm().mov64(R0, R2);
+    // r0 = pid (read back from the callee-saved register)
+    prog.asm().mov64(R0, R6);
 
-    // Instruction 7: exit
+    // exit
     prog.asm().exit();
 
     prog.finalize().unwrap();
@@ -561,11 +415,7 @@ fn demo_full_core_execution() {
 
     // Build memory with event struct at a known location
     let stack_size = 512;
-    let code_size = prog.instructions.len() * 8;
-    let mut mem_bytes = prog.to_bytes(stack_size);
-
-    // Place event struct in data area
-    let event_ptr = code_size as u64;
+    let code = prog.code();
 
     // Write event struct with HOST's layout:
     // offset 0: timestamp = 0x1234567890ABCDEF
@@ -575,12 +425,12 @@ fn demo_full_core_execution() {
     let flags: u32 = 0xDEAD;
     let pid: u32 = 42;
 
-    // Extend mem_bytes to have space for the struct
-    mem_bytes.resize(code_size + 16 + stack_size, 0);
-
-    mem_bytes[code_size..code_size + 8].copy_from_slice(&timestamp.to_le_bytes());
-    mem_bytes[code_size + 8..code_size + 12].copy_from_slice(&flags.to_le_bytes());
-    mem_bytes[code_size + 12..code_size + 16].copy_from_slice(&pid.to_le_bytes());
+    let mut mem = VmMemory::new();
+    let stack_top = mem.map(rvm::STACK_REGION, stack_size, rvm::Perms::RW) + stack_size as u64;
+    let event_ptr = mem.map(rvm::FIRST_FREE_REGION, 16, rvm::Perms::RW);
+    mem.write(event_ptr, timestamp).unwrap();
+    mem.write(event_ptr + 8, flags).unwrap();
+    mem.write(event_ptr + 12, pid).unwrap();
 
     println!("\nMemory layout at 0x{event_ptr:x}:");
     println!("  [0x{event_ptr:x}] timestamp = 0x{timestamp:016x}");
@@ -589,23 +439,12 @@ fn demo_full_core_execution() {
     println!("  [0x{flags_addr:x}] flags     = 0x{flags:08x}");
     println!("  [0x{pid_addr:x}] pid       = {pid}");
 
-    // Rebuild instructions into memory (they were patched)
-    for (i, insn) in prog.instructions.iter().enumerate() {
-        let off = i * 8;
-        mem_bytes[off..off + 8].copy_from_slice(&insn.to_le_bytes());
-    }
-
     // Run the program
-    let mem = DemoMemory::new(mem_bytes);
-    let mut ctx = Context::new(mem);
-
-    // r1 = pointer to event struct
-    ctx.regs[1] = event_ptr;
-    // r10 = stack pointer
-    ctx.regs[10] = (code_size + 16 + stack_size) as u64;
+    let helpers = build_helpers();
+    let mut executor = Executor::new(&code, &mut mem, &helpers, stack_top);
 
     println!("\nExecuting eBPF program...");
-    let result = run_ebpf(&mut ctx, 0);
+    let result = executor.call(0, &[event_ptr]);
 
     match result {
         Ok(ret) => {
@@ -796,25 +635,18 @@ mod tests {
 
         // Build memory
         let stack_size = 512;
-        let code_size = prog.instructions.len() * 8;
-        let mut mem_bytes = vec![0u8; code_size + 16 + stack_size];
-
-        // Write instructions
-        for (i, insn) in prog.instructions.iter().enumerate() {
-            mem_bytes[i * 8..(i + 1) * 8].copy_from_slice(&insn.to_le_bytes());
-        }
-
-        // Write event struct at code_size
-        let event_ptr = code_size as u64;
+        let code = prog.code();
         let pid: u32 = 999;
-        mem_bytes[code_size + 12..code_size + 16].copy_from_slice(&pid.to_le_bytes());
 
-        let mem = DemoMemory::new(mem_bytes);
-        let mut ctx = Context::new(mem);
-        ctx.regs[1] = event_ptr;
-        ctx.regs[10] = (code_size + 16 + stack_size) as u64;
+        let mut mem = VmMemory::new();
+        let stack_top = mem.map(rvm::STACK_REGION, stack_size, rvm::Perms::RW) + stack_size as u64;
+        let event_ptr = mem.map(rvm::FIRST_FREE_REGION, 16, rvm::Perms::RW);
+        mem.write(event_ptr + 12, pid).unwrap();
 
-        let result = run_ebpf(&mut ctx, 0).unwrap();
+        let helpers = build_helpers();
+        let mut executor = Executor::new(&code, &mut mem, &helpers, stack_top);
+
+        let result = executor.call(0, &[event_ptr]).unwrap();
         assert_eq!(result, 999);
     }
 }

@@ -39,7 +39,7 @@
 //! Note: Requires `bpf/core_example.o`. Compile with:
 //!   clang -target bpf -O2 -g -c bpf/core_example.c -o bpf/core_example.o
 
-use rvm::Vm;
+use rvm::{Perms, Vm};
 
 /// Compile-time layout (what the BPF program was compiled with)
 #[repr(C)]
@@ -244,45 +244,33 @@ fn test_function(program: &mut rvm::Program, name: &str, args: &[u64], expected:
 }
 
 fn write_event_to_memory(program: &mut rvm::Program, event: &CompileTimeEvent) -> u64 {
-    use rvm::Memory;
-
-    // Find a safe location after code (use a fixed high address)
-    let event_addr: u64 = 0x1000; // 4KB offset
-
-    // Ensure memory is large enough
+    // Map a scratch region for the event data.
     let mem = program.memory_mut();
-    if mem.len() < (event_addr as usize + 32) {
-        mem.resize(event_addr as usize + 256);
-    }
+    let event_addr = mem.map(rvm::FIRST_FREE_REGION, 32, Perms::RW);
 
     // Write fields at compile-time offsets
-    let _ = mem.store_u64(event_addr, event.timestamp);
-    let _ = mem.store_u32(event_addr + 8, event.pid);
-    let _ = mem.store_u32(event_addr + 12, event.uid);
-    let _ = mem.store_u32(event_addr + 16, event.flags);
-    let _ = mem.store_u32(event_addr + 20, event._pad);
-    let _ = mem.store_u64(event_addr + 24, event.data);
+    mem.write(event_addr, event.timestamp).unwrap();
+    mem.write(event_addr + 8, event.pid).unwrap();
+    mem.write(event_addr + 12, event.uid).unwrap();
+    mem.write(event_addr + 16, event.flags).unwrap();
+    mem.write(event_addr + 20, event._pad).unwrap();
+    mem.write(event_addr + 24, event.data).unwrap();
 
     event_addr
 }
 
 fn write_runtime_event_to_memory(program: &mut rvm::Program, event: &RuntimeEvent) -> u64 {
-    use rvm::Memory;
-
-    let event_addr: u64 = 0x1000;
-
     let mem = program.memory_mut();
-    if mem.len() < (event_addr as usize + 32) {
-        mem.resize(event_addr as usize + 256);
-    }
+    let event_addr = mem.map(rvm::FIRST_FREE_REGION, 32, Perms::RW);
 
     // Write fields at RUNTIME offsets (different from compile-time!)
-    let _ = mem.store_u32(event_addr, event.flags); // flags first
-    let _ = mem.store_u32(event_addr + 4, event.pid);
-    let _ = mem.store_u32(event_addr + 8, event.uid);
-    let _ = mem.store_u32(event_addr + 12, event._pad);
-    let _ = mem.store_u64(event_addr + 16, event.timestamp); // timestamp later
-    let _ = mem.store_u64(event_addr + 24, event.data);
+    mem.write(event_addr, event.flags).unwrap(); // flags first
+    mem.write(event_addr + 4, event.pid).unwrap();
+    mem.write(event_addr + 8, event.uid).unwrap();
+    mem.write(event_addr + 12, event._pad).unwrap();
+    mem.write(event_addr + 16, event.timestamp).unwrap(); // timestamp later
+    mem.write(event_addr + 24, event.data).unwrap();
 
     event_addr
 }
+

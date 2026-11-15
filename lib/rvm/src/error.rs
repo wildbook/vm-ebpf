@@ -143,6 +143,10 @@ impl std::error::Error for ElfError {}
 pub enum LinkError {
     /// Unresolved symbol.
     UnresolvedSymbol(String),
+    /// A call to a helper ID that isn't registered.
+    UnknownHelper(u32),
+    /// An extern's declared parameter count differs from the host function's.
+    SignatureMismatch { name: String, declared: usize, host: u8 },
     /// Duplicate symbol.
     DuplicateSymbol(String),
     /// Circular dependency.
@@ -155,6 +159,10 @@ impl fmt::Display for LinkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnresolvedSymbol(name) => write!(f, "unresolved symbol: {name}"),
+            Self::UnknownHelper(id) => write!(f, "call to unregistered helper {id}"),
+            Self::SignatureMismatch { name, declared, host } => {
+                write!(f, "extern {name} declares {declared} parameters but the host function takes {host}")
+            }
             Self::DuplicateSymbol(name) => write!(f, "duplicate symbol: {name}"),
             Self::CircularDependency(msg) => write!(f, "circular dependency: {msg}"),
             Self::InvalidReference(msg) => write!(f, "invalid reference: {msg}"),
@@ -201,6 +209,8 @@ impl std::error::Error for ExecError {}
 pub enum HelperError {
     /// Unknown helper ID.
     UnknownHelper(u32),
+    /// Unknown extern table slot.
+    UnknownSlot(u32),
     /// Helper returned an error.
     Failed(String),
     /// Invalid arguments.
@@ -211,6 +221,7 @@ impl fmt::Display for HelperError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownHelper(id) => write!(f, "unknown helper: {id}"),
+            Self::UnknownSlot(slot) => write!(f, "unknown extern slot: {slot}"),
             Self::Failed(msg) => write!(f, "helper failed: {msg}"),
             Self::InvalidArgs(msg) => write!(f, "invalid arguments: {msg}"),
         }

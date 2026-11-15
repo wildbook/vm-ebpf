@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-rvm-core = { path = "../../lib/rvm-core" }
+rvm = { path = "../../lib/rvm" }
 constelf = { path = "../../lib/constelf" }
 anyhow = "1.0.90"
-hex = "0.4.3"

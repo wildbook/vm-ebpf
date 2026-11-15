@@ -17,6 +17,11 @@ mod tests;
 #[derive(Copy, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Instruction(pub u64);
 
+/// Decode little-endian bytecode into instructions (a trailing partial word is ignored).
+pub fn instructions_from_bytes(bytes: &[u8]) -> Box<[Instruction]> {
+    bytes.as_chunks::<8>().0.iter().map(|w| Instruction(u64::from_le_bytes(*w))).collect()
+}
+
 impl Instruction {
     pub const fn imm(self) -> i32 {
         ((self.0 & 0xFFFFFFFF00000000) >> 32) as i32
@@ -65,8 +70,11 @@ pub enum Flow<C: Memory> {
     Call(i64), // Call
     Exit,      // Return
 
-    /// Call an external function.
-    CallExt(u64),
+    /// Call a helper by its numeric ID (`src_reg = 0`).
+    CallHelper(u32),
+    /// Call an external function by ID (`src_reg = BPF_PSEUDO_KFUNC_CALL`); the
+    /// runtime defines what the ID indexes (rvm: the program's extern table).
+    CallKfunc(u32),
 
     FailCpu, // Invalid instruction, etc.
     FailMem(C::Err),
@@ -89,11 +97,6 @@ pub trait Memory {
 
     fn load_u8(&self, addr: u64) -> Result<u8, Self::Err>;
     fn store_u8(&mut self, addr: u64, value: u8) -> Result<(), Self::Err>;
-
-    fn load_pc(&self, pc: u64) -> Result<Instruction, Self::Err> {
-        // Use wrapping_mul to avoid panic on overflow; invalid address will be caught by load_u64
-        self.load_u64(pc.wrapping_mul(8)).map(Instruction)
-    }
 
     fn load_u16(&self, addr: u64) -> Result<u16, Self::Err> {
         let lo = self.load_u8(addr)? as u16;
@@ -141,13 +144,26 @@ impl Memory for () {
     }
 }
 
+impl<M: Memory + ?Sized> Memory for &mut M {
+    type Err = M::Err;
+
+    fn load_u8(&self, addr: u64) -> Result<u8, Self::Err> { (**self).load_u8(addr) }
+    fn store_u8(&mut self, addr: u64, value: u8) -> Result<(), Self::Err> { (**self).store_u8(addr, value) }
+    fn load_u16(&self, addr: u64) -> Result<u16, Self::Err> { (**self).load_u16(addr) }
+    fn load_u32(&self, addr: u64) -> Result<u32, Self::Err> { (**self).load_u32(addr) }
+    fn load_u64(&self, addr: u64) -> Result<u64, Self::Err> { (**self).load_u64(addr) }
+    fn store_u16(&mut self, addr: u64, value: u16) -> Result<(), Self::Err> { (**self).store_u16(addr, value) }
+    fn store_u32(&mut self, addr: u64, value: u32) -> Result<(), Self::Err> { (**self).store_u32(addr, value) }
+    fn store_u64(&mut self, addr: u64, value: u64) -> Result<(), Self::Err> { (**self).store_u64(addr, value) }
+}
+
 /// Scratch register index for storing first half of LD_IMM64 instruction.
 /// This is beyond the eBPF-defined registers (r0-r10) and must not be used elsewhere.
 pub const REG_SCRATCH_LD64: usize = 11;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Context<M: Memory> {
-    // There's actually just 10 registers, but we'll do 16 as it allows for optimizations (regs[idx & 0xF]).
+    // Expose all 16 for now; the upper ones double as interpreter scratch state (e.g. r11 for LD_IMM64).
 
     // R0: return value from function calls, and exit value for eBPF programs
     // R1 - R5: arguments for function calls
@@ -199,7 +215,9 @@ mod alu {
         };
 
         let s = match (alu_src, BITS) {
-            (Source::Imm, _) => imm as i64 as u64,
+            (Source::Imm, BITS_64) => imm as i64 as u64,
+            // ALU32 treats the immediate as a 32-bit value.
+            (Source::Imm, BITS_32) => imm as u32 as u64,
             (Source::Reg, BITS_64) => ctx.regs[src_reg],
             (Source::Reg, BITS_32) => ctx.regs[src_reg] & 0xFFFFFFFF,
         };
@@ -292,24 +310,35 @@ mod alu {
                 _ => return Flow::FailCpu,
             },
             AluOpc::Xor => d ^ s,
-            AluOpc::Mov => s,
+            // MOV (offset=0) or MOVSX (offset=8/16/32, register source only; 32 is ALU64-only).
+            AluOpc::Mov => match (offset, alu_src, BITS) {
+                (0, _, _) => s,
+                (8, Source::Reg, _) => s as i8 as i64 as u64,
+                (16, Source::Reg, _) => s as i16 as i64 as u64,
+                (32, Source::Reg, BITS_64) => s as i32 as i64 as u64,
+                _ => return Flow::FailCpu,
+            },
             AluOpc::Arsh => match BITS {
                 BITS_64 => ((d as i64) >> (s & 63)) as u64,
                 BITS_32 => ((d as i32) >> (s & 31)) as u64,
             },
-            // END (byte swap) instructions have special handling:
-            // - Uses the full 64-bit register value regardless of ALU class
-            // - The result width is determined by imm (16, 32, 64), not by ALU class
-            // - Results should NOT be zero-extended based on ALU class
+            // END: width comes from imm and the result is not zero-extended by class.
+            // Guest memory is little-endian, so LE truncates and BE swaps; ALU64 TO_LE is the
+            // unconditional BSWAP and ALU64 TO_BE is reserved.
             AluOpc::End => {
-                let full_d = ctx.regs[dst_reg]; // Use full 64-bit value
-                ctx.regs[dst_reg] = match (alu_end, imm) {
-                    (AluEnd::ToLE, 16) => (full_d as u16).to_le() as u64,
-                    (AluEnd::ToLE, 32) => (full_d as u32).to_le() as u64,
-                    (AluEnd::ToLE, 64) => full_d.to_le(),
-                    (AluEnd::ToBE, 16) => (full_d as u16).to_be() as u64,
-                    (AluEnd::ToBE, 32) => (full_d as u32).to_be() as u64,
-                    (AluEnd::ToBE, 64) => full_d.to_be(),
+                let full_d = ctx.regs[dst_reg];
+                let swap = match (BITS, alu_end) {
+                    (BITS_32, AluEnd::ToLE) => false,
+                    (BITS_32, AluEnd::ToBE) | (BITS_64, AluEnd::ToLE) => true,
+                    (BITS_64, AluEnd::ToBE) => return Flow::FailCpu,
+                };
+                ctx.regs[dst_reg] = match (swap, imm) {
+                    (false, 16) => full_d as u16 as u64,
+                    (false, 32) => full_d as u32 as u64,
+                    (false, 64) => full_d,
+                    (true, 16) => (full_d as u16).swap_bytes() as u64,
+                    (true, 32) => (full_d as u32).swap_bytes() as u64,
+                    (true, 64) => full_d.swap_bytes(),
                     _ => return Flow::FailCpu,
                 };
                 return Flow::Next;
@@ -342,7 +371,8 @@ mod alu {
         };
 
         let s = match (jmp_src, BITS) {
-            (Source::Imm, _) => imm as i64 as u64,
+            (Source::Imm, BITS_64) => imm as i64 as u64,
+            (Source::Imm, BITS_32) => imm as u32 as u64,
             (Source::Reg, BITS_64) => ctx.regs[src_reg],
             (Source::Reg, BITS_32) => ctx.regs[src_reg] & 0xFFFFFFFF,
         };
@@ -379,9 +409,9 @@ mod alu {
                 BITS_32 => (d as i32) <= (s as i32),
             },
 
-            JmpOpc::Call if src_reg == 0 => return Flow::CallExt(imm as u32 as u64), // helper function by static ID
+            JmpOpc::Call if src_reg == 0 => return Flow::CallHelper(imm as u32),
             JmpOpc::Call if src_reg == BPF_PSEUDO_CALL => return Flow::Call(i64::from(imm)), // program-local function
-            JmpOpc::Call if src_reg == BPF_PSEUDO_KFUNC_CALL => return Flow::CallExt(imm as u32 as u64), // helper by BTF ID
+            JmpOpc::Call if src_reg == BPF_PSEUDO_KFUNC_CALL => return Flow::CallKfunc(imm as u32),
             JmpOpc::Call => return Flow::Missing,
 
             JmpOpc::Exit => return Flow::Exit,

@@ -149,6 +149,17 @@ impl Vm {
         self.helpers.register_raw(id, helper);
     }
 
+    /// Register an extern function that programs import by name
+    /// (`extern u64 name(...);` in C). Unresolved names fail at link time.
+    pub fn register_fn<F, A, R>(&mut self, name: impl Into<String>, func: F)
+    where
+        F: Fn(A) -> R + Send + Sync + 'static,
+        A: FromArgs + 'static,
+        R: IntoReturn + 'static,
+    {
+        self.helpers.register_fn(name, func);
+    }
+
     /// Get the helper registry.
     pub fn helpers(&self) -> &HelperRegistry {
         &self.helpers

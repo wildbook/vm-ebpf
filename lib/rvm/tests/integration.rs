@@ -115,35 +115,130 @@ fn test_module_parsing() {
     assert!(module.exports.contains_key("bpf_main"));
 }
 
+#[test]
+fn test_symbol_lookup_matches_name() {
+    let module = Vm::new().parse_module("test", &load_example_elf()).unwrap();
+    for name in ["call_count", "last_result", "simple_add", "MAGIC_VALUE"] {
+        assert_eq!(module.symbol(name).map(|s| s.name.as_str()), Some(name));
+    }
+}
+
+/// `bpf_main` writes globals through relocations; they must not land on other code.
+#[test]
+fn test_bpf_main_globals_do_not_clobber_code() {
+    let mut program = Vm::new().load_elf(&load_example_elf()).unwrap();
+    let scratch = program.memory_mut().map(rvm::FIRST_FREE_REGION, 4096, rvm::Perms::RW);
+    let ctx = scratch;
+    let out = ctx + 64;
+    let mem = program.memory_mut();
+    mem.write(ctx, 5u64).unwrap(); // value_a
+    mem.write(ctx + 8, 7u64).unwrap(); // value_b
+    mem.write(ctx + 16, 2u32).unwrap(); // operation = mul
+
+    assert_eq!(program.call("bpf_main", &[ctx, out]).unwrap(), 0);
+    assert_eq!(program.memory().read::<u64>(out).unwrap(), 35);
+    assert_eq!(program.call("simple_add", &[2, 3]).unwrap(), 5);
+}
+
+#[test]
+fn test_memory_survives_fault() {
+    let mut program = Vm::new().load_elf(&load_example_elf()).unwrap();
+    assert!(program.call("bpf_main", &[0xFFFF_FFFF_0000, 0xFFFF_FFFF_0000]).is_err());
+    assert_eq!(program.call("simple_add", &[2, 3]).unwrap(), 5);
+}
+
+// ==================== Linking & Externs ====================
+
+mod linking {
+    use rvm::{LinkError, Vm, VmError};
+
+    fn read(name: &str) -> Vec<u8> {
+        std::fs::read(format!("{}/../../bpf/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    }
+
+    /// Vm with everything link_main.o imports: helper 1 and `host_add`.
+    fn full_vm() -> Vm {
+        let mut vm = Vm::new();
+        vm.register_helper(1, |x: u64| x * 2);
+        vm.register_fn("host_add", |(a, b): (u64, u64)| a + b);
+        vm
+    }
+
+    fn link(vm: &Vm) -> rvm::Result<rvm::Program> {
+        let main = vm.parse_module("main", &read("link_main.o"))?;
+        let lib = vm.parse_module("lib", &read("link_lib.o"))?;
+        vm.link(&[&main, &lib])
+    }
+
+    #[test]
+    fn cross_module_call_helper_and_extern() {
+        let mut program = link(&full_vm()).unwrap();
+        // host_add(lib_scale(7), helper_double(7)) = 21 + 14
+        assert_eq!(program.call("run", &[7]).unwrap(), 35);
+        assert_eq!(program.call("lib_scale", &[5]).unwrap(), 15);
+    }
+
+    #[test]
+    fn missing_extern_fails_link() {
+        let mut vm = Vm::new();
+        vm.register_helper(1, |x: u64| x * 2);
+        assert!(matches!(
+            link(&vm).unwrap_err(),
+            VmError::Link(LinkError::UnresolvedSymbol(name)) if name == "host_add"
+        ));
+    }
+
+    #[test]
+    fn missing_helper_fails_link() {
+        let mut vm = Vm::new();
+        vm.register_fn("host_add", |(a, b): (u64, u64)| a + b);
+        assert!(matches!(link(&vm).unwrap_err(), VmError::Link(LinkError::UnknownHelper(1))));
+    }
+
+    #[test]
+    fn extern_arity_mismatch_fails_link() {
+        let mut vm = Vm::new();
+        vm.register_helper(1, |x: u64| x * 2);
+        vm.register_fn("host_add", |x: u64| x);
+        assert!(matches!(
+            link(&vm).unwrap_err(),
+            VmError::Link(LinkError::SignatureMismatch { declared: 2, host: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn replacing_extern_rebinds_linked_calls() {
+        let mut program = link(&full_vm()).unwrap();
+        program.helpers_mut().register_fn("host_add", |(a, b): (u64, u64)| a * b);
+        assert_eq!(program.call("run", &[7]).unwrap(), 21 * 14);
+    }
+}
+
 // ==================== Memory Safety Tests ====================
 
 mod memory_safety {
     use ebpf_asm::{Assembler, R0, R1, R10, R2, R6};
-    use rvm::{ExecError, Executor, HelperRegistry, Memory, VmError, VmMemory};
+    use rvm::{ExecError, Executor, HelperRegistry, Instruction, Perms, VmError, VmMemory};
 
-    /// Helper to load assembled instructions into memory and create an executor.
-    fn create_executor_with_program(memory: &mut VmMemory, asm: &mut Assembler) {
-        let instructions = asm.assemble_to_u64().unwrap();
-        for (i, insn) in instructions.iter().enumerate() {
-            memory.store_u64((i * 8) as u64, *insn).unwrap();
-        }
+    /// Assemble `asm` into an instruction slice the executor can run directly.
+    fn assemble(asm: &mut Assembler) -> Vec<Instruction> {
+        asm.assemble_to_u64().unwrap().into_iter().map(Instruction).collect()
     }
 
     #[test]
     fn test_memory_out_of_bounds_read() {
-        // Test that reading beyond memory bounds returns an error
-        let mut memory = VmMemory::new(256);
+        // Test that reading beyond memory bounds returns an error.
+        // 0x7FFFFFFF falls in region 0, which is never mapped.
+        let mut memory = VmMemory::new();
 
         let mut asm = Assembler::new();
-        // Try to load from address 0xFFFFFFFF (way beyond bounds)
-        asm.mov64_imm(R1, 0x7FFFFFFF); // Large address
+        asm.mov64_imm(R1, 0x7FFFFFFF); // Large address, unmapped region 0
         asm.ldxdw(R0, R1, 0); // Try to load from that address
         asm.exit();
-
-        create_executor_with_program(&mut memory, &mut asm);
+        let code = assemble(&mut asm);
 
         let helpers = HelperRegistry::new();
-        let mut executor = Executor::new(&mut memory, &helpers, 256);
+        let mut executor = Executor::new(&code, &mut memory, &helpers, 256);
 
         let result = executor.call(0, &[]);
         assert!(result.is_err(), "Expected error for OOB read, got {:?}", result);
@@ -159,20 +254,18 @@ mod memory_safety {
 
     #[test]
     fn test_memory_out_of_bounds_write() {
-        // Test that writing beyond memory bounds returns an error
-        let mut memory = VmMemory::new(256);
+        // Test that writing beyond memory bounds returns an error.
+        let mut memory = VmMemory::new();
 
         let mut asm = Assembler::new();
-        // Try to store to address 0xFFFFFFFF (way beyond bounds)
-        asm.mov64_imm(R1, 0x7FFFFFFF); // Large address
+        asm.mov64_imm(R1, 0x7FFFFFFF); // Large address, unmapped region 0
         asm.mov64_imm(R2, 42);
         asm.stxdw(R1, 0, R2); // Try to store to that address
         asm.exit();
-
-        create_executor_with_program(&mut memory, &mut asm);
+        let code = assemble(&mut asm);
 
         let helpers = HelperRegistry::new();
-        let mut executor = Executor::new(&mut memory, &helpers, 256);
+        let mut executor = Executor::new(&code, &mut memory, &helpers, 256);
 
         let result = executor.call(0, &[]);
         assert!(result.is_err(), "Expected error for OOB write, got {:?}", result);
@@ -188,20 +281,20 @@ mod memory_safety {
 
     #[test]
     fn test_memory_boundary_read() {
-        // Test reading at the exact boundary of memory
-        let mut memory = VmMemory::new(256);
+        // Test reading at the exact boundary of a mapped region.
+        let mut memory = VmMemory::new();
+        let base = memory.map(1, 256, Perms::RW);
 
         let mut asm = Assembler::new();
-        // Memory is 256 bytes, trying to read 8 bytes at offset 250 should fail
+        // Region is 256 bytes, trying to read 8 bytes at offset 250 should fail
         // (250 + 8 = 258 > 256)
-        asm.mov64_imm(R1, 250);
+        asm.lddw(R1, (base + 250) as i64);
         asm.ldxdw(R0, R1, 0);
         asm.exit();
-
-        create_executor_with_program(&mut memory, &mut asm);
+        let code = assemble(&mut asm);
 
         let helpers = HelperRegistry::new();
-        let mut executor = Executor::new(&mut memory, &helpers, 256);
+        let mut executor = Executor::new(&code, &mut memory, &helpers, base + 256);
 
         let result = executor.call(0, &[]);
         assert!(result.is_err(), "Expected error for boundary read, got {:?}", result);
@@ -211,7 +304,8 @@ mod memory_safety {
     fn test_stack_overflow_deep_recursion() {
         // Test that deep BPF-to-BPF recursion triggers stack overflow
         // MAX_CALL_DEPTH is 8 in executor.rs
-        let mut memory = VmMemory::new(512);
+        let mut memory = VmMemory::new();
+        let stack_top = memory.map(1, 512, Perms::RW) + 512;
 
         let mut asm = Assembler::new();
         // Create an infinite recursive function
@@ -219,11 +313,10 @@ mod memory_safety {
         asm.set_label(&mut func_start).unwrap();
         asm.call_local(&func_start); // Call self recursively
         asm.exit();
-
-        create_executor_with_program(&mut memory, &mut asm);
+        let code = assemble(&mut asm);
 
         let helpers = HelperRegistry::new();
-        let mut executor = Executor::new(&mut memory, &helpers, 512);
+        let mut executor = Executor::new(&code, &mut memory, &helpers, stack_top);
 
         let result = executor.call(0, &[]);
         assert!(result.is_err(), "Expected error for stack overflow, got {:?}", result);
@@ -240,17 +333,16 @@ mod memory_safety {
     #[test]
     fn test_instruction_limit_infinite_loop() {
         // Test that instruction limit is enforced on infinite loops
-        let mut memory = VmMemory::new(256);
+        let mut memory = VmMemory::new();
 
         let mut asm = Assembler::new();
         let mut loop_start = asm.create_label();
         asm.set_label(&mut loop_start).unwrap();
         asm.ja(&loop_start); // Infinite loop
-
-        create_executor_with_program(&mut memory, &mut asm);
+        let code = assemble(&mut asm);
 
         let helpers = HelperRegistry::new();
-        let mut executor = Executor::new(&mut memory, &helpers, 256);
+        let mut executor = Executor::new(&code, &mut memory, &helpers, 256);
         executor.set_instruction_limit(100);
 
         let result = executor.call(0, &[]);
@@ -268,7 +360,7 @@ mod memory_safety {
     #[test]
     fn test_invalid_program_counter() {
         // Test that jumping to invalid PC is caught
-        let mut memory = VmMemory::new(256);
+        let mut memory = VmMemory::new();
 
         let mut asm = Assembler::new();
         // Create a forward label that we never set (will result in offset 0)
@@ -277,11 +369,10 @@ mod memory_safety {
         asm.mov64_imm(R0, 0);
         // We'll just exit normally but start execution at invalid PC
         asm.exit();
-
-        create_executor_with_program(&mut memory, &mut asm);
+        let code = assemble(&mut asm);
 
         let helpers = HelperRegistry::new();
-        let mut executor = Executor::new(&mut memory, &helpers, 256);
+        let mut executor = Executor::new(&code, &mut memory, &helpers, 256);
 
         // Try to start execution at a very high PC
         let result = executor.call(1000, &[]);
@@ -299,8 +390,8 @@ mod memory_safety {
     #[test]
     fn test_stack_access_valid() {
         // Test that valid stack access works correctly
-        let mut memory = VmMemory::new(1024);
-        let stack_top = 1024u64;
+        let mut memory = VmMemory::new();
+        let stack_top = memory.map(1, 1024, Perms::RW) + 1024;
 
         let mut asm = Assembler::new();
         // Store value to stack (r10 is frame pointer, points to stack top)
@@ -308,11 +399,10 @@ mod memory_safety {
         asm.stxdw(R10, -8, R1); // Store at [r10 - 8]
         asm.ldxdw(R0, R10, -8); // Load back
         asm.exit();
-
-        create_executor_with_program(&mut memory, &mut asm);
+        let code = assemble(&mut asm);
 
         let helpers = HelperRegistry::new();
-        let mut executor = Executor::new(&mut memory, &helpers, stack_top);
+        let mut executor = Executor::new(&code, &mut memory, &helpers, stack_top);
 
         let result = executor.call(0, &[]);
         assert!(result.is_ok(), "Expected valid stack access, got {:?}", result);
@@ -321,19 +411,18 @@ mod memory_safety {
 
     #[test]
     fn test_negative_address_wrap() {
-        // Test that negative addresses (which wrap to large u64) are caught
-        let mut memory = VmMemory::new(256);
+        // Test that negative addresses (which wrap to large u64) are caught:
+        // 0 - 8 wraps to a region index far beyond MAX_REGIONS, so it stays unmapped.
+        let mut memory = VmMemory::new();
 
         let mut asm = Assembler::new();
-        // Load from r10-8 where r10 is 0 (not set), causing underflow
         asm.mov64_imm(R6, 0); // Set r6 to 0
         asm.ldxdw(R0, R6, -8); // Load from address -8 (wraps to 0xFFF...F8)
         asm.exit();
-
-        create_executor_with_program(&mut memory, &mut asm);
+        let code = assemble(&mut asm);
 
         let helpers = HelperRegistry::new();
-        let mut executor = Executor::new(&mut memory, &helpers, 256);
+        let mut executor = Executor::new(&code, &mut memory, &helpers, 256);
 
         let result = executor.call(0, &[]);
         // This should fail because 0 - 8 wraps to a huge address
@@ -343,16 +432,15 @@ mod memory_safety {
     #[test]
     fn test_helper_not_found() {
         // Test that calling an unregistered helper returns an error
-        let mut memory = VmMemory::new(256);
+        let mut memory = VmMemory::new();
 
         let mut asm = Assembler::new();
         asm.call(999); // Call helper ID 999 which isn't registered
         asm.exit();
-
-        create_executor_with_program(&mut memory, &mut asm);
+        let code = assemble(&mut asm);
 
         let helpers = HelperRegistry::new();
-        let mut executor = Executor::new(&mut memory, &helpers, 256);
+        let mut executor = Executor::new(&code, &mut memory, &helpers, 256);
 
         let result = executor.call(0, &[]);
         assert!(result.is_err(), "Expected error for unknown helper, got {:?}", result);

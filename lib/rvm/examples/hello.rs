@@ -6,7 +6,7 @@
 //! Run with: cargo run --example hello
 
 use ebpf_asm::{Assembler, R0, R1};
-use rvm::VmMemory;
+use rvm::{Perms, VmMemory};
 
 fn main() {
     println!("=== Hello rvm ===\n");
@@ -22,16 +22,16 @@ fn main() {
     asm.add64_imm(R0, 10); // r0 += 10
     asm.exit(); // exit
 
-    let program = asm.assemble().unwrap();
+    let bytes = asm.assemble().unwrap();
+    let code = rvm::instructions_from_bytes(&bytes);
 
-    // Create memory and load the program
-    let mut memory = VmMemory::new(program.len() + 512); // code + stack
-    memory.write_bytes(0, &program).unwrap();
+    // Code stays outside guest memory, so only the stack is mapped.
+    let mut memory = VmMemory::new();
+    let stack_top = memory.map(rvm::STACK_REGION, 512, Perms::RW) + 512;
 
     // Create executor and run
     let helpers = rvm::HelperRegistry::new();
-    let stack_top = (program.len() + 512) as u64;
-    let mut executor = rvm::Executor::new(&mut memory, &helpers, stack_top);
+    let mut executor = rvm::Executor::new(&code, &mut memory, &helpers, stack_top);
 
     // Call with argument r1 = 32
     let result = executor.call(0, &[32]).unwrap();

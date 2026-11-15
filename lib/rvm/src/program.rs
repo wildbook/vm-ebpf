@@ -9,6 +9,7 @@ use crate::error::{Result, VmError};
 use crate::executor::Executor;
 use crate::helper::HelperRegistry;
 use crate::memory::VmMemory;
+use rvm_core::Instruction;
 
 /// Information about an executable function.
 #[derive(Debug, Clone)]
@@ -23,8 +24,8 @@ pub struct FunctionInfo {
 
 /// A linked eBPF program ready for execution.
 ///
-/// Contains the memory layout (code + data + stack) and function table.
-/// Use `call()` to execute a function by name.
+/// Holds the code (outside guest memory), guest memory regions (stack, data),
+/// and function table. Use `call()` to execute a function by name.
 ///
 /// # Example
 ///
@@ -39,25 +40,55 @@ pub struct FunctionInfo {
 /// ```
 #[derive(Debug)]
 pub struct Program {
-    /// Program memory (code, data, stack).
+    /// Instructions; not addressable by the guest.
+    code: Box<[Instruction]>,
+    /// Guest memory regions (stack, data). See [`crate::linker`] for the layout.
     memory: VmMemory,
     /// Function table: name -> function info.
     functions: HashMap<String, FunctionInfo>,
     /// Stack top address (r10 initial value).
     stack_top: u64,
+    /// Helpers available to the program (snapshot of the VM's registry at link time).
+    helpers: HelperRegistry,
+    /// Maximum instructions per call (0 = unlimited).
+    instruction_limit: u64,
+    /// Stack bytes per call frame.
+    frame_size: u64,
 }
 
 impl Program {
     /// Create a new program.
-    pub fn new(memory: VmMemory, functions: HashMap<String, FunctionInfo>, stack_top: u64) -> Self {
+    pub fn new(
+        code: Box<[Instruction]>,
+        memory: VmMemory,
+        functions: HashMap<String, FunctionInfo>,
+        stack_top: u64,
+        helpers: HelperRegistry,
+        instruction_limit: u64,
+        frame_size: u64,
+    ) -> Self {
         Self {
+            code,
             memory,
             functions,
             stack_top,
+            helpers,
+            instruction_limit,
+            frame_size,
         }
     }
 
-    /// Get the memory region.
+    /// The program's instructions.
+    pub fn code(&self) -> &[Instruction] {
+        &self.code
+    }
+
+    /// Get the program's helper registry.
+    pub fn helpers_mut(&mut self) -> &mut HelperRegistry {
+        &mut self.helpers
+    }
+
+    /// Get guest memory.
     pub fn memory(&self) -> &VmMemory {
         &self.memory
     }
@@ -92,60 +123,36 @@ impl Program {
         self.functions.contains_key(name)
     }
 
-    /// Get the entry point (first function, or "main" if it exists).
+    /// Get the entry point: "main" if it exists, otherwise the lowest-addressed function.
     pub fn entry_point(&self) -> Option<&FunctionInfo> {
-        self.functions.get("main").or_else(|| self.functions.values().next())
+        self.functions
+            .get("main")
+            .or_else(|| self.functions.values().min_by_key(|f| (f.pc, &f.name)))
     }
 
-    /// Call a function by name with no helpers.
-    ///
-    /// This is a convenience method that creates an empty helper registry.
-    /// For programs that use helpers, use `call_with_helpers` instead.
+    /// Call a function by name; arguments go in r1-r5.
     pub fn call(&mut self, name: &str, args: &[u64]) -> Result<u64> {
-        let helpers = HelperRegistry::new();
-        self.call_with_helpers(name, args, &helpers, u64::MAX)
-    }
-
-    /// Call a function with a helper registry.
-    pub fn call_with_helpers(
-        &mut self,
-        name: &str,
-        args: &[u64],
-        helpers: &HelperRegistry,
-        instruction_limit: u64,
-    ) -> Result<u64> {
-        let func = self
+        let pc = self
             .functions
             .get(name)
             .ok_or_else(|| VmError::FunctionNotFound(name.to_string()))?
-            .clone();
-
-        let mut executor = Executor::new(&mut self.memory, helpers, self.stack_top);
-        executor.set_instruction_limit(instruction_limit);
-        executor.call(func.pc, args)
+            .pc;
+        self.call_pc(pc, args)
     }
 
     /// Call the entry point function.
     pub fn run(&mut self, args: &[u64]) -> Result<u64> {
-        let entry = self
+        let pc = self
             .entry_point()
             .ok_or_else(|| VmError::FunctionNotFound("no entry point".to_string()))?
-            .clone();
-
-        let helpers = HelperRegistry::new();
-        let mut executor = Executor::new(&mut self.memory, &helpers, self.stack_top);
-        executor.call(entry.pc, args)
+            .pc;
+        self.call_pc(pc, args)
     }
 
-    /// Run the entry point with helpers.
-    pub fn run_with_helpers(&mut self, args: &[u64], helpers: &HelperRegistry, instruction_limit: u64) -> Result<u64> {
-        let entry = self
-            .entry_point()
-            .ok_or_else(|| VmError::FunctionNotFound("no entry point".to_string()))?
-            .clone();
-
-        let mut executor = Executor::new(&mut self.memory, helpers, self.stack_top);
-        executor.set_instruction_limit(instruction_limit);
-        executor.call(entry.pc, args)
+    fn call_pc(&mut self, pc: u64, args: &[u64]) -> Result<u64> {
+        let mut executor = Executor::new(&self.code, &mut self.memory, &self.helpers, self.stack_top);
+        executor.set_instruction_limit(self.instruction_limit);
+        executor.set_frame_size(self.frame_size);
+        executor.call(pc, args)
     }
 }

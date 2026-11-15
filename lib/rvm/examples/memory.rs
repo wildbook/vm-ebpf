@@ -5,7 +5,7 @@
 //! Run with: cargo run --example memory
 
 use ebpf_asm::{Assembler, R0, R1, R2, R3};
-use rvm::VmMemory;
+use rvm::{Perms, VmMemory};
 
 fn main() {
     println!("=== Memory Access ===\n");
@@ -94,22 +94,16 @@ fn test_memory_with_offset() {
 // ============================================================================
 
 fn run_with_data(asm: &mut Assembler) -> u64 {
-    let program = asm.assemble().unwrap();
+    let bytes = asm.assemble().unwrap();
+    let code = rvm::instructions_from_bytes(&bytes);
 
-    // Layout: [code][gap][data area][stack]
-    let code_size = program.len();
-    let data_offset = code_size.div_ceil(8) * 8 + 64; // Align and add gap
-    let data_size = 128;
-    let stack_size = 512;
-    let total_size = data_offset + data_size + stack_size;
-
-    let mut memory = VmMemory::new(total_size);
-    memory.write_bytes(0, &program).unwrap();
+    let mut memory = VmMemory::new();
+    let stack_top = memory.map(rvm::STACK_REGION, 512, Perms::RW) + 512;
+    let data_base = memory.map(rvm::FIRST_FREE_REGION, 128, Perms::RW);
 
     let helpers = rvm::HelperRegistry::new();
-    let stack_top = total_size as u64;
-    let mut executor = rvm::Executor::new(&mut memory, &helpers, stack_top);
+    let mut executor = rvm::Executor::new(&code, &mut memory, &helpers, stack_top);
 
     // Pass data area pointer in r1
-    executor.call(0, &[data_offset as u64]).unwrap()
+    executor.call(0, &[data_base]).unwrap()
 }

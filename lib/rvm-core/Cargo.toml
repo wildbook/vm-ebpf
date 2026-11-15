@@ -9,4 +9,3 @@ edition = "2021"
 crate-type = ["lib", "cdylib"]
 
 [dependencies]
-hex-literal = "0.4.1"

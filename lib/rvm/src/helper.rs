@@ -16,6 +16,9 @@
 //! vm.register_helper(1, HelperFn::new(my_print));
 //! ```
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use crate::error::HelperError;
 use crate::memory::VmMemory;
 
@@ -62,21 +65,21 @@ impl HelperArgs {
 }
 
 /// Context available to helper functions.
-pub struct HelperContext<'a> {
+pub struct HelperContext<'a, M = VmMemory> {
     /// Helper arguments (r1-r5).
     pub args: HelperArgs,
     /// Memory access (if available).
-    pub memory: Option<&'a mut VmMemory>,
+    pub memory: Option<&'a mut M>,
 }
 
-impl<'a> HelperContext<'a> {
+impl<'a, M> HelperContext<'a, M> {
     /// Create a new helper context.
     pub fn new(args: HelperArgs) -> Self {
         Self { args, memory: None }
     }
 
     /// Create a helper context with memory access.
-    pub fn with_memory(args: HelperArgs, memory: &'a mut VmMemory) -> Self {
+    pub fn with_memory(args: HelperArgs, memory: &'a mut M) -> Self {
         Self {
             args,
             memory: Some(memory),
@@ -88,69 +91,66 @@ impl<'a> HelperContext<'a> {
 ///
 /// This trait enables type-safe argument extraction from the raw u64 registers.
 pub trait FromArgs: Sized {
+    /// Number of argument registers (r1..) this type reads.
+    const ARITY: u8;
+
     /// Extract arguments from the helper args.
     fn from_args(args: &HelperArgs) -> Self;
 }
 
-// Implement FromArgs for tuples of different arities
 impl FromArgs for () {
+    const ARITY: u8 = 0;
     fn from_args(_args: &HelperArgs) -> Self {}
 }
 
-impl FromArgs for u64 {
-    fn from_args(args: &HelperArgs) -> Self {
-        args.r1
-    }
-}
-
 impl FromArgs for (u64,) {
+    const ARITY: u8 = 1;
     fn from_args(args: &HelperArgs) -> Self {
         (args.r1,)
     }
 }
 
 impl FromArgs for (u64, u64) {
+    const ARITY: u8 = 2;
     fn from_args(args: &HelperArgs) -> Self {
         (args.r1, args.r2)
     }
 }
 
 impl FromArgs for (u64, u64, u64) {
+    const ARITY: u8 = 3;
     fn from_args(args: &HelperArgs) -> Self {
         (args.r1, args.r2, args.r3)
     }
 }
 
 impl FromArgs for (u64, u64, u64, u64) {
+    const ARITY: u8 = 4;
     fn from_args(args: &HelperArgs) -> Self {
         (args.r1, args.r2, args.r3, args.r4)
     }
 }
 
 impl FromArgs for (u64, u64, u64, u64, u64) {
+    const ARITY: u8 = 5;
     fn from_args(args: &HelperArgs) -> Self {
         (args.r1, args.r2, args.r3, args.r4, args.r5)
     }
 }
 
-// Also support extracting as other integer types
-impl FromArgs for u32 {
-    fn from_args(args: &HelperArgs) -> Self {
-        args.r1 as u32
-    }
+// Single-argument shorthands.
+macro_rules! single_arg {
+    ($($ty:ty),*) => {$(
+        impl FromArgs for $ty {
+            const ARITY: u8 = 1;
+            fn from_args(args: &HelperArgs) -> Self {
+                args.r1 as $ty
+            }
+        }
+    )*};
 }
 
-impl FromArgs for i64 {
-    fn from_args(args: &HelperArgs) -> Self {
-        args.r1 as i64
-    }
-}
-
-impl FromArgs for i32 {
-    fn from_args(args: &HelperArgs) -> Self {
-        args.r1 as i32
-    }
-}
+single_arg!(u64, u32, i64, i32);
 
 /// Trait for converting return values to u64 for r0.
 pub trait IntoReturn {
@@ -204,7 +204,7 @@ impl<T: IntoReturn, E> IntoReturn for Result<T, E> {
 }
 
 /// Type-erased helper function.
-pub type DynHelper = Box<dyn Fn(&mut HelperContext) -> Result<u64, HelperError> + Send + Sync>;
+pub type DynHelper<M = VmMemory> = Arc<dyn Fn(&mut HelperContext<M>) -> Result<u64, HelperError> + Send + Sync>;
 
 /// A wrapper for type-safe helper functions.
 ///
@@ -238,13 +238,13 @@ where
 }
 
 /// Convert a typed function into a dynamic helper.
-pub fn into_dyn_helper<F, A, R>(func: F) -> DynHelper
+pub fn into_dyn_helper<M: 'static, F, A, R>(func: F) -> DynHelper<M>
 where
     F: Fn(A) -> R + Send + Sync + 'static,
     A: FromArgs + 'static,
     R: IntoReturn + 'static,
 {
-    Box::new(move |ctx: &mut HelperContext| {
+    Arc::new(move |ctx: &mut HelperContext<M>| {
         let typed_args = A::from_args(&ctx.args);
         let result = func(typed_args);
         Ok(result.into_return())
@@ -252,29 +252,62 @@ where
 }
 
 /// Convert a function that takes HelperContext into a dynamic helper.
-pub fn into_dyn_helper_with_ctx<F, R>(func: F) -> DynHelper
+pub fn into_dyn_helper_with_ctx<M: 'static, F, R>(func: F) -> DynHelper<M>
 where
-    F: Fn(&mut HelperContext) -> R + Send + Sync + 'static,
+    F: Fn(&mut HelperContext<M>) -> R + Send + Sync + 'static,
     R: IntoReturn + 'static,
 {
-    Box::new(move |ctx: &mut HelperContext| {
+    Arc::new(move |ctx: &mut HelperContext<M>| {
         let result = func(ctx);
         Ok(result.into_return())
     })
 }
 
-/// A collection of registered helper functions.
-#[derive(Default)]
-pub struct HelperRegistry {
-    helpers: std::collections::HashMap<u32, DynHelper>,
+/// Extern table: host functions callable from eBPF, stored in dense slots.
+///
+/// Functions are registered either by numeric helper ID (standard BPF helpers,
+/// `call <id>`) or by name (extern functions declared in the program). The linker
+/// rewrites every call into a slot call, so linked programs dispatch by index.
+/// Re-registering an ID or name replaces the function in its existing slot, which
+/// keeps linked call sites valid (hot reload).
+pub struct HelperRegistry<M = VmMemory> {
+    slots: Vec<DynHelper<M>>,
+    // argument count per slot; `None` for raw and context helpers, which read registers themselves
+    arities: Vec<Option<u8>>,
+    by_id: HashMap<u32, u32>,
+    by_name: HashMap<String, u32>,
+}
+
+impl<M> Default for HelperRegistry<M> {
+    fn default() -> Self {
+        Self {
+            slots: Vec::new(),
+            arities: Vec::new(),
+            by_id: HashMap::new(),
+            by_name: HashMap::new(),
+        }
+    }
+}
+
+impl<M> Clone for HelperRegistry<M> {
+    fn clone(&self) -> Self {
+        Self {
+            slots: self.slots.clone(),
+            arities: self.arities.clone(),
+            by_id: self.by_id.clone(),
+            by_name: self.by_name.clone(),
+        }
+    }
 }
 
 impl HelperRegistry {
-    /// Create a new empty registry.
+    /// Create a new empty registry for [`VmMemory`]; use `default()` for other memories.
     pub fn new() -> Self {
         Self::default()
     }
+}
 
+impl<M: 'static> HelperRegistry<M> {
     /// Register a helper function by ID.
     ///
     /// # Example
@@ -291,50 +324,128 @@ impl HelperRegistry {
         A: FromArgs + 'static,
         R: IntoReturn + 'static,
     {
-        self.helpers.insert(id, into_dyn_helper(func));
+        let slot = self.by_id.get(&id).copied();
+        let slot = self.put(slot, into_dyn_helper(func), Some(A::ARITY));
+        self.by_id.insert(id, slot);
     }
 
     /// Register a helper that needs access to the context.
     pub fn register_with_ctx<F, R>(&mut self, id: u32, func: F)
     where
-        F: Fn(&mut HelperContext) -> R + Send + Sync + 'static,
+        F: Fn(&mut HelperContext<M>) -> R + Send + Sync + 'static,
         R: IntoReturn + 'static,
     {
-        self.helpers.insert(id, into_dyn_helper_with_ctx(func));
+        self.register_raw(id, into_dyn_helper_with_ctx(func));
     }
 
-    /// Register a raw dynamic helper.
-    pub fn register_raw(&mut self, id: u32, helper: DynHelper) {
-        self.helpers.insert(id, helper);
+    /// Register a raw dynamic helper by ID.
+    pub fn register_raw(&mut self, id: u32, helper: DynHelper<M>) {
+        let slot = self.by_id.get(&id).copied();
+        let slot = self.put(slot, helper, None);
+        self.by_id.insert(id, slot);
+    }
+
+    /// Register an extern function by name.
+    pub fn register_fn<F, A, R>(&mut self, name: impl Into<String>, func: F)
+    where
+        F: Fn(A) -> R + Send + Sync + 'static,
+        A: FromArgs + 'static,
+        R: IntoReturn + 'static,
+    {
+        let name = name.into();
+        let slot = self.by_name.get(&name).copied();
+        let slot = self.put(slot, into_dyn_helper(func), Some(A::ARITY));
+        self.by_name.insert(name, slot);
+    }
+
+    /// Register an extern function by name that needs access to the context.
+    pub fn register_fn_with_ctx<F, R>(&mut self, name: impl Into<String>, func: F)
+    where
+        F: Fn(&mut HelperContext<M>) -> R + Send + Sync + 'static,
+        R: IntoReturn + 'static,
+    {
+        self.register_fn_raw(name, into_dyn_helper_with_ctx(func));
+    }
+
+    /// Register a raw dynamic extern function by name.
+    pub fn register_fn_raw(&mut self, name: impl Into<String>, helper: DynHelper<M>) {
+        let name = name.into();
+        let slot = self.by_name.get(&name).copied();
+        let slot = self.put(slot, helper, None);
+        self.by_name.insert(name, slot);
+    }
+
+    /// Replace the function in `slot`, or append a new slot.
+    fn put(&mut self, slot: Option<u32>, helper: DynHelper<M>, arity: Option<u8>) -> u32 {
+        match slot {
+            Some(slot) => {
+                self.slots[slot as usize] = helper;
+                self.arities[slot as usize] = arity;
+                slot
+            }
+            None => {
+                self.slots.push(helper);
+                self.arities.push(arity);
+                (self.slots.len() - 1) as u32
+            }
+        }
+    }
+
+    /// Argument count of the function in `slot`, if it was registered with typed arguments.
+    pub fn arity(&self, slot: u32) -> Option<u8> {
+        self.arities.get(slot as usize).copied().flatten()
+    }
+
+    /// Slot of a helper ID.
+    pub fn slot_of_id(&self, id: u32) -> Option<u32> {
+        self.by_id.get(&id).copied()
+    }
+
+    /// Slot of a named extern function.
+    pub fn slot_of_name(&self, name: &str) -> Option<u32> {
+        self.by_name.get(name).copied()
     }
 
     /// Call a helper by ID.
-    pub fn call(&self, id: u32, ctx: &mut HelperContext) -> Result<u64, HelperError> {
-        let helper = self.helpers.get(&id).ok_or(HelperError::UnknownHelper(id))?;
+    pub fn call(&self, id: u32, ctx: &mut HelperContext<M>) -> Result<u64, HelperError> {
+        let slot = self.slot_of_id(id).ok_or(HelperError::UnknownHelper(id))?;
+        self.call_slot(slot, ctx)
+    }
+
+    /// Call the function in `slot`.
+    #[inline]
+    pub fn call_slot(&self, slot: u32, ctx: &mut HelperContext<M>) -> Result<u64, HelperError> {
+        let helper = self.slots.get(slot as usize).ok_or(HelperError::UnknownSlot(slot))?;
         helper(ctx)
     }
 
-    /// Check if a helper is registered.
+    /// Check if a helper ID is registered.
     pub fn has(&self, id: u32) -> bool {
-        self.helpers.contains_key(&id)
+        self.by_id.contains_key(&id)
     }
 
-    /// Get the number of registered helpers.
+    /// Check if a named extern function is registered.
+    pub fn has_fn(&self, name: &str) -> bool {
+        self.by_name.contains_key(name)
+    }
+
+    /// Number of slots.
     pub fn len(&self) -> usize {
-        self.helpers.len()
+        self.slots.len()
     }
 
     /// Check if the registry is empty.
     pub fn is_empty(&self) -> bool {
-        self.helpers.is_empty()
+        self.slots.is_empty()
     }
 }
 
-impl std::fmt::Debug for HelperRegistry {
+impl<M> std::fmt::Debug for HelperRegistry<M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HelperRegistry")
-            .field("count", &self.helpers.len())
-            .field("ids", &self.helpers.keys().collect::<Vec<_>>())
+            .field("slots", &self.slots.len())
+            .field("ids", &self.by_id)
+            .field("names", &self.by_name)
             .finish()
     }
 }

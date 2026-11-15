@@ -87,10 +87,10 @@
 //! │  │  Context (registers) ←→ rvm_core::step() ←→ Memory    ││
 //! │  │                           │                            ││
 //! │  │                           ▼                            ││
-//! │  │                  Flow::CallExt(id)                     ││
+//! │  │                  Flow::CallKfunc(slot)                 ││
 //! │  │                           │                            ││
 //! │  │                           ▼                            ││
-//! │  │               HelperRegistry.call(id)                  ││
+//! │  │             HelperRegistry.call_slot(slot)             ││
 //! │  └────────────────────────────────────────────────────────┘│
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
@@ -113,20 +113,21 @@ mod vm;
 // Main entry point
 // Errors
 pub use error::{ElfError, ExecError, HelperError, LinkError, MemoryError, Result, VmError};
-pub use executor::Executor;
+pub use executor::{Executor, DEFAULT_FRAME_SIZE, MAX_CALL_DEPTH};
 // Helper functions
 pub use helper::{
     into_dyn_helper, into_dyn_helper_with_ctx, DynHelper, FromArgs, HelperArgs, HelperContext, HelperFn,
     HelperRegistry, IntoReturn,
 };
 // Low-level re-exports for advanced users
-pub use linker::Linker;
+pub use linker::{Linker, DATA_REGION, FIRST_FREE_REGION, RODATA_REGION, STACK_REGION};
 // Memory
-pub use memory::{FromBytes, Memory, ToBytes, VmMemory};
+pub use memory::{region_base, Memory, Perms, Scalar, VmMemory, MAX_REGIONS, MAX_REGION_LEN, REGION_SHIFT};
 // Module loading
 pub use module::Module;
 // Program and execution
 pub use program::{FunctionInfo, Program};
+pub use rvm_core::{instructions_from_bytes, Instruction};
 pub use section::{Section, SectionKind};
 pub use symbol::{Export, Import, Symbol, SymbolBinding, SymbolKind};
 // Types (CO-RE)
