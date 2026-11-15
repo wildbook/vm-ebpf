@@ -139,6 +139,10 @@ cargo bench -p rvm --bench exec
 `exec` benchmarks interpreter throughput on hand-assembled ALU, memory, and
 call-heavy loops built with `ebpf-asm`.
 
+`lib/rvm/tests/integration/conformance.rs` runs the
+[bpf_conformance](https://github.com/Alan-Jowett/bpf_conformance) suite, vendored
+under `lib/rvm/tests/conformance/`, against the interpreter.
+
 ## Scope
 
 Not implemented: kfunc BTF ID resolution, and the legacy packet access modes

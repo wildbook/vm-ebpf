@@ -472,6 +472,8 @@ mod alu {
                 BITS_32 => (d as i32) <= (s as i32),
             },
 
+            // `callx` (target in a register) is a Linux extension rvm doesn't implement
+            JmpOpc::Call if jmp_src == Source::Reg => return Flow::Missing,
             JmpOpc::Call if src_reg == 0 => return Flow::CallHelper(imm as u32),
             JmpOpc::Call if src_reg == BPF_PSEUDO_CALL => return Flow::Call(i64::from(imm)), // program-local function
             JmpOpc::Call if src_reg == BPF_PSEUDO_KFUNC_CALL => return Flow::CallKfunc(imm as u32),

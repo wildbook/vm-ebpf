@@ -57,7 +57,7 @@ use std::fmt;
 
 use btf::{CoreRelo, CoreReloKind};
 
-use crate::instruction::{alu, class, jmp, mode, size, RawInstruction, SRC_IMM, SRC_REG};
+use crate::instruction::{alu, atomic, class, jmp, mode, size, RawInstruction, SRC_IMM, SRC_REG};
 use crate::register::Register;
 
 /// Assembler error type.
@@ -150,10 +150,10 @@ struct LabelRef {
 
 #[derive(Debug, Clone, Copy)]
 enum LabelRefType {
-    /// Jump (conditional or JA) - offset in bits 16-31.
+    /// Jump (conditional or JA in the JMP64 class) - offset in bits 16-31.
     Jump,
-    /// BPF-to-BPF call - offset in bits 32-63 (imm field).
-    LocalCall,
+    /// BPF-to-BPF call or JA in the JMP32 class - offset in bits 32-63 (imm field).
+    Imm32,
 }
 
 /// Internal instruction representation during assembly.
@@ -180,6 +180,21 @@ macro_rules! alu_family {
             pub fn $name_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
                 let opcode = class::$class | alu::$op | SRC_IMM;
                 self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, $off, imm));
+                self
+            }
+        )+
+    };
+}
+
+/// Emits one sign-extending move method per (source width, class) row. `$off`
+/// is the ALU `offset` nibble that selects the source width to sign-extend from.
+macro_rules! movsx_family {
+    ($( $name:ident = $class:ident, $off:expr );+ $(;)?) => {
+        $(
+            #[doc = concat!("`", stringify!($name), " dst, src`")]
+            pub fn $name(&mut self, dst: Register, src: Register) -> &mut Self {
+                let opcode = class::$class | alu::MOV | SRC_REG;
+                self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), $off, 0));
                 self
             }
         )+
@@ -251,14 +266,39 @@ macro_rules! st_family {
     };
 }
 
-/// Emits one byte-swap method per bit width, for a fixed source type (`le*` use
-/// `SRC_IMM`, `be*` use `SRC_REG`; the ISA distinguishes them that way).
+/// Emits a non-fetch/fetch pair of atomic read-modify-write methods per op, for
+/// one memory size. `xchg` and `cmpxchg` always report the prior value, so they
+/// are defined separately instead of through this macro.
+macro_rules! atomic_family {
+    ($size:ident; $( $name:ident, $name_fetch:ident = $op:ident );+ $(;)?) => {
+        $(
+            #[doc = concat!("`lock ", stringify!($op), " [dst+off], src`")]
+            pub fn $name(&mut self, dst: Register, offset: i16, src: Register) -> &mut Self {
+                let opcode = class::STX | size::$size | mode::ATOMIC;
+                self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, atomic::$op));
+                self
+            }
+
+            #[doc = concat!("`lock fetch ", stringify!($op), " [dst+off], src`")]
+            pub fn $name_fetch(&mut self, dst: Register, offset: i16, src: Register) -> &mut Self {
+                let opcode = class::STX | size::$size | mode::ATOMIC;
+                let imm = atomic::$op | atomic::FETCH;
+                self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, imm));
+                self
+            }
+        )+
+    };
+}
+
+/// Emits one byte-swap method per bit width, for a fixed class and source type
+/// (`le*`/`be*` are ALU32 and truncate; `swap*` is ALU64 and always swaps the
+/// full width regardless of host endianness).
 macro_rules! endian_family {
-    ($src:ident; $( $name:ident = $bits:expr ),+) => {
+    ($class:ident, $src:ident; $( $name:ident = $bits:expr ),+) => {
         $(
             #[doc = concat!("`", stringify!($name), " dst`")]
             pub fn $name(&mut self, dst: Register) -> &mut Self {
-                let opcode = class::ALU32 | alu::END | $src;
+                let opcode = class::$class | alu::END | $src;
                 self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, $bits));
                 self
             }
@@ -386,7 +426,7 @@ impl Assembler {
                     let new_offset = ((offset as i16 as u16 as u64) << 16) & 0x00000000FFFF0000;
                     insn.raw = RawInstruction::new((raw & mask) | new_offset);
                 }
-                LabelRefType::LocalCall => {
+                LabelRefType::Imm32 => {
                     // Offset in bits 32-63 (i32)
                     if offset < i32::MIN as i64 || offset > i32::MAX as i64 {
                         return Err(AsmError::OffsetOutOfRange {
@@ -528,10 +568,19 @@ impl Assembler {
         arsh32, arsh32_imm = ARSH, 0;
     );
 
+    movsx_family!(
+        movsx832 = ALU32, 8;
+        movsx1632 = ALU32, 16;
+        movsx864 = ALU64, 8;
+        movsx1664 = ALU64, 16;
+        movsx3264 = ALU64, 32;
+    );
+
     // ==================== Endianness Instructions ====================
 
-    endian_family!(SRC_IMM; le16 = 16, le32 = 32, le64 = 64);
-    endian_family!(SRC_REG; be16 = 16, be32 = 32, be64 = 64);
+    endian_family!(ALU32, SRC_IMM; le16 = 16, le32 = 32, le64 = 64);
+    endian_family!(ALU32, SRC_REG; be16 = 16, be32 = 32, be64 = 64);
+    endian_family!(ALU64, SRC_IMM; swap16 = 16, swap32 = 32, swap64 = 64);
 
     // ==================== Memory Load Instructions ====================
 
@@ -561,6 +610,51 @@ impl Assembler {
     stx_family!(stxdw = DW; stxw = W; stxh = H; stxb = B);
     st_family!(stdw = DW; stw = W; sth = H; stb = B);
 
+    // ==================== Atomic Instructions ====================
+
+    atomic_family!(DW;
+        atomic_add64, atomic_fetch_add64 = ADD;
+        atomic_or64, atomic_fetch_or64 = OR;
+        atomic_and64, atomic_fetch_and64 = AND;
+        atomic_xor64, atomic_fetch_xor64 = XOR;
+    );
+    atomic_family!(W;
+        atomic_add32, atomic_fetch_add32 = ADD;
+        atomic_or32, atomic_fetch_or32 = OR;
+        atomic_and32, atomic_fetch_and32 = AND;
+        atomic_xor32, atomic_fetch_xor32 = XOR;
+    );
+
+    /// `lock xchg [dst+off], src` - 64-bit atomic exchange; always reports the prior value.
+    pub fn atomic_xchg64(&mut self, dst: Register, offset: i16, src: Register) -> &mut Self {
+        let opcode = class::STX | size::DW | mode::ATOMIC;
+        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, atomic::XCHG));
+        self
+    }
+
+    /// `lock xchg32 [dst+off], src` - 32-bit atomic exchange; always reports the prior value.
+    pub fn atomic_xchg32(&mut self, dst: Register, offset: i16, src: Register) -> &mut Self {
+        let opcode = class::STX | size::W | mode::ATOMIC;
+        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, atomic::XCHG));
+        self
+    }
+
+    /// `lock cmpxchg [dst+off], src` - 64-bit atomic compare-and-exchange against `r0`;
+    /// always reports the prior value in `r0`.
+    pub fn atomic_cmpxchg64(&mut self, dst: Register, offset: i16, src: Register) -> &mut Self {
+        let opcode = class::STX | size::DW | mode::ATOMIC;
+        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, atomic::CMPXCHG));
+        self
+    }
+
+    /// `lock cmpxchg32 [dst+off], src` - 32-bit atomic compare-and-exchange against `r0`;
+    /// always reports the prior value in `r0`.
+    pub fn atomic_cmpxchg32(&mut self, dst: Register, offset: i16, src: Register) -> &mut Self {
+        let opcode = class::STX | size::W | mode::ATOMIC;
+        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, atomic::CMPXCHG));
+        self
+    }
+
     // ==================== Jump Instructions with Labels ====================
 
     /// `ja label` - Unconditional jump to label.
@@ -575,6 +669,15 @@ impl Assembler {
     pub fn ja_off(&mut self, offset: i16) -> &mut Self {
         let opcode = class::JMP64 | jmp::JA;
         self.emit(RawInstruction::from_parts(opcode, 0, 0, offset, 0));
+        self
+    }
+
+    /// `ja32 label` - Unconditional jump to label, JMP32 class (RFC 9669 Section 4.3:
+    /// the relative offset sits in the 32-bit `imm` field instead of the 16-bit `offset`).
+    pub fn ja32(&mut self, label: &Label) -> &mut Self {
+        let opcode = class::JMP32 | jmp::JA;
+        self.emit(RawInstruction::from_parts(opcode, 0, 0, 0, 0));
+        self.add_label_ref(label, LabelRefType::Imm32);
         self
     }
 
@@ -620,7 +723,7 @@ impl Assembler {
         let opcode = class::JMP64 | jmp::CALL;
         // src_reg = 1 indicates BPF-to-BPF call
         self.emit(RawInstruction::from_parts(opcode, 0, 1, 0, 0));
-        self.add_label_ref(label, LabelRefType::LocalCall);
+        self.add_label_ref(label, LabelRefType::Imm32);
         self
     }
 
