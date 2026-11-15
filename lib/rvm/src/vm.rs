@@ -205,9 +205,8 @@ impl Vm {
     ///
     /// # Safety
     ///
-    /// Programs that run at the same time on different threads may only touch the
-    /// map's values with atomic instructions; plain guest loads and stores to a value
-    /// another thread writes concurrently are a data race.
+    /// As [`VmMemory::map_shared`](crate::VmMemory::map_shared), for every program
+    /// linked afterwards.
     pub unsafe fn share_map(&self, name: &str, pad_values: bool) {
         self.shared_maps.declare(name, pad_values);
     }
@@ -219,8 +218,8 @@ impl Vm {
     ///
     /// # Safety
     ///
-    /// Programs that run at the same time on different threads may only touch the
-    /// region with atomic instructions where another thread writes concurrently.
+    /// As [`VmMemory::map_shared`](crate::VmMemory::map_shared), for every program
+    /// linked afterwards.
     pub unsafe fn share_region(&self, region: usize, len: usize, perms: Perms) -> Result<SharedRegion> {
         let mut regions = self.shared_regions.lock().unwrap_or_else(|e| e.into_inner());
         let usable = (FIRST_FREE_REGION..BORROW_FIRST_REGION).contains(&region);

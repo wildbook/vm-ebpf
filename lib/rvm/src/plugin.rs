@@ -13,7 +13,6 @@
 //! or through a chain of plugin calls, fails with [`VmError::PluginBusy`] instead of
 //! deadlocking.
 
-use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
 
 use crate::error::{HelperError, Result, VmError};
@@ -59,6 +58,7 @@ impl Plugin {
     /// function by name in the new program. Blocks until a running call finishes.
     pub fn replace(&self, program: Program) {
         *self.program.lock().unwrap_or_else(|e| e.into_inner()) = program;
+        self.program.clear_poison();
     }
 
     /// The extern that calls `func` in this plugin.
@@ -81,26 +81,23 @@ impl Plugin {
                 return program.call(&func, &args).map_err(failed);
             }
 
-            let caller = ctx.memory.as_deref_mut().ok_or_else(|| failed(no_memory()))?;
+            let caller = ctx.memory.as_deref().ok_or_else(|| failed(no_memory()))?;
             let mut mapped = Ok(());
             for &Borrow { arg, len_arg, writable } in &borrows {
                 let (addr, len) = (args[arg as usize], args[len_arg as usize] as usize);
-                let buffer = match caller.bytes_mut(addr, len) {
-                    Ok(buffer) => buffer,
+                // the caller must itself be allowed what the callee gets
+                let perms = if writable { Perms::RW } else { Perms::R };
+                let ptr = match caller.host_ptr(addr, len, perms) {
+                    Ok(ptr) => ptr,
                     Err(e) => {
                         mapped = Err(failed(e.into()));
                         break;
                     }
                 };
                 let region = BORROW_FIRST_REGION + arg as usize;
-                let perms = if writable { Perms::RW } else { Perms::R };
-                // SAFETY: the caller is blocked in this call, so its memory stays alive and
-                // untouched until the buffer is unmapped below.
-                unsafe {
-                    program
-                        .memory_mut()
-                        .map_host(region, NonNull::from(buffer).cast(), len, perms)
-                };
+                // SAFETY: the caller is blocked in this call; the regions are unmapped
+                // before it returns, or on the next lock after a panic.
+                unsafe { program.memory_mut().map_host(region, ptr, len, perms) };
                 args[arg as usize] = region_base(region);
             }
 
@@ -121,8 +118,16 @@ fn try_lock<'a>(program: &'a Mutex<Program>, name: &str) -> Result<MutexGuard<'a
     match program.try_lock() {
         Ok(guard) => Ok(guard),
         Err(TryLockError::WouldBlock) => Err(VmError::PluginBusy(name.to_string())),
-        // a panic inside a helper poisons the lock; the program state is still usable
-        Err(TryLockError::Poisoned(e)) => Ok(e.into_inner()),
+        // a panic during a call poisons the lock and may have skipped unmapping borrowed
+        // caller memory, which may be gone by now
+        Err(TryLockError::Poisoned(e)) => {
+            let mut guard = e.into_inner();
+            for region in BORROW_FIRST_REGION..BORROW_FIRST_REGION + 5 {
+                guard.memory_mut().unmap(region);
+            }
+            program.clear_poison();
+            Ok(guard)
+        }
     }
 }
 

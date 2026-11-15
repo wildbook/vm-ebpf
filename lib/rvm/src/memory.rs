@@ -89,8 +89,8 @@ impl Region {
 /// ```
 pub struct VmMemory {
     regions: [Region; MAX_REGIONS],
-    // buffers mapped with `map_shared`; holding them keeps those regions valid
-    shared: Vec<Arc<SharedBuffer>>,
+    // buffer behind each region mapped with `map_shared`, kept alive while mapped
+    shared: [Option<Arc<SharedBuffer>>; MAX_REGIONS],
 }
 
 // SAFETY: owned regions are plain heap allocations exclusively owned by this value.
@@ -110,7 +110,7 @@ impl VmMemory {
     pub const fn new() -> Self {
         Self {
             regions: [Region::EMPTY; MAX_REGIONS],
-            shared: Vec::new(),
+            shared: [const { None }; MAX_REGIONS],
         }
     }
 
@@ -173,18 +173,20 @@ impl VmMemory {
         )
     }
 
-    /// Map `buffer` as region `idx`. This memory keeps the buffer alive, so other
-    /// programs can map the same buffer and see the same bytes.
+    /// Map `buffer` as region `idx`. This memory keeps the buffer alive while it is
+    /// mapped, so other memories can map the same buffer and see the same bytes.
     ///
     /// # Safety
     ///
-    /// Code running on different threads at the same time may only touch the buffer
-    /// with atomics; plain accesses to bytes another thread writes concurrently are a
-    /// data race.
+    /// While a reference from [`bytes`](Self::bytes) or [`bytes_mut`](Self::bytes_mut)
+    /// into the buffer is alive, no other memory that maps it may access it. Code on
+    /// different threads may only touch bytes another thread writes concurrently with
+    /// atomics; guest stores, map helper writes and host writes all count as plain
+    /// stores.
     pub unsafe fn map_shared(&mut self, idx: usize, buffer: Arc<SharedBuffer>, perms: Perms) -> u64 {
-        // SAFETY: `self.shared` keeps the buffer alive for as long as this memory.
+        // SAFETY: `self.shared[idx]` keeps the buffer alive until the region is replaced.
         let base = unsafe { self.map_host(idx, buffer.as_ptr(), buffer.len(), perms) };
-        self.shared.push(buffer);
+        self.shared[idx] = Some(buffer);
         base
     }
 
@@ -202,6 +204,7 @@ impl VmMemory {
         assert!(idx != 0 && idx < MAX_REGIONS, "invalid region index {idx}");
         let old = std::mem::replace(&mut self.regions[idx], region);
         Self::free(old);
+        self.shared[idx] = None;
         region_base(idx)
     }
 
@@ -221,10 +224,16 @@ impl VmMemory {
     fn resolve(&self, addr: u64, len: usize, need: Perms) -> Option<NonNull<u8>> {
         let region = self.regions.get((addr >> REGION_SHIFT) as usize)?;
         let off = addr as u32 as usize;
-        // `off < 2^32` and `len` is small or a host length, so this can't overflow on 64-bit.
-        (region.perms.allows(need) && off + len <= region.len)
+        (region.perms.allows(need) && len <= region.len && off <= region.len - len)
             // SAFETY: in bounds of the region's allocation.
             .then(|| unsafe { region.ptr.add(off) })
+    }
+
+    /// Host pointer to `len` bytes at guest address `addr` whose region allows `need`.
+    /// No reference is created, so the bytes may be shared or aliased.
+    pub fn host_ptr(&self, addr: u64, len: usize, need: Perms) -> Result<NonNull<u8>, MemoryError> {
+        self.resolve(addr, len, need)
+            .ok_or(MemoryError::OutOfBounds { addr, size: len })
     }
 
     /// Borrow `len` bytes at guest address `addr` (host access, ignores perms).
@@ -292,8 +301,8 @@ pub struct SharedBuffer {
     len: usize,
 }
 
-// SAFETY: plain heap memory owned by this value; concurrent guest access is governed
-// by the contract of whichever unsafe call shared it (`Vm::share_map`, `Vm::share_region`).
+// SAFETY: plain heap memory owned by this value; access from guests follows the
+// `VmMemory::map_shared` contract.
 unsafe impl Send for SharedBuffer {}
 unsafe impl Sync for SharedBuffer {}
 
@@ -481,6 +490,9 @@ mod tests {
         assert_eq!(mem.load_u64(base + 9), Err(base + 9)); // straddles the end
         assert_eq!(mem.load_u8(region_base(MAX_REGIONS)), Err(region_base(MAX_REGIONS)));
         assert_eq!(mem.load_u8(u64::MAX), Err(u64::MAX));
+        // guest-controlled lengths (helper and borrow arguments) must not wrap the check
+        assert!(mem.bytes(base + 8, usize::MAX - 7).is_err());
+        assert!(mem.host_ptr(base, usize::MAX, Perms::NONE).is_err());
     }
 
     #[test]

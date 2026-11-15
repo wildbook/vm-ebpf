@@ -163,8 +163,8 @@ impl<'a> Linker<'a> {
         memory.map_bytes(RODATA_REGION, &image.rodata, image.rodata.len(), Perms::R);
         memory.map_bytes(DATA_REGION, &image.data, image.data.len(), Perms::RW);
         maps::map_region(&mut memory, maps_len);
-        // SAFETY: concurrent access to shared memory follows the contracts of
-        // `Vm::share_map` and `Vm::share_region`, which created these buffers.
+        // SAFETY: the callers of `Vm::share_map`/`Vm::share_region` accepted the
+        // `map_shared` contract.
         unsafe {
             for shared in maps.shared() {
                 memory.map_shared(shared.region(), shared.storage().clone(), Perms::RW);
