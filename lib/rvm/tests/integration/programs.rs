@@ -17,6 +17,14 @@ fn test_clang_atomics() {
     assert_eq!(program.memory().read::<u32>(bss + 8).unwrap(), 0xFFFF_FFFF);
 }
 
+/// Pointers in `.data` and `.rodata` (bpf/data_ptrs.c) are relocated at link time,
+/// including an addend into the middle of an array.
+#[test]
+fn data_pointers_are_relocated() {
+    let mut program = Vm::new().load_elf(&object("data_ptrs.o")).unwrap();
+    assert_eq!(program.call("deref", &[]).unwrap(), 42 + 10 + 30);
+}
+
 /// Array and hash maps from bpf/maps.c, used from the guest and the host.
 #[test]
 fn test_maps() {

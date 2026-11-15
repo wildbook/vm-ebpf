@@ -334,15 +334,17 @@ fn get_string_from_table(table: &[u8], offset: usize) -> String {
     }
 }
 
-/// Byte addend that a REL relocation stores in the patched instruction's `imm`.
+/// Byte addend that a REL relocation stores in the place it patches.
 fn rel_implicit_addend(data: &[u8], offset: u64, typ: u32) -> Option<i64> {
-    let at = usize::try_from(offset).ok()?.checked_add(4)?;
-    let imm = i32::from_le_bytes(data.get(at..at.checked_add(4)?)?.try_into().ok()?);
+    let at = usize::try_from(offset).ok()?;
+    let bytes = |skip: usize, len: usize| data.get(at.checked_add(skip)?..)?.get(..len);
     Some(match typ {
         // LD_IMM64: imm is a byte offset from the symbol.
-        reloc::bpf::BPF_64_64 => i64::from(imm as u32),
+        reloc::bpf::BPF_64_64 => i64::from(u32::from_le_bytes(bytes(4, 4)?.try_into().ok()?)),
         // Call: target = sym + (imm + 1) instructions (named functions use imm = -1).
-        reloc::bpf::BPF_64_32 => (i64::from(imm) + 1) * 8,
+        reloc::bpf::BPF_64_32 => (i64::from(i32::from_le_bytes(bytes(4, 4)?.try_into().ok()?)) + 1) * 8,
+        // A pointer in data: the stored 8 bytes are the offset from the symbol.
+        reloc::bpf::BPF_64_ABS64 => i64::from_le_bytes(bytes(0, 8)?.try_into().ok()?),
         _ => 0,
     })
 }

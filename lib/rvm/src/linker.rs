@@ -21,7 +21,7 @@ use crate::executor::MAX_CALL_DEPTH;
 use crate::helper::{HelperRegistry, SharedHelpers};
 use crate::layout::{DATA_REGION, MAPS_REGION, RODATA_REGION, STACK_REGION};
 use crate::maps::{map_defs, MapDef, Maps, SharedMaps};
-use crate::memory::{region_base, Perms, SharedRegion, VmMemory};
+use crate::memory::{region_base, Perms, SharedRegion, VmMemory, REGION_SHIFT};
 use crate::module::{Module, Relocation};
 use crate::program::{Borrow, FunctionInfo, Program};
 use crate::section::{Section, SectionKind};
@@ -75,6 +75,19 @@ impl Image {
             .get_mut(at..at + 8)
             .map(|s| s.try_into().unwrap())
             .ok_or_else(|| LinkError::InvalidReference(format!("code offset {at:#x}")).into())
+    }
+
+    /// `len` bytes of the data image at guest address `addr`.
+    fn data_mut(&mut self, addr: u64, len: usize) -> Result<&mut [u8]> {
+        let buf = match (addr >> REGION_SHIFT) as usize {
+            RODATA_REGION => &mut self.rodata,
+            DATA_REGION => &mut self.data,
+            _ => return Err(LinkError::InvalidReference(format!("data address {addr:#x}")).into()),
+        };
+        let at = addr as u32 as usize;
+        buf.get_mut(at..)
+            .and_then(|b| b.get_mut(..len))
+            .ok_or_else(|| LinkError::InvalidReference(format!("data address {addr:#x}")).into())
     }
 }
 
@@ -278,12 +291,11 @@ impl<'a> Linker<'a> {
         reloc: &Relocation,
         image: &mut Image,
     ) -> Result<()> {
-        // Only code is patched; relocations inside data (e.g. pointers stored in .data)
-        // aren't supported yet.
-        let Some(&Addr::Code(section_addr)) = layout.sections.get(&reloc.section_idx) else {
+        // relocations in sections that aren't loaded (debug info, BTF) don't matter here
+        let Some(&patch) = layout.sections.get(&reloc.section_idx) else {
             return Ok(());
         };
-        let patch_at = section_addr + reloc.offset;
+        let patch = patch.offset(reloc.offset);
 
         let symbol = module.symbol_by_idx(reloc.symbol_idx).ok_or_else(|| {
             let idx = reloc.symbol_idx;
@@ -291,9 +303,11 @@ impl<'a> Linker<'a> {
         })?;
 
         // `lddw rX, map`: the guest gets the map's handle.
-        if let (reloc::bpf::BPF_64_64, Some(handle)) = (reloc.rel_type, maps.handle(&symbol.name)) {
-            image.insn_mut(patch_at)?[4..8].copy_from_slice(&handle.to_le_bytes());
-            image.insn_mut(patch_at + 8)?[4..8].copy_from_slice(&0u32.to_le_bytes());
+        if let (reloc::bpf::BPF_64_64, Addr::Code(at), Some(handle)) =
+            (reloc.rel_type, patch, maps.handle(&symbol.name))
+        {
+            image.insn_mut(at)?[4..8].copy_from_slice(&handle.to_le_bytes());
+            image.insn_mut(at + 8)?[4..8].copy_from_slice(&0u32.to_le_bytes());
             return Ok(());
         }
 
@@ -306,12 +320,12 @@ impl<'a> Linker<'a> {
             section_addr.offset(symbol.value)
         } else if let Some(&addr) = global_symbols.get(&symbol.name) {
             addr
-        } else if reloc.rel_type == reloc::bpf::BPF_64_32 {
+        } else if let (reloc::bpf::BPF_64_32, Addr::Code(at)) = (reloc.rel_type, patch) {
             // Call to an extern function: bind it to its slot in the extern table.
             let slot = helpers
                 .slot_of_name(&symbol.name)
                 .ok_or_else(|| LinkError::UnresolvedSymbol(symbol.name.clone()))?;
-            set_slot_call(image.insn_mut(patch_at)?, slot);
+            set_slot_call(image.insn_mut(at)?, slot);
             return Ok(());
         } else {
             return Err(LinkError::UnresolvedSymbol(symbol.name.clone()).into());
@@ -320,24 +334,27 @@ impl<'a> Linker<'a> {
         let bad_target =
             || LinkError::InvalidReference(format!("relocation type {} -> {}", reloc.rel_type, symbol.name));
 
-        match (reloc.rel_type, sym_addr) {
-            (reloc::bpf::BPF_64_64, Addr::Data(addr)) => {
+        match (reloc.rel_type, patch, sym_addr) {
+            (reloc::bpf::BPF_64_64, Addr::Code(at), Addr::Data(addr)) => {
                 // LD_IMM64: split the address across the imm fields of both slots.
                 let addr = addr.wrapping_add_signed(reloc.addend);
-                image.insn_mut(patch_at)?[4..8].copy_from_slice(&(addr as u32).to_le_bytes());
-                image.insn_mut(patch_at + 8)?[4..8].copy_from_slice(&((addr >> 32) as u32).to_le_bytes());
+                image.insn_mut(at)?[4..8].copy_from_slice(&(addr as u32).to_le_bytes());
+                image.insn_mut(at + 8)?[4..8].copy_from_slice(&((addr >> 32) as u32).to_le_bytes());
             }
-            (reloc::bpf::BPF_64_32, Addr::Code(target)) => {
+            (reloc::bpf::BPF_64_32, Addr::Code(at), Addr::Code(target)) => {
                 // BPF-to-BPF call: imm becomes the instruction offset from the next instruction.
                 let target = target.wrapping_add_signed(reloc.addend);
-                let rel = ((target as i64 - (patch_at + 8) as i64) / 8) as i32;
-                image.insn_mut(patch_at)?[4..8].copy_from_slice(&rel.to_le_bytes());
+                let rel = ((target as i64 - (at + 8) as i64) / 8) as i32;
+                image.insn_mut(at)?[4..8].copy_from_slice(&rel.to_le_bytes());
             }
-            // Code addresses aren't guest-visible, and calls must target code.
-            (reloc::bpf::BPF_64_64 | reloc::bpf::BPF_64_32, _) => return Err(bad_target().into()),
-            _ => {
-                // Unknown relocation type - skip for now
+            (reloc::bpf::BPF_64_ABS64, Addr::Data(at), Addr::Data(addr)) => {
+                // a pointer stored in global data
+                let addr = addr.wrapping_add_signed(reloc.addend);
+                image.data_mut(at, 8)?.copy_from_slice(&addr.to_le_bytes());
             }
+            // Code addresses aren't guest-visible, so function pointers and calls into data
+            // can't be resolved; nor can relocation types a loaded section shouldn't carry.
+            _ => return Err(bad_target().into()),
         }
 
         Ok(())

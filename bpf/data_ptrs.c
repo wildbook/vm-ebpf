@@ -1,0 +1,19 @@
+/*
+ * Pointers stored in global data, which need data relocations at link time.
+ * Build: clang -target bpf -O2 -g -c bpf/data_ptrs.c -o bpf/data_ptrs.o
+ */
+typedef unsigned long long u64;
+
+u64 target = 41;
+const u64 table[3] = {10, 20, 30};
+
+u64 *ptr = &target;               /* .data -> .data */
+const u64 *const entries[2] = {   /* .rodata -> .rodata, with an addend */
+    &table[0],
+    &table[2],
+};
+
+u64 deref(void) {
+    *ptr += 1;
+    return *ptr + *entries[0] + *entries[1];
+}
