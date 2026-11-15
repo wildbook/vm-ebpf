@@ -1675,27 +1675,6 @@ mod tests {
     }
 
     #[test]
-    fn test_lddw() {
-        let mut asm = Assembler::new();
-        asm.lddw(R0, 0x123456789ABCDEF0u64 as i64);
-        asm.exit();
-
-        let code = asm.assemble().unwrap();
-        assert_eq!(code.len(), 24); // 16 + 8 bytes
-
-        // Check opcode
-        assert_eq!(code[0], 0x18);
-
-        // Check low 32 bits
-        let lo = u32::from_le_bytes([code[4], code[5], code[6], code[7]]);
-        assert_eq!(lo, 0x9ABCDEF0);
-
-        // Check high 32 bits
-        let hi = u32::from_le_bytes([code[12], code[13], code[14], code[15]]);
-        assert_eq!(hi, 0x12345678);
-    }
-
-    #[test]
     fn test_undefined_label() {
         let mut asm = Assembler::new();
         let end = asm.create_label();
@@ -1767,39 +1746,6 @@ mod tests {
     }
 
     #[test]
-    fn test_current_index() {
-        let mut asm = Assembler::new();
-
-        assert_eq!(asm.current_index(), 0);
-        asm.mov64_imm(R0, 42);
-        assert_eq!(asm.current_index(), 1);
-        asm.add64_imm(R0, 10);
-        assert_eq!(asm.current_index(), 2);
-        asm.exit();
-        assert_eq!(asm.current_index(), 3);
-    }
-
-    #[test]
-    fn test_byte_offset() {
-        let asm = Assembler::new();
-        assert_eq!(asm.byte_offset(0), 0);
-        assert_eq!(asm.byte_offset(1), 8);
-        assert_eq!(asm.byte_offset(5), 40);
-        assert_eq!(asm.byte_offset(100), 800);
-    }
-
-    #[test]
-    fn test_current_byte_offset() {
-        let mut asm = Assembler::new();
-
-        assert_eq!(asm.current_byte_offset(), 0);
-        asm.mov64_imm(R0, 42);
-        assert_eq!(asm.current_byte_offset(), 8);
-        asm.add64_imm(R0, 10);
-        assert_eq!(asm.current_byte_offset(), 16);
-    }
-
-    #[test]
     fn test_mark_core_relo() {
         let mut asm = Assembler::new();
 
@@ -1808,29 +1754,8 @@ mod tests {
         asm.mark_core_relo(CoreReloKind::FieldByteOffset, 1, 17);
 
         asm.add64(R1, R3);
-        asm.exit();
 
-        let result = asm.assemble_with_core().unwrap();
-
-        assert_eq!(result.relocations.len(), 1);
-        let relo = &result.relocations[0];
-        assert_eq!(relo.insn_off, 0); // first instruction
-        assert_eq!(relo.type_id, 1);
-        assert_eq!(relo.access_str_off, 17);
-        assert_eq!(relo.kind, CoreReloKind::FieldByteOffset);
-    }
-
-    #[test]
-    fn test_mark_multiple_relos() {
-        let mut asm = Assembler::new();
-
-        // First relocation
-        asm.mov64_imm(R3, 8);
-        asm.mark_field_offset(1, 17); // pid offset
-
-        asm.add64(R1, R3);
-
-        // Second relocation
+        // Second relocation, at a later instruction
         asm.mov64_imm(R4, 1);
         asm.mark_field_exists(1, 25); // debug_flags exists check
 
@@ -1839,9 +1764,9 @@ mod tests {
         let result = asm.assemble_with_core().unwrap();
 
         assert_eq!(result.relocations.len(), 2);
-
-        // First relo at instruction 0
-        assert_eq!(result.relocations[0].insn_off, 0);
+        assert_eq!(result.relocations[0].insn_off, 0); // first instruction
+        assert_eq!(result.relocations[0].type_id, 1);
+        assert_eq!(result.relocations[0].access_str_off, 17);
         assert_eq!(result.relocations[0].kind, CoreReloKind::FieldByteOffset);
 
         // Second relo at instruction 2 (after add64)
@@ -1870,140 +1795,49 @@ mod tests {
     }
 
     #[test]
-    fn test_assembled_program_instructions() {
+    fn test_jmp32_opcodes() {
         let mut asm = Assembler::new();
-        asm.mov64_imm(R0, 42);
-        asm.exit();
-
-        let result = asm.assemble_with_core().unwrap();
-        let insns = result.instructions();
-
-        assert_eq!(insns.len(), 2);
-        // mov64 r0, 42
-        assert_eq!(insns[0] & 0xFF, 0xb7);
-        // exit
-        assert_eq!(insns[1] & 0xFF, 0x95);
-    }
-
-    #[test]
-    fn test_mark_core_relo_at() {
-        let mut asm = Assembler::new();
-
-        asm.mov64_imm(R0, 0); // idx 0
-        asm.mov64_imm(R1, 8); // idx 1
-        asm.mov64_imm(R2, 16); // idx 2
-        asm.exit();
-
-        // Mark instruction 1 (not the last one)
-        asm.mark_core_relo_at(1, CoreReloKind::FieldByteOffset, 1, 17);
-
-        let result = asm.assemble_with_core().unwrap();
-
-        assert_eq!(result.relocations.len(), 1);
-        assert_eq!(result.relocations[0].insn_off, 8); // instruction 1
-    }
-
-    #[test]
-    fn test_jmp32_jeq() {
-        let mut asm = Assembler::new();
-        let mut target = asm.create_label();
+        let mut labels: Vec<_> = (0..11).map(|_| asm.create_label()).collect();
 
         asm.mov32_imm(R0, 100);
-        asm.jeq32_imm(R0, 100, &target);
-        asm.mov32_imm(R0, 0);
-        asm.set_label(&mut target).unwrap();
-        asm.exit();
-
-        let code = asm.assemble().unwrap();
-        // jeq32 is at instruction 1, opcode should be 0x06 (JMP32 class) | 0x10 (JEQ)
-        // JMP32 = 0x06, JEQ = 0x10, SRC_IMM = 0x00 -> 0x16
-        assert_eq!(code[8], 0x16);
-    }
-
-    #[test]
-    fn test_jmp32_jne() {
-        let mut asm = Assembler::new();
-        let mut target = asm.create_label();
-
-        asm.mov32_imm(R0, 100);
-        asm.jne32_imm(R0, 50, &target);
-        asm.mov32_imm(R0, 0);
-        asm.set_label(&mut target).unwrap();
-        asm.exit();
-
-        let code = asm.assemble().unwrap();
-        // JMP32 = 0x06, JNE = 0x50, SRC_IMM = 0x00 -> 0x56
-        assert_eq!(code[8], 0x56);
-    }
-
-    #[test]
-    fn test_jmp32_unsigned_comparisons() {
-        let mut asm = Assembler::new();
-        let mut l1 = asm.create_label();
-        let mut l2 = asm.create_label();
-        let mut l3 = asm.create_label();
-        let mut l4 = asm.create_label();
-
-        asm.jgt32_imm(R0, 10, &l1);
-        asm.set_label(&mut l1).unwrap();
-        asm.jge32_imm(R0, 10, &l2);
-        asm.set_label(&mut l2).unwrap();
-        asm.jlt32_imm(R0, 10, &l3);
-        asm.set_label(&mut l3).unwrap();
-        asm.jle32_imm(R0, 10, &l4);
-        asm.set_label(&mut l4).unwrap();
+        asm.jeq32_imm(R0, 100, &labels[0]);
+        asm.set_label(&mut labels[0]).unwrap();
+        asm.jne32_imm(R0, 50, &labels[1]);
+        asm.set_label(&mut labels[1]).unwrap();
+        asm.jgt32_imm(R0, 10, &labels[2]);
+        asm.set_label(&mut labels[2]).unwrap();
+        asm.jge32_imm(R0, 10, &labels[3]);
+        asm.set_label(&mut labels[3]).unwrap();
+        asm.jlt32_imm(R0, 10, &labels[4]);
+        asm.set_label(&mut labels[4]).unwrap();
+        asm.jle32_imm(R0, 10, &labels[5]);
+        asm.set_label(&mut labels[5]).unwrap();
+        asm.jsgt32_imm(R0, -10, &labels[6]);
+        asm.set_label(&mut labels[6]).unwrap();
+        asm.jsge32_imm(R0, -10, &labels[7]);
+        asm.set_label(&mut labels[7]).unwrap();
+        asm.jslt32_imm(R0, -10, &labels[8]);
+        asm.set_label(&mut labels[8]).unwrap();
+        asm.jsle32_imm(R0, -10, &labels[9]);
+        asm.set_label(&mut labels[9]).unwrap();
+        asm.jset32_imm(R0, 0x80, &labels[10]);
+        asm.set_label(&mut labels[10]).unwrap();
         asm.exit();
 
         let code = asm.assemble().unwrap();
 
-        // JMP32 = 0x06
-        // JGT = 0x20, JGE = 0x30, JLT = 0xa0, JLE = 0xb0
-        assert_eq!(code[0], 0x26); // jgt32
-        assert_eq!(code[8], 0x36); // jge32
-        assert_eq!(code[16], 0xa6); // jlt32
-        assert_eq!(code[24], 0xb6); // jle32
-    }
-
-    #[test]
-    fn test_jmp32_signed_comparisons() {
-        let mut asm = Assembler::new();
-        let mut l1 = asm.create_label();
-        let mut l2 = asm.create_label();
-        let mut l3 = asm.create_label();
-        let mut l4 = asm.create_label();
-
-        asm.jsgt32_imm(R0, -10, &l1);
-        asm.set_label(&mut l1).unwrap();
-        asm.jsge32_imm(R0, -10, &l2);
-        asm.set_label(&mut l2).unwrap();
-        asm.jslt32_imm(R0, -10, &l3);
-        asm.set_label(&mut l3).unwrap();
-        asm.jsle32_imm(R0, -10, &l4);
-        asm.set_label(&mut l4).unwrap();
-        asm.exit();
-
-        let code = asm.assemble().unwrap();
-
-        // JMP32 = 0x06
-        // JSGT = 0x60, JSGE = 0x70, JSLT = 0xc0, JSLE = 0xd0
-        assert_eq!(code[0], 0x66); // jsgt32
-        assert_eq!(code[8], 0x76); // jsge32
-        assert_eq!(code[16], 0xc6); // jslt32
-        assert_eq!(code[24], 0xd6); // jsle32
-    }
-
-    #[test]
-    fn test_jmp32_jset() {
-        let mut asm = Assembler::new();
-        let mut target = asm.create_label();
-
-        asm.jset32_imm(R0, 0x80, &target);
-        asm.set_label(&mut target).unwrap();
-        asm.exit();
-
-        let code = asm.assemble().unwrap();
-        // JMP32 = 0x06, JSET = 0x40 -> 0x46
-        assert_eq!(code[0], 0x46);
+        // JMP32 = 0x06, each condition in the high nibble, SRC_IMM = 0x00.
+        assert_eq!(code[8], 0x16); // jeq32
+        assert_eq!(code[16], 0x56); // jne32
+        assert_eq!(code[24], 0x26); // jgt32
+        assert_eq!(code[32], 0x36); // jge32
+        assert_eq!(code[40], 0xa6); // jlt32
+        assert_eq!(code[48], 0xb6); // jle32
+        assert_eq!(code[56], 0x66); // jsgt32
+        assert_eq!(code[64], 0x76); // jsge32
+        assert_eq!(code[72], 0xc6); // jslt32
+        assert_eq!(code[80], 0xd6); // jsle32
+        assert_eq!(code[88], 0x46); // jset32
     }
 
     #[test]

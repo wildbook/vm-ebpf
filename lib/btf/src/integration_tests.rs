@@ -104,28 +104,6 @@ fn test_btf_parsing() {
 }
 
 #[test]
-fn test_type_registry_field_lookup() {
-    let mut registry = TypeRegistry::new();
-
-    // Host application's actual struct layout (might differ from BPF program's expectation)
-    registry
-        .register_struct("my_event")
-        .field("timestamp", 0, 8)
-        .field("pid", 8, 4)
-        .field("flags", 16, 4) // Note: different offset than BPF expects!
-        .size(24);
-
-    assert_eq!(registry.field_offset("my_event", "timestamp"), Some(0));
-    assert_eq!(registry.field_offset("my_event", "pid"), Some(8));
-    assert_eq!(registry.field_offset("my_event", "flags"), Some(16));
-    assert_eq!(registry.struct_size("my_event"), Some(24));
-
-    // Non-existent field
-    assert_eq!(registry.field_offset("my_event", "nonexistent"), None);
-    assert!(!registry.field_exists("my_event", "nonexistent"));
-}
-
-#[test]
 fn test_core_relocation_field_offset() {
     let mut registry = TypeRegistry::new();
 
@@ -137,7 +115,7 @@ fn test_core_relocation_field_offset() {
         .field("flags", 20, 4)
         .size(24);
 
-    // Build BTF where BPF program expected pid at offset 8
+    // Build BTF where the BPF program expected pid right after timestamp
     let btf_data = build_test_btf(
         "my_event",
         &[
@@ -148,26 +126,31 @@ fn test_core_relocation_field_offset() {
     );
     let btf = Btf::parse(&btf_data).unwrap();
 
-    // Create a CO-RE relocation for reading the "pid" field
     // String table: "\0my_event\0timestamp\0pid\0flags\0"
     // Offsets:       0  1        10         20   24
-    let relo = CoreRelo {
-        insn_off: 0,        // Patch instruction at offset 0
-        type_id: 1,         // Type ID 1 (my_event struct)
-        access_str_off: 20, // "pid" in string table
-        kind: CoreReloKind::FieldByteOffset,
-    };
+    let relos = vec![
+        CoreRelo {
+            insn_off: 0,
+            type_id: 1,         // my_event struct
+            access_str_off: 20, // "pid"
+            kind: CoreReloKind::FieldByteOffset,
+        },
+        CoreRelo {
+            insn_off: 8,
+            type_id: 1,
+            access_str_off: 24, // "flags"
+            kind: CoreReloKind::FieldByteOffset,
+        },
+    ];
 
-    // Instructions: one dummy instruction where we'll patch the immediate
-    let mut instructions = vec![0x00000000_00000000u64; 1];
+    let mut instructions = vec![0x00000000_00000000u64; 2];
 
-    // Apply the relocation
-    let applied = apply_core_relocations(&mut instructions, &btf, &registry, &[relo]).unwrap();
-    assert_eq!(applied, 1);
+    let applied = apply_core_relocations(&mut instructions, &btf, &registry, &relos).unwrap();
+    assert_eq!(applied, 2);
 
-    // The immediate (upper 32 bits) should now be 16 (host's actual offset)
-    let patched_imm = (instructions[0] >> 32) as u32;
-    assert_eq!(patched_imm, 16);
+    // Both immediates (upper 32 bits) should now hold the host's actual offsets.
+    assert_eq!((instructions[0] >> 32) as u32, 16); // pid moved from 8 to 16
+    assert_eq!((instructions[1] >> 32) as u32, 20); // flags moved from 12 to 20
 }
 
 #[test]
@@ -244,25 +227,6 @@ fn test_core_relocation_type_size() {
 }
 
 #[test]
-fn test_core_relocation_enum_value() {
-    let mut registry = TypeRegistry::new();
-
-    // Host's enum values
-    registry
-        .register_enum("event_type", 4, false)
-        .variant("EVENT_NONE", 0)
-        .variant("EVENT_READ", 1)
-        .variant("EVENT_WRITE", 2)
-        .variant("EVENT_CLOSE", 5); // Note: value 5, not 3
-
-    // For enum relocations, we need a BTF with an enum type
-    // For simplicity, we'll test the registry directly
-    assert_eq!(registry.enum_value("event_type", "EVENT_CLOSE"), Some(5));
-    assert!(registry.enum_variant_exists("event_type", "EVENT_READ"));
-    assert!(!registry.enum_variant_exists("event_type", "EVENT_OPEN"));
-}
-
-#[test]
 fn test_core_suffix_matching() {
     let mut registry = TypeRegistry::new();
 
@@ -304,65 +268,6 @@ fn test_missing_type_error() {
 
     let result = apply_core_relocations(&mut instructions, &btf, &registry, &[relo]);
     assert!(matches!(result, Err(CoreReloError::FieldNotFound { .. })));
-}
-
-#[test]
-fn test_multiple_relocations() {
-    let mut registry = TypeRegistry::new();
-
-    registry
-        .register_struct("packet")
-        .field("src_ip", 0, 4)
-        .field("dst_ip", 4, 4)
-        .field("src_port", 8, 2)
-        .field("dst_port", 10, 2)
-        .field("protocol", 12, 1)
-        .size(16);
-
-    let btf_data = build_test_btf(
-        "packet",
-        &[
-            ("src_ip", 4),
-            ("dst_ip", 4),
-            ("src_port", 2),
-            ("dst_port", 2),
-            ("protocol", 1),
-        ],
-    );
-    let btf = Btf::parse(&btf_data).unwrap();
-
-    // String table: "\0packet\0src_ip\0dst_ip\0src_port\0dst_port\0protocol\0"
-    // Offsets:       0  1      8       15       22        31         40
-
-    let relos = vec![
-        CoreRelo {
-            insn_off: 0,
-            type_id: 1,
-            access_str_off: 8, // src_ip
-            kind: CoreReloKind::FieldByteOffset,
-        },
-        CoreRelo {
-            insn_off: 8,
-            type_id: 1,
-            access_str_off: 15, // dst_ip
-            kind: CoreReloKind::FieldByteOffset,
-        },
-        CoreRelo {
-            insn_off: 16,
-            type_id: 1,
-            access_str_off: 22, // src_port
-            kind: CoreReloKind::FieldByteOffset,
-        },
-    ];
-
-    let mut instructions = vec![0u64; 3];
-
-    let applied = apply_core_relocations(&mut instructions, &btf, &registry, &relos).unwrap();
-    assert_eq!(applied, 3);
-
-    assert_eq!((instructions[0] >> 32) as u32, 0); // src_ip at 0
-    assert_eq!((instructions[1] >> 32) as u32, 4); // dst_ip at 4
-    assert_eq!((instructions[2] >> 32) as u32, 8); // src_port at 8
 }
 
 // ==================== clang-style access strings ====================

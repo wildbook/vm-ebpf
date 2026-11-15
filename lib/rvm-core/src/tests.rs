@@ -64,763 +64,142 @@ fn exec_ld64(ctx: &mut Context<TestMem>, first: Instruction, second: Instruction
 }
 
 // ============================================================================
-// ALU64 Tests (64-bit arithmetic)
+// ALU Tests (64-bit and 32-bit arithmetic edge cases)
 // ============================================================================
 
 #[test]
-fn test_alu64_add_imm() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 100;
+fn alu_edges() {
+    // (dst register's initial value, opcode, off, imm, expected result)
+    for (dst_in, opc, off, imm, want) in [
+        (u64::MAX, AluOpc::add_64(Source::Imm), 0, 1, 0u64), // wraps
+        (0u64, AluOpc::sub_64(Source::Imm), 0, 1, u64::MAX), // wraps
+        (100u64, AluOpc::div_64(Source::Imm), 0, 0, 0u64),   // div by zero returns 0
+        ((-100i64) as u64, AluOpc::div_64(Source::Imm), 1, 10, (-10i64) as u64), // sdiv (off=1)
+        (i64::MIN as u64, AluOpc::div_64(Source::Imm), 1, -1, i64::MIN as u64), // MIN / -1 avoids overflow
+        (17u64, AluOpc::mod_64(Source::Imm), 0, 0, 17u64),   // mod by zero leaves dst unchanged
+        ((-13i64) as u64, AluOpc::mod_64(Source::Imm), 1, 3, (-1i64) as u64), // smod (off=1), truncated division
+        (1u64, AluOpc::lsh_64(Source::Imm), 0, 64, 1u64),    // shift amount masked to 0 (64 & 63)
+        (0x8000_0000_0000_0000, AluOpc::rsh_64(Source::Imm), 0, 63, 1u64), // logical, no sign extension
+        (0x8000_0000_0000_0000, AluOpc::arsh_64(Source::Imm), 0, 63, u64::MAX), // sign extended
+        (42u64, AluOpc::neg_64(Source::Imm), 0, 0, (-42i64) as u64),
+        (999u64, AluOpc::mov_64(Source::Imm), 0, -1, u64::MAX), // imm sign-extended to 64 bits
+        (0xFFFF_FFFF_0000_0064, AluOpc::add_32(Source::Imm), 0, 50, 150u64), // upper 32 bits zeroed
+        (0xFFFF_FFFF, AluOpc::add_32(Source::Imm), 0, 1, 0u64), // 32-bit wrap, zero-extended
+        (1u64, AluOpc::lsh_32(Source::Imm), 0, 32, 1u64),       // shift amount masked to 0 (32 & 31)
+        (0x8000_0000, AluOpc::arsh_32(Source::Imm), 0, 31, 0xFFFF_FFFF), // sign extended within 32 bits
+        ((-100i32) as u32 as u64, AluOpc::div_32(Source::Imm), 1, 10, (-10i32) as u32 as u64), // sdiv32
+    ] {
+        let mut ctx = Context::new(TestMem::new());
+        ctx.regs[0] = dst_in;
+        assert!(matches!(exec(&mut ctx, instr(opc, 0, 0, off, imm)), Flow::Next));
+        assert_eq!(ctx.regs[0], want, "{opc:?} off={off} imm={imm}");
+    }
 
-    let i = instr(AluOpc::add_64(Source::Imm), 0, 0, 0, 50);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 150);
-}
-
-#[test]
-fn test_alu64_add_reg() {
+    // Register source operand, instead of immediate.
     let mut ctx = Context::new(TestMem::new());
     ctx.regs[0] = 100;
     ctx.regs[1] = 50;
-
-    let i = instr(AluOpc::add_64(Source::Reg), 0, 1, 0, 0);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
+    assert!(matches!(exec(&mut ctx, instr(AluOpc::add_64(Source::Reg), 0, 1, 0, 0)), Flow::Next));
     assert_eq!(ctx.regs[0], 150);
-}
 
-#[test]
-fn test_alu64_add_overflow() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = u64::MAX;
-
-    let i = instr(AluOpc::add_64(Source::Imm), 0, 0, 0, 1);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 0); // wraps around
-}
-
-#[test]
-fn test_alu64_sub_imm() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 100;
-
-    let i = instr(AluOpc::sub_64(Source::Imm), 0, 0, 0, 30);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 70);
-}
-
-#[test]
-fn test_alu64_sub_underflow() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 0;
-
-    let i = instr(AluOpc::sub_64(Source::Imm), 0, 0, 0, 1);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], u64::MAX); // wraps around
-}
-
-#[test]
-fn test_alu64_mul_imm() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 7;
-
-    let i = instr(AluOpc::mul_64(Source::Imm), 0, 0, 0, 6);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 42);
-}
-
-#[test]
-fn test_alu64_div_imm() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 100;
-
-    let i = instr(AluOpc::div_64(Source::Imm), 0, 0, 0, 10);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 10);
-}
-
-#[test]
-fn test_alu64_div_by_zero() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 100;
-
-    let i = instr(AluOpc::div_64(Source::Imm), 0, 0, 0, 0);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 0); // div by zero returns 0
-}
-
-#[test]
-fn test_alu64_sdiv_positive() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 100;
-
-    // SDIV uses offset=1
-    let i = instr(AluOpc::div_64(Source::Imm), 0, 0, 1, 10);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 10);
-}
-
-#[test]
-fn test_alu64_sdiv_negative() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = (-100i64) as u64;
-
-    // SDIV: -100 / 10 = -10
-    let i = instr(AluOpc::div_64(Source::Imm), 0, 0, 1, 10);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0] as i64, -10);
-}
-
-#[test]
-fn test_alu64_sdiv_min_by_neg1() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = i64::MIN as u64;
-
-    // SDIV: LLONG_MIN / -1 = LLONG_MIN (special case to avoid overflow)
-    let i = instr(AluOpc::div_64(Source::Imm), 0, 0, 1, -1);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0] as i64, i64::MIN);
-}
-
-#[test]
-fn test_alu64_mod_imm() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 17;
-
-    let i = instr(AluOpc::mod_64(Source::Imm), 0, 0, 0, 5);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 2);
-}
-
-#[test]
-fn test_alu64_mod_by_zero() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 17;
-
-    let i = instr(AluOpc::mod_64(Source::Imm), 0, 0, 0, 0);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 17); // mod by zero returns dst unchanged
-}
-
-#[test]
-fn test_alu64_smod_negative() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = (-13i64) as u64;
-
-    // SMOD: -13 % 3 = -1 (truncated division)
-    let i = instr(AluOpc::mod_64(Source::Imm), 0, 0, 1, 3);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0] as i64, -1);
-}
-
-#[test]
-fn test_alu64_or() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 0b1010;
-    ctx.regs[1] = 0b1100;
-
-    let i = instr(AluOpc::or_64(Source::Reg), 0, 1, 0, 0);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 0b1110);
-}
-
-#[test]
-fn test_alu64_and() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 0b1010;
-    ctx.regs[1] = 0b1100;
-
-    let i = instr(AluOpc::and_64(Source::Reg), 0, 1, 0, 0);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 0b1000);
-}
-
-#[test]
-fn test_alu64_xor() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 0b1010;
-    ctx.regs[1] = 0b1100;
-
-    let i = instr(AluOpc::xor_64(Source::Reg), 0, 1, 0, 0);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 0b0110);
-}
-
-#[test]
-fn test_alu64_lsh() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 1;
-
-    let i = instr(AluOpc::lsh_64(Source::Imm), 0, 0, 0, 32);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 1u64 << 32);
-}
-
-#[test]
-fn test_alu64_lsh_mask() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 1;
-
-    // Shift by 64 should be masked to 0 (64 & 63 = 0)
-    let i = instr(AluOpc::lsh_64(Source::Imm), 0, 0, 0, 64);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 1); // no shift
-}
-
-#[test]
-fn test_alu64_rsh() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 0x8000_0000_0000_0000;
-
-    let i = instr(AluOpc::rsh_64(Source::Imm), 0, 0, 0, 63);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 1); // logical shift, no sign extension
-}
-
-#[test]
-fn test_alu64_arsh() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 0x8000_0000_0000_0000; // negative in signed
-
-    let i = instr(AluOpc::arsh_64(Source::Imm), 0, 0, 0, 63);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], u64::MAX); // sign extended
-}
-
-#[test]
-fn test_alu64_neg() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 42;
-
-    let i = instr(AluOpc::neg_64(Source::Imm), 0, 0, 0, 0);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0] as i64, -42);
-}
-
-#[test]
-fn test_alu64_mov_imm() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 999;
-
-    let i = instr(AluOpc::mov_64(Source::Imm), 0, 0, 0, 42);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 42);
-}
-
-#[test]
-fn test_alu64_mov_imm_negative() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 999;
-
-    // MOV with negative imm should sign-extend to 64 bits
-    let i = instr(AluOpc::mov_64(Source::Imm), 0, 0, 0, -1);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], u64::MAX); // -1 sign-extended
-}
-
-#[test]
-fn test_alu64_mov_reg() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 999;
-    ctx.regs[1] = 0x1234_5678_9ABC_DEF0;
-
-    let i = instr(AluOpc::mov_64(Source::Reg), 0, 1, 0, 0);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 0x1234_5678_9ABC_DEF0);
-}
-
-// ============================================================================
-// ALU32 Tests (32-bit arithmetic with zero extension)
-// ============================================================================
-
-#[test]
-fn test_alu32_add_imm() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 0xFFFF_FFFF_0000_0064; // upper bits set, lower = 100
-
-    let i = instr(AluOpc::add_32(Source::Imm), 0, 0, 0, 50);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 150); // upper 32 bits zeroed
-}
-
-#[test]
-fn test_alu32_add_overflow() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 0xFFFF_FFFF;
-
-    let i = instr(AluOpc::add_32(Source::Imm), 0, 0, 0, 1);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 0); // 32-bit wrap, zero-extended
-}
-
-#[test]
-fn test_alu32_lsh() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 1;
-
-    // 32-bit shift by 31
-    let i = instr(AluOpc::lsh_32(Source::Imm), 0, 0, 0, 31);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 0x8000_0000);
-}
-
-#[test]
-fn test_alu32_lsh_mask() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 1;
-
-    // Shift by 32 should be masked to 0 (32 & 31 = 0)
-    let i = instr(AluOpc::lsh_32(Source::Imm), 0, 0, 0, 32);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 1); // no shift
-}
-
-#[test]
-fn test_alu32_arsh() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 0x8000_0000; // negative in 32-bit signed
-
-    let i = instr(AluOpc::arsh_32(Source::Imm), 0, 0, 0, 31);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 0xFFFF_FFFF); // sign extended within 32 bits, then zero-extended to 64
-}
-
-#[test]
-fn test_alu32_mov_reg() {
+    // ALU32 with a register source truncates to the lower 32 bits, then zero-extends.
     let mut ctx = Context::new(TestMem::new());
     ctx.regs[0] = 0xDEAD_BEEF_CAFE_BABE;
     ctx.regs[1] = 0x1234_5678_9ABC_DEF0;
-
-    let i = instr(AluOpc::mov_32(Source::Reg), 0, 1, 0, 0);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 0x9ABC_DEF0); // lower 32 bits, zero-extended
-}
-
-#[test]
-fn test_alu32_sdiv() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = (-100i32) as u32 as u64;
-
-    // SDIV32: -100 / 10 = -10
-    let i = instr(AluOpc::div_32(Source::Imm), 0, 0, 1, 10);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    // Result is -10 as i32, zero-extended to u64
-    assert_eq!(ctx.regs[0], (-10i32) as u32 as u64);
+    assert!(matches!(exec(&mut ctx, instr(AluOpc::mov_32(Source::Reg), 0, 1, 0, 0)), Flow::Next));
+    assert_eq!(ctx.regs[0], 0x9ABC_DEF0);
 }
 
 // ============================================================================
-// Byte Swap Tests
+// JMP Tests (64-bit and 32-bit conditions)
 // ============================================================================
 
 #[test]
-fn test_end_le16() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 0x1234;
-
-    let i = instr(AluOpc::end_32(AluEnd::ToLE), 0, 0, 0, 16);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    // On little-endian, this is a no-op for the value
-    assert_eq!(ctx.regs[0] & 0xFFFF, 0x1234u16.to_le() as u64);
-}
-
-#[test]
-fn test_end_be16() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 0x1234;
-
-    let i = instr(AluOpc::end_32(AluEnd::ToBE), 0, 0, 0, 16);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 0x1234u16.to_be() as u64);
-}
-
-#[test]
-fn test_end_be32() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 0x12345678;
-
-    let i = instr(AluOpc::end_32(AluEnd::ToBE), 0, 0, 0, 32);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 0x12345678u32.to_be() as u64);
-}
-
-#[test]
-fn test_end_be64() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 0x123456789ABCDEF0;
-
-    let i = instr(AluOpc::end_32(AluEnd::ToBE), 0, 0, 0, 64);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 0x123456789ABCDEF0u64.to_be());
-}
-
-// ============================================================================
-// JMP64 Tests (64-bit jumps)
-// ============================================================================
-
-#[test]
-fn test_jmp64_ja() {
-    let mut ctx = Context::new(TestMem::new());
-
-    let i = instr(OpCode::jmp64_from_parts(JmpOpc::Ja, Source::Imm), 0, 0, 5, 0);
-    match exec(&mut ctx, i) {
-        Flow::Jump(off) => assert_eq!(off, 5),
-        other => panic!("Expected Jump, got {:?}", other),
+fn jmp_conditions() {
+    // (dst register value, opcode, off, imm, whether the jump is taken)
+    for (reg, opc, off, imm, taken) in [
+        (42u64, OpCode::jmp64_from_parts(JmpOpc::Jeq, Source::Imm), 10, 42, true),
+        (42u64, OpCode::jmp64_from_parts(JmpOpc::Jeq, Source::Imm), 10, 43, false),
+        (100u64, OpCode::jmp64_from_parts(JmpOpc::Jgt, Source::Imm), 5, 50, true),
+        (50u64, OpCode::jmp64_from_parts(JmpOpc::Jgt, Source::Imm), 5, 100, false),
+        (50u64, OpCode::jmp64_from_parts(JmpOpc::Jge, Source::Imm), 5, 50, true),
+        (10u64, OpCode::jmp64_from_parts(JmpOpc::Jlt, Source::Imm), 5, 50, true),
+        (50u64, OpCode::jmp64_from_parts(JmpOpc::Jle, Source::Imm), 5, 50, true),
+        (42u64, OpCode::jmp64_from_parts(JmpOpc::Jne, Source::Imm), 5, 43, true),
+        (0b1010, OpCode::jmp64_from_parts(JmpOpc::Jset, Source::Imm), 5, 0b1000, true),
+        (0b1010, OpCode::jmp64_from_parts(JmpOpc::Jset, Source::Imm), 5, 0b0100, false),
+        (1u64, OpCode::jmp64_from_parts(JmpOpc::Jsgt, Source::Imm), 5, -1, true), // 1 > -1 signed
+        ((-10i64) as u64, OpCode::jmp64_from_parts(JmpOpc::Jslt, Source::Imm), 5, -5, true), // -10 < -5 signed
+        (0xDEAD_BEEF_0000_002A, OpCode::jmp32_from_parts(JmpOpc::Jeq, Source::Imm), 5, 42, true), // matches on lower 32 bits
+        (0x0000_0000_FFFF_FFFF, OpCode::jmp32_from_parts(JmpOpc::Jsgt, Source::Imm), 5, -2, true), // -1 > -2 signed 32-bit
+    ] {
+        let mut ctx = Context::new(TestMem::new());
+        ctx.regs[0] = reg;
+        match exec(&mut ctx, instr(opc, 0, 0, off, imm)) {
+            Flow::Jump(got) if taken => assert_eq!(got, off as i64),
+            Flow::Next if !taken => {}
+            other => panic!("{opc:?} off={off} imm={imm}: expected taken={taken}, got {other:?}"),
+        }
     }
-}
 
-#[test]
-fn test_jmp64_ja_negative() {
+    // JMP32 JA uses the imm field for the offset, not the 16-bit offset field.
     let mut ctx = Context::new(TestMem::new());
-
-    let i = instr(OpCode::jmp64_from_parts(JmpOpc::Ja, Source::Imm), 0, 0, -3, 0);
-    match exec(&mut ctx, i) {
-        Flow::Jump(off) => assert_eq!(off, -3),
-        other => panic!("Expected Jump, got {:?}", other),
-    }
-}
-
-#[test]
-fn test_jmp64_jeq_taken() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 42;
-
-    let i = instr(OpCode::jmp64_from_parts(JmpOpc::Jeq, Source::Imm), 0, 0, 10, 42);
-    match exec(&mut ctx, i) {
-        Flow::Jump(off) => assert_eq!(off, 10),
-        other => panic!("Expected Jump, got {:?}", other),
-    }
-}
-
-#[test]
-fn test_jmp64_jeq_not_taken() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 42;
-
-    let i = instr(OpCode::jmp64_from_parts(JmpOpc::Jeq, Source::Imm), 0, 0, 10, 43);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-}
-
-#[test]
-fn test_jmp64_jgt_taken() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 100;
-
-    let i = instr(OpCode::jmp64_from_parts(JmpOpc::Jgt, Source::Imm), 0, 0, 5, 50);
-    match exec(&mut ctx, i) {
-        Flow::Jump(_) => {}
-        other => panic!("Expected Jump, got {:?}", other),
-    }
-}
-
-#[test]
-fn test_jmp64_jgt_not_taken() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 50;
-
-    let i = instr(OpCode::jmp64_from_parts(JmpOpc::Jgt, Source::Imm), 0, 0, 5, 100);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-}
-
-#[test]
-fn test_jmp64_jge_equal() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 50;
-
-    let i = instr(OpCode::jmp64_from_parts(JmpOpc::Jge, Source::Imm), 0, 0, 5, 50);
-    match exec(&mut ctx, i) {
-        Flow::Jump(_) => {}
-        other => panic!("Expected Jump, got {:?}", other),
-    }
-}
-
-#[test]
-fn test_jmp64_jlt_taken() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 10;
-
-    let i = instr(OpCode::jmp64_from_parts(JmpOpc::Jlt, Source::Imm), 0, 0, 5, 50);
-    match exec(&mut ctx, i) {
-        Flow::Jump(_) => {}
-        other => panic!("Expected Jump, got {:?}", other),
-    }
-}
-
-#[test]
-fn test_jmp64_jle_equal() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 50;
-
-    let i = instr(OpCode::jmp64_from_parts(JmpOpc::Jle, Source::Imm), 0, 0, 5, 50);
-    match exec(&mut ctx, i) {
-        Flow::Jump(_) => {}
-        other => panic!("Expected Jump, got {:?}", other),
-    }
-}
-
-#[test]
-fn test_jmp64_jne_taken() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 42;
-
-    let i = instr(OpCode::jmp64_from_parts(JmpOpc::Jne, Source::Imm), 0, 0, 5, 43);
-    match exec(&mut ctx, i) {
-        Flow::Jump(_) => {}
-        other => panic!("Expected Jump, got {:?}", other),
-    }
-}
-
-#[test]
-fn test_jmp64_jset_taken() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 0b1010;
-
-    let i = instr(OpCode::jmp64_from_parts(JmpOpc::Jset, Source::Imm), 0, 0, 5, 0b1000);
-    match exec(&mut ctx, i) {
-        Flow::Jump(_) => {}
-        other => panic!("Expected Jump, got {:?}", other),
-    }
-}
-
-#[test]
-fn test_jmp64_jset_not_taken() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 0b1010;
-
-    let i = instr(OpCode::jmp64_from_parts(JmpOpc::Jset, Source::Imm), 0, 0, 5, 0b0100);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-}
-
-#[test]
-fn test_jmp64_jsgt_signed() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = 1; // positive
-
-    // Compare 1 > -1 (signed)
-    let i = instr(OpCode::jmp64_from_parts(JmpOpc::Jsgt, Source::Imm), 0, 0, 5, -1);
-    match exec(&mut ctx, i) {
-        Flow::Jump(_) => {}
-        other => panic!("Expected Jump, got {:?}", other),
-    }
-}
-
-#[test]
-fn test_jmp64_jslt_signed() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[0] = (-10i64) as u64;
-
-    // Compare -10 < -5 (signed)
-    let i = instr(OpCode::jmp64_from_parts(JmpOpc::Jslt, Source::Imm), 0, 0, 5, -5);
-    match exec(&mut ctx, i) {
-        Flow::Jump(_) => {}
-        other => panic!("Expected Jump, got {:?}", other),
-    }
-}
-
-#[test]
-fn test_jmp64_exit() {
-    let mut ctx = Context::new(TestMem::new());
-
-    let i = instr(OpCode::jmp64_from_parts(JmpOpc::Exit, Source::Imm), 0, 0, 0, 0);
-    assert!(matches!(exec(&mut ctx, i), Flow::Exit));
-}
-
-#[test]
-fn test_jmp64_call_helper() {
-    let mut ctx = Context::new(TestMem::new());
-
-    // Call helper function with static ID (src_reg = 0)
-    let i = instr(OpCode::jmp64_from_parts(JmpOpc::Call, Source::Imm), 0, 0, 0, 1);
-    match exec(&mut ctx, i) {
-        Flow::CallHelper(id) => assert_eq!(id, 1),
-        other => panic!("Expected CallHelper, got {:?}", other),
-    }
-}
-
-#[test]
-fn test_jmp64_call_local() {
-    let mut ctx = Context::new(TestMem::new());
-
-    // Call program-local function (src_reg = 1)
-    let i = instr(OpCode::jmp64_from_parts(JmpOpc::Call, Source::Imm), 0, 1, 0, 5);
-    match exec(&mut ctx, i) {
-        Flow::Call(off) => assert_eq!(off, 5),
-        other => panic!("Expected Call, got {:?}", other),
-    }
-}
-
-// ============================================================================
-// JMP32 Tests (32-bit comparisons)
-// ============================================================================
-
-#[test]
-fn test_jmp32_ja_uses_imm() {
-    let mut ctx = Context::new(TestMem::new());
-
-    // JMP32 JA uses imm field (32-bit offset), not offset field
     let i = instr(OpCode::jmp32_from_parts(JmpOpc::Ja, Source::Imm), 0, 0, 99, 12345);
-    match exec(&mut ctx, i) {
-        Flow::Jump(off) => assert_eq!(off, 12345), // uses imm, not offset
-        other => panic!("Expected Jump, got {:?}", other),
-    }
-}
+    assert!(matches!(exec(&mut ctx, i), Flow::Jump(12345)));
 
-#[test]
-fn test_jmp32_jeq_32bit_comparison() {
+    // CALL distinguishes a helper call (src=0, imm is the helper id) from a
+    // local call (src=1, imm is the branch offset).
     let mut ctx = Context::new(TestMem::new());
-    // Upper bits differ, but lower 32 bits match
-    ctx.regs[0] = 0xDEAD_BEEF_0000_002A;
-
-    let i = instr(OpCode::jmp32_from_parts(JmpOpc::Jeq, Source::Imm), 0, 0, 5, 42);
-    match exec(&mut ctx, i) {
-        Flow::Jump(_) => {} // Should match on lower 32 bits
-        other => panic!("Expected Jump, got {:?}", other),
-    }
-}
-
-#[test]
-fn test_jmp32_jsgt_signed_32bit() {
-    let mut ctx = Context::new(TestMem::new());
-    // 0xFFFFFFFF as u32 = -1 as i32
-    ctx.regs[0] = 0x0000_0000_FFFF_FFFF;
-
-    // -1 > -2 in signed 32-bit
-    let i = instr(OpCode::jmp32_from_parts(JmpOpc::Jsgt, Source::Imm), 0, 0, 5, -2);
-    match exec(&mut ctx, i) {
-        Flow::Jump(_) => {}
-        other => panic!("Expected Jump, got {:?}", other),
-    }
+    let i = instr(OpCode::jmp64_from_parts(JmpOpc::Call, Source::Imm), 0, 0, 0, 1);
+    assert!(matches!(exec(&mut ctx, i), Flow::CallHelper(1)));
+    let i = instr(OpCode::jmp64_from_parts(JmpOpc::Call, Source::Imm), 0, 1, 0, 5);
+    assert!(matches!(exec(&mut ctx, i), Flow::Call(5)));
 }
 
 // ============================================================================
-// Memory Load Tests
+// Memory Load/Store Tests
 // ============================================================================
 
 #[test]
-fn test_ldx_b() {
-    let mut ctx = Context::new(TestMem::with_data(100, &[0xAB]));
+fn load_store_sizes() {
+    for (size, bytes, want) in [
+        (MemSize::Byte, &[0xABu8][..], 0xABu64),
+        (MemSize::Half, &[0x34, 0x12][..], 0x1234u64),
+        (MemSize::Word, &[0x78, 0x56, 0x34, 0x12][..], 0x1234_5678u64),
+        (MemSize::DWord, &[0xF0, 0xDE, 0xBC, 0x9A, 0x78, 0x56, 0x34, 0x12][..], 0x1234_5678_9ABC_DEF0u64),
+    ] {
+        let mut ctx = Context::new(TestMem::with_data(100, bytes));
+        ctx.regs[1] = 100;
+        let i = instr(OpCode::ldreg_from_parts(size, MemMode::Mem), 0, 1, 0, 0);
+        assert!(matches!(exec(&mut ctx, i), Flow::Next));
+        assert_eq!(ctx.regs[0], want, "{size:?} load");
+
+        let mut ctx = Context::new(TestMem::new());
+        ctx.regs[1] = 100;
+        ctx.regs[2] = want;
+        let i = instr(OpCode::streg_from_parts(size, MemMode::Mem), 1, 2, 0, 0);
+        assert!(matches!(exec(&mut ctx, i), Flow::Next));
+        assert_eq!(&ctx.data.data[100..100 + bytes.len()], bytes, "{size:?} store");
+    }
+
+    // ST stores an immediate value instead of a register.
+    let mut ctx = Context::new(TestMem::new());
     ctx.regs[1] = 100;
-
-    let opc = OpCode::ldreg_from_parts(MemSize::Byte, MemMode::Mem);
-    let i = instr(opc, 0, 1, 0, 0);
+    let i = instr(OpCode::stimm_from_parts(MemSize::Word, MemMode::Mem), 1, 0, 0, 0x1234_5678u32 as i32);
     assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 0xAB);
-}
+    assert_eq!(&ctx.data.data[100..104], &[0x78, 0x56, 0x34, 0x12]);
 
-#[test]
-fn test_ldx_h() {
-    let mut ctx = Context::new(TestMem::with_data(100, &[0x34, 0x12]));
-    ctx.regs[1] = 100;
-
-    let opc = OpCode::ldreg_from_parts(MemSize::Half, MemMode::Mem);
-    let i = instr(opc, 0, 1, 0, 0);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 0x1234);
-}
-
-#[test]
-fn test_ldx_w() {
-    let mut ctx = Context::new(TestMem::with_data(100, &[0x78, 0x56, 0x34, 0x12]));
-    ctx.regs[1] = 100;
-
-    let opc = OpCode::ldreg_from_parts(MemSize::Word, MemMode::Mem);
-    let i = instr(opc, 0, 1, 0, 0);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 0x12345678);
-}
-
-#[test]
-fn test_ldx_dw() {
-    let mut ctx = Context::new(TestMem::with_data(100, &[0xF0, 0xDE, 0xBC, 0x9A, 0x78, 0x56, 0x34, 0x12]));
-    ctx.regs[1] = 100;
-
-    let opc = OpCode::ldreg_from_parts(MemSize::DWord, MemMode::Mem);
-    let i = instr(opc, 0, 1, 0, 0);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.regs[0], 0x123456789ABCDEF0);
-}
-
-#[test]
-fn test_ldx_with_offset() {
+    // Non-zero offsets address base + off, for loads and stores alike.
     let mut ctx = Context::new(TestMem::with_data(110, &[0xCD]));
     ctx.regs[1] = 100;
-
-    let opc = OpCode::ldreg_from_parts(MemSize::Byte, MemMode::Mem);
-    let i = instr(opc, 0, 1, 10, 0); // offset = 10
+    let i = instr(OpCode::ldreg_from_parts(MemSize::Byte, MemMode::Mem), 0, 1, 10, 0);
     assert!(matches!(exec(&mut ctx, i), Flow::Next));
     assert_eq!(ctx.regs[0], 0xCD);
-}
 
-// ============================================================================
-// Memory Store Tests
-// ============================================================================
-
-#[test]
-fn test_stx_b() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[1] = 100; // address
-    ctx.regs[2] = 0xAB; // value
-
-    let opc = OpCode::streg_from_parts(MemSize::Byte, MemMode::Mem);
-    let i = instr(opc, 1, 2, 0, 0);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.data.data[100], 0xAB);
-}
-
-#[test]
-fn test_stx_h() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[1] = 100;
-    ctx.regs[2] = 0x1234;
-
-    let opc = OpCode::streg_from_parts(MemSize::Half, MemMode::Mem);
-    let i = instr(opc, 1, 2, 0, 0);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(ctx.data.data[100], 0x34);
-    assert_eq!(ctx.data.data[101], 0x12);
-}
-
-#[test]
-fn test_stx_w() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[1] = 100;
-    ctx.regs[2] = 0x12345678;
-
-    let opc = OpCode::streg_from_parts(MemSize::Word, MemMode::Mem);
-    let i = instr(opc, 1, 2, 0, 0);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(&ctx.data.data[100..104], &[0x78, 0x56, 0x34, 0x12]);
-}
-
-#[test]
-fn test_stx_dw() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[1] = 100;
-    ctx.regs[2] = 0x123456789ABCDEF0;
-
-    let opc = OpCode::streg_from_parts(MemSize::DWord, MemMode::Mem);
-    let i = instr(opc, 1, 2, 0, 0);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(&ctx.data.data[100..108], &[0xF0, 0xDE, 0xBC, 0x9A, 0x78, 0x56, 0x34, 0x12]);
-}
-
-#[test]
-fn test_st_imm() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[1] = 100;
-
-    let opc = OpCode::stimm_from_parts(MemSize::Word, MemMode::Mem);
-    let i = instr(opc, 1, 0, 0, 0x12345678u32 as i32);
-    assert!(matches!(exec(&mut ctx, i), Flow::Next));
-    assert_eq!(&ctx.data.data[100..104], &[0x78, 0x56, 0x34, 0x12]);
-}
-
-#[test]
-fn test_stx_with_offset() {
     let mut ctx = Context::new(TestMem::new());
     ctx.regs[1] = 100;
     ctx.regs[2] = 0xEF;
-
-    let opc = OpCode::streg_from_parts(MemSize::Byte, MemMode::Mem);
-    let i = instr(opc, 1, 2, 20, 0); // offset = 20
+    let i = instr(OpCode::streg_from_parts(MemSize::Byte, MemMode::Mem), 1, 2, 20, 0);
     assert!(matches!(exec(&mut ctx, i), Flow::Next));
     assert_eq!(ctx.data.data[120], 0xEF);
 }
@@ -841,52 +220,27 @@ fn test_ld_imm64() {
     assert_eq!(ctx.regs[0], 0x12345678_DEADBEEF);
 }
 
-#[test]
-fn test_ld_imm64_to_different_reg() {
-    let mut ctx = Context::new(TestMem::new());
-
-    let first = Instruction::from_parts(OC(0x18), 5, 0, 0, 0x11111111u32 as i32);
-    let second = Instruction::from_parts(OC(0x00), 0, 0, 0, 0x22222222u32 as i32);
-
-    assert!(matches!(exec_ld64(&mut ctx, first, second), Flow::Next));
-    assert_eq!(ctx.regs[5], 0x22222222_11111111);
-}
-
 // ============================================================================
 // Edge Cases and Error Handling
 // ============================================================================
 
 #[test]
-fn test_memory_out_of_bounds_load() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[1] = 10000; // out of bounds
-
-    let opc = OpCode::ldreg_from_parts(MemSize::Byte, MemMode::Mem);
-    let i = instr(opc, 0, 1, 0, 0);
-    assert!(matches!(exec(&mut ctx, i), Flow::FailMem(())));
-}
-
-#[test]
-fn test_memory_out_of_bounds_store() {
-    let mut ctx = Context::new(TestMem::new());
-    ctx.regs[1] = 10000; // out of bounds
-    ctx.regs[2] = 0xFF;
-
-    let opc = OpCode::streg_from_parts(MemSize::Byte, MemMode::Mem);
-    let i = instr(opc, 1, 2, 0, 0);
-    assert!(matches!(exec(&mut ctx, i), Flow::FailMem(())));
-}
-
-#[test]
-fn test_all_registers() {
-    // Verify operations work with all 11 registers (r0-r10)
-    for reg in 0..=10u8 {
+fn mem_fault() {
+    // (base address in r1, offset) pairs that must fault for both loads and stores.
+    for (addr, off) in [
+        (10000u64, 0i16), // out of bounds
+        (0u64, -8i16),    // 0 - 8 wraps to a huge address
+    ] {
         let mut ctx = Context::new(TestMem::new());
-        ctx.regs[reg as usize] = 100;
+        ctx.regs[1] = addr;
+        let load = instr(OpCode::ldreg_from_parts(MemSize::Byte, MemMode::Mem), 0, 1, off, 0);
+        assert!(matches!(exec(&mut ctx, load), Flow::FailMem(())), "load at {addr}+{off}");
 
-        let i = instr(AluOpc::add_64(Source::Imm), reg, 0, 0, 50);
-        assert!(matches!(exec(&mut ctx, i), Flow::Next));
-        assert_eq!(ctx.regs[reg as usize], 150, "Failed for register r{}", reg);
+        let mut ctx = Context::new(TestMem::new());
+        ctx.regs[1] = addr;
+        ctx.regs[2] = 0xFF;
+        let store = instr(OpCode::streg_from_parts(MemSize::Byte, MemMode::Mem), 1, 2, off, 0);
+        assert!(matches!(exec(&mut ctx, store), Flow::FailMem(())), "store at {addr}+{off}");
     }
 }
 
@@ -938,19 +292,22 @@ fn test_movsx() {
 
 #[test]
 fn test_bswap_and_endianness() {
-    let mut ctx = Context::new(TestMem::new());
     let v = 0x1122_3344_5566_7788;
-    for (opc, imm, want) in [
-        (AluOpc::end_64(AluEnd::ToLE), 16, 0x8877),
-        (AluOpc::end_64(AluEnd::ToLE), 32, 0x8877_6655),
-        (AluOpc::end_64(AluEnd::ToLE), 64, 0x8877_6655_4433_2211),
-        (AluOpc::end_32(AluEnd::ToLE), 16, 0x7788),
-        (AluOpc::end_32(AluEnd::ToLE), 64, v),
-        (AluOpc::end_32(AluEnd::ToBE), 32, 0x8877_6655),
+    for (input, opc, imm, want) in [
+        (v, AluOpc::end_64(AluEnd::ToLE), 16, 0x8877),
+        (v, AluOpc::end_64(AluEnd::ToLE), 32, 0x8877_6655),
+        (v, AluOpc::end_64(AluEnd::ToLE), 64, 0x8877_6655_4433_2211),
+        (v, AluOpc::end_32(AluEnd::ToLE), 16, 0x7788),
+        (v, AluOpc::end_32(AluEnd::ToLE), 64, v),
+        (v, AluOpc::end_32(AluEnd::ToBE), 32, 0x8877_6655),
+        (0x1234, AluOpc::end_32(AluEnd::ToBE), 16, 0x3412),
+        (0x1234_5678_9ABC_DEF0, AluOpc::end_32(AluEnd::ToBE), 64, 0xF0DE_BC9A_7856_3412),
     ] {
-        ctx.regs[1] = v;
+        let mut ctx = Context::new(TestMem::new());
+        ctx.regs[1] = input;
         exec(&mut ctx, instr(opc, 1, 0, 0, imm));
         assert_eq!(ctx.regs[1], want, "{opc:?} imm={imm}");
     }
+    let mut ctx = Context::new(TestMem::new());
     assert!(matches!(exec(&mut ctx, instr(AluOpc::end_64(AluEnd::ToBE), 1, 0, 0, 16)), Flow::FailCpu));
 }

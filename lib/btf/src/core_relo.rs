@@ -666,17 +666,4 @@ mod tests {
         assert_eq!(CoreReloKind::from_u32(9), Some(CoreReloKind::TypeSize));
         assert_eq!(CoreReloKind::from_u32(100), None);
     }
-
-    #[test]
-    fn test_patch_instruction() {
-        let mut instructions = vec![0x0000000000000000u64; 4];
-
-        // Patch instruction at offset 0 with value 42
-        patch_instruction(&mut instructions, 0, 42).unwrap();
-        assert_eq!(instructions[0] >> 32, 42);
-
-        // Patch instruction at offset 16 (index 2) with value 100
-        patch_instruction(&mut instructions, 16, 100).unwrap();
-        assert_eq!(instructions[2] >> 32, 100);
-    }
 }

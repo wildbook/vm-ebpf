@@ -468,25 +468,31 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_multiple() {
-        let bytes = [
-            0xb7, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00, // mov64 r0, 42
-            0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // exit
-        ];
-        let insns = decode_all(&bytes);
-        assert_eq!(insns.len(), 2);
-        assert_eq!(insns[0].mnemonic, Mnemonic::Mov64);
-        assert_eq!(insns[1].mnemonic, Mnemonic::Exit);
-    }
+    fn test_decode_atomic_ops() {
+        // Atomic ops use opcode 0xDB (STX | DW | ATOMIC); the imm selects the operation.
+        for (imm, want) in [
+            (0x00, Mnemonic::AtomicAdd64),
+            (0x01, Mnemonic::AtomicFetchAdd64),
+            (0x40, Mnemonic::AtomicOr64),
+            (0x50, Mnemonic::AtomicAnd64),
+            (0xa0, Mnemonic::AtomicXor64),
+            (0xe1, Mnemonic::AtomicXchg64),
+            (0xf1, Mnemonic::AtomicCmpxchg64),
+        ] {
+            // lock *(u64 *)(r1 + 0) <op>= r2
+            let bytes = [0xdb, 0x21, 0x00, 0x00, imm, 0x00, 0x00, 0x00];
+            let insn = decode_one(&bytes).unwrap();
+            assert_eq!(insn.mnemonic, want, "imm=0x{imm:02x}");
+        }
 
-    #[test]
-    fn test_decode_atomic_add64() {
-        // lock *(u64 *)(r1 + 0) += r2
-        // opcode = STX class (0x03) | DW size (0x18) | ATOMIC mode (0xC0) = 0xDB
-        // imm = 0x00 (ADD)
+        // W-sized atomics (STX | W | ATOMIC = 0xC3) decode to the 32-bit mnemonic.
+        let bytes = [0xc3, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let insn = decode_one(&bytes).unwrap();
+        assert_eq!(insn.mnemonic, Mnemonic::AtomicAdd32);
+
+        // AtomicAdd64 also carries dst/src operands, unlike the other mnemonics above.
         let bytes = [0xdb, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         let insn = decode_one(&bytes).unwrap();
-        assert_eq!(insn.mnemonic, Mnemonic::AtomicAdd64);
         assert_eq!(
             insn.dst,
             Operand::Mem {
@@ -495,69 +501,5 @@ mod tests {
             }
         );
         assert_eq!(insn.src, Operand::Reg(Register::R2));
-    }
-
-    #[test]
-    fn test_decode_atomic_add32() {
-        // lock *(u32 *)(r1 + 0) += r2
-        // opcode = STX class (0x03) | W size (0x00) | ATOMIC mode (0xC0) = 0xC3
-        // imm = 0x00 (ADD)
-        let bytes = [0xc3, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let insn = decode_one(&bytes).unwrap();
-        assert_eq!(insn.mnemonic, Mnemonic::AtomicAdd32);
-    }
-
-    #[test]
-    fn test_decode_atomic_fetch_add64() {
-        // r2 = atomic_fetch_add((u64 *)(r1 + 0), r2)
-        // opcode = 0xDB, imm = 0x01 (ADD | FETCH)
-        let bytes = [0xdb, 0x21, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00];
-        let insn = decode_one(&bytes).unwrap();
-        assert_eq!(insn.mnemonic, Mnemonic::AtomicFetchAdd64);
-    }
-
-    #[test]
-    fn test_decode_atomic_or64() {
-        // lock *(u64 *)(r1 + 0) |= r2
-        // opcode = 0xDB, imm = 0x40 (OR)
-        let bytes = [0xdb, 0x21, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00];
-        let insn = decode_one(&bytes).unwrap();
-        assert_eq!(insn.mnemonic, Mnemonic::AtomicOr64);
-    }
-
-    #[test]
-    fn test_decode_atomic_and64() {
-        // lock *(u64 *)(r1 + 0) &= r2
-        // opcode = 0xDB, imm = 0x50 (AND)
-        let bytes = [0xdb, 0x21, 0x00, 0x00, 0x50, 0x00, 0x00, 0x00];
-        let insn = decode_one(&bytes).unwrap();
-        assert_eq!(insn.mnemonic, Mnemonic::AtomicAnd64);
-    }
-
-    #[test]
-    fn test_decode_atomic_xor64() {
-        // lock *(u64 *)(r1 + 0) ^= r2
-        // opcode = 0xDB, imm = 0xa0 (XOR)
-        let bytes = [0xdb, 0x21, 0x00, 0x00, 0xa0, 0x00, 0x00, 0x00];
-        let insn = decode_one(&bytes).unwrap();
-        assert_eq!(insn.mnemonic, Mnemonic::AtomicXor64);
-    }
-
-    #[test]
-    fn test_decode_atomic_xchg64() {
-        // r2 = xchg((u64 *)(r1 + 0), r2)
-        // opcode = 0xDB, imm = 0xe1 (XCHG)
-        let bytes = [0xdb, 0x21, 0x00, 0x00, 0xe1, 0x00, 0x00, 0x00];
-        let insn = decode_one(&bytes).unwrap();
-        assert_eq!(insn.mnemonic, Mnemonic::AtomicXchg64);
-    }
-
-    #[test]
-    fn test_decode_atomic_cmpxchg64() {
-        // r0 = cmpxchg((u64 *)(r1 + 0), r0, r2)
-        // opcode = 0xDB, imm = 0xf1 (CMPXCHG)
-        let bytes = [0xdb, 0x21, 0x00, 0x00, 0xf1, 0x00, 0x00, 0x00];
-        let insn = decode_one(&bytes).unwrap();
-        assert_eq!(insn.mnemonic, Mnemonic::AtomicCmpxchg64);
     }
 }

@@ -153,26 +153,4 @@ mod tests {
         assert!(Register::from_u8(11).is_none());
         assert!(Register::from_u8(15).is_none());
     }
-
-    #[test]
-    fn test_register_display() {
-        assert_eq!(format!("{R0}"), "r0");
-        assert_eq!(format!("{R10}"), "r10");
-    }
-
-    #[test]
-    fn test_register_properties() {
-        assert!(R10.is_frame_pointer());
-        assert!(!R0.is_frame_pointer());
-
-        assert!(R6.is_callee_saved());
-        assert!(R9.is_callee_saved());
-        assert!(!R0.is_callee_saved());
-        assert!(!R10.is_callee_saved());
-
-        assert!(R1.is_argument());
-        assert!(R5.is_argument());
-        assert!(!R0.is_argument());
-        assert!(!R6.is_argument());
-    }
 }

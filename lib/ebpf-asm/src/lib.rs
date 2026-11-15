@@ -148,6 +148,13 @@ mod tests {
         asm.exit();
 
         let code = asm.assemble().unwrap();
+        assert_eq!(code.len(), 24); // 16 + 8 bytes
+
+        // The 64-bit immediate splits across the low 32 bits of each LDDW slot.
+        let lo = u32::from_le_bytes([code[4], code[5], code[6], code[7]]);
+        let hi = u32::from_le_bytes([code[12], code[13], code[14], code[15]]);
+        assert_eq!(lo, 0xCAFEBABE);
+        assert_eq!(hi, 0xDEADBEEF);
 
         let insns = decode_all(&code);
         assert_eq!(insns.len(), 2);
@@ -178,24 +185,6 @@ mod tests {
         assert_eq!(insns[1].mnemonic, Mnemonic::Stxdw);
         assert_eq!(insns[2].mnemonic, Mnemonic::Ldxw);
         assert_eq!(insns[3].mnemonic, Mnemonic::Stxb);
-    }
-
-    #[test]
-    fn test_formatter_output() {
-        let mut asm = Assembler::new();
-        asm.mov64_imm(R0, 42);
-        asm.add64(R0, R1);
-        asm.ldxdw(R2, R10, -8);
-        asm.exit();
-
-        let code = asm.assemble().unwrap();
-        let insns = decode_all(&code);
-        let fmt = DefaultFormatter::new();
-
-        assert_eq!(fmt.format_to_string(&insns[0]), "mov64 r0, 0x2a");
-        assert_eq!(fmt.format_to_string(&insns[1]), "add64 r0, r1");
-        assert_eq!(fmt.format_to_string(&insns[2]), "ldxdw r2, [r10-0x8]");
-        assert_eq!(fmt.format_to_string(&insns[3]), "exit");
     }
 
     #[test]

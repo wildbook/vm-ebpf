@@ -267,7 +267,7 @@ fn build_core_demo_program() -> EbpfProgram {
 }
 
 /// Demonstrates CO-RE patching when host has different struct layout.
-fn demo_core_relocation() {
+fn demo_core_relocation() -> Result<(), String> {
     println!("=== Demo: CO-RE Field Offset Relocation ===\n");
 
     // Build the eBPF program (expects pid at offset 8)
@@ -304,6 +304,9 @@ fn demo_core_relocation() {
         println!("  Host layout: event {{ timestamp: 0, pid: 8 }}");
         println!("  Applied {applied} relocation(s)");
         println!("  Patched off = {patched_off} (should be 8)");
+        if patched_off != 8 {
+            return Err(format!("scenario 1: expected patched offset 8, got {patched_off}"));
+        }
     }
 
     // === Scenario 2: Host has DIFFERENT layout ===
@@ -325,11 +328,15 @@ fn demo_core_relocation() {
         println!("  Host layout: event {{ timestamp: 0, flags: 8, pid: 12 }}");
         println!("  Applied {applied} relocation(s)");
         println!("  Patched off = {patched_off} (should be 12!)");
+        if patched_off != 12 {
+            return Err(format!("scenario 2: expected patched offset 12, got {patched_off}"));
+        }
 
         println!("\n  Running patched program...");
     }
 
     println!();
+    Ok(())
 }
 
 /// Build a program that correctly uses CO-RE with imm-based addressing.
@@ -376,7 +383,7 @@ fn build_correct_core_program() -> EbpfProgram {
     prog
 }
 
-fn demo_full_core_execution() {
+fn demo_full_core_execution() -> Result<(), String> {
     println!("=== Demo: Full CO-RE Execution ===\n");
 
     let mut prog = build_correct_core_program();
@@ -450,20 +457,20 @@ fn demo_full_core_execution() {
         Ok(ret) => {
             println!("\nProgram returned: {ret}");
             let pid_u64 = pid as u64;
-            if ret == pid_u64 {
-                println!("SUCCESS: CO-RE correctly relocated pid offset from 8 to 12!");
-            } else {
-                println!("UNEXPECTED: Got {ret} but expected {pid}");
+            if ret != pid_u64 {
+                return Err(format!("expected pid {pid}, got {ret}"));
             }
+            println!("SUCCESS: CO-RE correctly relocated pid offset from 8 to 12!");
         }
-        Err(e) => println!("Error: {e}"),
+        Err(e) => return Err(format!("execution failed: {e}")),
     }
 
     println!();
+    Ok(())
 }
 
 /// Demo: Field existence check
-fn demo_field_exists() {
+fn demo_field_exists() -> Result<(), String> {
     println!("=== Demo: CO-RE Field Existence Check ===\n");
 
     let mut prog = EbpfProgram::new();
@@ -513,6 +520,9 @@ fn demo_field_exists() {
         let exists_val = (instrs[0] >> 32) as i32;
         println!("  CO-RE patched FIELD_EXISTS = {exists_val}");
         println!("  Program would take 'field exists' path\n");
+        if exists_val != 1 {
+            return Err(format!("expected FIELD_EXISTS = 1 when the field is present, got {exists_val}"));
+        }
     }
 
     // Test 2: Host does NOT have the field
@@ -532,11 +542,16 @@ fn demo_field_exists() {
         let exists_val = (instrs[0] >> 32) as i32;
         println!("  CO-RE patched FIELD_EXISTS = {exists_val}");
         println!("  Program would take 'field missing' path\n");
+        if exists_val != 0 {
+            return Err(format!("expected FIELD_EXISTS = 0 when the field is missing, got {exists_val}"));
+        }
     }
+
+    Ok(())
 }
 
 /// Demo: Type size query
-fn demo_type_size() {
+fn demo_type_size() -> Result<(), String> {
     println!("=== Demo: CO-RE Type Size Query ===\n");
 
     let mut prog = EbpfProgram::new();
@@ -568,85 +583,26 @@ fn demo_type_size() {
     println!("BPF program expected: sizeof(event) = 12");
     println!("Host actually has:    sizeof(event) = 24");
     println!("CO-RE patched:        r0 = {size_val}\n");
+    if size_val != 24 {
+        return Err(format!("expected CO-RE to patch sizeof(event) to 24, got {size_val}"));
+    }
+    Ok(())
 }
 
 // ============================================================================
 // Main
 // ============================================================================
 
-fn main() {
+fn main() -> Result<(), String> {
     println!("########################################################");
     println!("#  eBPF VM Demo: BTF/CO-RE Compile Once - Run Everywhere");
     println!("########################################################\n");
 
-    demo_core_relocation();
-    demo_full_core_execution();
-    demo_field_exists();
-    demo_type_size();
+    demo_core_relocation()?;
+    demo_full_core_execution()?;
+    demo_field_exists()?;
+    demo_type_size()?;
 
     println!("=== All demos complete ===");
-}
-
-// ============================================================================
-// Tests
-// ============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_core_relocation_patches_offset() {
-        let mut prog = build_correct_core_program();
-        let btf_data = prog.btf_data.clone();
-        let relocations = prog.relocations.clone();
-        let btf = Btf::parse(&btf_data).unwrap();
-
-        let mut registry = TypeRegistry::new();
-        registry
-            .register_struct("event")
-            .field("timestamp", 0, 8)
-            .field("flags", 8, 4)
-            .field("pid", 12, 4) // Moved from offset 8 to 12
-            .size(16);
-
-        apply_core_relocations(prog.instructions_mut(), &btf, &registry, &relocations).unwrap();
-
-        // The MOV instruction's imm should be patched to 12
-        let patched_imm = (prog.instructions[0] >> 32) as i32;
-        assert_eq!(patched_imm, 12);
-    }
-
-    #[test]
-    fn test_full_execution_with_core() {
-        let mut prog = build_correct_core_program();
-        let btf_data = prog.btf_data.clone();
-        let relocations = prog.relocations.clone();
-        let btf = Btf::parse(&btf_data).unwrap();
-
-        let mut registry = TypeRegistry::new();
-        registry
-            .register_struct("event")
-            .field("timestamp", 0, 8)
-            .field("pid", 12, 4) // At offset 12
-            .size(16);
-
-        apply_core_relocations(prog.instructions_mut(), &btf, &registry, &relocations).unwrap();
-
-        // Build memory
-        let stack_size = 512;
-        let code = prog.code();
-        let pid: u32 = 999;
-
-        let mut mem = VmMemory::new();
-        let stack_top = mem.map(rvm::STACK_REGION, stack_size, rvm::Perms::RW) + stack_size as u64;
-        let event_ptr = mem.map(rvm::FIRST_FREE_REGION, 16, rvm::Perms::RW);
-        mem.write(event_ptr + 12, pid).unwrap();
-
-        let helpers = build_helpers();
-        let mut executor = Executor::new(&code, &mut mem, &helpers, stack_top);
-
-        let result = executor.call(0, &[event_ptr]).unwrap();
-        assert_eq!(result, 999);
-    }
+    Ok(())
 }

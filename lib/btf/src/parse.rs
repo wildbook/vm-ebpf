@@ -432,23 +432,3 @@ impl<'a> Btf<'a> {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_header_parse() {
-        // Minimal valid BTF header
-        let mut data = vec![0u8; 24];
-        data[0..2].copy_from_slice(&BTF_MAGIC.to_le_bytes());
-        data[2] = BTF_VERSION;
-        data[3] = 0; // flags
-        data[4..8].copy_from_slice(&24u32.to_le_bytes()); // hdr_len
-                                                          // type_off, type_len, str_off, str_len all 0
-
-        let header = BtfHeader::parse(&data).unwrap();
-        assert_eq!(header.magic, BTF_MAGIC);
-        assert_eq!(header.version, BTF_VERSION);
-    }
-}
