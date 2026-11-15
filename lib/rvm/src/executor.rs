@@ -4,9 +4,8 @@
 //! and dispatches helper function calls to the registered helpers.
 
 use std::fmt::Debug;
-use std::ops::ControlFlow;
 
-use rvm_core::{step, step_ld64, Context, Flow, Instruction, Memory};
+use rvm_core::{run, Context, Flow, Instruction, Memory};
 
 use crate::error::{ExecError, Result};
 use crate::helper::{HelperArgs, HelperContext, HelperRegistry};
@@ -19,6 +18,7 @@ pub const MAX_CALL_DEPTH: usize = 8;
 pub const DEFAULT_FRAME_SIZE: u64 = 512;
 
 /// Caller state saved across a BPF-to-BPF call.
+#[derive(Clone, Copy, Default)]
 struct Frame {
     /// r6-r9 (callee-saved) and r10 (frame pointer).
     regs: [u64; 5],
@@ -79,52 +79,38 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
         }
         ctx.regs[10] = self.stack_top;
 
-        let mut call_stack: Vec<Frame> = Vec::with_capacity(MAX_CALL_DEPTH);
+        let mut call_stack = [Frame::default(); MAX_CALL_DEPTH];
+        let mut depth = 0;
         let mut pc = pc;
-        let mut insn_count: u64 = 0;
+        let limit = match self.instruction_limit {
+            0 => u64::MAX,
+            limit => limit,
+        };
+        let mut fuel = limit;
 
         loop {
-            if self.instruction_limit > 0 && insn_count >= self.instruction_limit {
-                return Err(ExecError::InstructionLimit(insn_count).into());
-            }
-
-            let insn = fetch(self.code, pc)?;
-            insn_count += 1;
-
-            let flow = match step(&mut ctx, insn) {
-                ControlFlow::Break(flow) => flow,
-                ControlFlow::Continue(first) => {
-                    // LD_IMM64 occupies two slots.
-                    pc += 1;
-                    insn_count += 1;
-                    let second = fetch(self.code, pc)?;
-                    step_ld64(&mut ctx, first, second)
-                }
-            };
-
-            pc = match flow {
-                Flow::Next => pc + 1,
-                Flow::Jump(offset) => relative_pc(pc, offset)?,
+            pc = match run(&mut ctx, self.code, &mut pc, &mut fuel) {
                 Flow::Call(offset) => {
-                    if call_stack.len() >= MAX_CALL_DEPTH {
+                    if depth == MAX_CALL_DEPTH {
                         return Err(ExecError::StackOverflow.into());
                     }
                     let regs = &mut ctx.regs;
                     let callee_fp = regs[10].checked_sub(self.frame_size).ok_or(ExecError::StackOverflow)?;
-                    call_stack.push(Frame {
+                    call_stack[depth] = Frame {
                         regs: [regs[6], regs[7], regs[8], regs[9], regs[10]],
                         return_pc: pc + 1,
-                    });
+                    };
+                    depth += 1;
                     regs[10] = callee_fp;
-                    relative_pc(pc, offset)?
+                    pc.wrapping_add_signed(offset + 1)
                 }
-                Flow::Exit => match call_stack.pop() {
-                    Some(frame) => {
-                        ctx.regs[6..=10].copy_from_slice(&frame.regs);
-                        frame.return_pc
-                    }
-                    None => return Ok(ctx.regs[0]),
-                },
+                Flow::Exit if depth == 0 => return Ok(ctx.regs[0]),
+                Flow::Exit => {
+                    depth -= 1;
+                    let frame = &call_stack[depth];
+                    ctx.regs[6..=10].copy_from_slice(&frame.regs);
+                    frame.return_pc
+                }
                 // Raw bytecode path: look the helper ID up. Linked programs only use slots.
                 Flow::CallHelper(id) => {
                     let args = HelperArgs::from_regs(&ctx.regs);
@@ -138,28 +124,18 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
                     ctx.regs[0] = self.helpers.call_slot(slot, &mut helper_ctx)?;
                     pc + 1
                 }
+                Flow::OutOfFuel => return Err(ExecError::InstructionLimit(limit).into()),
+                Flow::BadPc => return Err(ExecError::InvalidPc(pc).into()),
                 Flow::FailCpu => return Err(ExecError::CpuFault("invalid instruction".to_string()).into()),
                 Flow::FailMem(err) => return Err(ExecError::MemoryFault(format!("access at {err:#x?} (pc {pc})")).into()),
                 Flow::Missing => {
                     return Err(ExecError::Unimplemented("instruction not implemented".to_string()).into())
                 }
+                // `run` handles these internally
+                Flow::Next | Flow::Jump(_) => unreachable!(),
             };
         }
     }
-}
-
-#[inline(always)]
-fn fetch(code: &[Instruction], pc: u64) -> Result<Instruction> {
-    Ok(*code.get(pc as usize).ok_or(ExecError::InvalidPc(pc))?)
-}
-
-/// Target of a jump/call relative to the instruction after `pc`.
-fn relative_pc(pc: u64, offset: i64) -> Result<u64> {
-    let target = (pc as i64) + 1 + offset;
-    if target < 0 {
-        return Err(ExecError::InvalidPc(target as u64).into());
-    }
-    Ok(target as u64)
 }
 
 #[cfg(test)]

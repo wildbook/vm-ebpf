@@ -263,6 +263,61 @@ where
     })
 }
 
+/// A registered function, called directly through `call` with `data` as its closure.
+struct Slot<M> {
+    call: unsafe fn(*const (), &mut HelperContext<M>) -> Result<u64, HelperError>,
+    data: *const (),
+    // keeps `data` alive; the call path never touches it
+    _owner: Arc<dyn Send + Sync>,
+}
+
+// SAFETY: `data` points into `_owner`, which is `Send + Sync` and lives as long as the slot.
+unsafe impl<M> Send for Slot<M> {}
+unsafe impl<M> Sync for Slot<M> {}
+
+impl<M> Clone for Slot<M> {
+    fn clone(&self) -> Self {
+        Self {
+            call: self.call,
+            data: self.data,
+            _owner: self._owner.clone(),
+        }
+    }
+}
+
+impl<M: 'static> Slot<M> {
+    fn new<F>(func: F) -> Self
+    where
+        F: Fn(&mut HelperContext<M>) -> Result<u64, HelperError> + Send + Sync + 'static,
+    {
+        /// # Safety
+        ///
+        /// `data` must point to a live `F`.
+        unsafe fn trampoline<M, F>(data: *const (), ctx: &mut HelperContext<M>) -> Result<u64, HelperError>
+        where
+            F: Fn(&mut HelperContext<M>) -> Result<u64, HelperError>,
+        {
+            unsafe { (*data.cast::<F>())(ctx) }
+        }
+
+        let owner = Arc::new(func);
+        Self {
+            call: trampoline::<M, F>,
+            data: Arc::as_ptr(&owner).cast(),
+            _owner: owner,
+        }
+    }
+
+    fn typed<F, A, R>(func: F) -> Self
+    where
+        F: Fn(A) -> R + Send + Sync + 'static,
+        A: FromArgs,
+        R: IntoReturn,
+    {
+        Self::new(move |ctx| Ok(func(A::from_args(&ctx.args)).into_return()))
+    }
+}
+
 /// Extern table: host functions callable from eBPF, stored in dense slots.
 ///
 /// Functions are registered either by numeric helper ID (standard BPF helpers,
@@ -271,7 +326,7 @@ where
 /// Re-registering an ID or name replaces the function in its existing slot, which
 /// keeps linked call sites valid (hot reload).
 pub struct HelperRegistry<M = VmMemory> {
-    slots: Vec<DynHelper<M>>,
+    slots: Vec<Slot<M>>,
     // argument count per slot; `None` for raw and context helpers, which read registers themselves
     arities: Vec<Option<u8>>,
     by_id: HashMap<u32, u32>,
@@ -325,7 +380,7 @@ impl<M: 'static> HelperRegistry<M> {
         R: IntoReturn + 'static,
     {
         let slot = self.by_id.get(&id).copied();
-        let slot = self.put(slot, into_dyn_helper(func), Some(A::ARITY));
+        let slot = self.put(slot, Slot::typed(func), Some(A::ARITY));
         self.by_id.insert(id, slot);
     }
 
@@ -335,13 +390,15 @@ impl<M: 'static> HelperRegistry<M> {
         F: Fn(&mut HelperContext<M>) -> R + Send + Sync + 'static,
         R: IntoReturn + 'static,
     {
-        self.register_raw(id, into_dyn_helper_with_ctx(func));
+        let slot = self.by_id.get(&id).copied();
+        let slot = self.put(slot, Slot::new(move |ctx| Ok(func(ctx).into_return())), None);
+        self.by_id.insert(id, slot);
     }
 
     /// Register a raw dynamic helper by ID.
     pub fn register_raw(&mut self, id: u32, helper: DynHelper<M>) {
         let slot = self.by_id.get(&id).copied();
-        let slot = self.put(slot, helper, None);
+        let slot = self.put(slot, Slot::new(move |ctx| helper(ctx)), None);
         self.by_id.insert(id, slot);
     }
 
@@ -354,7 +411,7 @@ impl<M: 'static> HelperRegistry<M> {
     {
         let name = name.into();
         let slot = self.by_name.get(&name).copied();
-        let slot = self.put(slot, into_dyn_helper(func), Some(A::ARITY));
+        let slot = self.put(slot, Slot::typed(func), Some(A::ARITY));
         self.by_name.insert(name, slot);
     }
 
@@ -364,19 +421,22 @@ impl<M: 'static> HelperRegistry<M> {
         F: Fn(&mut HelperContext<M>) -> R + Send + Sync + 'static,
         R: IntoReturn + 'static,
     {
-        self.register_fn_raw(name, into_dyn_helper_with_ctx(func));
+        let name = name.into();
+        let slot = self.by_name.get(&name).copied();
+        let slot = self.put(slot, Slot::new(move |ctx| Ok(func(ctx).into_return())), None);
+        self.by_name.insert(name, slot);
     }
 
     /// Register a raw dynamic extern function by name.
     pub fn register_fn_raw(&mut self, name: impl Into<String>, helper: DynHelper<M>) {
         let name = name.into();
         let slot = self.by_name.get(&name).copied();
-        let slot = self.put(slot, helper, None);
+        let slot = self.put(slot, Slot::new(move |ctx| helper(ctx)), None);
         self.by_name.insert(name, slot);
     }
 
     /// Replace the function in `slot`, or append a new slot.
-    fn put(&mut self, slot: Option<u32>, helper: DynHelper<M>, arity: Option<u8>) -> u32 {
+    fn put(&mut self, slot: Option<u32>, helper: Slot<M>, arity: Option<u8>) -> u32 {
         match slot {
             Some(slot) => {
                 self.slots[slot as usize] = helper;
@@ -416,7 +476,8 @@ impl<M: 'static> HelperRegistry<M> {
     #[inline]
     pub fn call_slot(&self, slot: u32, ctx: &mut HelperContext<M>) -> Result<u64, HelperError> {
         let helper = self.slots.get(slot as usize).ok_or(HelperError::UnknownSlot(slot))?;
-        helper(ctx)
+        // SAFETY: `Slot::new` paired `call` with a `data` pointer of the type it expects.
+        unsafe { (helper.call)(helper.data, ctx) }
     }
 
     /// Check if a helper ID is registered.

@@ -80,6 +80,11 @@ pub enum Flow<C: Memory> {
     FailMem(C::Err),
 
     Missing, // Not yet implemented.
+
+    /// [`run`] used up its instruction budget before the next instruction.
+    OutOfFuel,
+    /// [`run`] reached a `pc` outside the code slice.
+    BadPc,
 }
 
 pub trait Runner {
@@ -580,4 +585,44 @@ pub fn step_ld64<M: Memory>(ctx: &mut Context<M>, instr: Instruction, second: In
     }
 
     Flow::Next
+}
+
+/// Execute from `*pc` until an instruction the caller must handle.
+///
+/// Plain ALU, memory and jump instructions stay inside this loop, so each one costs a
+/// single dispatch. The loop returns [`Flow::Call`], [`Flow::Exit`], helper calls and
+/// faults with `*pc` at the instruction that produced them, and [`Flow::OutOfFuel`] or
+/// [`Flow::BadPc`] with `*pc` at the instruction that could not run. Each executed
+/// instruction (both slots of LD_IMM64) consumes one unit of `fuel`.
+#[inline]
+pub fn run<M: Memory>(ctx: &mut Context<M>, code: &[Instruction], pc: &mut u64, fuel: &mut u64) -> Flow<M> {
+    loop {
+        if *fuel == 0 {
+            return Flow::OutOfFuel;
+        }
+        let Some(&insn) = code.get(*pc as usize) else {
+            return Flow::BadPc;
+        };
+        *fuel -= 1;
+
+        let flow = match step(ctx, insn) {
+            ControlFlow::Break(flow) => flow,
+            ControlFlow::Continue(first) => {
+                let Some(&second) = code.get(*pc as usize + 1) else {
+                    *pc += 1;
+                    return Flow::BadPc;
+                };
+                *pc += 1;
+                *fuel = fuel.saturating_sub(1);
+                step_ld64(ctx, first, second)
+            }
+        };
+
+        match flow {
+            Flow::Next => *pc += 1,
+            // a negative target wraps to a huge pc and fails the next fetch
+            Flow::Jump(offset) => *pc = pc.wrapping_add_signed(offset + 1),
+            other => return other,
+        }
+    }
 }

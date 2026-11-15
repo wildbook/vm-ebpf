@@ -5,6 +5,7 @@ pub struct OpCode(pub u8);
 
 #[allow(clippy::unusual_byte_groupings)]
 impl OpCode {
+    #[inline(always)]
     pub const fn class(self) -> Class {
         Class::from_u8(self.0 & 0b00000_111)
     }
@@ -35,22 +36,29 @@ impl OpCode {
 #[rustfmt::skip]
 #[allow(clippy::unusual_byte_groupings)]
 impl OpCode {
+    #[inline(always)]
     pub const fn alu_opc(self) -> AluOpc { AluOpc::from_u8(self.0 & 0b1111_0_000) }
+    #[inline(always)]
     pub const fn alu_src(self) -> Source { Source::from_u8(self.0 & 0b0000_1_000) }
+    #[inline(always)]
     pub const fn alu_end(self) -> AluEnd { AluEnd::from_u8(self.0 & 0b0000_1_000) }
 }
 
 #[rustfmt::skip]
 #[allow(clippy::unusual_byte_groupings)]
 impl OpCode {
+    #[inline(always)]
     pub const fn jmp_opc(self) -> JmpOpc { JmpOpc::from_u8(self.0 & 0b1111_0_000) }
+    #[inline(always)]
     pub const fn jmp_src(self) -> Source { Source::from_u8(self.0 & 0b0000_1_000) }
 }
 
 #[rustfmt::skip]
 #[allow(clippy::unusual_byte_groupings)]
 impl OpCode {
+    #[inline(always)]
     pub const fn mem_size(self) -> MemSize { MemSize::from_u8(self.0 & 0b000_11_000) }
+    #[inline(always)]
     pub const fn mem_mode(self) -> MemMode { MemMode::from_u8(self.0 & 0b111_00_000) }
 }
 
@@ -179,6 +187,7 @@ pub enum MemMode {
 }
 
 impl Class {
+    #[inline(always)]
     pub const fn from_u8(x: u8) -> Self {
         debug_assert!((x & !0b0000_0111) == 0);
         match x {
@@ -196,6 +205,7 @@ impl Class {
 }
 
 impl Source {
+    #[inline(always)]
     pub const fn from_u8(x: u8) -> Self {
         debug_assert!((x & !0b0000_1000) == 0);
         match x {
@@ -207,6 +217,7 @@ impl Source {
 }
 
 impl AluOpc {
+    #[inline(always)]
     pub const fn from_u8(x: u8) -> Self {
         debug_assert!((x & !0b1111_0000) == 0);
         match x {
@@ -233,6 +244,7 @@ impl AluOpc {
 }
 
 impl AluEnd {
+    #[inline(always)]
     pub const fn from_u8(x: u8) -> Self {
         debug_assert!((x & !0b0000_1000) == 0);
         match x {
@@ -244,6 +256,7 @@ impl AluEnd {
 }
 
 impl JmpOpc {
+    #[inline(always)]
     pub const fn from_u8(x: u8) -> Self {
         debug_assert!((x & !0b1111_0000) == 0);
         match x {
@@ -270,6 +283,7 @@ impl JmpOpc {
 }
 
 impl MemSize {
+    #[inline(always)]
     pub const fn from_u8(x: u8) -> Self {
         debug_assert!((x & !0b0001_1000) == 0);
         match x {
@@ -283,6 +297,7 @@ impl MemSize {
 }
 
 impl MemMode {
+    #[inline(always)]
     pub const fn from_u8(x: u8) -> Self {
         debug_assert!((x & !0b1110_0000) == 0);
         match x {
