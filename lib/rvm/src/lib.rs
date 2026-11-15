@@ -129,7 +129,9 @@ pub use maps::{
     BPF_FUNC_MAP_UPDATE_ELEM, BPF_NOEXIST, MAPS_REGION, SHARED_MAPS_FIRST_REGION,
 };
 // Memory
-pub use memory::{region_base, Memory, Perms, Scalar, VmMemory, MAX_REGIONS, MAX_REGION_LEN, REGION_SHIFT};
+pub use memory::{
+    region_base, Memory, Perms, Scalar, SharedBuffer, SharedRegion, VmMemory, MAX_REGIONS, MAX_REGION_LEN, REGION_SHIFT,
+};
 // Module loading
 pub use module::Module;
 pub use plugin::Plugin;

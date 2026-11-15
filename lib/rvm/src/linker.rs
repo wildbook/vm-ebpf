@@ -28,7 +28,7 @@ use crate::error::{LinkError, Result, VmError};
 use crate::executor::MAX_CALL_DEPTH;
 use crate::helper::{HelperRegistry, SharedHelpers};
 use crate::maps::{self, map_defs, MapDef, Maps, SharedMaps, MAPS_REGION};
-use crate::memory::{region_base, Perms, VmMemory};
+use crate::memory::{region_base, Perms, SharedRegion, VmMemory};
 use crate::module::{Module, Relocation};
 use crate::program::{FunctionInfo, Program};
 use crate::section::{Section, SectionKind};
@@ -99,6 +99,7 @@ impl Image {
 pub struct Linker<'a> {
     helpers: &'a Arc<SharedHelpers>,
     shared_maps: &'a SharedMaps,
+    shared_regions: &'a [SharedRegion],
     types: &'a TypeRegistry,
     config: &'a VmConfig,
 }
@@ -108,12 +109,14 @@ impl<'a> Linker<'a> {
     pub fn new(
         helpers: &'a Arc<SharedHelpers>,
         shared_maps: &'a SharedMaps,
+        shared_regions: &'a [SharedRegion],
         types: &'a TypeRegistry,
         config: &'a VmConfig,
     ) -> Self {
         Self {
             helpers,
             shared_maps,
+            shared_regions,
             types,
             config,
         }
@@ -160,11 +163,15 @@ impl<'a> Linker<'a> {
         memory.map_bytes(RODATA_REGION, &image.rodata, image.rodata.len(), Perms::R);
         memory.map_bytes(DATA_REGION, &image.data, image.data.len(), Perms::RW);
         maps::map_region(&mut memory, maps_len);
-        for shared in maps.shared() {
-            let (ptr, len) = shared.storage();
-            // SAFETY: `maps` holds the shared map, so its storage outlives `memory` in
-            // the program; concurrent access follows `Vm::share_map`'s contract.
-            unsafe { memory.map_host(shared.region(), ptr, len, Perms::RW) };
+        // SAFETY: concurrent access to shared memory follows the contracts of
+        // `Vm::share_map` and `Vm::share_region`, which created these buffers.
+        unsafe {
+            for shared in maps.shared() {
+                memory.map_shared(shared.region(), shared.storage().clone(), Perms::RW);
+            }
+            for shared in self.shared_regions {
+                memory.map_shared(shared.region(), shared.buffer().clone(), shared.perms());
+            }
         }
 
         let code = instructions_from_bytes(&image.code);

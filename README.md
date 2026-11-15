@@ -146,6 +146,12 @@ different layout fails the link. `pad_values` puts each value on its own cache
 line. The call is `unsafe`: programs running on different threads at the same
 time may only touch shared values with atomics.
 
+`Vm::share_region(region, len, perms)` allocates a buffer and maps it at region
+`region` (between `FIRST_FREE_REGION` and `SHARED_MAPS_FIRST_REGION`) into every
+program linked afterwards, so plugins can pass plain pointers into it. The host
+reaches the same bytes through `SharedRegion::buffer`. It has the same `unsafe`
+contract as `share_map`.
+
 Atomics (`BPF_ATOMIC` add, or, and, xor with and without fetch, xchg and
 cmpxchg, 32 and 64 bit) go through `Memory::atomic_u32` and
 `Memory::atomic_u64`. `VmMemory` uses real host atomics and faults on

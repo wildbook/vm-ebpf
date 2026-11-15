@@ -310,6 +310,27 @@ mod plugins {
         });
         assert_eq!(plugins[0].call("bump", &[]).unwrap(), 2 * N + 1);
     }
+
+    /// One plugin writes through a pointer into a shared region, another reads it.
+    #[test]
+    fn shared_region_is_visible_to_every_plugin() {
+        let vm = Vm::new();
+        // SAFETY: the plugins run on this thread only.
+        let rw = unsafe { vm.share_region(rvm::FIRST_FREE_REGION, 64, rvm::Perms::RW) }.unwrap();
+        let ro = unsafe { vm.share_region(rvm::FIRST_FREE_REGION + 1, 64, rvm::Perms::R) }.unwrap();
+        assert!(unsafe { vm.share_region(rvm::FIRST_FREE_REGION, 64, rvm::Perms::RW) }.is_err());
+
+        let x = vm.load_plugin("x", &read("shared_region.o")).unwrap();
+        let y = vm.load_plugin("y", &read("shared_region.o")).unwrap();
+        let slot = rw.base() + 8;
+        x.call("put", &[slot, 42]).unwrap();
+        assert_eq!(y.call("get", &[slot]).unwrap(), 42);
+        // SAFETY: no plugin is running.
+        let host = unsafe { rw.buffer().as_ptr().add(8).cast::<u64>().read_unaligned() };
+        assert_eq!(host, 42);
+
+        assert!(matches!(x.call("put", &[ro.base(), 1]).unwrap_err(), VmError::Exec(rvm::ExecError::MemoryFault(_))));
+    }
 }
 
 /// Every atomic form clang emits (bpf/atomics.c), with the expected values worked

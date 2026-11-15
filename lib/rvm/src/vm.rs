@@ -31,14 +31,15 @@
 //! let result = program.call("my_func", &[42])?;
 //! ```
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use hashbrown::HashMap;
 
 use crate::error::{Result, VmError};
 use crate::helper::{DynHelper, FromArgs, IntoReturn, SharedHelpers};
-use crate::linker::Linker;
-use crate::maps::SharedMaps;
+use crate::linker::{Linker, FIRST_FREE_REGION};
+use crate::maps::{SharedMaps, SHARED_MAPS_FIRST_REGION};
+use crate::memory::{Perms, SharedBuffer, SharedRegion, MAX_REGION_LEN};
 use crate::module::Module;
 use crate::plugin::Plugin;
 use crate::program::Program;
@@ -79,6 +80,8 @@ pub struct Vm {
     helpers: Arc<SharedHelpers>,
     /// Maps shared by name between the programs this VM links.
     shared_maps: SharedMaps,
+    /// Buffers mapped into every program this VM links.
+    shared_regions: Mutex<Vec<SharedRegion>>,
     /// Type registry for CO-RE.
     types: TypeRegistry,
     /// VM configuration.
@@ -108,6 +111,7 @@ impl Vm {
         Self {
             helpers,
             shared_maps: SharedMaps::default(),
+            shared_regions: Mutex::default(),
             types: TypeRegistry::new(),
             config,
             modules: HashMap::new(),
@@ -208,6 +212,26 @@ impl Vm {
         self.shared_maps.declare(name, pad_values);
     }
 
+    /// Allocate `len` zeroed bytes and map them as region `region` into every program
+    /// linked afterwards, so plugins can exchange data through plain pointers.
+    /// `region` must lie in `FIRST_FREE_REGION..SHARED_MAPS_FIRST_REGION` and not be
+    /// shared already.
+    ///
+    /// # Safety
+    ///
+    /// Programs that run at the same time on different threads may only touch the
+    /// region with atomic instructions where another thread writes concurrently.
+    pub unsafe fn share_region(&self, region: usize, len: usize, perms: Perms) -> Result<SharedRegion> {
+        let mut regions = self.shared_regions.lock().unwrap_or_else(|e| e.into_inner());
+        let usable = (FIRST_FREE_REGION..SHARED_MAPS_FIRST_REGION).contains(&region);
+        if !usable || regions.iter().any(|r| r.region() == region) || len == 0 || len > MAX_REGION_LEN {
+            return Err(VmError::InvalidArgument(format!("cannot share region {region} with {len} bytes")));
+        }
+        let shared = SharedRegion::new(region, perms, Arc::new(SharedBuffer::new(len)));
+        regions.push(shared.clone());
+        Ok(shared)
+    }
+
     // =========================================================================
     // Type Registration (CO-RE)
     // =========================================================================
@@ -290,7 +314,8 @@ impl Vm {
     /// let program = vm.link(&[&utils, &main])?;
     /// ```
     pub fn link(&self, modules: &[&Module]) -> Result<Program> {
-        Linker::new(&self.helpers, &self.shared_maps, &self.types, &self.config).link(modules)
+        let shared_regions = self.shared_regions.lock().unwrap_or_else(|e| e.into_inner());
+        Linker::new(&self.helpers, &self.shared_maps, &shared_regions, &self.types, &self.config).link(modules)
     }
 
     /// Link a single module into a program.

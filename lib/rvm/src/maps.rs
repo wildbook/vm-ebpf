@@ -17,9 +17,7 @@
 //! The guest refers to a map by its handle: the `lddw` the program uses to load a map
 //! gets the map's index in this program.
 
-use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
 use std::hash::BuildHasher;
-use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use btf::{Btf, BtfTypeInfo};
@@ -28,7 +26,7 @@ use hashbrown::{HashMap, HashTable};
 
 use crate::error::{LinkError, Result, VmError};
 use crate::helper::{HelperContext, HelperRegistry};
-use crate::memory::{region_base, Perms, VmMemory, MAX_REGIONS};
+use crate::memory::{region_base, Perms, SharedBuffer, VmMemory, MAX_REGIONS};
 use crate::module::Module;
 use crate::section::SectionKind;
 
@@ -397,7 +395,7 @@ pub struct SharedMap {
     def: MapDef,
     region: usize,
     stride: u64,
-    storage: Storage,
+    storage: Arc<SharedBuffer>,
     index: Option<RwLock<HashIndex>>,
 }
 
@@ -407,9 +405,9 @@ impl SharedMap {
         self.region
     }
 
-    /// Host pointer and length of the values.
-    pub fn storage(&self) -> (NonNull<u8>, usize) {
-        (self.storage.ptr, self.storage.len)
+    /// The values' backing memory.
+    pub fn storage(&self) -> &Arc<SharedBuffer> {
+        &self.storage
     }
 }
 
@@ -442,45 +440,12 @@ impl SharedMaps {
             def: def.clone(),
             region,
             stride,
-            storage: Storage::new((stride * u64::from(def.max_entries)) as usize),
+            storage: Arc::new(SharedBuffer::new((stride * u64::from(def.max_entries)) as usize)),
             index: (def.kind == MapKind::Hash).then(|| RwLock::new(HashIndex::new(def.key_size, def.max_entries))),
         });
         state.next_region += 1;
         state.bound.insert(def.name.clone(), map.clone());
         Ok(Some(map))
-    }
-}
-
-/// Zeroed, cache-line aligned host memory.
-#[derive(Debug)]
-struct Storage {
-    ptr: NonNull<u8>,
-    len: usize,
-}
-
-// SAFETY: plain heap memory owned by this value; concurrent guest access is governed
-// by the contract of `Vm::share_map`.
-unsafe impl Send for Storage {}
-unsafe impl Sync for Storage {}
-
-impl Storage {
-    fn new(len: usize) -> Self {
-        let layout = Self::layout(len);
-        // SAFETY: non-zero size (`max_entries` and `value_size` are non-zero).
-        let raw = unsafe { alloc_zeroed(layout) };
-        let ptr = NonNull::new(raw).unwrap_or_else(|| handle_alloc_error(layout));
-        Self { ptr, len }
-    }
-
-    fn layout(len: usize) -> Layout {
-        Layout::from_size_align(len, CACHE_LINE as usize).expect("map storage layout")
-    }
-}
-
-impl Drop for Storage {
-    fn drop(&mut self) {
-        // SAFETY: allocated in `new` with this layout.
-        unsafe { dealloc(self.ptr.as_ptr(), Self::layout(self.len)) };
     }
 }
 

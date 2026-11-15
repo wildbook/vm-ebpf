@@ -13,6 +13,7 @@ use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::Arc;
 
 use rvm_core::AtomicOp;
 // Re-export the Memory trait from rvm-core
@@ -88,6 +89,8 @@ impl Region {
 /// ```
 pub struct VmMemory {
     regions: [Region; MAX_REGIONS],
+    // buffers mapped with `map_shared`; holding them keeps those regions valid
+    shared: Vec<Arc<SharedBuffer>>,
 }
 
 // SAFETY: owned regions are plain heap allocations exclusively owned by this value.
@@ -107,6 +110,7 @@ impl VmMemory {
     pub const fn new() -> Self {
         Self {
             regions: [Region::EMPTY; MAX_REGIONS],
+            shared: Vec::new(),
         }
     }
 
@@ -167,6 +171,21 @@ impl VmMemory {
                 owned: false,
             },
         )
+    }
+
+    /// Map `buffer` as region `idx`. This memory keeps the buffer alive, so other
+    /// programs can map the same buffer and see the same bytes.
+    ///
+    /// # Safety
+    ///
+    /// Code running on different threads at the same time may only touch the buffer
+    /// with atomics; plain accesses to bytes another thread writes concurrently are a
+    /// data race.
+    pub unsafe fn map_shared(&mut self, idx: usize, buffer: Arc<SharedBuffer>, perms: Perms) -> u64 {
+        // SAFETY: `self.shared` keeps the buffer alive for as long as this memory.
+        let base = unsafe { self.map_host(idx, buffer.as_ptr(), buffer.len(), perms) };
+        self.shared.push(buffer);
+        base
     }
 
     /// Unmap region `idx`, freeing it if it was allocated by [`map`](Self::map).
@@ -263,6 +282,91 @@ impl Drop for VmMemory {
         for region in self.regions {
             Self::free(region);
         }
+    }
+}
+
+/// Zeroed, cache-line aligned host memory that several programs map at once.
+#[derive(Debug)]
+pub struct SharedBuffer {
+    ptr: NonNull<u8>,
+    len: usize,
+}
+
+// SAFETY: plain heap memory owned by this value; concurrent guest access is governed
+// by the contract of whichever unsafe call shared it (`Vm::share_map`, `Vm::share_region`).
+unsafe impl Send for SharedBuffer {}
+unsafe impl Sync for SharedBuffer {}
+
+impl SharedBuffer {
+    /// Allocate `len` zeroed bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len` is 0.
+    pub fn new(len: usize) -> Self {
+        assert!(len != 0, "empty shared buffer");
+        let layout = Self::layout(len);
+        // SAFETY: non-zero size.
+        let raw = unsafe { alloc_zeroed(layout) };
+        let ptr = NonNull::new(raw).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+        Self { ptr, len }
+    }
+
+    pub fn as_ptr(&self) -> NonNull<u8> {
+        self.ptr
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn layout(len: usize) -> Layout {
+        Layout::from_size_align(len, 64).expect("shared buffer layout")
+    }
+}
+
+impl Drop for SharedBuffer {
+    fn drop(&mut self) {
+        // SAFETY: allocated in `new` with this layout.
+        unsafe { dealloc(self.ptr.as_ptr(), Self::layout(self.len)) };
+    }
+}
+
+/// A buffer mapped at one region index into every program a VM links.
+#[derive(Debug, Clone)]
+pub struct SharedRegion {
+    region: usize,
+    perms: Perms,
+    buffer: Arc<SharedBuffer>,
+}
+
+impl SharedRegion {
+    pub fn new(region: usize, perms: Perms, buffer: Arc<SharedBuffer>) -> Self {
+        Self { region, perms, buffer }
+    }
+
+    /// Region index, the same in every program.
+    pub fn region(&self) -> usize {
+        self.region
+    }
+
+    /// Guest address of the first byte.
+    pub fn base(&self) -> u64 {
+        region_base(self.region)
+    }
+
+    /// Guest permissions.
+    pub fn perms(&self) -> Perms {
+        self.perms
+    }
+
+    /// The host memory behind the region.
+    pub fn buffer(&self) -> &Arc<SharedBuffer> {
+        &self.buffer
     }
 }
 
