@@ -88,7 +88,8 @@ A guest address is `(region << 32) | offset`. `rvm::VmMemory` holds
 | `STACK_REGION` (1) | stack, one frame per call level | RW |
 | `RODATA_REGION` (2) | `.rodata*` | R |
 | `DATA_REGION` (3) | `.data*`, `.bss*` | RW |
-| `FIRST_FREE_REGION` (4) and up | free for the host | - |
+| `MAPS_REGION` (4) | map values | RW |
+| `FIRST_FREE_REGION` (5) and up | free for the host | - |
 
 Host code maps its own regions with `VmMemory::map` (zeroed) or
 `VmMemory::map_bytes` (host-owned buffer), and can map existing host memory
@@ -107,8 +108,15 @@ call-heavy loops built with `ebpf-asm`.
 
 ## Scope
 
-Not implemented: BPF maps, kfunc BTF ID resolution, and the legacy packet
-access modes `BPF_ABS` and `BPF_IND`, which return `Flow::Missing`.
+Not implemented: kfunc BTF ID resolution, and the legacy packet access modes
+`BPF_ABS` and `BPF_IND`, which return `Flow::Missing`.
+
+Maps: array and hash maps declared libbpf style in `.maps` (`__uint(type, ...)`,
+`__type(key, ...)`, `__type(value, ...)`, `max_entries`). Helpers 1 to 3
+(`map_lookup_elem`, `map_update_elem`, `map_delete_elem`) are built in unless the
+host registers its own under those IDs. Values live in `MAPS_REGION`, so a looked
+up pointer is an ordinary guest address. The host reads and writes maps through
+`Program::map(name)`.
 
 Atomics (`BPF_ATOMIC` add, or, and, xor with and without fetch, xchg and
 cmpxchg, 32 and 64 bit) go through `Memory::atomic_u32` and

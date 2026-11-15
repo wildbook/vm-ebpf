@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::HelperError;
+use crate::maps::Maps;
 use crate::memory::VmMemory;
 
 /// Arguments passed to a helper function.
@@ -70,12 +71,18 @@ pub struct HelperContext<'a, M = VmMemory> {
     pub args: HelperArgs,
     /// Memory access (if available).
     pub memory: Option<&'a mut M>,
+    /// The calling program's maps (if it has any).
+    pub maps: Option<&'a mut Maps>,
 }
 
 impl<'a, M> HelperContext<'a, M> {
     /// Create a new helper context.
     pub fn new(args: HelperArgs) -> Self {
-        Self { args, memory: None }
+        Self {
+            args,
+            memory: None,
+            maps: None,
+        }
     }
 
     /// Create a helper context with memory access.
@@ -83,6 +90,7 @@ impl<'a, M> HelperContext<'a, M> {
         Self {
             args,
             memory: Some(memory),
+            maps: None,
         }
     }
 }

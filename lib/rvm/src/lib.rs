@@ -100,6 +100,7 @@ mod error;
 mod executor;
 mod helper;
 mod linker;
+mod maps;
 mod memory;
 mod module;
 mod program;
@@ -121,6 +122,10 @@ pub use helper::{
 };
 // Low-level re-exports for advanced users
 pub use linker::{Linker, DATA_REGION, FIRST_FREE_REGION, RODATA_REGION, STACK_REGION};
+pub use maps::{
+    MapDef, MapError, MapKind, MapRef, Maps, BPF_ANY, BPF_EXIST, BPF_FUNC_MAP_DELETE_ELEM, BPF_FUNC_MAP_LOOKUP_ELEM,
+    BPF_FUNC_MAP_UPDATE_ELEM, BPF_NOEXIST, MAPS_REGION,
+};
 // Memory
 pub use memory::{region_base, Memory, Perms, Scalar, VmMemory, MAX_REGIONS, MAX_REGION_LEN, REGION_SHIFT};
 // Module loading

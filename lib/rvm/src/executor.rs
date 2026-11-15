@@ -9,6 +9,7 @@ use rvm_core::{run, Context, Flow, Instruction, Memory};
 
 use crate::error::{ExecError, Result};
 use crate::helper::{HelperArgs, HelperContext, HelperRegistry};
+use crate::maps::Maps;
 use crate::memory::VmMemory;
 
 /// Maximum nesting of BPF-to-BPF calls below the entry frame.
@@ -46,6 +47,8 @@ pub struct Executor<'a, M: Memory = VmMemory> {
     frame_size: u64,
     /// Maximum instructions to execute (0 = unlimited).
     instruction_limit: u64,
+    /// Maps passed to helpers through [`HelperContext::maps`].
+    maps: Option<&'a mut Maps>,
 }
 
 impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
@@ -58,6 +61,7 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
             stack_top,
             frame_size: DEFAULT_FRAME_SIZE,
             instruction_limit: 0,
+            maps: None,
         }
     }
 
@@ -69,6 +73,11 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
     /// Set the stack bytes reserved per call frame.
     pub fn set_frame_size(&mut self, size: u64) {
         self.frame_size = size;
+    }
+
+    /// Give helpers access to `maps`.
+    pub fn set_maps(&mut self, maps: &'a mut Maps) {
+        self.maps = Some(maps);
     }
 
     /// Call the function at `pc` (instruction index) with `args` in r1-r5; returns r0.
@@ -115,12 +124,14 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
                 Flow::CallHelper(id) => {
                     let args = HelperArgs::from_regs(&ctx.regs);
                     let mut helper_ctx = HelperContext::with_memory(args, &mut *ctx.data);
+                    helper_ctx.maps = self.maps.as_deref_mut();
                     ctx.regs[0] = self.helpers.call(id, &mut helper_ctx)?;
                     pc + 1
                 }
                 Flow::CallKfunc(slot) => {
                     let args = HelperArgs::from_regs(&ctx.regs);
                     let mut helper_ctx = HelperContext::with_memory(args, &mut *ctx.data);
+                    helper_ctx.maps = self.maps.as_deref_mut();
                     ctx.regs[0] = self.helpers.call_slot(slot, &mut helper_ctx)?;
                     pc + 1
                 }

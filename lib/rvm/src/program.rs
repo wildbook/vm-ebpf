@@ -10,6 +10,7 @@ use rvm_core::Instruction;
 use crate::error::{Result, VmError};
 use crate::executor::Executor;
 use crate::helper::HelperRegistry;
+use crate::maps::{MapRef, Maps};
 use crate::memory::VmMemory;
 
 /// Information about an executable function.
@@ -43,8 +44,9 @@ pub struct FunctionInfo {
 pub struct Program {
     /// Instructions; not addressable by the guest.
     code: Box<[Instruction]>,
-    /// Guest memory regions (stack, data). See [`crate::linker`] for the layout.
+    /// Guest memory regions (stack, data, maps). See [`crate::linker`] for the layout.
     memory: VmMemory,
+    maps: Maps,
     /// Function table: name -> function info.
     functions: HashMap<String, FunctionInfo>,
     /// Stack top address (r10 initial value).
@@ -58,10 +60,12 @@ pub struct Program {
 }
 
 impl Program {
-    /// Create a new program.
+    /// Create a new program. The linker is the usual caller.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         code: Box<[Instruction]>,
         memory: VmMemory,
+        maps: Maps,
         functions: HashMap<String, FunctionInfo>,
         stack_top: u64,
         helpers: HelperRegistry,
@@ -71,6 +75,7 @@ impl Program {
         Self {
             code,
             memory,
+            maps,
             functions,
             stack_top,
             helpers,
@@ -97,6 +102,12 @@ impl Program {
     /// Get mutable access to memory.
     pub fn memory_mut(&mut self) -> &mut VmMemory {
         &mut self.memory
+    }
+
+    /// Host access to the map called `name`.
+    pub fn map(&mut self, name: &str) -> Option<MapRef<'_>> {
+        let handle = self.maps.handle(name)?;
+        Some(MapRef::new(&mut self.maps, &mut self.memory, handle))
     }
 
     /// Get the function table.
@@ -154,6 +165,7 @@ impl Program {
         let mut executor = Executor::new(&self.code, &mut self.memory, &self.helpers, self.stack_top);
         executor.set_instruction_limit(self.instruction_limit);
         executor.set_frame_size(self.frame_size);
+        executor.set_maps(&mut self.maps);
         executor.call(pc, args)
     }
 }

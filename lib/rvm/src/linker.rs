@@ -14,6 +14,7 @@
 //! | [`STACK_REGION`] | stack, one frame per call level | RW |
 //! | [`RODATA_REGION`] | `.rodata*` | R |
 //! | [`DATA_REGION`] | `.data*`, `.bss*` | RW |
+//! | [`MAPS_REGION`] | map values | RW |
 //! | [`FIRST_FREE_REGION`].. | free for the host | - |
 
 use std::collections::HashMap;
@@ -25,6 +26,7 @@ use rvm_core::instructions_from_bytes;
 use crate::error::{LinkError, Result, VmError};
 use crate::executor::MAX_CALL_DEPTH;
 use crate::helper::HelperRegistry;
+use crate::maps::{self, map_defs, MapDef, Maps, MAPS_REGION};
 use crate::memory::{region_base, Perms, VmMemory};
 use crate::module::{Module, Relocation};
 use crate::program::{FunctionInfo, Program};
@@ -39,7 +41,7 @@ pub const RODATA_REGION: usize = 2;
 /// Guest region holding writable data and bss.
 pub const DATA_REGION: usize = 3;
 /// First region index the linker leaves free for the host.
-pub const FIRST_FREE_REGION: usize = 4;
+pub const FIRST_FREE_REGION: usize = MAPS_REGION + 1;
 
 /// `src_reg` of a call into the extern table (`imm` = slot).
 const BPF_PSEUDO_KFUNC_CALL: u8 = 2;
@@ -115,13 +117,29 @@ impl<'a> Linker<'a> {
         let global_symbols = Self::build_symbol_table(modules, &layouts)?;
         self.check_extern_signatures(modules)?;
 
-        // Relocations bind named externs to slots; then numeric helper calls.
-        for (module, layout) in modules.iter().zip(&layouts) {
-            for reloc in &module.relocations {
-                self.apply_relocation(module, layout, &global_symbols, reloc, &mut image)?;
+        let mut defs = Vec::new();
+        for module in modules {
+            for def in map_defs(module)? {
+                if defs.iter().any(|d: &MapDef| d.name == def.name) {
+                    return Err(LinkError::DuplicateSymbol(def.name).into());
+                }
+                defs.push(def);
             }
         }
-        self.bind_helper_calls(&mut image)?;
+        let (maps, maps_len) = Maps::new(defs);
+
+        let mut helpers = self.helpers.clone();
+        if !maps.is_empty() {
+            maps::register_helpers(&mut helpers);
+        }
+
+        // Relocations bind maps and named externs; then numeric helper calls.
+        for (module, layout) in modules.iter().zip(&layouts) {
+            for reloc in &module.relocations {
+                Self::apply_relocation(&helpers, &maps, module, layout, &global_symbols, reloc, &mut image)?;
+            }
+        }
+        Self::bind_helper_calls(&helpers, &mut image)?;
         self.apply_core_relocations(modules, &layouts, &mut image);
 
         let functions = Self::build_function_table(modules, &layouts);
@@ -131,15 +149,17 @@ impl<'a> Linker<'a> {
         let stack_top = memory.map(STACK_REGION, stack_len, Perms::RW) + stack_len as u64;
         memory.map_bytes(RODATA_REGION, &image.rodata, image.rodata.len(), Perms::R);
         memory.map_bytes(DATA_REGION, &image.data, image.data.len(), Perms::RW);
+        maps::map_region(&mut memory, maps_len);
 
         let code = instructions_from_bytes(&image.code);
 
         Ok(Program::new(
             code,
             memory,
+            maps,
             functions,
             stack_top,
-            self.helpers.clone(),
+            helpers,
             self.config.instruction_limit,
             self.config.stack_size as u64,
         ))
@@ -252,7 +272,8 @@ impl<'a> Linker<'a> {
 
     /// Apply a single relocation.
     fn apply_relocation(
-        &self,
+        helpers: &HelperRegistry,
+        maps: &Maps,
         module: &Module,
         layout: &ModuleLayout,
         global_symbols: &HashMap<String, Addr>,
@@ -271,6 +292,13 @@ impl<'a> Linker<'a> {
             LinkError::InvalidReference(format!("symbol index {idx}"))
         })?;
 
+        // `lddw rX, map`: the guest gets the map's handle.
+        if let (reloc::bpf::BPF_64_64, Some(handle)) = (reloc.rel_type, maps.handle(&symbol.name)) {
+            image.insn_mut(patch_at)?[4..8].copy_from_slice(&handle.to_le_bytes());
+            image.insn_mut(patch_at + 8)?[4..8].copy_from_slice(&0u32.to_le_bytes());
+            return Ok(());
+        }
+
         let sym_addr = if symbol.is_defined() {
             let sym_section_idx = symbol.section_idx.unwrap();
             let section_addr = layout
@@ -282,8 +310,7 @@ impl<'a> Linker<'a> {
             addr
         } else if reloc.rel_type == reloc::bpf::BPF_64_32 {
             // Call to an extern function: bind it to its slot in the extern table.
-            let slot = self
-                .helpers
+            let slot = helpers
                 .slot_of_name(&symbol.name)
                 .ok_or_else(|| LinkError::UnresolvedSymbol(symbol.name.clone()))?;
             set_slot_call(image.insn_mut(patch_at)?, slot);
@@ -320,7 +347,7 @@ impl<'a> Linker<'a> {
 
     /// Rewrite every `call <helper id>` into a slot call, so linked programs never
     /// look helpers up at runtime. Unregistered IDs fail the link.
-    fn bind_helper_calls(&self, image: &mut Image) -> Result<()> {
+    fn bind_helper_calls(helpers: &HelperRegistry, image: &mut Image) -> Result<()> {
         const BPF_CALL: u8 = 0x85;
         const BPF_LD_IMM64: u8 = 0x18;
 
@@ -334,7 +361,7 @@ impl<'a> Linker<'a> {
             }
             if insn[0] == BPF_CALL && insn[1] >> 4 == 0 {
                 let id = u32::from_le_bytes(insn[4..8].try_into().unwrap());
-                let slot = self.helpers.slot_of_id(id).ok_or(LinkError::UnknownHelper(id))?;
+                let slot = helpers.slot_of_id(id).ok_or(LinkError::UnknownHelper(id))?;
                 set_slot_call(insn, slot);
             }
             i += 1;
