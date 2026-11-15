@@ -1,6 +1,6 @@
 /*
  * Map helper throughput, for lib/rvm/benches/exec.rs.
- * Build: clang -target bpf -O2 -g -c bpf/map_bench.c -o bpf/map_bench.o
+ * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/map_bench.c -o bpf/map_bench.o
  */
 typedef unsigned int u32;
 typedef unsigned long long u64;

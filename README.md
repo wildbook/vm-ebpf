@@ -17,6 +17,11 @@ clang:
 clang -target bpf -O2 -g -c bpf/example.c -o bpf/example.o
 ```
 
+Each file's header has its exact build line. Benchmark programs (`workloads.c`,
+`map_bench.c`) are built with `-mcpu=v4`, which needs LLVM 18 or newer, so the
+numbers reflect clang's current ISA: sign-extending loads, `movsx`, `sdiv`/`smod`,
+`bswap` and 32-bit jumps.
+
 ## Running
 
 ```bash

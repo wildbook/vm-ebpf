@@ -1,6 +1,6 @@
 /*
  * Benchmark workloads for lib/rvm/benches.
- * Build: clang -target bpf -mcpu=v3 -O2 -g -c bpf/workloads.c -o bpf/workloads.o
+ * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/workloads.c -o bpf/workloads.o
  */
 typedef unsigned char u8;
 typedef unsigned int u32;
