@@ -19,3 +19,7 @@ ebpf-asm = { path = "../ebpf-asm" }
 [[bench]]
 name = "exec"
 harness = false
+
+[[bench]]
+name = "workloads"
+harness = false
