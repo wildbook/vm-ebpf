@@ -293,13 +293,13 @@ fn emit(
             asm.be64(reg(&ops[0])?);
         }
         "swap16" | "bswap16" => {
-            asm.swap16(reg(&ops[0])?);
+            asm.bswap16(reg(&ops[0])?);
         }
         "swap32" | "bswap32" => {
-            asm.swap32(reg(&ops[0])?);
+            asm.bswap32(reg(&ops[0])?);
         }
         "swap64" | "bswap64" => {
-            asm.swap64(reg(&ops[0])?);
+            asm.bswap64(reg(&ops[0])?);
         }
         "movsx832" => {
             asm.movsx832(reg(&ops[0])?, reg(&ops[1])?);

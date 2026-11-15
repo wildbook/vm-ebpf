@@ -49,14 +49,19 @@ impl DefaultFormatter {
 
         match insn.mnemonic {
             Mnemonic::Exit => {}
-            Mnemonic::Ja | Mnemonic::Ja32 | Mnemonic::Call | Mnemonic::CallLocal => {
+            Mnemonic::Ja
+            | Mnemonic::Ja32
+            | Mnemonic::Call
+            | Mnemonic::CallLocal
+            | Mnemonic::CallKfunc
+            | Mnemonic::Callx => {
                 write!(out, " {}", insn.dst).unwrap();
             }
             _ if insn.mnemonic.is_conditional_jump() => {
                 // Conditional jumps carry their offset in the raw instruction, not in
                 // the decoded src/dst operands.
                 let offset = ((insn.raw >> 16) & 0xFFFF) as i16;
-                write!(out, " {}, {}, {}", insn.dst, insn.src, Operand::Off(offset)).unwrap();
+                write!(out, " {}, {}, {}", insn.dst, insn.src, Operand::Off(offset.into())).unwrap();
             }
             _ if insn.mnemonic.is_endian() || matches!(insn.mnemonic, Mnemonic::Neg64 | Mnemonic::Neg32) => {
                 write!(out, " {}", insn.dst).unwrap();

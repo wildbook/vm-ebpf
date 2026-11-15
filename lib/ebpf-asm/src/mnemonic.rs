@@ -45,6 +45,11 @@ mnemonics! {
 
     // Byte swap operations
     Le16 = "le16", Le32 = "le32", Le64 = "le64", Be16 = "be16", Be32 = "be32", Be64 = "be64",
+    Bswap16 = "bswap16", Bswap32 = "bswap32", Bswap64 = "bswap64",
+
+    // Sign-extending moves: source width, then destination width
+    Movsx832 = "movsx832", Movsx1632 = "movsx1632",
+    Movsx864 = "movsx864", Movsx1664 = "movsx1664", Movsx3264 = "movsx3264",
 
     // Jump operations (64-bit comparison)
     Ja = "ja", Jeq = "jeq", Jgt = "jgt", Jge = "jge", Jlt = "jlt", Jle = "jle",
@@ -61,7 +66,8 @@ mnemonics! {
     Stdw = "stdw", Stw = "stw", Sth = "sth", Stb = "stb",
 
     // Special instructions
-    Lddw = "lddw", Call = "call", CallLocal = "call", Exit = "exit",
+    Lddw = "lddw", Call = "call", CallLocal = "call", CallKfunc = "call kfunc", Callx = "callx",
+    Exit = "exit",
 
     // Atomic operations
     AtomicAdd64 = "lock add64", AtomicAdd32 = "lock add32",
@@ -122,7 +128,15 @@ impl Mnemonic {
     pub const fn is_endian(self) -> bool {
         matches!(
             self,
-            Mnemonic::Le16 | Mnemonic::Le32 | Mnemonic::Le64 | Mnemonic::Be16 | Mnemonic::Be32 | Mnemonic::Be64
+            Mnemonic::Le16
+                | Mnemonic::Le32
+                | Mnemonic::Le64
+                | Mnemonic::Be16
+                | Mnemonic::Be32
+                | Mnemonic::Be64
+                | Mnemonic::Bswap16
+                | Mnemonic::Bswap32
+                | Mnemonic::Bswap64
         )
     }
 

@@ -117,24 +117,19 @@ fn decode_alu(
     let alu_op = opcode & 0xF0;
     let src_type = opcode & 0x08;
 
-    // Handle endianness conversions (special case)
     if alu_op == alu::END {
-        let mnemonic = if src_type == SRC_IMM {
-            // LE
-            match imm {
-                16 => Mnemonic::Le16,
-                32 => Mnemonic::Le32,
-                64 => Mnemonic::Le64,
-                _ => Mnemonic::Unknown,
-            }
-        } else {
-            // BE
-            match imm {
-                16 => Mnemonic::Be16,
-                32 => Mnemonic::Be32,
-                64 => Mnemonic::Be64,
-                _ => Mnemonic::Unknown,
-            }
+        // ALU64 is the unconditional swap; ALU32 converts to the endianness in the source bit
+        let mnemonic = match (is_64, src_type == SRC_IMM, imm) {
+            (true, true, 16) => Mnemonic::Bswap16,
+            (true, true, 32) => Mnemonic::Bswap32,
+            (true, true, 64) => Mnemonic::Bswap64,
+            (false, true, 16) => Mnemonic::Le16,
+            (false, true, 32) => Mnemonic::Le32,
+            (false, true, 64) => Mnemonic::Le64,
+            (false, false, 16) => Mnemonic::Be16,
+            (false, false, 32) => Mnemonic::Be32,
+            (false, false, 64) => Mnemonic::Be64,
+            _ => Mnemonic::Unknown,
         };
         return (mnemonic, Operand::Reg(dst), Operand::None, 8, None);
     }
@@ -166,8 +161,14 @@ fn decode_alu(
         (alu::MOD, false, 1) => Mnemonic::SMod32,
         (alu::XOR, true, _) => Mnemonic::Xor64,
         (alu::XOR, false, _) => Mnemonic::Xor32,
-        (alu::MOV, true, _) => Mnemonic::Mov64,
-        (alu::MOV, false, _) => Mnemonic::Mov32,
+        (alu::MOV, true, 0) => Mnemonic::Mov64,
+        (alu::MOV, false, 0) => Mnemonic::Mov32,
+        // `off` is the source width of a sign-extending move
+        (alu::MOV, false, 8) => Mnemonic::Movsx832,
+        (alu::MOV, false, 16) => Mnemonic::Movsx1632,
+        (alu::MOV, true, 8) => Mnemonic::Movsx864,
+        (alu::MOV, true, 16) => Mnemonic::Movsx1664,
+        (alu::MOV, true, 32) => Mnemonic::Movsx3264,
         (alu::ARSH, true, _) => Mnemonic::Arsh64,
         (alu::ARSH, false, _) => Mnemonic::Arsh32,
         _ => Mnemonic::Unknown,
@@ -205,22 +206,21 @@ fn decode_jmp(
             return (Mnemonic::Exit, Operand::None, Operand::None, 8, None);
         }
         jmp::CALL => {
-            let mnemonic = if src_reg.number() == 1 {
-                Mnemonic::CallLocal
-            } else {
-                Mnemonic::Call
+            return match (src_type == SRC_REG, src_reg.number()) {
+                // `callx`: the target is in dst_reg
+                (true, _) => (Mnemonic::Callx, Operand::Reg(dst), Operand::None, 8, None),
+                (false, 1) => (Mnemonic::CallLocal, Operand::Imm(imm), Operand::None, 8, None),
+                (false, 2) => (Mnemonic::CallKfunc, Operand::Imm(imm), Operand::None, 8, None),
+                _ => (Mnemonic::Call, Operand::Imm(imm), Operand::None, 8, None),
             };
-            return (mnemonic, Operand::Imm(imm), Operand::None, 8, None);
         }
         jmp::JA => {
-            let mnemonic = if is_64 { Mnemonic::Ja } else { Mnemonic::Ja32 };
-            // JA uses offset for 64-bit class, imm for 32-bit class
-            let target = if is_64 {
-                Operand::Off(offset)
-            } else {
-                Operand::Off(imm as i16)
+            // JMP64 `ja` jumps by `off`, JMP32 `ja32` (`gotol`) by the 32-bit `imm`
+            let (mnemonic, target) = match is_64 {
+                true => (Mnemonic::Ja, i32::from(offset)),
+                false => (Mnemonic::Ja32, imm),
             };
-            return (mnemonic, target, Operand::None, 8, None);
+            return (mnemonic, Operand::Off(target), Operand::None, 8, None);
         }
         _ => {}
     }

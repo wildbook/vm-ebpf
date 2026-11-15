@@ -580,7 +580,7 @@ impl Assembler {
 
     endian_family!(ALU32, SRC_IMM; le16 = 16, le32 = 32, le64 = 64);
     endian_family!(ALU32, SRC_REG; be16 = 16, be32 = 32, be64 = 64);
-    endian_family!(ALU64, SRC_IMM; swap16 = 16, swap32 = 32, swap64 = 64);
+    endian_family!(ALU64, SRC_IMM; bswap16 = 16, bswap32 = 32, bswap64 = 64);
 
     // ==================== Memory Load Instructions ====================
 

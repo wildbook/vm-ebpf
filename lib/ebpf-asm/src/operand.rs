@@ -17,7 +17,7 @@ pub enum Operand {
     #[allow(missing_docs)]
     Mem { base: Register, offset: i16 },
     /// Offset for jumps (relative to next instruction).
-    Off(i16),
+    Off(i32),
     /// No operand.
     None,
 }
@@ -41,21 +41,10 @@ impl fmt::Display for Operand {
                 }
             }
             Operand::Mem { base, offset } => {
-                if *offset >= 0 {
-                    let off = *offset as u16;
-                    write!(f, "[{base}+{off:#x}]")
-                } else {
-                    let off = (-*offset) as u16;
-                    write!(f, "[{base}-{off:#x}]")
-                }
+                let sign = if *offset < 0 { '-' } else { '+' };
+                write!(f, "[{base}{sign}{:#x}]", offset.unsigned_abs())
             }
-            Operand::Off(off) => {
-                if *off >= 0 {
-                    write!(f, "+{off}")
-                } else {
-                    write!(f, "{off}")
-                }
-            }
+            Operand::Off(off) => write!(f, "{off:+}"),
             Operand::None => Ok(()),
         }
     }

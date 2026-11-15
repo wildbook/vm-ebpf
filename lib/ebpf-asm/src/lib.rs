@@ -187,4 +187,51 @@ mod tests {
         assert_eq!(consumed, code.len(), "decoder must consume every emitted byte");
         assert!(insns.iter().all(|i| i.mnemonic != Mnemonic::Unknown), "every emitted opcode must decode");
     }
+
+    /// The v4 forms that share an opcode with an older instruction and differ only in
+    /// `off`, the class or the source bit, plus extreme offsets.
+    #[test]
+    fn v4_forms_disassemble_distinctly() {
+        let mut asm = Assembler::new();
+        let mut far = asm.create_label();
+        asm.movsx832(R0, R1)
+            .movsx1632(R0, R1)
+            .movsx864(R0, R1)
+            .movsx1664(R0, R1)
+            .movsx3264(R0, R1);
+        asm.bswap16(R0).bswap32(R0).bswap64(R0).le16(R0).be64(R0);
+        asm.ja32(&far);
+        asm.ldxdw(R0, R1, i16::MIN).jeq_imm(R0, i32::MIN, &far);
+        asm.set_label(&mut far).unwrap();
+        asm.exit();
+
+        let fmt = DefaultFormatter::new();
+        let text: Vec<String> = decode_all(&asm.assemble().unwrap())
+            .iter()
+            .map(|i| fmt.format_to_string(i))
+            .collect();
+        assert_eq!(
+            text,
+            [
+                "movsx832 r0, r1",
+                "movsx1632 r0, r1",
+                "movsx864 r0, r1",
+                "movsx1664 r0, r1",
+                "movsx3264 r0, r1",
+                "bswap16 r0",
+                "bswap32 r0",
+                "bswap64 r0",
+                "le16 r0",
+                "be64 r0",
+                "ja32 +2",
+                "ldxdw r0, [r1-0x8000]",
+                "jeq r0, -0x80000000, +0",
+                "exit",
+            ]
+        );
+
+        // `ja32` carries its offset in the 32-bit imm, beyond the reach of `off`
+        let insn = &decode_all(&[0x06, 0, 0, 0, 0x00, 0x00, 0x01, 0x00])[0];
+        assert_eq!(fmt.format_to_string(insn), "ja32 +65536");
+    }
 }
