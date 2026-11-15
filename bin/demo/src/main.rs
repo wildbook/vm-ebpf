@@ -266,6 +266,17 @@ fn build_core_demo_program() -> EbpfProgram {
     prog
 }
 
+/// Apply `relos`, failing if any target is missing from the host. Returns the count.
+fn relocate(insns: &mut [u64], btf: &Btf, registry: &TypeRegistry, relos: &[CoreRelo]) -> Result<usize, String> {
+    match apply_core_relocations(insns, btf, registry, relos)
+        .map_err(|e| e.to_string())?
+        .first()
+    {
+        Some(u) => Err(format!("unresolved CO-RE relocation at {:#x}: {}", u.insn_off, u.error)),
+        None => Ok(relos.len()),
+    }
+}
+
 /// Demonstrates CO-RE patching when host has different struct layout.
 fn demo_core_relocation() -> Result<(), String> {
     println!("=== Demo: CO-RE Field Offset Relocation ===\n");
@@ -296,8 +307,7 @@ fn demo_core_relocation() -> Result<(), String> {
             .size(12);
 
         let mut prog_copy = prog.instructions.clone();
-        let applied =
-            apply_core_relocations(&mut prog_copy, &btf, &registry, &prog.relocations).expect("relocation failed");
+        let applied = relocate(&mut prog_copy, &btf, &registry, &prog.relocations)?;
 
         // LDX/STX relocations patch the instruction's `off` field, not `imm`.
         let patched_off = ((prog_copy[0] >> 16) & 0xFFFF) as i16;
@@ -321,8 +331,7 @@ fn demo_core_relocation() -> Result<(), String> {
             .size(16);
 
         let mut prog_copy = prog.instructions.clone();
-        let applied =
-            apply_core_relocations(&mut prog_copy, &btf, &registry, &prog.relocations).expect("relocation failed");
+        let applied = relocate(&mut prog_copy, &btf, &registry, &prog.relocations)?;
 
         let patched_off = ((prog_copy[0] >> 16) & 0xFFFF) as i16;
         println!("  Host layout: event {{ timestamp: 0, flags: 8, pid: 12 }}");
@@ -410,8 +419,7 @@ fn demo_full_core_execution() -> Result<(), String> {
         .size(16);
 
     // Apply CO-RE relocations
-    let applied =
-        apply_core_relocations(prog.instructions_mut(), &btf, &registry, &relocations).expect("relocation failed");
+    let applied = relocate(prog.instructions_mut(), &btf, &registry, &relocations)?;
 
     println!("Applied {applied} CO-RE relocation(s)");
 
@@ -515,7 +523,7 @@ fn demo_field_exists() -> Result<(), String> {
             .size(16);
 
         let mut instrs = prog.instructions.clone();
-        apply_core_relocations(&mut instrs, &btf, &registry, &prog.relocations).expect("relo failed");
+        relocate(&mut instrs, &btf, &registry, &prog.relocations)?;
 
         let exists_val = (instrs[0] >> 32) as i32;
         println!("  CO-RE patched FIELD_EXISTS = {exists_val}");
@@ -537,7 +545,7 @@ fn demo_field_exists() -> Result<(), String> {
             .size(12);
 
         let mut instrs = prog.instructions.clone();
-        apply_core_relocations(&mut instrs, &btf, &registry, &prog.relocations).expect("relo failed");
+        relocate(&mut instrs, &btf, &registry, &prog.relocations)?;
 
         let exists_val = (instrs[0] >> 32) as i32;
         println!("  CO-RE patched FIELD_EXISTS = {exists_val}");
@@ -577,7 +585,7 @@ fn demo_type_size() -> Result<(), String> {
         .size(24);
 
     let mut instrs = prog.instructions.clone();
-    apply_core_relocations(&mut instrs, &btf, &registry, &prog.relocations).expect("relo failed");
+    relocate(&mut instrs, &btf, &registry, &prog.relocations)?;
 
     let size_val = (instrs[0] >> 32) as i32;
     println!("BPF program expected: sizeof(event) = 12");

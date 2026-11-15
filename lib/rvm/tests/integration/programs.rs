@@ -1,6 +1,7 @@
-//! Clang-compiled programs exercising atomics, maps and the standard helpers.
+//! Clang-compiled programs exercising atomics, maps, data relocations, CO-RE and the
+//! standard helpers.
 
-use rvm::Vm;
+use rvm::{ExecError, Perms, Vm, VmError, FIRST_FREE_REGION};
 
 use crate::common::object;
 
@@ -23,6 +24,28 @@ fn test_clang_atomics() {
 fn data_pointers_are_relocated() {
     let mut program = Vm::new().load_elf(&object("data_ptrs.o")).unwrap();
     assert_eq!(program.call("deref", &[]).unwrap(), 42 + 10 + 30);
+}
+
+/// CO-RE against a host whose `struct event` moved `pid` and lacks `flags`
+/// (bpf/core_guard.c): field accesses follow the host layout, an existence check
+/// takes the fallback, and an unguarded access to the missing field fails when run.
+#[test]
+fn core_relocations_follow_host_layout() {
+    let mut vm = Vm::new();
+    vm.types()
+        .register_struct("event")
+        .field("timestamp", 0, 8)
+        .field("pid", 12, 4)
+        .size(16);
+    let mut program = vm.load_elf(&object("core_guard.o")).unwrap();
+
+    let event = program.memory_mut().map(FIRST_FREE_REGION, 16, Perms::R);
+    program.memory_mut().write::<u32>(event + 12, 77).unwrap();
+
+    assert_eq!(program.call("read_pid", &[event]).unwrap(), 77);
+    assert_eq!(program.call("read_flags", &[event]).unwrap(), 0xdead);
+    let err = program.call("read_flags_unguarded", &[event]).unwrap_err();
+    assert!(matches!(err, VmError::Exec(ExecError::UnresolvedCoreRelo { .. })), "{err}");
 }
 
 /// Array and hash maps from bpf/maps.c, used from the guest and the host.

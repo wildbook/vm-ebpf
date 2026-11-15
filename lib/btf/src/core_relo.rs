@@ -329,56 +329,54 @@ impl core::fmt::Display for CoreReloError {
 
 impl std::error::Error for CoreReloError {}
 
-/// Result of applying a CO-RE relocation.
-#[derive(Debug, Clone, Copy)]
-pub struct ReloResult {
-    /// The computed value to patch into the instruction.
-    pub value: u64,
-    /// Whether the relocation succeeded (for existence checks).
-    #[allow(dead_code)]
-    pub success: bool,
+/// Helper ID that unresolved relocations call, as in libbpf: running such an
+/// instruction must fail, while a program that never reaches it still works.
+pub const CORE_POISON_HELPER: u32 = 0xbad2310;
+
+/// A relocation whose target the host doesn't have; its instruction was poisoned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unresolved {
+    /// Byte offset of the poisoned instruction in its section.
+    pub insn_off: u32,
+    /// Why the relocation couldn't be resolved.
+    pub error: CoreReloError,
 }
 
-/// Apply CO-RE relocations to eBPF instructions.
+/// Apply CO-RE relocations to eBPF instructions, against the host's types in `registry`.
 ///
-/// # Arguments
-///
-/// * `instructions` - Mutable slice of 8-byte eBPF instructions
-/// * `btf` - The program's BTF (for type information)
-/// * `registry` - The host's type registry
-/// * `relos` - CO-RE relocations to apply
-///
-/// # Returns
-///
-/// Number of relocations successfully applied.
+/// A relocation whose type, field or enum value the host lacks rewrites its instruction
+/// into a call to [`CORE_POISON_HELPER`], so code guarded by an existence check still
+/// loads; those are returned. Malformed relocations and unsupported kinds are errors.
 pub fn apply_core_relocations(
     instructions: &mut [u64],
     btf: &Btf<'_>,
     registry: &TypeRegistry,
     relos: &[CoreRelo],
-) -> Result<usize, CoreReloError> {
-    let mut applied = 0;
+) -> Result<Vec<Unresolved>, CoreReloError> {
+    const BPF_CALL: u64 = 0x85;
 
+    let mut unresolved = Vec::new();
     for relo in relos {
         match apply_single_relocation(instructions, btf, registry, relo) {
-            Ok(_) => applied += 1,
-            Err(e) => {
-                // For existence checks, a "not found" is not an error
-                if matches!(
-                    relo.kind,
-                    CoreReloKind::FieldExists | CoreReloKind::TypeExists | CoreReloKind::EnumvalExists
-                ) {
-                    // Patch with 0 (does not exist)
-                    patch_instruction(instructions, relo.insn_off, 0)?;
-                    applied += 1;
-                } else {
-                    return Err(e);
-                }
+            Ok(()) => {}
+            Err(
+                error @ (CoreReloError::TypeNotFound(_)
+                | CoreReloError::FieldNotFound { .. }
+                | CoreReloError::EnumVariantNotFound { .. }),
+            ) => {
+                let insn = instructions
+                    .get_mut((relo.insn_off / 8) as usize)
+                    .ok_or(CoreReloError::InstructionOutOfBounds(relo.insn_off))?;
+                *insn = BPF_CALL | (u64::from(CORE_POISON_HELPER) << 32);
+                unresolved.push(Unresolved {
+                    insn_off: relo.insn_off,
+                    error,
+                });
             }
+            Err(e) => return Err(e),
         }
     }
-
-    Ok(applied)
+    Ok(unresolved)
 }
 
 fn apply_single_relocation(
@@ -386,7 +384,7 @@ fn apply_single_relocation(
     btf: &Btf<'_>,
     registry: &TypeRegistry,
     relo: &CoreRelo,
-) -> Result<ReloResult, CoreReloError> {
+) -> Result<(), CoreReloError> {
     // Get the type from BTF
     let btf_type = btf
         .type_by_id(relo.type_id)
@@ -398,11 +396,8 @@ fn apply_single_relocation(
         CoreReloError::InvalidAccessString(format!("offset {off}"))
     })?;
 
-    let result = compute_relocation_value(btf_type, btf, registry, access_str, relo.kind)?;
-
-    patch_instruction(instructions, relo.insn_off, result.value)?;
-
-    Ok(result)
+    let value = compute_relocation_value(btf_type, btf, registry, access_str, relo.kind)?;
+    patch_instruction(instructions, relo.insn_off, value)
 }
 
 fn compute_relocation_value(
@@ -411,12 +406,11 @@ fn compute_relocation_value(
     registry: &TypeRegistry,
     access_str: &str,
     kind: CoreReloKind,
-) -> Result<ReloResult, CoreReloError> {
+) -> Result<u64, CoreReloError> {
     // libbpf strips typedefs/modifiers from the root (`typedef struct {..} ev_t`).
     let root = skip_modifiers(btf, btf_type)?;
     let type_name = root.name().unwrap_or("");
 
-    let found = |value: u64| ReloResult { value, success: true };
     let field_not_found = |missing: (String, String)| CoreReloError::FieldNotFound {
         type_name: missing.0,
         field_name: missing.1,
@@ -425,44 +419,35 @@ fn compute_relocation_value(
     match kind {
         CoreReloKind::FieldByteOffset => {
             let field = resolve_field(root, btf, registry, access_str)?.map_err(field_not_found)?;
-            Ok(found(field.offset))
+            Ok(field.offset)
         }
 
         CoreReloKind::FieldByteSize => {
             let field = resolve_field(root, btf, registry, access_str)?.map_err(field_not_found)?;
-            Ok(found(field.size))
+            Ok(field.size)
         }
 
         CoreReloKind::FieldExists => {
             let exists = resolve_field(root, btf, registry, access_str)?.is_ok();
-            Ok(ReloResult {
-                value: exists as u64,
-                success: exists,
-            })
+            Ok(exists as u64)
         }
 
         CoreReloKind::TypeExists => {
             let exists = registry.has_struct(type_name) || registry.has_enum(type_name);
-            Ok(ReloResult {
-                value: exists as u64,
-                success: exists,
-            })
+            Ok(exists as u64)
         }
 
         CoreReloKind::TypeSize => {
             let size = registry
                 .struct_size(type_name)
                 .ok_or_else(|| CoreReloError::TypeNotFound(type_name.to_string()))?;
-            Ok(found(size as u64))
+            Ok(size as u64)
         }
 
         CoreReloKind::EnumvalExists => {
             let variant_name = resolve_enum_variant(root, access_str)?;
             let exists = registry.enum_variant_exists(type_name, variant_name);
-            Ok(ReloResult {
-                value: exists as u64,
-                success: exists,
-            })
+            Ok(exists as u64)
         }
 
         CoreReloKind::EnumvalValue => {
@@ -474,10 +459,10 @@ fn compute_relocation_value(
                         enum_name: type_name.to_string(),
                         variant_name: variant_name.to_string(),
                     })?;
-            Ok(found(value as u64))
+            Ok(value as u64)
         }
 
-        // For now, we don't fully support these
+        // the bitfield kinds need bit offsets and signedness the registry doesn't record
         CoreReloKind::FieldSigned
         | CoreReloKind::FieldLShiftU64
         | CoreReloKind::FieldRShiftU64

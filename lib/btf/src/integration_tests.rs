@@ -145,8 +145,8 @@ fn test_core_relocation_field_offset() {
 
     let mut instructions = vec![0x00000000_00000000u64; 2];
 
-    let applied = apply_core_relocations(&mut instructions, &btf, &registry, &relos).unwrap();
-    assert_eq!(applied, 2);
+    let unresolved = apply_core_relocations(&mut instructions, &btf, &registry, &relos).unwrap();
+    assert!(unresolved.is_empty());
 
     // Both immediates (upper 32 bits) should now hold the host's actual offsets.
     assert_eq!((instructions[0] >> 32) as u32, 16); // pid moved from 8 to 16
@@ -185,8 +185,8 @@ fn test_core_relocation_field_exists() {
 
     let mut instructions = vec![0xFFFFFFFF_00000000u64; 1]; // Start with imm=0xFFFFFFFF
 
-    let applied = apply_core_relocations(&mut instructions, &btf, &registry, &[relo]).unwrap();
-    assert_eq!(applied, 1);
+    let unresolved = apply_core_relocations(&mut instructions, &btf, &registry, &[relo]).unwrap();
+    assert!(unresolved.is_empty());
 
     // Should be patched to 0 (field doesn't exist)
     let patched_imm = (instructions[0] >> 32) as u32;
@@ -218,8 +218,8 @@ fn test_core_relocation_type_size() {
 
     let mut instructions = vec![0u64; 1];
 
-    let applied = apply_core_relocations(&mut instructions, &btf, &registry, &[relo]).unwrap();
-    assert_eq!(applied, 1);
+    let unresolved = apply_core_relocations(&mut instructions, &btf, &registry, &[relo]).unwrap();
+    assert!(unresolved.is_empty());
 
     // Should return host's actual size: 80
     let patched_imm = (instructions[0] >> 32) as u32;
@@ -249,25 +249,42 @@ fn test_core_suffix_matching() {
     assert_eq!(registry.field_offset("task_struct___v2", "state"), Some(8));
 }
 
+/// A field the host lacks poisons its instruction, like libbpf, instead of failing:
+/// the program still loads and only faults if it runs that instruction.
 #[test]
-fn test_missing_type_error() {
+fn test_missing_type_poisons_instruction() {
     let registry = TypeRegistry::new();
-    // Don't register any types
 
     let btf_data = build_test_btf("unknown_struct", &[("field", 4)]);
     let btf = Btf::parse(&btf_data).unwrap();
 
     let relo = CoreRelo {
-        insn_off: 0,
+        insn_off: 8,
         type_id: 1,
         access_str_off: 1, // "unknown_struct"
         kind: CoreReloKind::FieldByteOffset,
     };
 
-    let mut instructions = vec![0u64; 1];
+    let mut instructions = vec![0u64; 2];
 
-    let result = apply_core_relocations(&mut instructions, &btf, &registry, &[relo]);
-    assert!(matches!(result, Err(CoreReloError::FieldNotFound { .. })));
+    let unresolved = apply_core_relocations(&mut instructions, &btf, &registry, &[relo]).unwrap();
+    assert_eq!(unresolved.len(), 1);
+    assert!(matches!(unresolved[0].error, CoreReloError::FieldNotFound { .. }));
+    assert_eq!(instructions, [0, 0x0bad2310_00000085]); // call 0xbad2310
+}
+
+#[test]
+fn test_unsupported_kind_is_an_error() {
+    let btf_data = build_test_btf("s", &[("field", 4)]);
+    let btf = Btf::parse(&btf_data).unwrap();
+    let relo = CoreRelo {
+        insn_off: 0,
+        type_id: 1,
+        access_str_off: 1,
+        kind: CoreReloKind::FieldSigned,
+    };
+    let result = apply_core_relocations(&mut [0], &btf, &TypeRegistry::new(), &[relo]);
+    assert_eq!(result, Err(CoreReloError::UnsupportedRelo(CoreReloKind::FieldSigned)));
 }
 
 // ==================== clang-style access strings ====================

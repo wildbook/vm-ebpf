@@ -110,6 +110,8 @@ pub enum LinkError {
     DuplicateSymbol(String),
     /// Invalid reference.
     InvalidReference(String),
+    /// A malformed or unsupported CO-RE relocation.
+    CoreRelo(btf::CoreReloError),
 }
 
 impl fmt::Display for LinkError {
@@ -126,6 +128,7 @@ impl fmt::Display for LinkError {
             Self::MapMismatch(name) => write!(f, "shared map {name} is declared with a different layout"),
             Self::DuplicateSymbol(name) => write!(f, "duplicate symbol: {name}"),
             Self::InvalidReference(msg) => write!(f, "invalid reference: {msg}"),
+            Self::CoreRelo(e) => write!(f, "CO-RE relocation: {e}"),
         }
     }
 }
@@ -147,6 +150,8 @@ pub enum ExecError {
     StackOverflow,
     /// Invalid program counter.
     InvalidPc(u64),
+    /// Ran an instruction whose CO-RE relocation the host couldn't resolve.
+    UnresolvedCoreRelo { pc: u64 },
 }
 
 impl fmt::Display for ExecError {
@@ -158,6 +163,9 @@ impl fmt::Display for ExecError {
             Self::InstructionLimit(count) => write!(f, "instruction limit exceeded: {count}"),
             Self::StackOverflow => write!(f, "stack overflow"),
             Self::InvalidPc(pc) => write!(f, "invalid program counter: {pc}"),
+            Self::UnresolvedCoreRelo { pc } => {
+                write!(f, "instruction {pc} uses a type or field the host doesn't have (CO-RE)")
+            }
         }
     }
 }

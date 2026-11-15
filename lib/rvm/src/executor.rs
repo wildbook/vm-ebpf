@@ -120,7 +120,11 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
                     ctx.regs[6..=10].copy_from_slice(&frame.regs);
                     frame.return_pc
                 }
-                // Raw bytecode path: look the helper ID up. Linked programs only use slots.
+                // Raw bytecode path: look the helper ID up. Linked programs only use slots,
+                // except for calls the linker planted for unresolved CO-RE relocations.
+                Flow::CallHelper(btf::CORE_POISON_HELPER) => {
+                    return Err(ExecError::UnresolvedCoreRelo { pc }.into());
+                }
                 Flow::CallHelper(id) => {
                     let args = HelperArgs::from_regs(&ctx.regs);
                     let mut helper_ctx = HelperContext {

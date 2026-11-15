@@ -155,7 +155,7 @@ impl<'a> Linker<'a> {
             }
         }
         Self::bind_helper_calls(&helpers, &mut image)?;
-        self.apply_core_relocations(modules, &layouts, &btfs, &mut image);
+        self.apply_core_relocations(modules, &layouts, &btfs, &mut image)?;
 
         let functions = Self::build_function_table(modules, &layouts, &btfs)?;
 
@@ -384,21 +384,20 @@ impl<'a> Linker<'a> {
         Ok(())
     }
 
-    /// Apply CO-RE relocations. Failures leave the compile-time values in place.
+    /// Apply CO-RE relocations. Instructions whose target the host lacks become calls
+    /// that fail when run; malformed or unsupported relocations fail the link.
     fn apply_core_relocations(
         &self,
         modules: &[&Module],
         layouts: &[ModuleLayout],
         btfs: &[Option<Btf<'_>>],
         image: &mut Image,
-    ) {
+    ) -> Result<()> {
         for ((module, layout), btf) in modules.iter().zip(layouts).zip(btfs) {
             let (Some(btf), Some(btf_ext_data)) = (btf, &module.btf_ext_data) else {
                 continue;
             };
-            let Ok(btf_ext) = btf::BtfExt::parse(btf_ext_data, btf.strings()) else {
-                continue;
-            };
+            let btf_ext = btf::BtfExt::parse(btf_ext_data, btf.strings())?;
 
             for (section_idx, section) in module.sections.iter().enumerate() {
                 let Some(&Addr::Code(at)) = layout.sections.get(&section_idx) else {
@@ -420,12 +419,13 @@ impl<'a> Linker<'a> {
                     .iter()
                     .map(|w| u64::from_le_bytes(*w))
                     .collect();
-                let _ = apply_core_relocations(&mut insns, btf, self.types, relos);
+                apply_core_relocations(&mut insns, btf, self.types, relos).map_err(LinkError::CoreRelo)?;
                 for (dst, insn) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(&insns) {
                     *dst = insn.to_le_bytes();
                 }
             }
         }
+        Ok(())
     }
 
     /// Build the function table.
