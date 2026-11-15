@@ -155,6 +155,8 @@ pub enum LinkError {
     UnknownHelper(u32),
     /// An extern's declared parameter count differs from the host function's.
     SignatureMismatch { name: String, declared: usize, host: u8 },
+    /// A program declares a shared map with a different layout than the existing one.
+    MapMismatch(String),
     /// Duplicate symbol.
     DuplicateSymbol(String),
     /// Circular dependency.
@@ -174,6 +176,7 @@ impl fmt::Display for LinkError {
             Self::SignatureMismatch { name, declared, host } => {
                 write!(f, "extern {name} declares {declared} parameters but the host function takes {host}")
             }
+            Self::MapMismatch(name) => write!(f, "shared map {name} is declared with a different layout"),
             Self::DuplicateSymbol(name) => write!(f, "duplicate symbol: {name}"),
             Self::CircularDependency(msg) => write!(f, "circular dependency: {msg}"),
             Self::InvalidReference(msg) => write!(f, "invalid reference: {msg}"),

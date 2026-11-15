@@ -104,7 +104,8 @@ A guest address is `(region << 32) | offset`. `rvm::VmMemory` holds
 | `RODATA_REGION` (2) | `.rodata*` | R |
 | `DATA_REGION` (3) | `.data*`, `.bss*` | RW |
 | `MAPS_REGION` (4) | map values | RW |
-| `FIRST_FREE_REGION` (5) and up | free for the host | - |
+| `FIRST_FREE_REGION` (5) to 31 | free for the host | - |
+| `SHARED_MAPS_FIRST_REGION` (32) to 63 | shared maps, one region each | RW |
 
 Host code maps its own regions with `VmMemory::map` (zeroed) or
 `VmMemory::map_bytes` (host-owned buffer), and can map existing host memory
@@ -137,6 +138,13 @@ Maps: array and hash maps declared libbpf style in `.maps` (`__uint(type, ...)`,
 host registers its own under those IDs. Values live in `MAPS_REGION`, so a looked
 up pointer is an ordinary guest address. The host reads and writes maps through
 `Program::map(name)`.
+
+`Vm::share_map(name, pad_values)` makes maps of that name one instance across
+every program the VM links afterwards, at the same guest address in each. The
+first program to declare it creates it, and a later declaration with a
+different layout fails the link. `pad_values` puts each value on its own cache
+line. The call is `unsafe`: programs running on different threads at the same
+time may only touch shared values with atomics.
 
 Atomics (`BPF_ATOMIC` add, or, and, xor with and without fetch, xchg and
 cmpxchg, 32 and 64 bit) go through `Memory::atomic_u32` and

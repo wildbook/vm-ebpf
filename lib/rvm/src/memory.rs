@@ -21,7 +21,7 @@ pub use rvm_core::Memory;
 use crate::error::MemoryError;
 
 /// Number of region slots in a [`VmMemory`].
-pub const MAX_REGIONS: usize = 16;
+pub const MAX_REGIONS: usize = 64;
 
 /// Bit position of the region index in a guest address.
 pub const REGION_SHIFT: u32 = 32;

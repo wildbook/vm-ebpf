@@ -126,7 +126,7 @@ pub use helper::{
 pub use linker::{Linker, DATA_REGION, FIRST_FREE_REGION, RODATA_REGION, STACK_REGION};
 pub use maps::{
     MapDef, MapError, MapKind, MapRef, Maps, BPF_ANY, BPF_EXIST, BPF_FUNC_MAP_DELETE_ELEM, BPF_FUNC_MAP_LOOKUP_ELEM,
-    BPF_FUNC_MAP_UPDATE_ELEM, BPF_NOEXIST, MAPS_REGION,
+    BPF_FUNC_MAP_UPDATE_ELEM, BPF_NOEXIST, MAPS_REGION, SHARED_MAPS_FIRST_REGION,
 };
 // Memory
 pub use memory::{region_base, Memory, Perms, Scalar, VmMemory, MAX_REGIONS, MAX_REGION_LEN, REGION_SHIFT};

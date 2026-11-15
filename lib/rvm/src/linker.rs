@@ -27,7 +27,7 @@ use rvm_core::instructions_from_bytes;
 use crate::error::{LinkError, Result, VmError};
 use crate::executor::MAX_CALL_DEPTH;
 use crate::helper::{HelperRegistry, SharedHelpers};
-use crate::maps::{self, map_defs, MapDef, Maps, MAPS_REGION};
+use crate::maps::{self, map_defs, MapDef, Maps, SharedMaps, MAPS_REGION};
 use crate::memory::{region_base, Perms, VmMemory};
 use crate::module::{Module, Relocation};
 use crate::program::{FunctionInfo, Program};
@@ -98,14 +98,25 @@ impl Image {
 /// Linker for eBPF modules.
 pub struct Linker<'a> {
     helpers: &'a Arc<SharedHelpers>,
+    shared_maps: &'a SharedMaps,
     types: &'a TypeRegistry,
     config: &'a VmConfig,
 }
 
 impl<'a> Linker<'a> {
     /// Create a new linker.
-    pub fn new(helpers: &'a Arc<SharedHelpers>, types: &'a TypeRegistry, config: &'a VmConfig) -> Self {
-        Self { helpers, types, config }
+    pub fn new(
+        helpers: &'a Arc<SharedHelpers>,
+        shared_maps: &'a SharedMaps,
+        types: &'a TypeRegistry,
+        config: &'a VmConfig,
+    ) -> Self {
+        Self {
+            helpers,
+            shared_maps,
+            types,
+            config,
+        }
     }
 
     /// Link multiple modules into a single program.
@@ -130,7 +141,7 @@ impl<'a> Linker<'a> {
                 defs.push(def);
             }
         }
-        let (maps, maps_len) = Maps::new(defs);
+        let (maps, maps_len) = Maps::new(defs, self.shared_maps)?;
 
         // Relocations bind maps and named externs; then numeric helper calls.
         for (module, layout) in modules.iter().zip(&layouts) {
@@ -149,6 +160,12 @@ impl<'a> Linker<'a> {
         memory.map_bytes(RODATA_REGION, &image.rodata, image.rodata.len(), Perms::R);
         memory.map_bytes(DATA_REGION, &image.data, image.data.len(), Perms::RW);
         maps::map_region(&mut memory, maps_len);
+        for shared in maps.shared() {
+            let (ptr, len) = shared.storage();
+            // SAFETY: `maps` holds the shared map, so its storage outlives `memory` in
+            // the program; concurrent access follows `Vm::share_map`'s contract.
+            unsafe { memory.map_host(shared.region(), ptr, len, Perms::RW) };
+        }
 
         let code = instructions_from_bytes(&image.code);
 

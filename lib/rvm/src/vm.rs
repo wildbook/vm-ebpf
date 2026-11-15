@@ -37,6 +37,7 @@ use std::sync::Arc;
 use crate::error::{Result, VmError};
 use crate::helper::{DynHelper, FromArgs, IntoReturn, SharedHelpers};
 use crate::linker::Linker;
+use crate::maps::SharedMaps;
 use crate::module::Module;
 use crate::plugin::Plugin;
 use crate::program::Program;
@@ -75,6 +76,8 @@ impl Default for VmConfig {
 pub struct Vm {
     /// Extern table shared with every program this VM links.
     helpers: Arc<SharedHelpers>,
+    /// Maps shared by name between the programs this VM links.
+    shared_maps: SharedMaps,
     /// Type registry for CO-RE.
     types: TypeRegistry,
     /// VM configuration.
@@ -103,6 +106,7 @@ impl Vm {
         helpers.update(maps::register_helpers);
         Self {
             helpers,
+            shared_maps: SharedMaps::default(),
             types: TypeRegistry::new(),
             config,
             modules: HashMap::new(),
@@ -183,6 +187,24 @@ impl Vm {
     /// The extern table shared with linked programs.
     pub fn helpers(&self) -> &SharedHelpers {
         &self.helpers
+    }
+
+    /// Share maps called `name` between every program linked afterwards: they bind to
+    /// one instance, created by the first program that declares it, and later
+    /// declarations must match its layout. `pad_values` puts each value on its own
+    /// cache line, so atomics on neighbouring values from different threads don't
+    /// contend.
+    ///
+    /// Values live at the same guest address in every program, from region
+    /// [`crate::SHARED_MAPS_FIRST_REGION`] up.
+    ///
+    /// # Safety
+    ///
+    /// Programs that run at the same time on different threads may only touch the
+    /// map's values with atomic instructions; plain guest loads and stores to a value
+    /// another thread writes concurrently are a data race.
+    pub unsafe fn share_map(&self, name: &str, pad_values: bool) {
+        self.shared_maps.declare(name, pad_values);
     }
 
     // =========================================================================
@@ -267,7 +289,7 @@ impl Vm {
     /// let program = vm.link(&[&utils, &main])?;
     /// ```
     pub fn link(&self, modules: &[&Module]) -> Result<Program> {
-        Linker::new(&self.helpers, &self.types, &self.config).link(modules)
+        Linker::new(&self.helpers, &self.shared_maps, &self.types, &self.config).link(modules)
     }
 
     /// Link a single module into a program.

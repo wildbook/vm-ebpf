@@ -272,6 +272,44 @@ mod plugins {
         assert_eq!(error.lock().unwrap().as_deref(), Some("plugin b is already running a call"));
         assert_eq!(b.call("b_run", &[5]).unwrap(), 11);
     }
+
+    #[test]
+    fn shared_map_is_one_instance_across_plugins() {
+        let vm = Vm::new();
+        let x = vm.load_plugin("x", &read("shared_counter.o")).unwrap();
+        let y = vm.load_plugin("y", &read("shared_counter.o")).unwrap();
+        assert_eq!((x.call("bump", &[]).unwrap(), y.call("bump", &[]).unwrap()), (1, 1)); // private
+
+        // SAFETY: the plugins run on this thread only.
+        unsafe { vm.share_map("hits", true) };
+        let x = vm.load_plugin("x", &read("shared_counter.o")).unwrap();
+        let y = vm.load_plugin("y", &read("shared_counter.o")).unwrap();
+        assert_eq!(x.call("bump", &[]).unwrap(), 1);
+        assert_eq!(y.call("bump", &[]).unwrap(), 2);
+        assert_eq!(x.lock().unwrap().map("hits").unwrap().get(&0u32.to_le_bytes()), Some(&2u64.to_le_bytes()[..]));
+
+        assert!(matches!(
+            vm.load_plugin("z", &read("shared_counter_u32.o")).unwrap_err(),
+            VmError::Link(LinkError::MapMismatch(name)) if name == "hits"
+        ));
+    }
+
+    /// Two plugins on two threads bump one shared counter with guest atomics.
+    #[test]
+    fn shared_map_atomics_across_threads() {
+        const N: u64 = 10_000;
+        let vm = Vm::new();
+        // SAFETY: `bump` only touches the value with an atomic add.
+        unsafe { vm.share_map("hits", true) };
+        let plugins = ["x", "y"].map(|name| vm.load_plugin(name, &read("shared_counter.o")).unwrap());
+
+        std::thread::scope(|s| {
+            for plugin in &plugins {
+                s.spawn(|| (0..N).for_each(|_| _ = plugin.call("bump", &[]).unwrap()));
+            }
+        });
+        assert_eq!(plugins[0].call("bump", &[]).unwrap(), 2 * N + 1);
+    }
 }
 
 /// Every atomic form clang emits (bpf/atomics.c), with the expected values worked
