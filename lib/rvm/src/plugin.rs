@@ -16,14 +16,10 @@
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
 
 use crate::error::{HelperError, Result, VmError};
-use crate::helper::{DynHelper, HelperContext};
-use crate::maps::SHARED_MAPS_FIRST_REGION;
+use crate::helper::HelperContext;
+use crate::layout::BORROW_FIRST_REGION;
 use crate::memory::{region_base, Perms};
 use crate::program::{Borrow, Program};
-
-/// First of the five regions in each program reserved for borrowed buffers, one per
-/// argument register.
-pub const BORROW_FIRST_REGION: usize = SHARED_MAPS_FIRST_REGION - 5;
 
 /// A linked program that other programs can call into.
 #[derive(Clone)]
@@ -62,12 +58,15 @@ impl Plugin {
     }
 
     /// The extern that calls `func` in this plugin.
-    pub fn export_fn(&self, func: &str) -> DynHelper {
+    pub fn export_fn(
+        &self,
+        func: &str,
+    ) -> impl Fn(&mut HelperContext) -> std::result::Result<u64, HelperError> + Send + Sync + 'static {
         let program: Weak<Mutex<Program>> = Arc::downgrade(&self.program);
         let name = self.name.clone();
         let func: Arc<str> = func.into();
 
-        Arc::new(move |ctx: &mut HelperContext| {
+        move |ctx: &mut HelperContext| -> std::result::Result<u64, HelperError> {
             let failed = |e: VmError| HelperError::Failed(format!("{name}::{func}: {e}"));
             let program = program
                 .upgrade()
@@ -81,7 +80,7 @@ impl Plugin {
                 return program.call(&func, &args).map_err(failed);
             }
 
-            let caller = ctx.memory.as_deref().ok_or_else(|| failed(no_memory()))?;
+            let caller = &*ctx.memory;
             let mut mapped = Ok(());
             for &Borrow { arg, len_arg, writable } in &borrows {
                 let (addr, len) = (args[arg as usize], args[len_arg as usize] as usize);
@@ -106,12 +105,8 @@ impl Plugin {
                 program.memory_mut().unmap(BORROW_FIRST_REGION + borrow.arg as usize);
             }
             result
-        })
+        }
     }
-}
-
-fn no_memory() -> VmError {
-    VmError::InvalidArgument("borrowed buffer without caller memory".to_string())
 }
 
 fn try_lock<'a>(program: &'a Mutex<Program>, name: &str) -> Result<MutexGuard<'a, Program>> {

@@ -11,8 +11,10 @@ use rvm_core::Instruction;
 use crate::error::{Result, VmError};
 use crate::executor::Executor;
 use crate::helper::{HelperRegistry, SharedHelpers};
+use crate::layout::STACK_REGION;
 use crate::maps::{MapRef, Maps};
-use crate::memory::VmMemory;
+use crate::memory::{region_base, VmMemory};
+use crate::vm::VmConfig;
 
 /// Information about an executable function.
 #[derive(Debug, Clone)]
@@ -75,19 +77,17 @@ pub struct Program {
 
 impl Program {
     /// Create a new program. The linker is the usual caller.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         code: Box<[Instruction]>,
         memory: VmMemory,
         maps: Maps,
         functions: HashMap<String, FunctionInfo>,
-        stack_top: u64,
         shared_helpers: Arc<SharedHelpers>,
-        helpers: HelperRegistry,
-        helpers_version: u64,
-        instruction_limit: u64,
-        frame_size: u64,
+        helpers: (HelperRegistry, u64),
+        config: &VmConfig,
     ) -> Self {
+        let stack_top = region_base(STACK_REGION) + memory.region_len(STACK_REGION) as u64;
+        let (helpers, helpers_version) = helpers;
         Self {
             code,
             memory,
@@ -97,8 +97,8 @@ impl Program {
             shared_helpers,
             helpers,
             helpers_version,
-            instruction_limit,
-            frame_size,
+            instruction_limit: config.instruction_limit,
+            frame_size: config.frame_size as u64,
         }
     }
 
@@ -148,28 +148,12 @@ impl Program {
         self.functions.contains_key(name)
     }
 
-    /// Get the entry point: "main" if it exists, otherwise the lowest-addressed function.
-    pub fn entry_point(&self) -> Option<&FunctionInfo> {
-        self.functions
-            .get("main")
-            .or_else(|| self.functions.values().min_by_key(|f| (f.pc, &f.name)))
-    }
-
     /// Call a function by name; arguments go in r1-r5.
     pub fn call(&mut self, name: &str, args: &[u64]) -> Result<u64> {
         let pc = self
             .functions
             .get(name)
             .ok_or_else(|| VmError::FunctionNotFound(name.to_string()))?
-            .pc;
-        self.call_pc(pc, args)
-    }
-
-    /// Call the entry point function.
-    pub fn run(&mut self, args: &[u64]) -> Result<u64> {
-        let pc = self
-            .entry_point()
-            .ok_or_else(|| VmError::FunctionNotFound("no entry point".to_string()))?
             .pc;
         self.call_pc(pc, args)
     }

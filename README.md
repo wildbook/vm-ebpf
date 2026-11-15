@@ -65,7 +65,7 @@ let result = program.call("run", &[42])?;
 ```
 
 `load_elf` parses and links a single module. For multi-module programs, call
-`Vm::load_module` for each object and `Vm::link` with the set of modules.
+`Vm::parse_module` for each object and `Vm::link` with the set of modules.
 
 Registering a helper again replaces it everywhere: programs linked earlier
 pick up the change at their next call, and helper calls themselves take no
@@ -97,7 +97,7 @@ runs.
 
 ## Linking
 
-`Linker::link` places code and data sections, resolves relocations between
+`Vm::link` places code and data sections, resolves relocations between
 modules, binds the remaining calls to numeric helper IDs, and applies CO-RE
 relocations. A call is bound to a slot in the program's extern table at link
 time; linking fails if a named extern has no matching helper or module

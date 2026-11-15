@@ -9,13 +9,10 @@ pub type Result<T> = std::result::Result<T, VmError>;
 #[derive(Debug)]
 pub enum VmError {
     /// ELF parsing error.
-    Elf(ElfError),
+    Elf(String),
 
     /// BTF parsing error.
     Btf(btf::BtfError),
-
-    /// CO-RE relocation error.
-    CoreRelo(btf::CoreReloError),
 
     /// Linking error.
     Link(LinkError),
@@ -29,14 +26,8 @@ pub enum VmError {
     /// Memory access error.
     Memory(MemoryError),
 
-    /// Module not found.
-    ModuleNotFound(String),
-
     /// Function not found.
     FunctionNotFound(String),
-
-    /// Symbol not found.
-    SymbolNotFound(String),
 
     /// Invalid argument.
     InvalidArgument(String),
@@ -51,16 +42,13 @@ pub enum VmError {
 impl fmt::Display for VmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Elf(e) => write!(f, "ELF error: {e}"),
+            Self::Elf(msg) => write!(f, "ELF error: {msg}"),
             Self::Btf(e) => write!(f, "BTF error: {e}"),
-            Self::CoreRelo(e) => write!(f, "CO-RE relocation error: {e}"),
             Self::Link(e) => write!(f, "link error: {e}"),
             Self::Exec(e) => write!(f, "execution error: {e}"),
             Self::Helper(e) => write!(f, "helper error: {e}"),
             Self::Memory(e) => write!(f, "memory error: {e}"),
-            Self::ModuleNotFound(name) => write!(f, "module not found: {name}"),
             Self::FunctionNotFound(name) => write!(f, "function not found: {name}"),
-            Self::SymbolNotFound(name) => write!(f, "symbol not found: {name}"),
             Self::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
             Self::PluginBusy(name) => write!(f, "plugin {name} is already running a call"),
             Self::PluginUnloaded(name) => write!(f, "plugin {name} was unloaded"),
@@ -72,7 +60,6 @@ impl std::error::Error for VmError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Btf(e) => Some(e),
-            Self::CoreRelo(e) => Some(e),
             _ => None,
         }
     }
@@ -81,18 +68,6 @@ impl std::error::Error for VmError {
 impl From<btf::BtfError> for VmError {
     fn from(e: btf::BtfError) -> Self {
         Self::Btf(e)
-    }
-}
-
-impl From<btf::CoreReloError> for VmError {
-    fn from(e: btf::CoreReloError) -> Self {
-        Self::CoreRelo(e)
-    }
-}
-
-impl From<ElfError> for VmError {
-    fn from(e: ElfError) -> Self {
-        Self::Elf(e)
     }
 }
 
@@ -120,32 +95,6 @@ impl From<MemoryError> for VmError {
     }
 }
 
-/// ELF loading errors.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ElfError {
-    /// Invalid ELF format.
-    InvalidFormat(String),
-    /// Section not found.
-    SectionNotFound(String),
-    /// Invalid relocation.
-    InvalidRelocation(String),
-    /// Unsupported feature.
-    Unsupported(String),
-}
-
-impl fmt::Display for ElfError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidFormat(msg) => write!(f, "invalid ELF format: {msg}"),
-            Self::SectionNotFound(name) => write!(f, "section not found: {name}"),
-            Self::InvalidRelocation(msg) => write!(f, "invalid relocation: {msg}"),
-            Self::Unsupported(msg) => write!(f, "unsupported: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for ElfError {}
-
 /// Linking errors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkError {
@@ -159,8 +108,6 @@ pub enum LinkError {
     MapMismatch(String),
     /// Duplicate symbol.
     DuplicateSymbol(String),
-    /// Circular dependency.
-    CircularDependency(String),
     /// Invalid reference.
     InvalidReference(String),
 }
@@ -178,7 +125,6 @@ impl fmt::Display for LinkError {
             }
             Self::MapMismatch(name) => write!(f, "shared map {name} is declared with a different layout"),
             Self::DuplicateSymbol(name) => write!(f, "duplicate symbol: {name}"),
-            Self::CircularDependency(msg) => write!(f, "circular dependency: {msg}"),
             Self::InvalidReference(msg) => write!(f, "invalid reference: {msg}"),
         }
     }
@@ -227,8 +173,6 @@ pub enum HelperError {
     UnknownSlot(u32),
     /// Helper returned an error.
     Failed(String),
-    /// Invalid arguments.
-    InvalidArgs(String),
 }
 
 impl fmt::Display for HelperError {
@@ -237,38 +181,22 @@ impl fmt::Display for HelperError {
             Self::UnknownHelper(id) => write!(f, "unknown helper: {id}"),
             Self::UnknownSlot(slot) => write!(f, "unknown extern slot: {slot}"),
             Self::Failed(msg) => write!(f, "helper failed: {msg}"),
-            Self::InvalidArgs(msg) => write!(f, "invalid arguments: {msg}"),
         }
     }
 }
 
 impl std::error::Error for HelperError {}
 
-/// Memory access errors.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MemoryError {
-    /// Out of bounds access.
-    OutOfBounds { addr: u64, size: usize },
-    /// Alignment error.
-    Alignment { addr: u64, required: usize },
-    /// Read-only memory.
-    ReadOnly { addr: u64 },
-    /// Allocation failed.
-    AllocationFailed { size: usize },
+/// Out of bounds guest memory access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryError {
+    pub addr: u64,
+    pub size: usize,
 }
 
 impl fmt::Display for MemoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::OutOfBounds { addr, size } => {
-                write!(f, "out of bounds: addr=0x{addr:x}, size={size}")
-            }
-            Self::Alignment { addr, required } => {
-                write!(f, "alignment error: addr=0x{addr:x}, required={required}")
-            }
-            Self::ReadOnly { addr } => write!(f, "read-only memory: addr=0x{addr:x}"),
-            Self::AllocationFailed { size } => write!(f, "allocation failed: size={size}"),
-        }
+        write!(f, "out of bounds: addr=0x{:x}, size={}", self.addr, self.size)
     }
 }
 

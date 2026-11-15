@@ -1,23 +1,9 @@
 //! Helper function support for the eBPF VM.
 //!
 //! This module provides type-safe helper function registration and dispatch.
-//!
-//! # Example
-//!
-//! ```ignore
-//! use rvm::{Vm, HelperFn};
-//!
-//! fn my_print(arg: u64) -> u64 {
-//!     println!("Value: {}", arg);
-//!     0
-//! }
-//!
-//! let mut vm = Vm::new();
-//! vm.register_helper(1, HelperFn::new(my_print));
-//! ```
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use hashbrown::HashMap;
 
@@ -53,48 +39,16 @@ impl HelperArgs {
             r5: regs[5],
         }
     }
-
-    /// Get argument by index (0-4 for r1-r5).
-    pub fn arg(&self, idx: usize) -> u64 {
-        match idx {
-            0 => self.r1,
-            1 => self.r2,
-            2 => self.r3,
-            3 => self.r4,
-            4 => self.r5,
-            _ => 0,
-        }
-    }
 }
 
 /// Context available to helper functions.
 pub struct HelperContext<'a, M = VmMemory> {
     /// Helper arguments (r1-r5).
     pub args: HelperArgs,
-    /// Memory access (if available).
-    pub memory: Option<&'a mut M>,
+    /// Memory access.
+    pub memory: &'a mut M,
     /// The calling program's maps (if it has any).
     pub maps: Option<&'a mut Maps>,
-}
-
-impl<'a, M> HelperContext<'a, M> {
-    /// Create a new helper context.
-    pub fn new(args: HelperArgs) -> Self {
-        Self {
-            args,
-            memory: None,
-            maps: None,
-        }
-    }
-
-    /// Create a helper context with memory access.
-    pub fn with_memory(args: HelperArgs, memory: &'a mut M) -> Self {
-        Self {
-            args,
-            memory: Some(memory),
-            maps: None,
-        }
-    }
 }
 
 /// Trait for extracting typed arguments from helper args.
@@ -211,66 +165,6 @@ impl<T: IntoReturn, E> IntoReturn for Result<T, E> {
             Err(_) => u64::MAX, // -1 in two's complement
         }
     }
-}
-
-/// Type-erased helper function.
-pub type DynHelper<M = VmMemory> = Arc<dyn Fn(&mut HelperContext<M>) -> Result<u64, HelperError> + Send + Sync>;
-
-/// A wrapper for type-safe helper functions.
-///
-/// This allows registering functions with typed signatures while storing
-/// them uniformly in the VM.
-pub struct HelperFn<F, A, R> {
-    func: F,
-    _marker: std::marker::PhantomData<(A, R)>,
-}
-
-impl<F, A, R> HelperFn<F, A, R>
-where
-    F: Fn(A) -> R,
-    A: FromArgs,
-    R: IntoReturn,
-{
-    /// Create a new helper function wrapper.
-    pub fn new(func: F) -> Self {
-        Self {
-            func,
-            _marker: std::marker::PhantomData,
-        }
-    }
-
-    /// Call the helper function.
-    pub fn call(&self, args: &HelperArgs) -> u64 {
-        let typed_args = A::from_args(args);
-        let result = (self.func)(typed_args);
-        result.into_return()
-    }
-}
-
-/// Convert a typed function into a dynamic helper.
-pub fn into_dyn_helper<M: 'static, F, A, R>(func: F) -> DynHelper<M>
-where
-    F: Fn(A) -> R + Send + Sync + 'static,
-    A: FromArgs + 'static,
-    R: IntoReturn + 'static,
-{
-    Arc::new(move |ctx: &mut HelperContext<M>| {
-        let typed_args = A::from_args(&ctx.args);
-        let result = func(typed_args);
-        Ok(result.into_return())
-    })
-}
-
-/// Convert a function that takes HelperContext into a dynamic helper.
-pub fn into_dyn_helper_with_ctx<M: 'static, F, R>(func: F) -> DynHelper<M>
-where
-    F: Fn(&mut HelperContext<M>) -> R + Send + Sync + 'static,
-    R: IntoReturn + 'static,
-{
-    Arc::new(move |ctx: &mut HelperContext<M>| {
-        let result = func(ctx);
-        Ok(result.into_return())
-    })
 }
 
 /// A registered function, called directly through `call` with `data` as its closure.
@@ -405,13 +299,6 @@ impl<M: 'static> HelperRegistry<M> {
         self.by_id.insert(id, slot);
     }
 
-    /// Register a raw dynamic helper by ID.
-    pub fn register_raw(&mut self, id: u32, helper: DynHelper<M>) {
-        let slot = self.by_id.get(&id).copied();
-        let slot = self.put(slot, Slot::new(move |ctx| helper(ctx)), None);
-        self.by_id.insert(id, slot);
-    }
-
     /// Register an extern function by name.
     pub fn register_fn<F, A, R>(&mut self, name: impl Into<String>, func: F)
     where
@@ -425,23 +312,14 @@ impl<M: 'static> HelperRegistry<M> {
         self.by_name.insert(name, slot);
     }
 
-    /// Register an extern function by name that needs access to the context.
-    pub fn register_fn_with_ctx<F, R>(&mut self, name: impl Into<String>, func: F)
+    /// Register a raw extern function by name, called directly with the context.
+    pub fn register_fn_raw<F>(&mut self, name: impl Into<String>, func: F)
     where
-        F: Fn(&mut HelperContext<M>) -> R + Send + Sync + 'static,
-        R: IntoReturn + 'static,
+        F: Fn(&mut HelperContext<M>) -> Result<u64, HelperError> + Send + Sync + 'static,
     {
         let name = name.into();
         let slot = self.by_name.get(&name).copied();
-        let slot = self.put(slot, Slot::new(move |ctx| Ok(func(ctx).into_return())), None);
-        self.by_name.insert(name, slot);
-    }
-
-    /// Register a raw dynamic extern function by name.
-    pub fn register_fn_raw(&mut self, name: impl Into<String>, helper: DynHelper<M>) {
-        let name = name.into();
-        let slot = self.by_name.get(&name).copied();
-        let slot = self.put(slot, Slot::new(move |ctx| helper(ctx)), None);
+        let slot = self.put(slot, Slot::new(func), None);
         self.by_name.insert(name, slot);
     }
 
@@ -494,21 +372,6 @@ impl<M: 'static> HelperRegistry<M> {
     pub fn has(&self, id: u32) -> bool {
         self.by_id.contains_key(&id)
     }
-
-    /// Check if a named extern function is registered.
-    pub fn has_fn(&self, name: &str) -> bool {
-        self.by_name.contains_key(name)
-    }
-
-    /// Number of slots.
-    pub fn len(&self) -> usize {
-        self.slots.len()
-    }
-
-    /// Check if the registry is empty.
-    pub fn is_empty(&self) -> bool {
-        self.slots.is_empty()
-    }
 }
 
 impl<M> std::fmt::Debug for HelperRegistry<M> {
@@ -541,11 +404,6 @@ impl SharedHelpers {
         result
     }
 
-    /// Read the table.
-    pub fn read(&self) -> RwLockReadGuard<'_, HelperRegistry> {
-        self.registry.read().unwrap_or_else(PoisonError::into_inner)
-    }
-
     /// The current version.
     #[inline]
     pub fn version(&self) -> u64 {
@@ -554,55 +412,7 @@ impl SharedHelpers {
 
     /// A copy of the table and the version it belongs to.
     pub fn snapshot(&self) -> (HelperRegistry, u64) {
-        let registry = self.read();
+        let registry = self.registry.read().unwrap_or_else(PoisonError::into_inner);
         (registry.clone(), self.version())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_from_args() {
-        let args = HelperArgs::new(1, 2, 3, 4, 5);
-
-        assert_eq!(<u64>::from_args(&args), 1);
-        assert_eq!(<(u64, u64)>::from_args(&args), (1, 2));
-        assert_eq!(<(u64, u64, u64)>::from_args(&args), (1, 2, 3));
-    }
-
-    #[test]
-    fn test_into_return() {
-        assert_eq!(42u64.into_return(), 42);
-        assert_eq!(42u32.into_return(), 42);
-        assert_eq!((-1i64).into_return(), u64::MAX);
-        assert_eq!(true.into_return(), 1);
-        assert_eq!(false.into_return(), 0);
-    }
-
-    #[test]
-    fn test_helper_fn() {
-        let helper = HelperFn::new(|(a, b): (u64, u64)| a + b);
-        let args = HelperArgs::new(10, 20, 0, 0, 0);
-        assert_eq!(helper.call(&args), 30);
-    }
-
-    #[test]
-    fn test_helper_registry() {
-        let mut registry = HelperRegistry::new();
-
-        registry.register(1, |x: u64| x * 2);
-        registry.register(2, |(a, b): (u64, u64)| a + b);
-
-        let args1 = HelperArgs::new(21, 0, 0, 0, 0);
-        let args2 = HelperArgs::new(10, 20, 0, 0, 0);
-
-        let mut ctx1 = HelperContext::new(args1);
-        let mut ctx2 = HelperContext::new(args2);
-
-        assert_eq!(registry.call(1, &mut ctx1).unwrap(), 42);
-        assert_eq!(registry.call(2, &mut ctx2).unwrap(), 30);
-        assert!(registry.call(99, &mut ctx1).is_err());
     }
 }

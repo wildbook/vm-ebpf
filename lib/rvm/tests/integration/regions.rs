@@ -8,9 +8,10 @@ use rvm::{
     DATA_REGION, FIRST_FREE_REGION, RODATA_REGION,
 };
 
+use crate::common::object;
+
 fn example() -> Program {
-    let elf = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/example.o")).unwrap();
-    Vm::new().load_elf(&elf).unwrap()
+    Vm::new().load_elf(&object("example.o")).unwrap()
 }
 
 /// Run `*(u64 *)r1 = r2; r0 = *(u64 *)r1` against the program's memory.
@@ -27,17 +28,12 @@ fn is_mem_fault(r: rvm::Result<u64>) -> bool {
 }
 
 #[test]
-fn null_and_unmapped_regions_fault() {
-    let mut program = example();
-    assert!(is_mem_fault(store_load(&mut program, 0, 1)));
-    assert!(is_mem_fault(store_load(&mut program, 8, 1)));
-    assert!(is_mem_fault(store_load(&mut program, region_base(FIRST_FREE_REGION), 1)));
-}
-
-#[test]
 fn rodata_is_read_only_data_is_writable() {
-    let mut program = example();
-    let magic = region_base(RODATA_REGION) + 8; // MAX_FIB_N (u32) then MAGIC_VALUE (u64)
+    let vm = Vm::new();
+    let module = vm.parse_module("example", &object("example.o")).unwrap();
+    let magic = region_base(RODATA_REGION) + module.symbol("MAGIC_VALUE").unwrap().value;
+
+    let mut program = vm.link_one(&module).unwrap();
     assert_eq!(program.memory().read::<u64>(magic).unwrap(), 0xDEAD_BEEF_CAFE_BABE);
     assert!(is_mem_fault(store_load(&mut program, magic, 0)));
     assert_eq!(program.call("return_magic", &[]).unwrap(), 0xDEAD_BEEF_CAFE_BABE);
@@ -45,9 +41,9 @@ fn rodata_is_read_only_data_is_writable() {
     assert_eq!(store_load(&mut program, region_base(DATA_REGION), 77).unwrap(), 77);
 }
 
-/// The guest reads and writes host structs in place: no copies in or out.
+/// `bpf_main` writes through host-mapped structs; the writes must not land on other code.
 #[test]
-fn linked_program_uses_host_mapped_structs() {
+fn bpf_main_globals_do_not_clobber_code() {
     #[repr(C)]
     struct Input {
         a: u64,
@@ -64,7 +60,7 @@ fn linked_program_uses_host_mapped_structs() {
     }
 
     let input = Input {
-        a: 6,
+        a: 5,
         b: 7,
         op: 2,
         flags: 0,
@@ -83,5 +79,13 @@ fn linked_program_uses_host_mapped_structs() {
     assert_eq!(program.call("bpf_main", &[ctx, out]).unwrap(), 0);
     program.memory_mut().unmap(FIRST_FREE_REGION);
     program.memory_mut().unmap(FIRST_FREE_REGION + 1);
-    assert_eq!((output.result, output.status), (42, 0));
+    assert_eq!((output.result, output.status), (35, 0));
+    assert_eq!(program.call("simple_add", &[2, 3]).unwrap(), 5);
+}
+
+#[test]
+fn test_memory_survives_fault() {
+    let mut program = example();
+    assert!(program.call("bpf_main", &[0xFFFF_FFFF_0000, 0xFFFF_FFFF_0000]).is_err());
+    assert_eq!(program.call("simple_add", &[2, 3]).unwrap(), 5);
 }

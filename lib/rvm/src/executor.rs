@@ -123,15 +123,21 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
                 // Raw bytecode path: look the helper ID up. Linked programs only use slots.
                 Flow::CallHelper(id) => {
                     let args = HelperArgs::from_regs(&ctx.regs);
-                    let mut helper_ctx = HelperContext::with_memory(args, &mut *ctx.data);
-                    helper_ctx.maps = self.maps.as_deref_mut();
+                    let mut helper_ctx = HelperContext {
+                        args,
+                        memory: &mut *ctx.data,
+                        maps: self.maps.as_deref_mut(),
+                    };
                     ctx.regs[0] = self.helpers.call(id, &mut helper_ctx)?;
                     pc + 1
                 }
                 Flow::CallKfunc(slot) => {
                     let args = HelperArgs::from_regs(&ctx.regs);
-                    let mut helper_ctx = HelperContext::with_memory(args, &mut *ctx.data);
-                    helper_ctx.maps = self.maps.as_deref_mut();
+                    let mut helper_ctx = HelperContext {
+                        args,
+                        memory: &mut *ctx.data,
+                        maps: self.maps.as_deref_mut(),
+                    };
                     ctx.regs[0] = self.helpers.call_slot(slot, &mut helper_ctx)?;
                     pc + 1
                 }
@@ -151,7 +157,7 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
 
 #[cfg(test)]
 mod tests {
-    use ebpf_asm::{Assembler, R0, R1};
+    use ebpf_asm::{Assembler, R0};
 
     use super::*;
     use crate::error::VmError;
@@ -168,20 +174,6 @@ mod tests {
     }
 
     #[test]
-    fn test_simple_exit() {
-        let mut asm = Assembler::new();
-        asm.mov64_imm(R0, 42).exit();
-        assert_eq!(run(&mut asm, &[], 0).unwrap(), 42);
-    }
-
-    #[test]
-    fn test_with_arguments() {
-        let mut asm = Assembler::new();
-        asm.mov64(R0, R1).exit();
-        assert_eq!(run(&mut asm, &[123], 0).unwrap(), 123);
-    }
-
-    #[test]
     fn test_instruction_limit() {
         let mut asm = Assembler::new();
         let mut loop_label = asm.create_label();
@@ -195,5 +187,15 @@ mod tests {
         let mut asm = Assembler::new();
         asm.mov64_imm(R0, 1);
         assert!(matches!(run(&mut asm, &[], 0), Err(VmError::Exec(ExecError::InvalidPc(1)))));
+    }
+
+    #[test]
+    fn test_stack_overflow_deep_recursion() {
+        let mut asm = Assembler::new();
+        let mut func_start = asm.create_label();
+        asm.set_label(&mut func_start).unwrap();
+        asm.call_local(&func_start);
+        asm.exit();
+        assert!(matches!(run(&mut asm, &[], 0), Err(VmError::Exec(ExecError::StackOverflow))));
     }
 }

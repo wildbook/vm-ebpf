@@ -8,6 +8,7 @@ use std::sync::LazyLock;
 use std::time::Instant;
 
 use crate::helper::{HelperContext, HelperRegistry};
+use crate::maps::{BPF_FUNC_MAP_DELETE_ELEM, BPF_FUNC_MAP_LOOKUP_ELEM, BPF_FUNC_MAP_UPDATE_ELEM};
 use crate::memory::VmMemory;
 
 /// `u64 bpf_ktime_get_ns(void)`
@@ -20,9 +21,9 @@ pub const BPF_FUNC_GET_PRANDOM_U32: u32 = 7;
 /// Name of a standard helper ID, for error messages.
 pub fn helper_name(id: u32) -> Option<&'static str> {
     Some(match id {
-        1 => "map_lookup_elem",
-        2 => "map_update_elem",
-        3 => "map_delete_elem",
+        BPF_FUNC_MAP_LOOKUP_ELEM => "map_lookup_elem",
+        BPF_FUNC_MAP_UPDATE_ELEM => "map_update_elem",
+        BPF_FUNC_MAP_DELETE_ELEM => "map_delete_elem",
         BPF_FUNC_KTIME_GET_NS => "ktime_get_ns",
         BPF_FUNC_TRACE_PRINTK => "trace_printk",
         BPF_FUNC_GET_PRANDOM_U32 => "get_prandom_u32",
@@ -64,13 +65,10 @@ pub fn register_random(helpers: &mut HelperRegistry) {
 pub fn register_print(helpers: &mut HelperRegistry, sink: impl Fn(&str) + Send + Sync + 'static) {
     helpers.register_with_ctx(BPF_FUNC_TRACE_PRINTK, move |ctx: &mut HelperContext| -> i64 {
         const EINVAL: i64 = 22;
-        let Some(mem) = ctx.memory.as_deref() else {
+        let Ok(fmt) = ctx.memory.bytes(ctx.args.r1, ctx.args.r2 as usize) else {
             return -EINVAL;
         };
-        let Ok(fmt) = mem.bytes(ctx.args.r1, ctx.args.r2 as usize) else {
-            return -EINVAL;
-        };
-        let line = format(mem, fmt, [ctx.args.r3, ctx.args.r4, ctx.args.r5]);
+        let line = format(ctx.memory, fmt, [ctx.args.r3, ctx.args.r4, ctx.args.r5]);
         sink(line.trim_end_matches('\n'));
         line.len() as i64
     });

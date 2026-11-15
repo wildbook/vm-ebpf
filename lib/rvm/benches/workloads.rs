@@ -64,7 +64,9 @@ fn guest(c: &mut Criterion) {
         records.extend([(i % 4) as u8, n]);
         records.extend((0..n).map(|j| j.wrapping_mul(31)));
     }
-    let buf = program.memory_mut().map_bytes(FIRST_FREE_REGION, &records, BUF, Perms::R);
+    let buf = program
+        .memory_mut()
+        .map_bytes(FIRST_FREE_REGION, &records, BUF, Perms::R);
 
     let mut group = c.benchmark_group("guest");
     group.throughput(Throughput::Bytes(records.len() as u64));

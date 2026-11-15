@@ -107,7 +107,7 @@ fn print_module_info(module: &Module) {
     if !module.imports.is_empty() {
         println!("\n=== Imports ===");
         for import in &module.imports {
-            println!("  {}", import.name);
+            println!("  {import}");
         }
     }
 

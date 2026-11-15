@@ -6,20 +6,12 @@
 //! Code and data live in separate address spaces. Code sections are concatenated
 //! into one instruction array (addressed by byte offset during linking, by
 //! instruction index at runtime) that the guest cannot read or write. Data
-//! sections go into guest memory regions:
-//!
-//! | Region | Contents | Guest perms |
-//! |---|---|---|
-//! | 0 | unmapped (null) | - |
-//! | [`STACK_REGION`] | stack, one frame per call level | RW |
-//! | [`RODATA_REGION`] | `.rodata*` | R |
-//! | [`DATA_REGION`] | `.data*`, `.bss*` | RW |
-//! | [`MAPS_REGION`] | map values | RW |
-//! | [`FIRST_FREE_REGION`].. | free for the host | - |
+//! sections go into guest memory regions; see [`crate::layout`] for the complete
+//! table.
 
 use std::sync::Arc;
 
-use btf::{apply_core_relocations, Btf, BtfTypeInfo};
+use btf::{apply_core_relocations, Btf, BtfTypeInfo, TypeRegistry};
 use constelf::raw::reloc;
 use hashbrown::HashMap;
 use rvm_core::instructions_from_bytes;
@@ -27,22 +19,13 @@ use rvm_core::instructions_from_bytes;
 use crate::error::{LinkError, Result, VmError};
 use crate::executor::MAX_CALL_DEPTH;
 use crate::helper::{HelperRegistry, SharedHelpers};
-use crate::maps::{self, map_defs, MapDef, Maps, SharedMaps, MAPS_REGION};
+use crate::layout::{DATA_REGION, MAPS_REGION, RODATA_REGION, STACK_REGION};
+use crate::maps::{map_defs, MapDef, Maps, SharedMaps};
 use crate::memory::{region_base, Perms, SharedRegion, VmMemory};
 use crate::module::{Module, Relocation};
 use crate::program::{Borrow, FunctionInfo, Program};
 use crate::section::{Section, SectionKind};
-use crate::types::TypeRegistry;
 use crate::vm::VmConfig;
-
-/// Guest region holding the stack.
-pub const STACK_REGION: usize = 1;
-/// Guest region holding read-only data.
-pub const RODATA_REGION: usize = 2;
-/// Guest region holding writable data and bss.
-pub const DATA_REGION: usize = 3;
-/// First region index the linker leaves free for the host.
-pub const FIRST_FREE_REGION: usize = MAPS_REGION + 1;
 
 /// `src_reg` of a call into the extern table (`imm` = slot).
 const BPF_PSEUDO_KFUNC_CALL: u8 = 2;
@@ -123,7 +106,7 @@ impl<'a> Linker<'a> {
     }
 
     /// Link multiple modules into a single program.
-    pub fn link(&self, modules: &[&Module]) -> Result<Program> {
+    pub fn link<'m>(&self, modules: &[&'m Module]) -> Result<Program> {
         if modules.is_empty() {
             return Err(VmError::InvalidArgument("no modules to link".to_string()));
         }
@@ -131,13 +114,19 @@ impl<'a> Linker<'a> {
         // Bind against one version of the table; the program refreshes from there.
         let (helpers, version) = self.helpers.snapshot();
 
+        // Each module's BTF, parsed once and shared by every pass below.
+        let btfs = modules
+            .iter()
+            .map(|m| m.btf_data.as_deref().map(Btf::parse).transpose())
+            .collect::<std::result::Result<Vec<Option<Btf<'m>>>, _>>()?;
+
         let (mut image, layouts) = Self::lay_out(modules);
         let global_symbols = Self::build_symbol_table(modules, &layouts)?;
-        Self::check_extern_signatures(&helpers, modules)?;
+        Self::check_extern_signatures(&helpers, &btfs)?;
 
         let mut defs = Vec::new();
-        for module in modules {
-            for def in map_defs(module)? {
+        for (module, btf) in modules.iter().zip(&btfs) {
+            for def in map_defs(module, btf.as_ref())? {
                 if defs.iter().any(|d: &MapDef| d.name == def.name) {
                     return Err(LinkError::DuplicateSymbol(def.name).into());
                 }
@@ -153,16 +142,18 @@ impl<'a> Linker<'a> {
             }
         }
         Self::bind_helper_calls(&helpers, &mut image)?;
-        self.apply_core_relocations(modules, &layouts, &mut image);
+        self.apply_core_relocations(modules, &layouts, &btfs, &mut image);
 
-        let functions = Self::build_function_table(modules, &layouts)?;
+        let functions = Self::build_function_table(modules, &layouts, &btfs)?;
 
         let mut memory = VmMemory::new();
-        let stack_len = self.config.stack_size * (MAX_CALL_DEPTH + 1);
-        let stack_top = memory.map(STACK_REGION, stack_len, Perms::RW) + stack_len as u64;
+        let stack_len = self.config.frame_size * (MAX_CALL_DEPTH + 1);
+        memory.map(STACK_REGION, stack_len, Perms::RW);
         memory.map_bytes(RODATA_REGION, &image.rodata, image.rodata.len(), Perms::R);
         memory.map_bytes(DATA_REGION, &image.data, image.data.len(), Perms::RW);
-        maps::map_region(&mut memory, maps_len);
+        if maps_len != 0 {
+            memory.map(MAPS_REGION, maps_len, Perms::RW);
+        }
         // SAFETY: the callers of `Vm::share_map`/`Vm::share_region` accepted the
         // `map_shared` contract.
         unsafe {
@@ -176,18 +167,7 @@ impl<'a> Linker<'a> {
 
         let code = instructions_from_bytes(&image.code);
 
-        Ok(Program::new(
-            code,
-            memory,
-            maps,
-            functions,
-            stack_top,
-            self.helpers.clone(),
-            helpers,
-            version,
-            self.config.instruction_limit,
-            self.config.stack_size as u64,
-        ))
+        Ok(Program::new(code, memory, maps, functions, self.helpers.clone(), (helpers, version), self.config))
     }
 
     /// Place every allocatable section and copy its contents into the image.
@@ -231,13 +211,10 @@ impl<'a> Linker<'a> {
     /// Compare each host-bound extern's BTF prototype with the registered function's
     /// argument count. Modules without BTF and host functions without a known arity
     /// (raw and context helpers) are not checked.
-    fn check_extern_signatures(helpers: &HelperRegistry, modules: &[&Module]) -> Result<()> {
+    fn check_extern_signatures(helpers: &HelperRegistry, btfs: &[Option<Btf<'_>>]) -> Result<()> {
         const BTF_FUNC_EXTERN: u16 = 2;
 
-        for module in modules {
-            let Some(btf) = module.btf_data.as_deref().and_then(|data| Btf::parse(data).ok()) else {
-                continue;
-            };
+        for btf in btfs.iter().flatten() {
             for (_, ty) in btf.types() {
                 let BtfTypeInfo::Func {
                     name,
@@ -391,12 +368,15 @@ impl<'a> Linker<'a> {
     }
 
     /// Apply CO-RE relocations. Failures leave the compile-time values in place.
-    fn apply_core_relocations(&self, modules: &[&Module], layouts: &[ModuleLayout], image: &mut Image) {
-        for (module, layout) in modules.iter().zip(layouts) {
-            let (Some(btf_data), Some(btf_ext_data)) = (&module.btf_data, &module.btf_ext_data) else {
-                continue;
-            };
-            let Ok(btf) = Btf::parse(btf_data) else {
+    fn apply_core_relocations(
+        &self,
+        modules: &[&Module],
+        layouts: &[ModuleLayout],
+        btfs: &[Option<Btf<'_>>],
+        image: &mut Image,
+    ) {
+        for ((module, layout), btf) in modules.iter().zip(layouts).zip(btfs) {
+            let (Some(btf), Some(btf_ext_data)) = (btf, &module.btf_ext_data) else {
                 continue;
             };
             let Ok(btf_ext) = btf::BtfExt::parse(btf_ext_data, btf.strings()) else {
@@ -423,7 +403,7 @@ impl<'a> Linker<'a> {
                     .iter()
                     .map(|w| u64::from_le_bytes(*w))
                     .collect();
-                let _ = apply_core_relocations(&mut insns, &btf, self.types, relos);
+                let _ = apply_core_relocations(&mut insns, btf, self.types, relos);
                 for (dst, insn) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(&insns) {
                     *dst = insn.to_le_bytes();
                 }
@@ -432,10 +412,14 @@ impl<'a> Linker<'a> {
     }
 
     /// Build the function table.
-    fn build_function_table(modules: &[&Module], layouts: &[ModuleLayout]) -> Result<HashMap<String, FunctionInfo>> {
+    fn build_function_table(
+        modules: &[&Module],
+        layouts: &[ModuleLayout],
+        btfs: &[Option<Btf<'_>>],
+    ) -> Result<HashMap<String, FunctionInfo>> {
         let mut functions = HashMap::new();
-        for (module, layout) in modules.iter().zip(layouts) {
-            let borrows = Self::borrows(module)?;
+        for ((module, layout), btf) in modules.iter().zip(layouts).zip(btfs) {
+            let borrows = Self::borrows(btf.as_ref())?;
             for (name, export) in module.exports.iter().filter(|(_, e)| e.is_function) {
                 let Some(Addr::Code(at)) = layout
                     .sections
@@ -475,9 +459,9 @@ impl<'a> Linker<'a> {
     }
 
     /// `borrow:N` / `borrow_ro:N` decl tags on function parameters, by function name.
-    fn borrows(module: &Module) -> Result<HashMap<String, Vec<Borrow>>> {
+    fn borrows(btf: Option<&Btf<'_>>) -> Result<HashMap<String, Vec<Borrow>>> {
         let mut borrows: HashMap<String, Vec<Borrow>> = HashMap::new();
-        let Some(btf) = module.btf_data.as_deref().and_then(|data| Btf::parse(data).ok()) else {
+        let Some(btf) = btf else {
             return Ok(borrows);
         };
         for (_, ty) in btf.types() {

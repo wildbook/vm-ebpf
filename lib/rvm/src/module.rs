@@ -10,9 +10,9 @@ use constelf::file::ElfFile;
 use constelf::raw::{reloc, shf, sht, stb, stt};
 use hashbrown::HashMap;
 
-use crate::error::{ElfError, Result};
+use crate::error::{Result, VmError};
 use crate::section::{section_kind_from_name, Section, SectionKind};
-use crate::symbol::{Export, Import, Symbol, SymbolBinding, SymbolKind};
+use crate::symbol::{Export, Symbol, SymbolBinding, SymbolKind};
 
 /// Relocation entry for a module.
 #[derive(Debug, Clone)]
@@ -46,7 +46,7 @@ pub struct Module {
     pub exports: HashMap<String, Export>,
 
     /// Imports (undefined global symbols).
-    pub imports: Vec<Import>,
+    pub imports: Vec<String>,
 
     /// Relocations.
     pub relocations: Vec<Relocation>,
@@ -57,16 +57,13 @@ pub struct Module {
     /// BTF.ext data (if present).
     pub btf_ext_data: Option<Vec<u8>>,
 
-    /// Map from section name to index.
-    section_by_name: HashMap<String, usize>,
-
     /// Map from symbol name to index.
     symbol_by_name: HashMap<String, usize>,
 }
 
 impl Module {
     /// Create a new empty module.
-    pub fn new(name: impl Into<String>) -> Self {
+    fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             sections: Vec::new(),
@@ -76,7 +73,6 @@ impl Module {
             relocations: Vec::new(),
             btf_data: None,
             btf_ext_data: None,
-            section_by_name: HashMap::new(),
             symbol_by_name: HashMap::new(),
         }
     }
@@ -84,11 +80,11 @@ impl Module {
     /// Parse a module from ELF bytes.
     pub fn from_elf(name: impl Into<String>, elf_bytes: &[u8]) -> Result<Self> {
         let name = name.into();
-        let elf = ElfFile::new(elf_bytes).map_err(|e| ElfError::InvalidFormat(format!("{e:?}")))?;
+        let elf = ElfFile::new(elf_bytes).map_err(|e| VmError::Elf(format!("{e:?}")))?;
 
         let elf_sections = elf
             .sections()
-            .map_err(|e| ElfError::InvalidFormat(format!("failed to get sections: {e:?}")))?;
+            .map_err(|e| VmError::Elf(format!("failed to get sections: {e:?}")))?;
 
         let mut module = Self::new(&name);
 
@@ -96,7 +92,7 @@ impl Module {
         for (idx, header) in elf_sections.headers().iter().enumerate() {
             let section_name = elf_sections
                 .name(header)
-                .map_err(|e| ElfError::InvalidFormat(format!("failed to get section name: {e:?}")))?;
+                .map_err(|e| VmError::Elf(format!("failed to get section name: {e:?}")))?;
             let name_str = section_name.to_str().unwrap_or("");
 
             // Determine section kind
@@ -130,20 +126,21 @@ impl Module {
                 Vec::new() // .bss has no data
             } else if let Some(sect) = elf_sections.by_index(idx) {
                 sect.bytes()
-                    .map_err(|e| ElfError::InvalidFormat(format!("failed to get section bytes: {e:?}")))?
+                    .map_err(|e| VmError::Elf(format!("failed to get section bytes: {e:?}")))?
                     .to_vec()
             } else {
                 Vec::new()
             };
 
-            let section = Section::new(name_str, kind)
-                .with_data(data)
-                .with_size(header.sh_size)
-                .with_align(header.sh_addralign.max(1))
-                .with_elf_index(idx);
+            let section = Section {
+                name: name_str.to_string(),
+                kind,
+                data,
+                size: header.sh_size,
+                align: header.sh_addralign.max(1),
+                elf_index: idx,
+            };
 
-            let section_idx = module.sections.len();
-            module.section_by_name.insert(name_str.to_string(), section_idx);
             module.sections.push(section);
         }
 
@@ -192,13 +189,14 @@ impl Module {
                         .position(|s| s.elf_index == sym.st_shndx as usize)
                 };
 
-                let symbol = Symbol::new(&sym_name)
-                    .with_binding(binding)
-                    .with_kind(kind)
-                    .with_value(sym.st_value)
-                    .with_size(sym.st_size);
-
-                let symbol = section_idx.map_or(symbol.clone(), |idx| symbol.with_section(idx));
+                let symbol = Symbol {
+                    name: sym_name.clone(),
+                    binding,
+                    kind,
+                    section_idx,
+                    value: sym.st_value,
+                    size: sym.st_size,
+                };
 
                 if !sym_name.is_empty() {
                     module.symbol_by_name.insert(sym_name.clone(), sym_idx);
@@ -207,7 +205,7 @@ impl Module {
                 // Track exports and imports
                 if symbol.is_export() {
                     if let Some(sect_idx) = section_idx {
-                        let export = Export::new(&sym_name, sect_idx, sym.st_value).with_size(sym.st_size);
+                        let export = Export::new(sect_idx, sym.st_value).with_size(sym.st_size);
                         let export = if kind == SymbolKind::Function {
                             export.as_function()
                         } else {
@@ -215,8 +213,8 @@ impl Module {
                         };
                         module.exports.insert(sym_name.clone(), export);
                     }
-                } else if symbol.is_import() {
-                    module.imports.push(Import::symbol(&sym_name));
+                } else if symbol.is_undefined() {
+                    module.imports.push(sym_name.clone());
                 }
 
                 module.symbols.push(symbol);
@@ -227,7 +225,7 @@ impl Module {
         let mut reloc_iter = elf
             .relocs()
             .iter()
-            .map_err(|e| ElfError::InvalidFormat(format!("failed to get relocations: {e:?}")))?;
+            .map_err(|e| VmError::Elf(format!("failed to get relocations: {e:?}")))?;
 
         loop {
             let (next, chunk) = reloc_iter.into_next();
@@ -247,14 +245,14 @@ impl Module {
             use constelf::relocs::ElfRelocsChunk;
             match chunk
                 .relocs()
-                .map_err(|e| ElfError::InvalidFormat(format!("failed to get relocs: {e:?}")))?
+                .map_err(|e| VmError::Elf(format!("failed to get relocs: {e:?}")))?
             {
                 ElfRelocsChunk::Rel(relocs) => {
                     let data = &module.sections[section_idx].data;
                     for r in relocs {
                         let addend = rel_implicit_addend(data, r.r_offset, r.typ()).ok_or_else(|| {
                             let off = r.r_offset;
-                            ElfError::InvalidFormat(format!("relocation offset {off:#x} out of bounds"))
+                            VmError::Elf(format!("relocation offset {off:#x} out of bounds"))
                         })?;
                         module.relocations.push(Relocation {
                             section_idx,
@@ -283,16 +281,6 @@ impl Module {
         Ok(module)
     }
 
-    /// Get a section by name.
-    pub fn section(&self, name: &str) -> Option<&Section> {
-        self.section_by_name.get(name).map(|&idx| &self.sections[idx])
-    }
-
-    /// Get a section by index.
-    pub fn section_by_idx(&self, idx: usize) -> Option<&Section> {
-        self.sections.get(idx)
-    }
-
     /// Get a symbol by name.
     pub fn symbol(&self, name: &str) -> Option<&Symbol> {
         self.symbol_by_name.get(name).map(|&idx| &self.symbols[idx])
@@ -301,42 +289,6 @@ impl Module {
     /// Get a symbol by index.
     pub fn symbol_by_idx(&self, idx: usize) -> Option<&Symbol> {
         self.symbols.get(idx)
-    }
-
-    /// Check if a symbol is exported.
-    pub fn has_export(&self, name: &str) -> bool {
-        self.exports.contains_key(name)
-    }
-
-    /// Get an export by name.
-    pub fn export(&self, name: &str) -> Option<&Export> {
-        self.exports.get(name)
-    }
-
-    /// Get all code sections.
-    pub fn code_sections(&self) -> impl Iterator<Item = &Section> {
-        self.sections.iter().filter(|s| s.kind == SectionKind::Code)
-    }
-
-    /// Get all data sections (including rodata and bss).
-    pub fn data_sections(&self) -> impl Iterator<Item = &Section> {
-        self.sections
-            .iter()
-            .filter(|s| s.is_allocatable() && !s.is_executable())
-    }
-
-    /// Get total size of allocatable sections.
-    pub fn allocatable_size(&self) -> u64 {
-        self.sections
-            .iter()
-            .filter(|s| s.is_allocatable())
-            .map(|s| s.size)
-            .sum()
-    }
-
-    /// Get function exports.
-    pub fn function_exports(&self) -> impl Iterator<Item = (&String, &Export)> {
-        self.exports.iter().filter(|(_, e)| e.is_function)
     }
 }
 
@@ -359,8 +311,7 @@ impl std::fmt::Display for Module {
         }
         let import_count = self.imports.len();
         writeln!(f, "  Imports: {import_count}")?;
-        for import in &self.imports {
-            let name = &import.name;
+        for name in &self.imports {
             writeln!(f, "    {name}")?;
         }
         let relo_count = self.relocations.len();

@@ -232,15 +232,14 @@ impl VmMemory {
     /// Host pointer to `len` bytes at guest address `addr` whose region allows `need`.
     /// No reference is created, so the bytes may be shared or aliased.
     pub fn host_ptr(&self, addr: u64, len: usize, need: Perms) -> Result<NonNull<u8>, MemoryError> {
-        self.resolve(addr, len, need)
-            .ok_or(MemoryError::OutOfBounds { addr, size: len })
+        self.resolve(addr, len, need).ok_or(MemoryError { addr, size: len })
     }
 
     /// Borrow `len` bytes at guest address `addr` (host access, ignores perms).
     pub fn bytes(&self, addr: u64, len: usize) -> Result<&[u8], MemoryError> {
         let ptr = self
             .resolve(addr, len, Perms::NONE)
-            .ok_or(MemoryError::OutOfBounds { addr, size: len })?;
+            .ok_or(MemoryError { addr, size: len })?;
         // SAFETY: `resolve` checked the range lies inside a live region.
         Ok(unsafe { std::slice::from_raw_parts(ptr.as_ptr(), len) })
     }
@@ -249,7 +248,7 @@ impl VmMemory {
     pub fn bytes_mut(&mut self, addr: u64, len: usize) -> Result<&mut [u8], MemoryError> {
         let ptr = self
             .resolve(addr, len, Perms::NONE)
-            .ok_or(MemoryError::OutOfBounds { addr, size: len })?;
+            .ok_or(MemoryError { addr, size: len })?;
         // SAFETY: as `bytes`; `&mut self` guarantees exclusive access.
         Ok(unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), len) })
     }
@@ -265,10 +264,10 @@ impl VmMemory {
     pub fn copy(&mut self, src: u64, dst: u64, len: usize) -> Result<(), MemoryError> {
         let src = self
             .resolve(src, len, Perms::NONE)
-            .ok_or(MemoryError::OutOfBounds { addr: src, size: len })?;
+            .ok_or(MemoryError { addr: src, size: len })?;
         let dst = self
             .resolve(dst, len, Perms::NONE)
-            .ok_or(MemoryError::OutOfBounds { addr: dst, size: len })?;
+            .ok_or(MemoryError { addr: dst, size: len })?;
         // SAFETY: both ranges are inside live regions; `copy` allows overlap.
         unsafe { std::ptr::copy(src.as_ptr(), dst.as_ptr(), len) };
         Ok(())

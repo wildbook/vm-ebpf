@@ -23,8 +23,8 @@
 //!     .field("pid", 8, 4)
 //!     .size(12);
 //!
-//! // Load and link a module
-//! let module = vm.load_module("main", elf_bytes)?;
+//! // Parse and link a module
+//! let module = vm.parse_module("main", elf_bytes)?;
 //! let program = vm.link(&[&module])?;
 //!
 //! // Execute a function
@@ -33,17 +33,18 @@
 
 use std::sync::{Arc, Mutex};
 
-use hashbrown::HashMap;
+use btf::TypeRegistry;
 
 use crate::error::{Result, VmError};
-use crate::helper::{DynHelper, FromArgs, IntoReturn, SharedHelpers};
-use crate::linker::{Linker, FIRST_FREE_REGION};
+use crate::executor::DEFAULT_FRAME_SIZE;
+use crate::helper::{FromArgs, IntoReturn, SharedHelpers};
+use crate::layout::{BORROW_FIRST_REGION, FIRST_FREE_REGION};
+use crate::linker::Linker;
 use crate::maps::SharedMaps;
 use crate::memory::{Perms, SharedBuffer, SharedRegion, MAX_REGION_LEN};
 use crate::module::Module;
-use crate::plugin::{Plugin, BORROW_FIRST_REGION};
+use crate::plugin::Plugin;
 use crate::program::Program;
-use crate::types::TypeRegistry;
 use crate::{maps, std_helpers};
 
 /// Configuration for the VM.
@@ -51,18 +52,15 @@ use crate::{maps, std_helpers};
 pub struct VmConfig {
     /// Maximum number of instructions to execute (0 = no limit).
     pub instruction_limit: u64,
-    /// Stack size in bytes.
-    pub stack_size: usize,
-    /// Whether to enable debug output.
-    pub debug: bool,
+    /// Stack bytes reserved per call frame.
+    pub frame_size: usize,
 }
 
 impl Default for VmConfig {
     fn default() -> Self {
         Self {
             instruction_limit: 1_000_000,
-            stack_size: 512,
-            debug: false,
+            frame_size: DEFAULT_FRAME_SIZE as usize,
         }
     }
 }
@@ -86,8 +84,6 @@ pub struct Vm {
     types: TypeRegistry,
     /// VM configuration.
     config: VmConfig,
-    /// Loaded modules.
-    modules: HashMap<String, Module>,
 }
 
 impl Default for Vm {
@@ -114,18 +110,7 @@ impl Vm {
             shared_regions: Mutex::default(),
             types: TypeRegistry::new(),
             config,
-            modules: HashMap::new(),
         }
-    }
-
-    /// Get the VM configuration.
-    pub fn config(&self) -> &VmConfig {
-        &self.config
-    }
-
-    /// Get a mutable reference to the VM configuration.
-    pub fn config_mut(&mut self) -> &mut VmConfig {
-        &mut self.config
     }
 
     // =========================================================================
@@ -158,11 +143,6 @@ impl Vm {
         self.helpers.update(|h| h.register(id, func));
     }
 
-    /// Register a raw dynamic helper function.
-    pub fn register_helper_raw(&self, id: u32, helper: DynHelper) {
-        self.helpers.update(|h| h.register_raw(id, helper));
-    }
-
     /// Register an extern function that programs import by name
     /// (`extern u64 name(...);` in C). Unresolved names fail at link time.
     pub fn register_fn<F, A, R>(&self, name: impl Into<String>, func: F)
@@ -187,11 +167,6 @@ impl Vm {
     /// Enable `trace_printk` (helper 6); each formatted line goes to `sink`.
     pub fn enable_print(&self, sink: impl Fn(&str) + Send + Sync + 'static) {
         self.helpers.update(|h| std_helpers::register_print(h, sink));
-    }
-
-    /// The extern table shared with linked programs.
-    pub fn helpers(&self) -> &SharedHelpers {
-        &self.helpers
     }
 
     /// Share maps called `name` between every program linked afterwards: they bind to
@@ -250,48 +225,22 @@ impl Vm {
         &mut self.types
     }
 
-    /// Get an immutable reference to the type registry.
-    pub fn types_ref(&self) -> &TypeRegistry {
-        &self.types
-    }
-
     // =========================================================================
     // Module Loading
     // =========================================================================
 
-    /// Load a module from ELF bytes.
+    /// Parse a module from ELF bytes.
     ///
-    /// The module is parsed but not yet linked. Use `link()` to create
-    /// an executable program from one or more modules.
+    /// The module is not linked yet. Use `link()` to create an executable program
+    /// from one or more modules.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let module = vm.load_module("main", &elf_bytes)?;
+    /// let module = vm.parse_module("main", &elf_bytes)?;
     /// ```
-    pub fn load_module(&mut self, name: &str, elf_bytes: &[u8]) -> Result<&Module> {
-        let module = Module::from_elf(name, elf_bytes)?;
-        self.modules.insert(name.to_string(), module);
-        self.modules
-            .get(name)
-            .ok_or_else(|| VmError::ModuleNotFound(name.to_string()))
-    }
-
-    /// Load a module and return it without storing in the VM.
-    ///
-    /// This is useful when you want to manage module lifetimes yourself.
     pub fn parse_module(&self, name: &str, elf_bytes: &[u8]) -> Result<Module> {
         Module::from_elf(name, elf_bytes)
-    }
-
-    /// Get a loaded module by name.
-    pub fn module(&self, name: &str) -> Option<&Module> {
-        self.modules.get(name)
-    }
-
-    /// Get all loaded modules.
-    pub fn modules(&self) -> impl Iterator<Item = (&String, &Module)> {
-        self.modules.iter()
     }
 
     // =========================================================================
@@ -328,7 +277,7 @@ impl Vm {
     // Convenience Methods
     // =========================================================================
 
-    /// Load, link, and prepare a single ELF file.
+    /// Parse, link, and prepare a single ELF file.
     ///
     /// This is a convenience method that combines `parse_module` and `link`.
     ///
@@ -373,26 +322,6 @@ impl std::fmt::Debug for Vm {
             .field("helpers", &self.helpers)
             .field("types", &format_args!("<TypeRegistry>"))
             .field("config", &self.config)
-            .field("modules", &self.modules.keys().collect::<Vec<_>>())
             .finish()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_type_registration() {
-        let mut vm = Vm::new();
-
-        vm.types()
-            .register_struct("event")
-            .field("timestamp", 0, 8)
-            .field("pid", 8, 4)
-            .size(12);
-
-        assert!(vm.types_ref().has_struct("event"));
-        assert_eq!(vm.types_ref().field_offset("event", "pid"), Some(8));
     }
 }
