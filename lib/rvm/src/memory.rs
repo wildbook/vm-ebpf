@@ -235,8 +235,12 @@ impl VmMemory {
     /// Copy `len` bytes from guest address `src` to `dst`, which may be in different
     /// regions or overlap (host access).
     pub fn copy(&mut self, src: u64, dst: u64, len: usize) -> Result<(), MemoryError> {
-        let src = self.resolve(src, len, Perms::NONE).ok_or(MemoryError::OutOfBounds { addr: src, size: len })?;
-        let dst = self.resolve(dst, len, Perms::NONE).ok_or(MemoryError::OutOfBounds { addr: dst, size: len })?;
+        let src = self
+            .resolve(src, len, Perms::NONE)
+            .ok_or(MemoryError::OutOfBounds { addr: src, size: len })?;
+        let dst = self
+            .resolve(dst, len, Perms::NONE)
+            .ok_or(MemoryError::OutOfBounds { addr: dst, size: len })?;
         // SAFETY: both ranges are inside live regions; `copy` allows overlap.
         unsafe { std::ptr::copy(src.as_ptr(), dst.as_ptr(), len) };
         Ok(())

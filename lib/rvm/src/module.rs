@@ -4,11 +4,11 @@
 //! imports, and exports. Modules are combined by the linker to create an
 //! executable program.
 
-use std::collections::HashMap;
 use std::ffi::CStr;
 
 use constelf::file::ElfFile;
 use constelf::raw::{reloc, shf, sht, stb, stt};
+use hashbrown::HashMap;
 
 use crate::error::{ElfError, Result};
 use crate::section::{section_kind_from_name, Section, SectionKind};

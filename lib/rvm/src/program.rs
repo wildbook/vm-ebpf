@@ -3,9 +3,9 @@
 //! A `Program` is the result of linking one or more `Module`s together.
 //! It contains the executable code, data, and function table.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
+use hashbrown::HashMap;
 use rvm_core::Instruction;
 
 use crate::error::{Result, VmError};

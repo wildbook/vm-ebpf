@@ -16,9 +16,10 @@
 //! vm.register_helper(1, HelperFn::new(my_print));
 //! ```
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
+
+use hashbrown::HashMap;
 
 use crate::error::HelperError;
 use crate::maps::Maps;

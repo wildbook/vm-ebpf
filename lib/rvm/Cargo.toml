@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0"
 rvm-core = { path = "../rvm-core" }
 constelf = { path = "../constelf" }
 btf = { path = "../btf" }
-hashbrown = { version = "0.17.1", default-features = false }
+hashbrown = { version = "0.17.1", default-features = false, features = ["default-hasher"] }
 foldhash = { version = "0.2.0", default-features = false }
 
 [dev-dependencies]

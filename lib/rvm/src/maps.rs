@@ -18,15 +18,13 @@
 //! gets the map's index in this program.
 
 use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
-use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use hashbrown::hash_table::Entry;
-use hashbrown::HashTable;
-
 use btf::{Btf, BtfTypeInfo};
+use hashbrown::hash_table::Entry;
+use hashbrown::{HashMap, HashTable};
 
 use crate::error::{LinkError, Result, VmError};
 use crate::helper::{HelperContext, HelperRegistry};
@@ -292,7 +290,10 @@ impl Maps {
         value: &[u8],
         flags: u64,
     ) -> std::result::Result<(), MapError> {
-        if self.def(handle).is_none_or(|def| value.len() != def.value_size as usize) {
+        if self
+            .def(handle)
+            .is_none_or(|def| value.len() != def.value_size as usize)
+        {
             return Err(MapError::Invalid);
         }
         let addr = self.upsert(handle, key, flags)?;

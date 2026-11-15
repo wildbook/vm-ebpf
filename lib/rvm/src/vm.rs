@@ -31,8 +31,9 @@
 //! let result = program.call("my_func", &[42])?;
 //! ```
 
-use std::collections::HashMap;
 use std::sync::Arc;
+
+use hashbrown::HashMap;
 
 use crate::error::{Result, VmError};
 use crate::helper::{DynHelper, FromArgs, IntoReturn, SharedHelpers};

@@ -17,11 +17,11 @@
 //! | [`MAPS_REGION`] | map values | RW |
 //! | [`FIRST_FREE_REGION`].. | free for the host | - |
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use btf::{apply_core_relocations, Btf, BtfTypeInfo};
 use constelf::raw::reloc;
+use hashbrown::HashMap;
 use rvm_core::instructions_from_bytes;
 
 use crate::error::{LinkError, Result, VmError};

@@ -23,7 +23,7 @@
 //! assert_eq!(offset, Some(8));
 //! ```
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 /// A field within a struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
