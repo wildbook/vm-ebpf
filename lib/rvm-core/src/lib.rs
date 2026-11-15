@@ -375,8 +375,9 @@ mod alu {
             },
             AluOpc::Xor => d ^ s,
             // MOV (offset=0) or MOVSX (offset=8/16/32, register source only; 32 is ALU64-only).
+            // Plain MOV is tested first so the common copy is a branch, not a jump table.
+            AluOpc::Mov if offset == 0 => s,
             AluOpc::Mov => match (offset, alu_src, BITS) {
-                (0, _, _) => s,
                 (8, Source::Reg, _) => s as i8 as i64 as u64,
                 (16, Source::Reg, _) => s as i16 as i64 as u64,
                 (32, Source::Reg, BITS_64) => s as i32 as i64 as u64,
@@ -746,33 +747,36 @@ pub fn step_ld64<M: Memory>(ctx: &mut Context<M>, instr: Instruction, second: In
 /// instruction (both slots of LD_IMM64) consumes one unit of `fuel`.
 #[inline]
 pub fn run<M: Memory>(ctx: &mut Context<M>, code: &[Instruction], pc: &mut u64, fuel: &mut u64) -> Flow<M> {
-    loop {
-        if *fuel == 0 {
-            return Flow::OutOfFuel;
+    // locals, written back once on exit, so the loop never stores through the pointers
+    let (mut p, mut f) = (*pc, *fuel);
+    let flow = loop {
+        if f == 0 {
+            break Flow::OutOfFuel;
         }
-        let Some(&insn) = code.get(*pc as usize) else {
-            return Flow::BadPc;
+        let Some(&insn) = code.get(p as usize) else {
+            break Flow::BadPc;
         };
-        *fuel -= 1;
+        f -= 1;
 
         let flow = match step_by_opcode(ctx, insn) {
             ControlFlow::Break(flow) => flow,
             ControlFlow::Continue(first) => {
-                let Some(&second) = code.get(*pc as usize + 1) else {
-                    *pc += 1;
-                    return Flow::BadPc;
+                p += 1;
+                let Some(&second) = code.get(p as usize) else {
+                    break Flow::BadPc;
                 };
-                *pc += 1;
-                *fuel = fuel.saturating_sub(1);
+                f = f.saturating_sub(1);
                 step_ld64(ctx, first, second)
             }
         };
 
         match flow {
-            Flow::Next => *pc += 1,
+            Flow::Next => p += 1,
             // a negative target wraps to a huge pc and fails the next fetch
-            Flow::Jump(offset) => *pc = pc.wrapping_add_signed(offset + 1),
-            other => return other,
+            Flow::Jump(offset) => p = p.wrapping_add_signed(offset + 1),
+            other => break other,
         }
-    }
+    };
+    (*pc, *fuel) = (p, f);
+    flow
 }
