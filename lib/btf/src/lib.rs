@@ -15,7 +15,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use btf::{Btf, BtfBuilder};
+//! use btf::{Btf, BtfBuilder, BtfExt};
 //!
 //! // Host application describes its struct layout as BTF
 //! let mut host = BtfBuilder::new();
@@ -28,12 +28,13 @@
 //! let target_bytes = host.encode();
 //! let target = Btf::parse(&target_bytes)?;
 //!
-//! // Parse BTF from eBPF program
+//! // Parse BTF and CO-RE relocations from the eBPF program
 //! let local = Btf::parse(btf_section_bytes)?;
+//! let btf_ext = BtfExt::parse(btf_ext_bytes, local.strings())?;
+//! let relocations = btf_ext.relos_for_section(".text").unwrap_or(&[]);
 //!
 //! // Apply CO-RE relocations
-//! let relocations = parse_btf_ext(btf_ext_bytes)?;
-//! apply_core_relocations(&mut instructions, &local, &target, &relocations)?;
+//! apply_core_relocations(&mut instructions, &local, &target, relocations)?;
 //! ```
 
 mod builder;

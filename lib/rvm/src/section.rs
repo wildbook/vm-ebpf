@@ -19,13 +19,6 @@ pub enum SectionKind {
     Other,
 }
 
-impl SectionKind {
-    /// Check if this section contains executable code.
-    pub fn is_executable(&self) -> bool {
-        matches!(self, Self::Code)
-    }
-}
-
 /// A section in an eBPF module.
 #[derive(Clone)]
 pub struct Section {
@@ -41,13 +34,6 @@ pub struct Section {
     pub align: u64,
     /// Original section index in the ELF.
     pub elf_index: usize,
-}
-
-impl Section {
-    /// Check if this section is executable.
-    pub fn is_executable(&self) -> bool {
-        self.kind.is_executable()
-    }
 }
 
 impl fmt::Debug for Section {

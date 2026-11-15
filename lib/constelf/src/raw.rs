@@ -29,51 +29,6 @@ pub mod reloc {
         pub const BPF_64_NODYLD32: u32 = 4;  // R_BPF_64_NODYLD32
         pub const BPF_64_32:       u32 = 10; // R_BPF_64_32
     }
-
-    pub mod x86_64 {
-        pub const X86_64_NONE: u32 = 0;
-        pub const X86_64_64: u32 = 1;
-        pub const X86_64_PC32: u32 = 2;
-        pub const X86_64_GOT32: u32 = 3;
-        pub const X86_64_PLT32: u32 = 4;
-        pub const X86_64_COPY: u32 = 5;
-        pub const X86_64_GLOB_DAT: u32 = 6;
-        pub const X86_64_JUMP_SLOT: u32 = 7;
-        pub const X86_64_RELATIVE: u32 = 8;
-        pub const X86_64_GOTPCREL: u32 = 9;
-        pub const X86_64_32: u32 = 10;
-        pub const X86_64_32S: u32 = 11;
-        pub const X86_64_16: u32 = 12;
-        pub const X86_64_PC16: u32 = 13;
-        pub const X86_64_8: u32 = 14;
-        pub const X86_64_PC8: u32 = 15;
-        pub const X86_64_DTPMOD64: u32 = 16;
-        pub const X86_64_DTPOFF64: u32 = 17;
-        pub const X86_64_TPOFF64: u32 = 18;
-        pub const X86_64_TLSGD: u32 = 19;
-        pub const X86_64_TLSLD: u32 = 20;
-        pub const X86_64_DTPOFF32: u32 = 21;
-        pub const X86_64_GOTTPOFF: u32 = 22;
-        pub const X86_64_TPOFF32: u32 = 23;
-        pub const X86_64_PC64: u32 = 24;
-        pub const X86_64_GOTOFF64: u32 = 25;
-        pub const X86_64_GOTPC32: u32 = 26;
-        pub const X86_64_GOT64: u32 = 27;
-        pub const X86_64_GOTPCREL64: u32 = 28;
-        pub const X86_64_GOTPC64: u32 = 29;
-        pub const X86_64_GOTPLT64: u32 = 30;
-        pub const X86_64_PLTOFF64: u32 = 31;
-        pub const X86_64_SIZE32: u32 = 32;
-        pub const X86_64_SIZE64: u32 = 33;
-        pub const X86_64_GOTPC32_TLSDESC: u32 = 34;
-        pub const X86_64_TLSDESC_CALL: u32 = 35;
-        pub const X86_64_TLSDESC: u32 = 36;
-        pub const X86_64_IRELATIVE: u32 = 37;
-        pub const X86_64_RELATIVE64: u32 = 38;
-        pub const X86_64_GOTPCRELX: u32 = 41;
-        pub const X86_64_REX_GOTPCRELX: u32 = 42;
-        pub const X86_64_NUM: u32 = 43;
-    }
 }
 
 #[rustfmt::skip]

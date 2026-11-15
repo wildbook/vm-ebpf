@@ -166,16 +166,6 @@ impl Maps {
         self.maps.get(handle as usize).map(|m| &m.def)
     }
 
-    /// Number of maps.
-    pub fn len(&self) -> usize {
-        self.maps.len()
-    }
-
-    /// Whether the program declares no maps.
-    pub fn is_empty(&self) -> bool {
-        self.maps.is_empty()
-    }
-
     /// Guest address of the value for `key`, if present.
     #[inline]
     pub fn lookup(&self, handle: u32, key: &[u8]) -> Option<u64> {
@@ -201,34 +191,6 @@ impl Maps {
         let slot = map.with_hash(|index| index.remove(key)).ok_or(MapError::Invalid)??;
         Ok(map.addr(slot))
     }
-
-    /// Insert or replace the value for `key`; see [`Maps::upsert`] for `flags`.
-    pub fn update(
-        &mut self,
-        mem: &mut VmMemory,
-        handle: u32,
-        key: &[u8],
-        value: &[u8],
-        flags: u64,
-    ) -> std::result::Result<(), MapError> {
-        if self
-            .def(handle)
-            .is_none_or(|def| value.len() != def.value_size as usize)
-        {
-            return Err(MapError::Invalid);
-        }
-        let addr = self.upsert(handle, key, flags)?;
-        mem.write_bytes(addr, value).expect("map slots are mapped");
-        Ok(())
-    }
-
-    /// Remove `key` and zero its value.
-    pub fn delete(&mut self, mem: &mut VmMemory, handle: u32, key: &[u8]) -> std::result::Result<(), MapError> {
-        let addr = self.remove(handle, key)?;
-        let len = self.maps[handle as usize].def.value_size as usize;
-        mem.bytes_mut(addr, len).expect("map slots are mapped").fill(0);
-        Ok(())
-    }
 }
 
 impl<'a> MapRef<'a> {
@@ -247,14 +209,26 @@ impl<'a> MapRef<'a> {
         self.memory.bytes(addr, self.def().value_size as usize).ok()
     }
 
-    /// Insert or replace the value for `key`; see [`Maps::update`] for `flags`.
+    /// Insert or replace the value for `key`; see [`Maps::upsert`] for `flags`.
     pub fn update(&mut self, key: &[u8], value: &[u8], flags: u64) -> std::result::Result<(), MapError> {
-        self.maps.update(self.memory, self.handle, key, value, flags)
+        if self
+            .maps
+            .def(self.handle)
+            .is_none_or(|def| value.len() != def.value_size as usize)
+        {
+            return Err(MapError::Invalid);
+        }
+        let addr = self.maps.upsert(self.handle, key, flags)?;
+        self.memory.write_bytes(addr, value).expect("map slots are mapped");
+        Ok(())
     }
 
-    /// Remove `key`.
+    /// Remove `key` and zero its value.
     pub fn delete(&mut self, key: &[u8]) -> std::result::Result<(), MapError> {
-        self.maps.delete(self.memory, self.handle, key)
+        let addr = self.maps.remove(self.handle, key)?;
+        let len = self.def().value_size as usize;
+        self.memory.bytes_mut(addr, len).expect("map slots are mapped").fill(0);
+        Ok(())
     }
 }
 

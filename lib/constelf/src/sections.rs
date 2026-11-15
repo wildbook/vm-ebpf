@@ -63,12 +63,9 @@ impl<'a> ElfSections<'a> {
 }
 
 impl<'a> ElfSections<'a> {
+    #[allow(clippy::len_without_is_empty)] // `is_empty` had no callers; removed as dead API
     pub const fn len(self) -> usize {
         self.ehdr.e_shnum as usize
-    }
-
-    pub const fn is_empty(self) -> bool {
-        self.ehdr.e_shnum == 0
     }
 
     pub const fn headers(self) -> &'a [Elf64Shdr] {
@@ -93,31 +90,6 @@ impl<'a> ElfSections<'a> {
             all: self,
             raw: tryopt!(self.header_by_index(index)),
         })
-    }
-
-    pub const fn by_name(self, name: &[u8]) -> Option<ElfSection<'a>> {
-        let headers = self.headers();
-
-        let mut i = 0;
-        while i < headers.len() {
-            let header = &headers[i];
-            i += 1;
-
-            if let Ok(snm) = self.name(header) {
-                if util::slice_eq(snm.to_bytes(), name) {
-                    return Some(ElfSection { all: self, raw: header });
-                }
-            }
-        }
-
-        None
-    }
-
-    pub const fn string_table(self) -> ElfResult<&'a [u8]> {
-        match self.header_by_index(self.ehdr.e_shstrndx as usize) {
-            Some(sect) => self.bytes(sect),
-            None => Err(err::ElfError::Sections),
-        }
     }
 
     pub const fn symtab(self) -> ElfResult<ElfSymTab<'a>> {

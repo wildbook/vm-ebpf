@@ -12,7 +12,7 @@ use hashbrown::HashMap;
 
 use crate::error::{Result, VmError};
 use crate::section::{section_kind_from_name, Section, SectionKind};
-use crate::symbol::{Export, Symbol, SymbolBinding, SymbolKind};
+use crate::symbol::{Export, Symbol};
 
 /// Relocation entry for a module.
 #[derive(Debug, Clone)]
@@ -31,7 +31,7 @@ pub struct Relocation {
 }
 
 /// A parsed eBPF ELF module.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Module {
     /// Module name (user-provided or derived from file).
     pub name: String,
@@ -56,27 +56,9 @@ pub struct Module {
 
     /// BTF.ext data (if present).
     pub btf_ext_data: Option<Vec<u8>>,
-
-    /// Map from symbol name to index.
-    symbol_by_name: HashMap<String, usize>,
 }
 
 impl Module {
-    /// Create a new empty module.
-    fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            sections: Vec::new(),
-            symbols: Vec::new(),
-            exports: HashMap::new(),
-            imports: Vec::new(),
-            relocations: Vec::new(),
-            btf_data: None,
-            btf_ext_data: None,
-            symbol_by_name: HashMap::new(),
-        }
-    }
-
     /// Parse a module from ELF bytes.
     pub fn from_elf(name: impl Into<String>, elf_bytes: &[u8]) -> Result<Self> {
         let name = name.into();
@@ -86,7 +68,10 @@ impl Module {
             .sections()
             .map_err(|e| VmError::Elf(format!("failed to get sections: {e:?}")))?;
 
-        let mut module = Self::new(&name);
+        let mut module = Self {
+            name,
+            ..Default::default()
+        };
 
         // First pass: collect sections
         for (idx, header) in elf_sections.headers().iter().enumerate() {
@@ -103,17 +88,20 @@ impl Module {
             };
 
             // Handle BTF sections specially
-            if name_str == ".BTF" {
-                if let Some(sect) = elf_sections.by_index(idx) {
-                    module.btf_data = sect.bytes().ok().map(|b| b.to_vec());
+            match name_str {
+                ".BTF" => {
+                    if let Some(sect) = elf_sections.by_index(idx) {
+                        module.btf_data = sect.bytes().ok().map(|b| b.to_vec());
+                    }
+                    continue;
                 }
-                continue;
-            }
-            if name_str == ".BTF.ext" {
-                if let Some(sect) = elf_sections.by_index(idx) {
-                    module.btf_ext_data = sect.bytes().ok().map(|b| b.to_vec());
+                ".BTF.ext" => {
+                    if let Some(sect) = elf_sections.by_index(idx) {
+                        module.btf_ext_data = sect.bytes().ok().map(|b| b.to_vec());
+                    }
+                    continue;
                 }
-                continue;
+                _ => {}
             }
 
             // Skip non-ALLOC sections (except we already handled BTF)
@@ -149,7 +137,7 @@ impl Module {
             // Get symbol string table
             let strtab = elf_sections.sym_strtab().ok();
 
-            for (sym_idx, sym) in symtab.iter().enumerate() {
+            for sym in symtab.iter() {
                 // Get symbol name from string table
                 let sym_name = match (sym.st_name != 0, strtab) {
                     (true, Some(strtab)) => get_string_from_table(strtab, sym.st_name as usize),
@@ -158,25 +146,17 @@ impl Module {
 
                 if sym_name.is_empty() && sym.st_shndx == 0 {
                     // Keep a placeholder so `symbols` stays indexed by ELF symbol index.
-                    module.symbols.push(Symbol::new(""));
+                    module.symbols.push(Symbol {
+                        name: String::new(),
+                        section_idx: None,
+                        value: 0,
+                    });
                     continue;
                 }
 
-                let binding = match sym.bind() {
-                    b if b == stb::LOCAL => SymbolBinding::Local,
-                    b if b == stb::GLOBAL => SymbolBinding::Global,
-                    b if b == stb::WEAK => SymbolBinding::Weak,
-                    _ => SymbolBinding::Local,
-                };
-
-                let kind = match sym.typ() {
-                    t if t == stt::NOTYPE => SymbolKind::None,
-                    t if t == stt::OBJECT => SymbolKind::Object,
-                    t if t == stt::FUNC => SymbolKind::Function,
-                    t if t == stt::SECTION => SymbolKind::Section,
-                    t if t == stt::FILE => SymbolKind::File,
-                    _ => SymbolKind::None,
-                };
+                // Weak binds like a local reference for export/import purposes.
+                let is_global = sym.bind() == stb::GLOBAL;
+                let is_function = sym.typ() == stt::FUNC;
 
                 // Map ELF section index to our section index
                 let section_idx = if sym.st_shndx == 0 {
@@ -189,35 +169,28 @@ impl Module {
                         .position(|s| s.elf_index == sym.st_shndx as usize)
                 };
 
-                let symbol = Symbol {
-                    name: sym_name.clone(),
-                    binding,
-                    kind,
+                // Track exports and imports
+                match (is_global, section_idx) {
+                    (true, Some(sect_idx)) => {
+                        module.exports.insert(
+                            sym_name.clone(),
+                            Export {
+                                section_idx: sect_idx,
+                                offset: sym.st_value,
+                                size: sym.st_size,
+                                is_function,
+                            },
+                        );
+                    }
+                    (true, None) => module.imports.push(sym_name.clone()),
+                    (false, _) => {}
+                }
+
+                module.symbols.push(Symbol {
+                    name: sym_name,
                     section_idx,
                     value: sym.st_value,
-                    size: sym.st_size,
-                };
-
-                if !sym_name.is_empty() {
-                    module.symbol_by_name.insert(sym_name.clone(), sym_idx);
-                }
-
-                // Track exports and imports
-                if symbol.is_export() {
-                    if let Some(sect_idx) = section_idx {
-                        let export = Export::new(sect_idx, sym.st_value).with_size(sym.st_size);
-                        let export = if kind == SymbolKind::Function {
-                            export.as_function()
-                        } else {
-                            export
-                        };
-                        module.exports.insert(sym_name.clone(), export);
-                    }
-                } else if symbol.is_undefined() {
-                    module.imports.push(sym_name.clone());
-                }
-
-                module.symbols.push(symbol);
+                });
             }
         }
 
@@ -274,7 +247,6 @@ impl Module {
                         });
                     }
                 }
-                ElfRelocsChunk::None => continue,
             }
         }
 
@@ -283,7 +255,7 @@ impl Module {
 
     /// Get a symbol by name.
     pub fn symbol(&self, name: &str) -> Option<&Symbol> {
-        self.symbol_by_name.get(name).map(|&idx| &self.symbols[idx])
+        self.symbols.iter().find(|s| s.name == name)
     }
 
     /// Get a symbol by index.
@@ -292,46 +264,13 @@ impl Module {
     }
 }
 
-impl std::fmt::Display for Module {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let module_name = &self.name;
-        let section_count = self.sections.len();
-        writeln!(f, "Module: {module_name}")?;
-        writeln!(f, "  Sections: {section_count}")?;
-        for section in &self.sections {
-            writeln!(f, "    {section}")?;
-        }
-        let export_count = self.exports.len();
-        writeln!(f, "  Exports: {export_count}")?;
-        for (name, export) in &self.exports {
-            let section_idx = export.section_idx;
-            let offset = export.offset;
-            let suffix = if export.is_function { " (func)" } else { "" };
-            writeln!(f, "    {name} @ section[{section_idx}]+0x{offset:x}{suffix}")?;
-        }
-        let import_count = self.imports.len();
-        writeln!(f, "  Imports: {import_count}")?;
-        for name in &self.imports {
-            writeln!(f, "    {name}")?;
-        }
-        let relo_count = self.relocations.len();
-        let btf_size = self.btf_data.as_ref().map(|d| d.len()).unwrap_or(0);
-        writeln!(f, "  Relocations: {relo_count}")?;
-        writeln!(f, "  BTF: {btf_size}")?;
-        Ok(())
-    }
-}
-
 /// Extract a null-terminated string from a string table at the given offset.
 fn get_string_from_table(table: &[u8], offset: usize) -> String {
-    if offset >= table.len() {
-        return String::new();
-    }
-
-    match CStr::from_bytes_until_nul(&table[offset..]) {
-        Ok(cstr) => cstr.to_string_lossy().into_owned(),
-        Err(_) => String::new(),
-    }
+    table
+        .get(offset..)
+        .and_then(|b| CStr::from_bytes_until_nul(b).ok())
+        .map(|cstr| cstr.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Byte addend that a REL relocation stores in the place it patches.

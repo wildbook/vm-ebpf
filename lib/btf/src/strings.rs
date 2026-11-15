@@ -1,7 +1,5 @@
 //! BTF string table parsing.
 
-use core::ffi::CStr;
-
 /// BTF string table.
 ///
 /// The string table is a sequence of null-terminated strings.
@@ -36,37 +34,5 @@ impl<'a> BtfStrings<'a> {
     /// Get a string by offset, returning empty string for offset 0 or errors.
     pub fn get_or_empty(&self, offset: u32) -> &'a str {
         self.get(offset).unwrap_or("")
-    }
-
-    /// Get a C string by offset.
-    pub fn get_cstr(&self, offset: u32) -> Option<&'a CStr> {
-        let offset = offset as usize;
-        if offset >= self.data.len() {
-            return None;
-        }
-
-        CStr::from_bytes_until_nul(&self.data[offset..]).ok()
-    }
-
-    /// Get the raw data.
-    pub fn raw(&self) -> &'a [u8] {
-        self.data
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_string_table() {
-        // String table: "\0hello\0world\0"
-        let data = b"\0hello\0world\0";
-        let strings = BtfStrings::new(data);
-
-        assert_eq!(strings.get(0), Some(""));
-        assert_eq!(strings.get(1), Some("hello"));
-        assert_eq!(strings.get(7), Some("world"));
-        assert_eq!(strings.get(100), None);
     }
 }

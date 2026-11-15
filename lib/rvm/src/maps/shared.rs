@@ -41,20 +41,8 @@ pub struct SharedMap {
     def: MapDef,
     pub region: usize,
     pub stride: u64,
-    storage: Arc<SharedBuffer>,
+    pub storage: Arc<SharedBuffer>,
     pub index: Option<RwLock<HashIndex>>,
-}
-
-impl SharedMap {
-    /// Guest region the values live in.
-    pub fn region(&self) -> usize {
-        self.region
-    }
-
-    /// The values' backing memory.
-    pub fn storage(&self) -> &Arc<SharedBuffer> {
-        &self.storage
-    }
 }
 
 impl SharedMaps {

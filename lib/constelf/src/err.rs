@@ -7,7 +7,6 @@ pub enum ErrHeader {
     Ident,  // ElfIdent field was invalid
 
     Size,
-    Other,
 }
 
 #[derive(Debug, Copy, Clone)]

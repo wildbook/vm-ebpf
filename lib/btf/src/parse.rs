@@ -1,6 +1,6 @@
 //! BTF parsing from raw bytes.
 
-use crate::raw::*;
+use crate::raw::{BtfKind, BTF_MAGIC, BTF_VERSION};
 use crate::strings::BtfStrings;
 use crate::types::*;
 
@@ -19,8 +19,6 @@ pub enum BtfError {
     InvalidType(u32),
     /// Unknown type kind.
     UnknownKind(u8),
-    /// Invalid string offset.
-    InvalidString(u32),
 }
 
 impl core::fmt::Display for BtfError {
@@ -32,21 +30,26 @@ impl core::fmt::Display for BtfError {
             Self::SectionOverflow => write!(f, "BTF section extends beyond data"),
             Self::InvalidType(id) => write!(f, "invalid BTF type at id {id}"),
             Self::UnknownKind(k) => write!(f, "unknown BTF kind: {k}"),
-            Self::InvalidString(off) => write!(f, "invalid string offset: {off}"),
         }
     }
 }
 
 impl std::error::Error for BtfError {}
 
+/// Read a little-endian `u32` at word index `i` (byte offset `i * 4`).
+///
+/// # Panics
+///
+/// Panics if the word does not fit in `b`; callers only use it on slices already
+/// bounds-checked against the record size they are reading.
+pub fn word(b: &[u8], i: usize) -> u32 {
+    let o = i * 4;
+    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+}
+
 /// Parsed BTF data.
 #[derive(Debug, Clone)]
 pub struct Btf<'a> {
-    /// The raw data.
-    #[allow(dead_code)]
-    data: &'a [u8],
-    /// The header.
-    header: BtfHeader,
     /// String table.
     strings: BtfStrings<'a>,
     /// Parsed types (index 0 is void, types start at index 1).
@@ -56,23 +59,27 @@ pub struct Btf<'a> {
 impl<'a> Btf<'a> {
     /// Parse BTF from raw section bytes.
     pub fn parse(data: &'a [u8]) -> Result<Self, BtfError> {
-        let header = BtfHeader::parse(data).ok_or(BtfError::TooShort)?;
-
-        // Validate header
-        if header.magic != BTF_MAGIC {
-            return Err(BtfError::BadMagic(header.magic));
+        if data.len() < 24 {
+            return Err(BtfError::TooShort);
         }
-        if header.version != BTF_VERSION {
-            return Err(BtfError::BadVersion(header.version));
+        let magic = u16::from_le_bytes([data[0], data[1]]);
+        let version = data[2];
+        if magic != BTF_MAGIC {
+            return Err(BtfError::BadMagic(magic));
         }
+        if version != BTF_VERSION {
+            return Err(BtfError::BadVersion(version));
+        }
+        let hdr_len = word(data, 1) as usize;
+        let type_off = word(data, 2) as usize;
+        let type_len = word(data, 3) as usize;
+        let str_off = word(data, 4) as usize;
+        let str_len = word(data, 5) as usize;
 
-        let hdr_len = header.hdr_len as usize;
-
-        // Validate section bounds
-        let type_start = hdr_len + header.type_off as usize;
-        let type_end = type_start + header.type_len as usize;
-        let str_start = hdr_len + header.str_off as usize;
-        let str_end = str_start + header.str_len as usize;
+        let type_start = hdr_len + type_off;
+        let type_end = type_start + type_len;
+        let str_start = hdr_len + str_off;
+        let str_end = str_start + str_len;
 
         if type_end > data.len() || str_end > data.len() {
             return Err(BtfError::SectionOverflow);
@@ -82,15 +89,9 @@ impl<'a> Btf<'a> {
         let str_data = &data[str_start..str_end];
         let strings = BtfStrings::new(str_data);
 
-        // Parse types
         let types = Self::parse_types(type_data, &strings)?;
 
-        Ok(Self {
-            data,
-            header,
-            strings,
-            types,
-        })
+        Ok(Self { strings, types })
     }
 
     fn parse_types(type_data: &'a [u8], strings: &BtfStrings<'a>) -> Result<Vec<BtfTypeInfo<'a>>, BtfError> {
@@ -101,81 +102,78 @@ impl<'a> Btf<'a> {
 
         while offset < type_data.len() {
             let remaining = &type_data[offset..];
-            let btf_type = BtfType::parse(remaining).ok_or(BtfError::InvalidType(type_id))?;
-
-            let kind = btf_type
-                .kind()
-                .ok_or(BtfError::UnknownKind(((btf_type.info >> 24) & 0x1F) as u8))?;
-            let vlen = btf_type.vlen();
-            let kind_flag = btf_type.kind_flag();
-            let extra_size = kind.extra_size(vlen);
-
-            let extra_start = offset + BtfType::SIZE;
-            let extra_end = extra_start + extra_size;
-            if extra_end > type_data.len() {
+            if remaining.len() < 12 {
                 return Err(BtfError::InvalidType(type_id));
             }
-            let extra = &type_data[extra_start..extra_end];
+            let name_off = word(remaining, 0);
+            let info = word(remaining, 1);
+            let size_or_type = word(remaining, 2);
 
-            let name = strings.get_or_empty(btf_type.name_off);
+            let kind = BtfKind::from_info(info).ok_or(BtfError::UnknownKind(((info >> 24) & 0x1F) as u8))?;
+            let vlen = (info & 0xFFFF) as u16;
+            let kind_flag = (info >> 31) != 0;
+            let extra_size = kind.extra_size(vlen);
+
+            let extra_start = 12;
+            let extra_end = extra_start + extra_size;
+            if extra_end > remaining.len() {
+                return Err(BtfError::InvalidType(type_id));
+            }
+            let extra = &remaining[extra_start..extra_end];
+
+            let name = strings.get_or_empty(name_off);
 
             let type_info = match kind {
                 BtfKind::Void => BtfTypeInfo::Void,
 
                 BtfKind::Int => {
-                    if extra.len() < 4 {
-                        return Err(BtfError::InvalidType(type_id));
-                    }
-                    let int_info = u32::from_le_bytes([extra[0], extra[1], extra[2], extra[3]]);
+                    let int_info = word(extra, 0);
                     BtfTypeInfo::Int {
                         name,
-                        size: btf_type.size_or_type,
-                        encoding: btf_int_encoding(int_info),
-                        offset: btf_int_offset(int_info),
-                        bits: btf_int_bits(int_info),
+                        size: size_or_type,
+                        encoding: ((int_info & 0x0F000000) >> 24) as u8,
+                        offset: ((int_info & 0x00FF0000) >> 16) as u8,
+                        bits: (int_info & 0x000000FF) as u8,
                     }
                 }
 
                 BtfKind::Ptr => BtfTypeInfo::Ptr {
-                    pointee_type: btf_type.size_or_type,
+                    pointee_type: size_or_type,
                 },
 
-                BtfKind::Array => {
-                    let arr = BtfArray::parse(extra).ok_or(BtfError::InvalidType(type_id))?;
-                    BtfTypeInfo::Array {
-                        elem_type: arr.elem_type,
-                        index_type: arr.index_type,
-                        nelems: arr.nelems,
-                    }
-                }
+                BtfKind::Array => BtfTypeInfo::Array {
+                    elem_type: word(extra, 0),
+                    index_type: word(extra, 1),
+                    nelems: word(extra, 2),
+                },
 
-                BtfKind::Struct => {
-                    let members = Self::parse_members(extra, vlen, kind_flag, strings)?;
-                    BtfTypeInfo::Struct {
-                        name,
-                        size: btf_type.size_or_type,
-                        members,
-                    }
-                }
+                BtfKind::Struct => BtfTypeInfo::Struct {
+                    name,
+                    size: size_or_type,
+                    members: Self::parse_members(extra, vlen, kind_flag, strings),
+                },
 
-                BtfKind::Union => {
-                    let members = Self::parse_members(extra, vlen, kind_flag, strings)?;
-                    BtfTypeInfo::Union {
-                        name,
-                        size: btf_type.size_or_type,
-                        members,
-                    }
-                }
+                BtfKind::Union => BtfTypeInfo::Union {
+                    name,
+                    size: size_or_type,
+                    members: Self::parse_members(extra, vlen, kind_flag, strings),
+                },
 
-                BtfKind::Enum => {
-                    let variants = Self::parse_enum_values(extra, vlen, strings)?;
-                    BtfTypeInfo::Enum {
-                        name,
-                        size: btf_type.size_or_type,
-                        is_signed: kind_flag,
-                        variants,
-                    }
-                }
+                BtfKind::Enum => BtfTypeInfo::Enum {
+                    name,
+                    size: size_or_type,
+                    is_signed: kind_flag,
+                    is_64: false,
+                    variants: extra
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|c| EnumValue {
+                            name: strings.get_or_empty(word(c, 0)),
+                            value: i64::from(word(c, 1) as i32),
+                        })
+                        .collect(),
+                },
 
                 BtfKind::Fwd => BtfTypeInfo::Fwd {
                     name,
@@ -184,179 +182,111 @@ impl<'a> Btf<'a> {
 
                 BtfKind::Typedef => BtfTypeInfo::Typedef {
                     name,
-                    type_id: btf_type.size_or_type,
+                    type_id: size_or_type,
                 },
 
-                BtfKind::Volatile => BtfTypeInfo::Volatile {
-                    type_id: btf_type.size_or_type,
-                },
+                BtfKind::Volatile => BtfTypeInfo::Volatile { type_id: size_or_type },
 
-                BtfKind::Const => BtfTypeInfo::Const {
-                    type_id: btf_type.size_or_type,
-                },
+                BtfKind::Const => BtfTypeInfo::Const { type_id: size_or_type },
 
-                BtfKind::Restrict => BtfTypeInfo::Restrict {
-                    type_id: btf_type.size_or_type,
-                },
+                BtfKind::Restrict => BtfTypeInfo::Restrict { type_id: size_or_type },
 
                 BtfKind::Func => BtfTypeInfo::Func {
                     name,
-                    proto_type: btf_type.size_or_type,
+                    proto_type: size_or_type,
                     linkage: vlen,
                 },
 
-                BtfKind::FuncProto => {
-                    let params = Self::parse_params(extra, vlen, strings)?;
-                    BtfTypeInfo::FuncProto {
-                        return_type: btf_type.size_or_type,
-                        params,
-                    }
-                }
+                BtfKind::FuncProto => BtfTypeInfo::FuncProto {
+                    return_type: size_or_type,
+                    params: extra
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|c| Param {
+                            name: strings.get_or_empty(word(c, 0)),
+                            type_id: word(c, 1),
+                        })
+                        .collect(),
+                },
 
-                BtfKind::Var => {
-                    let var = BtfVar::parse(extra).ok_or(BtfError::InvalidType(type_id))?;
-                    BtfTypeInfo::Var {
-                        name,
-                        type_id: btf_type.size_or_type,
-                        linkage: var.linkage,
-                    }
-                }
+                BtfKind::Var => BtfTypeInfo::Var {
+                    name,
+                    type_id: size_or_type,
+                    linkage: word(extra, 0),
+                },
 
-                BtfKind::DataSec => {
-                    let vars = Self::parse_var_secinfos(extra, vlen)?;
-                    BtfTypeInfo::DataSec {
-                        name,
-                        size: btf_type.size_or_type,
-                        vars,
-                    }
-                }
+                BtfKind::DataSec => BtfTypeInfo::DataSec {
+                    name,
+                    size: size_or_type,
+                    vars: extra
+                        .as_chunks::<12>()
+                        .0
+                        .iter()
+                        .map(|c| VarSecInfo {
+                            type_id: word(c, 0),
+                            offset: word(c, 1),
+                            size: word(c, 2),
+                        })
+                        .collect(),
+                },
 
                 BtfKind::Float => BtfTypeInfo::Float {
                     name,
-                    size: btf_type.size_or_type,
+                    size: size_or_type,
                 },
 
-                BtfKind::DeclTag => {
-                    if extra.len() < 4 {
-                        return Err(BtfError::InvalidType(type_id));
-                    }
-                    let component_idx = i32::from_le_bytes([extra[0], extra[1], extra[2], extra[3]]);
-                    BtfTypeInfo::DeclTag {
-                        name,
-                        type_id: btf_type.size_or_type,
-                        component_idx,
-                    }
-                }
+                BtfKind::DeclTag => BtfTypeInfo::DeclTag {
+                    name,
+                    type_id: size_or_type,
+                    component_idx: word(extra, 0) as i32,
+                },
 
                 BtfKind::TypeTag => BtfTypeInfo::TypeTag {
                     name,
-                    type_id: btf_type.size_or_type,
+                    type_id: size_or_type,
                 },
 
-                BtfKind::Enum64 => {
-                    let variants = Self::parse_enum64_values(extra, vlen, strings)?;
-                    BtfTypeInfo::Enum64 {
-                        name,
-                        size: btf_type.size_or_type,
-                        is_signed: kind_flag,
-                        variants,
-                    }
-                }
+                BtfKind::Enum64 => BtfTypeInfo::Enum {
+                    name,
+                    size: size_or_type,
+                    is_signed: kind_flag,
+                    is_64: true,
+                    variants: extra
+                        .as_chunks::<12>()
+                        .0
+                        .iter()
+                        .map(|c| EnumValue {
+                            name: strings.get_or_empty(word(c, 0)),
+                            value: ((word(c, 2) as u64) << 32 | word(c, 1) as u64) as i64,
+                        })
+                        .collect(),
+                },
             };
 
             types.push(type_info);
-            offset = extra_end;
+            offset += extra_end;
             type_id += 1;
         }
 
         Ok(types)
     }
 
-    fn parse_members(
-        data: &'a [u8],
-        count: u16,
-        kind_flag: bool,
-        strings: &BtfStrings<'a>,
-    ) -> Result<Vec<Member<'a>>, BtfError> {
-        let mut members = Vec::with_capacity(count as usize);
-        for i in 0..count as usize {
-            let start = i * BtfMember::SIZE;
-            let member_data = &data[start..];
-            let raw = BtfMember::parse(member_data).ok_or(BtfError::InvalidType(0))?;
-            members.push(Member {
-                name: strings.get_or_empty(raw.name_off),
-                type_id: raw.type_id,
-                bit_offset: raw.bit_offset(kind_flag),
-                bitfield_size: raw.bitfield_size(kind_flag),
-            });
-        }
-        Ok(members)
-    }
-
-    fn parse_enum_values(data: &'a [u8], count: u16, strings: &BtfStrings<'a>) -> Result<Vec<EnumValue<'a>>, BtfError> {
-        let mut values = Vec::with_capacity(count as usize);
-        for i in 0..count as usize {
-            let start = i * BtfEnum::SIZE;
-            let enum_data = &data[start..];
-            let raw = BtfEnum::parse(enum_data).ok_or(BtfError::InvalidType(0))?;
-            values.push(EnumValue {
-                name: strings.get_or_empty(raw.name_off),
-                value: raw.val,
-            });
-        }
-        Ok(values)
-    }
-
-    fn parse_enum64_values(
-        data: &'a [u8],
-        count: u16,
-        strings: &BtfStrings<'a>,
-    ) -> Result<Vec<Enum64Value<'a>>, BtfError> {
-        let mut values = Vec::with_capacity(count as usize);
-        for i in 0..count as usize {
-            let start = i * BtfEnum64::SIZE;
-            let enum_data = &data[start..];
-            let raw = BtfEnum64::parse(enum_data).ok_or(BtfError::InvalidType(0))?;
-            values.push(Enum64Value {
-                name: strings.get_or_empty(raw.name_off),
-                value: raw.value(),
-            });
-        }
-        Ok(values)
-    }
-
-    fn parse_params(data: &'a [u8], count: u16, strings: &BtfStrings<'a>) -> Result<Vec<Param<'a>>, BtfError> {
-        let mut params = Vec::with_capacity(count as usize);
-        for i in 0..count as usize {
-            let start = i * BtfParam::SIZE;
-            let param_data = &data[start..];
-            let raw = BtfParam::parse(param_data).ok_or(BtfError::InvalidType(0))?;
-            params.push(Param {
-                name: strings.get_or_empty(raw.name_off),
-                type_id: raw.type_id,
-            });
-        }
-        Ok(params)
-    }
-
-    fn parse_var_secinfos(data: &[u8], count: u16) -> Result<Vec<VarSecInfo>, BtfError> {
-        let mut vars = Vec::with_capacity(count as usize);
-        for i in 0..count as usize {
-            let start = i * BtfVarSecinfo::SIZE;
-            let var_data = &data[start..];
-            let raw = BtfVarSecinfo::parse(var_data).ok_or(BtfError::InvalidType(0))?;
-            vars.push(VarSecInfo {
-                type_id: raw.type_id,
-                offset: raw.offset,
-                size: raw.size,
-            });
-        }
-        Ok(vars)
-    }
-
-    /// Get the header.
-    pub fn header(&self) -> &BtfHeader {
-        &self.header
+    fn parse_members(data: &'a [u8], count: u16, kind_flag: bool, strings: &BtfStrings<'a>) -> Vec<Member<'a>> {
+        data.as_chunks::<12>()
+            .0
+            .iter()
+            .take(count as usize)
+            .map(|c| {
+                let raw_offset = word(c, 2);
+                Member {
+                    name: strings.get_or_empty(word(c, 0)),
+                    type_id: word(c, 1),
+                    bit_offset: if kind_flag { raw_offset & 0xFFFFFF } else { raw_offset },
+                    bitfield_size: if kind_flag { raw_offset >> 24 } else { 0 },
+                }
+            })
+            .collect()
     }
 
     /// Get the string table.
@@ -371,35 +301,9 @@ impl<'a> Btf<'a> {
         self.types.get(id as usize)
     }
 
-    /// Get the number of types (including void at index 0).
-    pub fn type_count(&self) -> usize {
-        self.types.len()
-    }
-
     /// Iterate over all types.
     pub fn types(&self) -> impl Iterator<Item = (u32, &BtfTypeInfo<'a>)> {
         self.types.iter().enumerate().map(|(i, t)| (i as u32, t))
-    }
-
-    /// Find a type by name and kind.
-    pub fn find_type(&self, name: &str, kind: BtfKind) -> Option<(u32, &BtfTypeInfo<'a>)> {
-        self.types().find(|(_, t)| t.kind() == kind && t.name() == Some(name))
-    }
-
-    /// Find a struct by name.
-    pub fn find_struct(&self, name: &str) -> Option<(u32, &BtfTypeInfo<'a>)> {
-        self.find_type(name, BtfKind::Struct)
-    }
-
-    /// Find a union by name.
-    pub fn find_union(&self, name: &str) -> Option<(u32, &BtfTypeInfo<'a>)> {
-        self.find_type(name, BtfKind::Union)
-    }
-
-    /// Find an enum by name.
-    pub fn find_enum(&self, name: &str) -> Option<(u32, &BtfTypeInfo<'a>)> {
-        self.find_type(name, BtfKind::Enum)
-            .or_else(|| self.find_type(name, BtfKind::Enum64))
     }
 
     /// Resolve a type through modifiers (const, volatile, restrict, typedef).
@@ -421,14 +325,28 @@ impl<'a> Btf<'a> {
         }
     }
 
-    /// Get a struct member by name.
-    pub fn struct_member(&self, type_id: u32, member_name: &str) -> Option<&Member<'a>> {
-        let (_, ty) = self.resolve_type(type_id)?;
-        match ty {
-            BtfTypeInfo::Struct { members, .. } | BtfTypeInfo::Union { members, .. } => {
-                members.iter().find(|m| m.name == member_name)
-            }
-            _ => None,
+    /// Byte size of a type, resolving through typedefs/modifiers/vars and, like libbpf's
+    /// `btf__resolve_size`, multiplying an array's element size by its length.
+    pub fn resolve_size(&self, mut id: u32) -> Option<u64> {
+        loop {
+            let ty = self.type_by_id(id)?;
+            return match ty {
+                BtfTypeInfo::Typedef { type_id, .. }
+                | BtfTypeInfo::Volatile { type_id }
+                | BtfTypeInfo::Const { type_id }
+                | BtfTypeInfo::Restrict { type_id }
+                | BtfTypeInfo::TypeTag { type_id, .. }
+                | BtfTypeInfo::Var { type_id, .. } => {
+                    id = *type_id;
+                    continue;
+                }
+                BtfTypeInfo::Array { elem_type, nelems, .. } => {
+                    let elem_size = self.resolve_size(*elem_type)?;
+                    Some(elem_size * u64::from(*nelems))
+                }
+                BtfTypeInfo::Ptr { .. } => Some(8),
+                _ => ty.size().map(u64::from),
+            };
         }
     }
 }

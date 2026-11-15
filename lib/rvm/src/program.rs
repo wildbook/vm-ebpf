@@ -19,8 +19,6 @@ use crate::vm::VmConfig;
 /// Information about an executable function.
 #[derive(Debug, Clone)]
 pub struct FunctionInfo {
-    /// Function name.
-    pub name: String,
     /// Program counter (instruction index) where the function starts.
     pub pc: u64,
     /// Size of the function in bytes.
@@ -136,16 +134,6 @@ impl Program {
     /// Get the stack top address.
     pub fn stack_top(&self) -> u64 {
         self.stack_top
-    }
-
-    /// List all function names.
-    pub fn function_names(&self) -> impl Iterator<Item = &str> {
-        self.functions.keys().map(|s| s.as_str())
-    }
-
-    /// Check if a function exists.
-    pub fn has_function(&self, name: &str) -> bool {
-        self.functions.contains_key(name)
     }
 
     /// Call a function by name; arguments go in r1-r5.

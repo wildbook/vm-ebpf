@@ -7,7 +7,7 @@ use std::fmt::Debug;
 
 use rvm_core::{run, Context, Flow, Instruction, Memory};
 
-use crate::error::{ExecError, Result};
+use crate::error::{ExecError, HelperError, Result};
 use crate::helper::{HelperArgs, HelperContext, HelperRegistry};
 use crate::maps::Maps;
 use crate::memory::VmMemory;
@@ -126,32 +126,21 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
                     return Err(ExecError::UnresolvedCoreRelo { pc }.into());
                 }
                 Flow::CallHelper(id) => {
-                    let args = HelperArgs::from_regs(&ctx.regs);
-                    let mut helper_ctx = HelperContext {
-                        args,
-                        memory: &mut *ctx.data,
-                        maps: self.maps.as_deref_mut(),
-                    };
-                    ctx.regs[0] = self.helpers.call(id, &mut helper_ctx)?;
+                    let slot = self.helpers.slot_of_id(id).ok_or(HelperError::UnknownHelper(id))?;
+                    ctx.regs[0] = call_slot(self.helpers, slot, &mut ctx, self.maps.as_deref_mut())?;
                     pc + 1
                 }
                 Flow::CallKfunc(slot) => {
-                    let args = HelperArgs::from_regs(&ctx.regs);
-                    let mut helper_ctx = HelperContext {
-                        args,
-                        memory: &mut *ctx.data,
-                        maps: self.maps.as_deref_mut(),
-                    };
-                    ctx.regs[0] = self.helpers.call_slot(slot, &mut helper_ctx)?;
+                    ctx.regs[0] = call_slot(self.helpers, slot, &mut ctx, self.maps.as_deref_mut())?;
                     pc + 1
                 }
                 Flow::OutOfFuel => return Err(ExecError::InstructionLimit(limit).into()),
                 Flow::BadPc => return Err(ExecError::InvalidPc(pc).into()),
-                Flow::FailCpu => return Err(ExecError::CpuFault("invalid instruction".to_string()).into()),
+                Flow::FailCpu => return Err(ExecError::CpuFault.into()),
                 Flow::FailMem(err) => {
                     return Err(ExecError::MemoryFault(format!("access at {err:#x?} (pc {pc})")).into())
                 }
-                Flow::Missing => return Err(ExecError::Unimplemented("instruction not implemented".to_string()).into()),
+                Flow::Missing => return Err(ExecError::Unimplemented.into()),
                 // `run` handles these internally
                 Flow::Next | Flow::Jump(_) => unreachable!(),
             };
@@ -159,9 +148,24 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
     }
 }
 
+/// Call the extern table entry at `slot` with the arguments in `ctx.regs[1..=5]`.
+fn call_slot<M: Memory<Err: Debug> + 'static>(
+    helpers: &HelperRegistry<M>,
+    slot: u32,
+    ctx: &mut Context<&mut M>,
+    maps: Option<&mut Maps>,
+) -> Result<u64> {
+    let mut helper_ctx = HelperContext {
+        args: HelperArgs::from_regs(&ctx.regs),
+        memory: &mut *ctx.data,
+        maps,
+    };
+    Ok(helpers.call_slot(slot, &mut helper_ctx)?)
+}
+
 #[cfg(test)]
 mod tests {
-    use ebpf_asm::{Assembler, R0};
+    use ebpf_asm::{Assembler, R0, R6, R7};
 
     use super::*;
     use crate::error::VmError;
@@ -201,5 +205,25 @@ mod tests {
         asm.call_local(&func_start);
         asm.exit();
         assert!(matches!(run(&mut asm, &[], 0), Err(VmError::Exec(ExecError::StackOverflow))));
+    }
+
+    #[test]
+    fn test_callee_saved_registers_survive_a_local_call() {
+        let mut asm = Assembler::new();
+        let mut callee = asm.create_label();
+
+        asm.mov64_imm(R6, 100);
+        asm.mov64_imm(R7, 200);
+        asm.call_local(&callee);
+        asm.mov64(R0, R6);
+        asm.add64(R0, R7);
+        asm.exit();
+
+        asm.set_label(&mut callee).unwrap();
+        asm.mov64_imm(R6, 0);
+        asm.mov64_imm(R7, 0);
+        asm.exit();
+
+        assert_eq!(run(&mut asm, &[], 0).unwrap(), 300);
     }
 }

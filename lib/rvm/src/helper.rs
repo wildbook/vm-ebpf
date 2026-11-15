@@ -24,11 +24,6 @@ pub struct HelperArgs {
 }
 
 impl HelperArgs {
-    /// Create new helper arguments.
-    pub fn new(r1: u64, r2: u64, r3: u64, r4: u64, r5: u64) -> Self {
-        Self { r1, r2, r3, r4, r5 }
-    }
-
     /// Create from a register array.
     pub fn from_regs(regs: &[u64; 16]) -> Self {
         Self {
@@ -62,44 +57,30 @@ pub trait FromArgs: Sized {
     fn from_args(args: &HelperArgs) -> Self;
 }
 
+/// Implements `FromArgs` for a tuple reading `$arity` registers starting at r1.
+macro_rules! tuple_args {
+    ($(($($reg:ident),*) $arity:literal);* $(;)?) => {$(
+        impl FromArgs for ($(tuple_args!(@unit $reg),)*) {
+            const ARITY: u8 = $arity;
+            fn from_args(args: &HelperArgs) -> Self {
+                ($(args.$reg,)*)
+            }
+        }
+    )*};
+    (@unit $reg:ident) => { u64 };
+}
+
 impl FromArgs for () {
     const ARITY: u8 = 0;
     fn from_args(_args: &HelperArgs) -> Self {}
 }
 
-impl FromArgs for (u64,) {
-    const ARITY: u8 = 1;
-    fn from_args(args: &HelperArgs) -> Self {
-        (args.r1,)
-    }
-}
-
-impl FromArgs for (u64, u64) {
-    const ARITY: u8 = 2;
-    fn from_args(args: &HelperArgs) -> Self {
-        (args.r1, args.r2)
-    }
-}
-
-impl FromArgs for (u64, u64, u64) {
-    const ARITY: u8 = 3;
-    fn from_args(args: &HelperArgs) -> Self {
-        (args.r1, args.r2, args.r3)
-    }
-}
-
-impl FromArgs for (u64, u64, u64, u64) {
-    const ARITY: u8 = 4;
-    fn from_args(args: &HelperArgs) -> Self {
-        (args.r1, args.r2, args.r3, args.r4)
-    }
-}
-
-impl FromArgs for (u64, u64, u64, u64, u64) {
-    const ARITY: u8 = 5;
-    fn from_args(args: &HelperArgs) -> Self {
-        (args.r1, args.r2, args.r3, args.r4, args.r5)
-    }
+tuple_args! {
+    (r1) 1;
+    (r1, r2) 2;
+    (r1, r2, r3) 3;
+    (r1, r2, r3, r4) 4;
+    (r1, r2, r3, r4, r5) 5;
 }
 
 // Single-argument shorthands.
@@ -128,35 +109,17 @@ impl IntoReturn for () {
     }
 }
 
-impl IntoReturn for u64 {
-    fn into_return(self) -> u64 {
-        self
-    }
+macro_rules! into_return {
+    ($($ty:ty),*) => {$(
+        impl IntoReturn for $ty {
+            fn into_return(self) -> u64 {
+                self as u64
+            }
+        }
+    )*};
 }
 
-impl IntoReturn for u32 {
-    fn into_return(self) -> u64 {
-        self as u64
-    }
-}
-
-impl IntoReturn for i64 {
-    fn into_return(self) -> u64 {
-        self as u64
-    }
-}
-
-impl IntoReturn for i32 {
-    fn into_return(self) -> u64 {
-        self as u64
-    }
-}
-
-impl IntoReturn for bool {
-    fn into_return(self) -> u64 {
-        self as u64
-    }
-}
+into_return!(u64, u32, i64, i32, bool);
 
 impl<T: IntoReturn, E> IntoReturn for Result<T, E> {
     fn into_return(self) -> u64 {
@@ -173,6 +136,9 @@ struct Slot<M> {
     data: *const (),
     // keeps `data` alive; the call path never touches it
     _owner: Arc<dyn Send + Sync>,
+    // argument count, if registered with typed arguments; `None` for raw and context
+    // helpers, which read registers themselves
+    arity: Option<u8>,
 }
 
 // SAFETY: `data` points into `_owner`, which is `Send + Sync` and lives as long as the slot.
@@ -185,12 +151,13 @@ impl<M> Clone for Slot<M> {
             call: self.call,
             data: self.data,
             _owner: self._owner.clone(),
+            arity: self.arity,
         }
     }
 }
 
 impl<M: 'static> Slot<M> {
-    fn new<F>(func: F) -> Self
+    fn new<F>(func: F, arity: Option<u8>) -> Self
     where
         F: Fn(&mut HelperContext<M>) -> Result<u64, HelperError> + Send + Sync + 'static,
     {
@@ -209,6 +176,7 @@ impl<M: 'static> Slot<M> {
             call: trampoline::<M, F>,
             data: Arc::as_ptr(&owner).cast(),
             _owner: owner,
+            arity,
         }
     }
 
@@ -218,7 +186,7 @@ impl<M: 'static> Slot<M> {
         A: FromArgs,
         R: IntoReturn,
     {
-        Self::new(move |ctx| Ok(func(A::from_args(&ctx.args)).into_return()))
+        Self::new(move |ctx| Ok(func(A::from_args(&ctx.args)).into_return()), Some(A::ARITY))
     }
 }
 
@@ -231,8 +199,6 @@ impl<M: 'static> Slot<M> {
 /// keeps linked call sites valid (hot reload).
 pub struct HelperRegistry<M = VmMemory> {
     slots: Vec<Slot<M>>,
-    // argument count per slot; `None` for raw and context helpers, which read registers themselves
-    arities: Vec<Option<u8>>,
     by_id: HashMap<u32, u32>,
     by_name: HashMap<String, u32>,
 }
@@ -241,7 +207,6 @@ impl<M> Default for HelperRegistry<M> {
     fn default() -> Self {
         Self {
             slots: Vec::new(),
-            arities: Vec::new(),
             by_id: HashMap::new(),
             by_name: HashMap::new(),
         }
@@ -252,7 +217,6 @@ impl<M> Clone for HelperRegistry<M> {
     fn clone(&self) -> Self {
         Self {
             slots: self.slots.clone(),
-            arities: self.arities.clone(),
             by_id: self.by_id.clone(),
             by_name: self.by_name.clone(),
         }
@@ -283,9 +247,7 @@ impl<M: 'static> HelperRegistry<M> {
         A: FromArgs + 'static,
         R: IntoReturn + 'static,
     {
-        let slot = self.by_id.get(&id).copied();
-        let slot = self.put(slot, Slot::typed(func), Some(A::ARITY));
-        self.by_id.insert(id, slot);
+        self.put_id(id, Slot::typed(func));
     }
 
     /// Register a helper that needs access to the context.
@@ -294,9 +256,7 @@ impl<M: 'static> HelperRegistry<M> {
         F: Fn(&mut HelperContext<M>) -> R + Send + Sync + 'static,
         R: IntoReturn + 'static,
     {
-        let slot = self.by_id.get(&id).copied();
-        let slot = self.put(slot, Slot::new(move |ctx| Ok(func(ctx).into_return())), None);
-        self.by_id.insert(id, slot);
+        self.put_id(id, Slot::new(move |ctx| Ok(func(ctx).into_return()), None));
     }
 
     /// Register an extern function by name.
@@ -306,10 +266,7 @@ impl<M: 'static> HelperRegistry<M> {
         A: FromArgs + 'static,
         R: IntoReturn + 'static,
     {
-        let name = name.into();
-        let slot = self.by_name.get(&name).copied();
-        let slot = self.put(slot, Slot::typed(func), Some(A::ARITY));
-        self.by_name.insert(name, slot);
+        self.put_name(name.into(), Slot::typed(func));
     }
 
     /// Register a raw extern function by name, called directly with the context.
@@ -317,23 +274,32 @@ impl<M: 'static> HelperRegistry<M> {
     where
         F: Fn(&mut HelperContext<M>) -> Result<u64, HelperError> + Send + Sync + 'static,
     {
-        let name = name.into();
+        self.put_name(name.into(), Slot::new(func, None));
+    }
+
+    /// Replace the function registered under `id`, or append a new slot.
+    fn put_id(&mut self, id: u32, helper: Slot<M>) {
+        let slot = self.by_id.get(&id).copied();
+        let slot = self.put(slot, helper);
+        self.by_id.insert(id, slot);
+    }
+
+    /// Replace the function registered under `name`, or append a new slot.
+    fn put_name(&mut self, name: String, helper: Slot<M>) {
         let slot = self.by_name.get(&name).copied();
-        let slot = self.put(slot, Slot::new(func), None);
+        let slot = self.put(slot, helper);
         self.by_name.insert(name, slot);
     }
 
     /// Replace the function in `slot`, or append a new slot.
-    fn put(&mut self, slot: Option<u32>, helper: Slot<M>, arity: Option<u8>) -> u32 {
+    fn put(&mut self, slot: Option<u32>, helper: Slot<M>) -> u32 {
         match slot {
             Some(slot) => {
                 self.slots[slot as usize] = helper;
-                self.arities[slot as usize] = arity;
                 slot
             }
             None => {
                 self.slots.push(helper);
-                self.arities.push(arity);
                 (self.slots.len() - 1) as u32
             }
         }
@@ -341,7 +307,7 @@ impl<M: 'static> HelperRegistry<M> {
 
     /// Argument count of the function in `slot`, if it was registered with typed arguments.
     pub fn arity(&self, slot: u32) -> Option<u8> {
-        self.arities.get(slot as usize).copied().flatten()
+        self.slots.get(slot as usize)?.arity
     }
 
     /// Slot of a helper ID.
@@ -366,11 +332,6 @@ impl<M: 'static> HelperRegistry<M> {
         let helper = self.slots.get(slot as usize).ok_or(HelperError::UnknownSlot(slot))?;
         // SAFETY: `Slot::new` paired `call` with a `data` pointer of the type it expects.
         unsafe { (helper.call)(helper.data, ctx) }
-    }
-
-    /// Check if a helper ID is registered.
-    pub fn has(&self, id: u32) -> bool {
-        self.by_id.contains_key(&id)
     }
 }
 

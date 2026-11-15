@@ -41,11 +41,14 @@ pub enum BtfTypeInfo<'a> {
         members: Vec<Member<'a>>,
     },
 
-    /// Enum type (32-bit values).
+    /// Enum type. `is_64` tells apart the kernel's 32-bit `BTF_KIND_ENUM` and 64-bit
+    /// `BTF_KIND_ENUM64` encodings; `kind()` reports them separately, but every other
+    /// consumer treats the two the same.
     Enum {
         name: &'a str,
         size: u32,
         is_signed: bool,
+        is_64: bool,
         variants: Vec<EnumValue<'a>>,
     },
 
@@ -96,14 +99,6 @@ pub enum BtfTypeInfo<'a> {
 
     /// Type tag.
     TypeTag { name: &'a str, type_id: u32 },
-
-    /// Enum64 type (64-bit values).
-    Enum64 {
-        name: &'a str,
-        size: u32,
-        is_signed: bool,
-        variants: Vec<Enum64Value<'a>>,
-    },
 }
 
 impl<'a> BtfTypeInfo<'a> {
@@ -116,7 +111,8 @@ impl<'a> BtfTypeInfo<'a> {
             Self::Array { .. } => BtfKind::Array,
             Self::Struct { .. } => BtfKind::Struct,
             Self::Union { .. } => BtfKind::Union,
-            Self::Enum { .. } => BtfKind::Enum,
+            Self::Enum { is_64: false, .. } => BtfKind::Enum,
+            Self::Enum { is_64: true, .. } => BtfKind::Enum64,
             Self::Fwd { .. } => BtfKind::Fwd,
             Self::Typedef { .. } => BtfKind::Typedef,
             Self::Volatile { .. } => BtfKind::Volatile,
@@ -129,7 +125,6 @@ impl<'a> BtfTypeInfo<'a> {
             Self::Float { .. } => BtfKind::Float,
             Self::DeclTag { .. } => BtfKind::DeclTag,
             Self::TypeTag { .. } => BtfKind::TypeTag,
-            Self::Enum64 { .. } => BtfKind::Enum64,
         }
     }
 
@@ -155,7 +150,6 @@ impl<'a> BtfTypeInfo<'a> {
             Self::Float { name, .. } => Some(*name),
             Self::DeclTag { name, .. } => Some(*name),
             Self::TypeTag { name, .. } => Some(*name),
-            Self::Enum64 { name, .. } => Some(*name),
         }
     }
 
@@ -168,7 +162,6 @@ impl<'a> BtfTypeInfo<'a> {
             Self::Enum { size, .. } => Some(*size),
             Self::DataSec { size, .. } => Some(*size),
             Self::Float { size, .. } => Some(*size),
-            Self::Enum64 { size, .. } => Some(*size),
             _ => None,
         }
     }
@@ -187,25 +180,10 @@ pub struct Member<'a> {
     pub bitfield_size: u32,
 }
 
-impl<'a> Member<'a> {
-    /// Get the byte offset (only valid for non-bitfields).
-    pub fn byte_offset(&self) -> u32 {
-        self.bit_offset / 8
-    }
-}
-
-/// An enum value (32-bit).
+/// An enum value. 32-bit `BTF_KIND_ENUM` values are sign-extended to `i64` at parse time,
+/// the same widening libbpf applies when comparing a 32-bit enum against a 64-bit one.
 #[derive(Debug, Clone)]
 pub struct EnumValue<'a> {
-    /// Variant name.
-    pub name: &'a str,
-    /// Value.
-    pub value: i32,
-}
-
-/// An enum64 value (64-bit).
-#[derive(Debug, Clone)]
-pub struct Enum64Value<'a> {
     /// Variant name.
     pub name: &'a str,
     /// Value.

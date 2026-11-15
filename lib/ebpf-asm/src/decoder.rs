@@ -32,25 +32,13 @@ impl<'a> Decoder<'a> {
     pub fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
     }
+}
 
-    /// Get the current byte offset.
-    pub fn offset(&self) -> usize {
-        self.offset
-    }
+impl<'a> Iterator for Decoder<'a> {
+    type Item = Instruction;
 
-    /// Get the remaining bytes.
-    pub fn remaining(&self) -> &'a [u8] {
-        &self.bytes[self.offset..]
-    }
-
-    /// Check if there are more instructions to decode.
-    pub fn can_decode(&self) -> bool {
-        self.offset + 8 <= self.bytes.len()
-    }
-
-    /// Decode the next instruction.
-    pub fn decode(&mut self) -> Option<Instruction> {
-        if !self.can_decode() {
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset + 8 > self.bytes.len() {
             return None;
         }
 
@@ -114,14 +102,6 @@ impl<'a> Decoder<'a> {
             raw: raw.value(),
             raw2,
         })
-    }
-}
-
-impl<'a> Iterator for Decoder<'a> {
-    type Item = Instruction;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.decode()
     }
 }
 
@@ -292,7 +272,7 @@ fn decode_ldx(opcode: u8, dst: Register, src: Register, offset: i16) -> (Mnemoni
         (mode::MEM, size::W) => Mnemonic::Ldxw,
         (mode::MEM, size::H) => Mnemonic::Ldxh,
         (mode::MEM, size::B) => Mnemonic::Ldxb,
-        (mode::MEMSX, size::DW) => Mnemonic::Ldxsdw,
+        (mode::MEMSX, size::DW) => Mnemonic::Unknown, // no 64-bit sign-extending load in the ISA
         (mode::MEMSX, size::W) => Mnemonic::Ldxsw,
         (mode::MEMSX, size::H) => Mnemonic::Ldxsh,
         (mode::MEMSX, size::B) => Mnemonic::Ldxsb,
@@ -389,11 +369,6 @@ fn decode_st(opcode: u8, dst: Register, offset: i16, imm: i32) -> (Mnemonic, Ope
     (mnemonic, Operand::Mem { base: dst, offset }, Operand::Imm(imm), 8, None)
 }
 
-/// Decode a single instruction from bytes.
-pub fn decode_one(bytes: &[u8]) -> Option<Instruction> {
-    Decoder::new(bytes).decode()
-}
-
 /// Decode all instructions from bytes.
 pub fn decode_all(bytes: &[u8]) -> Vec<Instruction> {
     Decoder::new(bytes).collect()
@@ -406,7 +381,7 @@ mod tests {
     #[test]
     fn test_decode_exit() {
         let bytes = [0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let insn = decode_one(&bytes).unwrap();
+        let insn = Decoder::new(&bytes).next().unwrap();
         assert_eq!(insn.mnemonic, Mnemonic::Exit);
     }
 
@@ -414,7 +389,7 @@ mod tests {
     fn test_decode_mov64_imm() {
         // mov64 r0, 42
         let bytes = [0xb7, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00];
-        let insn = decode_one(&bytes).unwrap();
+        let insn = Decoder::new(&bytes).next().unwrap();
         assert_eq!(insn.mnemonic, Mnemonic::Mov64);
         assert_eq!(insn.dst, Operand::Reg(Register::R0));
         assert_eq!(insn.src, Operand::Imm(42));
@@ -424,7 +399,7 @@ mod tests {
     fn test_decode_add64_reg() {
         // add64 r0, r1
         let bytes = [0x0f, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let insn = decode_one(&bytes).unwrap();
+        let insn = Decoder::new(&bytes).next().unwrap();
         assert_eq!(insn.mnemonic, Mnemonic::Add64);
         assert_eq!(insn.dst, Operand::Reg(Register::R0));
         assert_eq!(insn.src, Operand::Reg(Register::R1));
@@ -437,7 +412,7 @@ mod tests {
             0x18, 0x00, 0x00, 0x00, 0xf0, 0xde, 0xbc, 0x9a, // first insn: imm = low 32 bits
             0x00, 0x00, 0x00, 0x00, 0x78, 0x56, 0x34, 0x12, // second insn: imm = high 32 bits
         ];
-        let insn = decode_one(&bytes).unwrap();
+        let insn = Decoder::new(&bytes).next().unwrap();
         assert_eq!(insn.mnemonic, Mnemonic::Lddw);
         assert_eq!(insn.size, 16);
         assert_eq!(insn.src, Operand::Imm64(0x123456789abcdef0u64 as i64));
@@ -447,7 +422,7 @@ mod tests {
     fn test_decode_ldxdw() {
         // ldxdw r0, [r1+16]
         let bytes = [0x79, 0x10, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let insn = decode_one(&bytes).unwrap();
+        let insn = Decoder::new(&bytes).next().unwrap();
         assert_eq!(insn.mnemonic, Mnemonic::Ldxdw);
         assert_eq!(insn.dst, Operand::Reg(Register::R0));
         assert_eq!(
@@ -463,7 +438,7 @@ mod tests {
     fn test_decode_jeq() {
         // jeq r0, 0, +5
         let bytes = [0x15, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let insn = decode_one(&bytes).unwrap();
+        let insn = Decoder::new(&bytes).next().unwrap();
         assert_eq!(insn.mnemonic, Mnemonic::Jeq);
     }
 
@@ -481,18 +456,18 @@ mod tests {
         ] {
             // lock *(u64 *)(r1 + 0) <op>= r2
             let bytes = [0xdb, 0x21, 0x00, 0x00, imm, 0x00, 0x00, 0x00];
-            let insn = decode_one(&bytes).unwrap();
+            let insn = Decoder::new(&bytes).next().unwrap();
             assert_eq!(insn.mnemonic, want, "imm=0x{imm:02x}");
         }
 
         // W-sized atomics (STX | W | ATOMIC = 0xC3) decode to the 32-bit mnemonic.
         let bytes = [0xc3, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let insn = decode_one(&bytes).unwrap();
+        let insn = Decoder::new(&bytes).next().unwrap();
         assert_eq!(insn.mnemonic, Mnemonic::AtomicAdd32);
 
         // AtomicAdd64 also carries dst/src operands, unlike the other mnemonics above.
         let bytes = [0xdb, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let insn = decode_one(&bytes).unwrap();
+        let insn = Decoder::new(&bytes).next().unwrap();
         assert_eq!(
             insn.dst,
             Operand::Mem {

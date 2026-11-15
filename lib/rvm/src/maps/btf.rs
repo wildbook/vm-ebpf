@@ -59,8 +59,8 @@ fn parse_def(btf: &Btf<'_>, name: &str, type_id: u32) -> Result<MapDef> {
             "max_entries" => max_entries = Some(uint()?),
             "key_size" => key_size = Some(uint()?),
             "value_size" => value_size = Some(uint()?),
-            "key" => key_size = Some(size_of_type(btf, *pointee_type).ok_or_else(|| bad("unsized key"))?),
-            "value" => value_size = Some(size_of_type(btf, *pointee_type).ok_or_else(|| bad("unsized value"))?),
+            "key" => key_size = Some(resolve_size(btf, *pointee_type).ok_or_else(|| bad("unsized key"))?),
+            "value" => value_size = Some(resolve_size(btf, *pointee_type).ok_or_else(|| bad("unsized value"))?),
             _ => {}
         }
     }
@@ -93,10 +93,6 @@ fn resolve<'a, 'b>(btf: &'b Btf<'a>, id: u32) -> Option<&'b BtfTypeInfo<'a>> {
     btf.resolve_type(id).map(|(_, ty)| ty)
 }
 
-fn size_of_type(btf: &Btf<'_>, id: u32) -> Option<u32> {
-    match resolve(btf, id)? {
-        BtfTypeInfo::Ptr { .. } => Some(8),
-        BtfTypeInfo::Array { elem_type, nelems, .. } => Some(size_of_type(btf, *elem_type)? * nelems),
-        ty => ty.size(),
-    }
+fn resolve_size(btf: &Btf<'_>, id: u32) -> Option<u32> {
+    btf.resolve_size(id).map(|s| s as u32)
 }

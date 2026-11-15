@@ -2,34 +2,7 @@
 //!
 //! The `Vm` struct is the central registry for helper functions, types,
 //! and configuration. Use it to load modules and create linked programs.
-//!
-//! # Example
-//!
-//! ```ignore
-//! use rvm::Vm;
-//!
-//! let mut vm = Vm::new();
-//!
-//! // Register a helper function
-//! vm.register_helper(1, |x: u64| {
-//!     println!("Got: {}", x);
-//!     0u64
-//! });
-//!
-//! // Describe the host's types, as BTF, for CO-RE
-//! let event = vm.types().add_struct("event", 12);
-//! let u64_t = vm.types().int("u64", 8, false);
-//! let u32_t = vm.types().int("u32", 4, false);
-//! vm.types().member(event, "timestamp", 0, u64_t);
-//! vm.types().member(event, "pid", 8, u32_t);
-//!
-//! // Parse and link a module
-//! let module = vm.parse_module("main", elf_bytes)?;
-//! let program = vm.link(&[&module])?;
-//!
-//! // Execute a function
-//! let result = program.call("my_func", &[42])?;
-//! ```
+//! See the crate documentation for a usage example.
 
 use std::sync::{Arc, Mutex};
 
@@ -39,13 +12,12 @@ use crate::error::{Result, VmError};
 use crate::executor::DEFAULT_FRAME_SIZE;
 use crate::helper::{FromArgs, IntoReturn, SharedHelpers};
 use crate::layout::{BORROW_FIRST_REGION, FIRST_FREE_REGION};
-use crate::linker::Linker;
 use crate::maps::SharedMaps;
 use crate::memory::{Perms, SharedBuffer, SharedRegion, MAX_REGION_LEN};
 use crate::module::Module;
 use crate::plugin::Plugin;
 use crate::program::Program;
-use crate::{maps, std_helpers};
+use crate::{linker, maps, std_helpers};
 
 /// Configuration for the VM.
 #[derive(Debug, Clone)]
@@ -263,7 +235,7 @@ impl Vm {
     /// ```
     pub fn link(&self, modules: &[&Module]) -> Result<Program> {
         let shared_regions = self.shared_regions.lock().unwrap_or_else(|e| e.into_inner());
-        Linker::new(&self.helpers, &self.shared_maps, &shared_regions, &self.types, &self.config).link(modules)
+        linker::link(&self.helpers, &self.shared_maps, &shared_regions, &self.types, &self.config, modules)
     }
 
     /// Link a single module into a program.
@@ -307,7 +279,7 @@ impl Vm {
     /// Programs linked afterwards can import it; programs that already import it pick
     /// up the new target at their next call.
     pub fn export(&self, plugin: &Plugin, func: &str) -> Result<()> {
-        if !plugin.lock()?.has_function(func) {
+        if plugin.lock()?.function(func).is_none() {
             return Err(VmError::FunctionNotFound(format!("{}::{func}", plugin.name())));
         }
         let helper = plugin.export_fn(func);

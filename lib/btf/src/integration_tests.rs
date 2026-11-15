@@ -1,129 +1,30 @@
 //! End-to-end CO-RE relocation tests: a local (compile-time) BTF is relocated against a
 //! target (host) BTF, exactly like a BPF program's debug info gets relocated against the
-//! kernel's BTF. Both are hand-encoded with [`TestBtf`] so each test controls, and can
+//! kernel's BTF. Both are encoded with [`BtfBuilder`] so each test controls, and can
 //! hand-derive, the exact offsets/values the relocation must produce.
 
+use crate::builder::BtfBuilder;
 use crate::core_relo::{apply_core_relocations, CoreRelo, CoreReloError, CoreReloKind, Unresolved, CORE_POISON_HELPER};
 use crate::parse::Btf;
-use crate::raw::{BTF_MAGIC, BTF_VERSION};
 
-/// Minimal BTF encoder: each method appends one type and returns its ID (IDs start at 1,
-/// matching [`Btf::parse`]'s numbering).
-#[derive(Default)]
-struct TestBtf {
-    strings: Vec<u8>,
-    types: Vec<u32>,
-    next_id: u32,
-}
-
-/// A struct/union member: name, member type ID, bit offset.
-type Field<'a> = (&'a str, u32, u32);
-/// A bitfield member: name, member type ID, bit offset, bit size.
-type Bitfield<'a> = (&'a str, u32, u32, u32);
-
-impl TestBtf {
-    fn new() -> Self {
-        Self { strings: vec![0], next_id: 1, types: Vec::new() }
-    }
-
-    fn name(&mut self, s: &str) -> u32 {
-        if s.is_empty() {
-            return 0;
-        }
-        let off = self.strings.len() as u32;
-        self.strings.extend_from_slice(s.as_bytes());
-        self.strings.push(0);
-        off
-    }
-
-    fn push(&mut self, name_off: u32, info: u32, size_or_type: u32, extra: &[u32]) -> u32 {
-        self.types.push(name_off);
-        self.types.push(info);
-        self.types.push(size_or_type);
-        self.types.extend_from_slice(extra);
-        let id = self.next_id;
-        self.next_id += 1;
-        id
-    }
-
-    fn int(&mut self, name: &str, size: u32, signed: bool) -> u32 {
-        let n = self.name(name);
-        let enc = u32::from(signed);
-        self.push(n, 1 << 24, size, &[(enc << 24) | (size * 8)])
-    }
-
-    fn array(&mut self, elem: u32, nelems: u32) -> u32 {
-        self.push(0, 3 << 24, 0, &[elem, 0, nelems])
-    }
-
-    fn composite(&mut self, kind: u32, kind_flag: bool, name: &str, size: u32, members: &[u32]) -> u32 {
-        let n = self.name(name);
-        let vlen = (members.len() / 3) as u32;
-        let info = (kind << 24) | (u32::from(kind_flag) << 31) | vlen;
-        self.push(n, info, size, members)
-    }
-
-    fn struct_(&mut self, name: &str, size: u32, fields: &[Field<'_>]) -> u32 {
-        let mut members = Vec::new();
-        for (fname, ftype, boff) in fields {
-            let n = self.name(fname);
-            members.extend_from_slice(&[n, *ftype, *boff]);
-        }
-        self.composite(4, false, name, size, &members)
-    }
-
-    fn union_(&mut self, name: &str, size: u32, fields: &[Field<'_>]) -> u32 {
-        let mut members = Vec::new();
-        for (fname, ftype, boff) in fields {
-            let n = self.name(fname);
-            members.extend_from_slice(&[n, *ftype, *boff]);
-        }
-        self.composite(5, false, name, size, &members)
-    }
-
-    fn bitfield_struct(&mut self, name: &str, size: u32, fields: &[Bitfield<'_>]) -> u32 {
-        let mut members = Vec::new();
-        for (fname, ftype, boff, bsz) in fields {
-            let n = self.name(fname);
-            members.extend_from_slice(&[n, *ftype, (bsz << 24) | boff]);
-        }
-        self.composite(4, true, name, size, &members)
-    }
-
-    fn enum_(&mut self, name: &str, variants: &[(&str, i32)]) -> u32 {
-        let n = self.name(name);
-        let mut extra = Vec::new();
-        for (vname, val) in variants {
-            let vn = self.name(vname);
-            extra.push(vn);
-            extra.push(*val as u32);
-        }
-        self.push(n, (6 << 24) | variants.len() as u32, 4, &extra)
-    }
-
-    fn encode(&self) -> Vec<u8> {
-        let types: Vec<u8> = self.types.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let mut btf = Vec::new();
-        btf.extend_from_slice(&BTF_MAGIC.to_le_bytes());
-        btf.extend_from_slice(&[BTF_VERSION, 0]);
-        for w in [24, 0, types.len() as u32, types.len() as u32, self.strings.len() as u32] {
-            btf.extend_from_slice(&w.to_le_bytes());
-        }
-        btf.extend_from_slice(&types);
-        btf.extend_from_slice(&self.strings);
-        btf
-    }
-}
-
-/// Encode a single `CoreRelo` whose access string is appended to a scratch `TestBtf`'s
+/// Encode a single `CoreRelo` whose access string is appended to a scratch `BtfBuilder`'s
 /// string table (CO-RE access strings live in the *local* BTF's strings).
-fn relo(local: &mut TestBtf, type_id: u32, access_str: &str, kind: CoreReloKind) -> CoreRelo {
-    let access_str_off = local.name(access_str);
-    CoreRelo { insn_off: 0, type_id, access_str_off, kind }
+fn relo(local: &mut BtfBuilder, type_id: u32, access_str: &str, kind: CoreReloKind) -> CoreRelo {
+    let access_str_off = local.string(access_str);
+    CoreRelo {
+        insn_off: 0,
+        type_id,
+        access_str_off,
+        kind,
+    }
 }
 
 fn insn(opcode: u8, dst: u8, src: u8, off: i16, imm: i32) -> u64 {
-    u64::from(opcode) | u64::from(dst) << 8 | u64::from(src) << 12 | u64::from(off as u16) << 16 | u64::from(imm as u32) << 32
+    u64::from(opcode)
+        | u64::from(dst) << 8
+        | u64::from(src) << 12
+        | u64::from(off as u16) << 16
+        | u64::from(imm as u32) << 32
 }
 
 fn off_of(i: u64) -> i16 {
@@ -140,17 +41,22 @@ const ALU64_MOV_K: u8 = 0xb7; // BPF_ALU64 | BPF_MOV | BPF_K
 /// A field moving to a new offset in the target patches the instruction's `off`.
 #[test]
 fn moved_field_offset() {
-    let mut local = TestBtf::new();
+    let mut local = BtfBuilder::new();
     let int_ty = local.int("int", 4, true);
-    let event = local.struct_("event", 8, &[("ts", int_ty, 0), ("pid", int_ty, 32)]);
+    let event = local.add_struct("event", 8);
+    local.member(event, "ts", 0, int_ty);
+    local.member(event, "pid", 4, int_ty);
     let r = relo(&mut local, event, "0:1", CoreReloKind::FieldByteOffset);
     let local_bytes = local.encode();
     let local_btf = Btf::parse(&local_bytes).unwrap();
 
-    let mut target = TestBtf::new();
+    let mut target = BtfBuilder::new();
     let t_int = target.int("int", 4, true);
     // Host's "event" has an extra field between ts and pid, pushing pid from byte 4 to byte 8.
-    target.struct_("event", 12, &[("ts", t_int, 0), ("extra", t_int, 32), ("pid", t_int, 64)]);
+    let t_event = target.add_struct("event", 12);
+    target.member(t_event, "ts", 0, t_int);
+    target.member(t_event, "extra", 4, t_int);
+    target.member(t_event, "pid", 8, t_int);
     let target_bytes = target.encode();
     let target_btf = Btf::parse(&target_bytes).unwrap();
 
@@ -164,18 +70,23 @@ fn moved_field_offset() {
 /// offset includes the anonymous union's own offset.
 #[test]
 fn nested_anonymous_member() {
-    let mut local = TestBtf::new();
+    let mut local = BtfBuilder::new();
     let int_ty = local.int("int", 4, true);
-    let s = local.struct_("anonish", 4, &[("val", int_ty, 0)]);
+    let s = local.add_struct("anonish", 4);
+    local.member(s, "val", 0, int_ty);
     let r = relo(&mut local, s, "0:0", CoreReloKind::FieldByteOffset);
     let local_bytes = local.encode();
     let local_btf = Btf::parse(&local_bytes).unwrap();
 
-    let mut target = TestBtf::new();
+    let mut target = BtfBuilder::new();
     let t_int = target.int("int", 4, true);
     // `val` lives inside an anonymous union starting at byte 4, alongside `padding`.
-    let anon_union = target.union_("", 4, &[("padding", t_int, 0), ("val", t_int, 0)]);
-    target.struct_("anonish", 8, &[("other", t_int, 0), ("", anon_union, 32)]);
+    let anon_union = target.add_union("", 4);
+    target.member(anon_union, "padding", 0, t_int);
+    target.member(anon_union, "val", 0, t_int);
+    let t_anonish = target.add_struct("anonish", 8);
+    target.member(t_anonish, "other", 0, t_int);
+    target.member(t_anonish, "", 4, anon_union);
     let target_bytes = target.encode();
     let target_btf = Btf::parse(&target_bytes).unwrap();
 
@@ -187,19 +98,24 @@ fn nested_anonymous_member() {
 /// Array element access follows the target's own array offset and element size.
 #[test]
 fn array_element_offset() {
-    let mut local = TestBtf::new();
+    let mut local = BtfBuilder::new();
     let int_ty = local.int("int", 4, true);
     let arr = local.array(int_ty, 4);
-    let s = local.struct_("withArr", 20, &[("before", int_ty, 0), ("items", arr, 32)]);
+    let s = local.add_struct("withArr", 20);
+    local.member(s, "before", 0, int_ty);
+    local.member(s, "items", 4, arr);
     let r = relo(&mut local, s, "0:1:2", CoreReloKind::FieldByteOffset);
     let local_bytes = local.encode();
     let local_btf = Btf::parse(&local_bytes).unwrap();
 
-    let mut target = TestBtf::new();
+    let mut target = BtfBuilder::new();
     let t_int = target.int("int", 4, true);
     let t_arr = target.array(t_int, 4);
     // Host inserted a padding field before the array, moving it from byte 4 to byte 8.
-    target.struct_("withArr", 24, &[("before", t_int, 0), ("pad", t_int, 32), ("items", t_arr, 64)]);
+    let t_with_arr = target.add_struct("withArr", 24);
+    target.member(t_with_arr, "before", 0, t_int);
+    target.member(t_with_arr, "pad", 4, t_int);
+    target.member(t_with_arr, "items", 8, t_arr);
     let target_bytes = target.encode();
     let target_btf = Btf::parse(&target_bytes).unwrap();
 
@@ -212,20 +128,22 @@ fn array_element_offset() {
 /// right byte offset.
 #[test]
 fn bitfield_signed_and_shifts() {
-    let mut local = TestBtf::new();
+    let mut local = BtfBuilder::new();
     let int_ty = local.int("int", 4, true);
     // `v` occupies bits [3, 8) of a 4-byte int: byte_sz=4, byte_off=0.
-    let s = local.bitfield_struct("flags", 4, &[("v", int_ty, 3, 5)]);
+    let s = local.add_struct("flags", 4);
+    local.bitfield_member(s, "v", 3, 5, int_ty);
     let r_signed = relo(&mut local, s, "0:0", CoreReloKind::FieldSigned);
     let r_rshift = relo(&mut local, s, "0:0", CoreReloKind::FieldRShiftU64);
     let r_lshift = relo(&mut local, s, "0:0", CoreReloKind::FieldLShiftU64);
     let local_bytes = local.encode();
     let local_btf = Btf::parse(&local_bytes).unwrap();
 
-    let mut target = TestBtf::new();
+    let mut target = BtfBuilder::new();
     let t_int = target.int("int", 4, true);
     // `v` occupies bits [20, 25) of a 4-byte int: byte_sz=4, byte_off=0.
-    target.bitfield_struct("flags", 4, &[("v", t_int, 20, 5)]);
+    let t_flags = target.add_struct("flags", 4);
+    target.bitfield_member(t_flags, "v", 20, 5, t_int);
     let target_bytes = target.encode();
     let target_btf = Btf::parse(&target_bytes).unwrap();
 
@@ -251,21 +169,25 @@ fn bitfield_signed_and_shifts() {
 /// the same change on a signed field poisons rather than risk sign-extending wrongly.
 #[test]
 fn size_change_adjusts_or_poisons_memory_access() {
-    let mut local = TestBtf::new();
+    let mut local = BtfBuilder::new();
     let u32_ty = local.int("unsigned int", 4, false);
     let i32_ty = local.int("int", 4, true);
-    let safe = local.struct_("safe", 4, &[("count", u32_ty, 0)]);
-    let unsafe_ = local.struct_("unsafe", 4, &[("count", i32_ty, 0)]);
+    let safe = local.add_struct("safe", 4);
+    local.member(safe, "count", 0, u32_ty);
+    let unsafe_ = local.add_struct("unsafe", 4);
+    local.member(unsafe_, "count", 0, i32_ty);
     let r_safe = relo(&mut local, safe, "0:0", CoreReloKind::FieldByteOffset);
     let r_unsafe = relo(&mut local, unsafe_, "0:0", CoreReloKind::FieldByteOffset);
     let local_bytes = local.encode();
     let local_btf = Btf::parse(&local_bytes).unwrap();
 
-    let mut target = TestBtf::new();
+    let mut target = BtfBuilder::new();
     let u64_ty = target.int("unsigned long", 8, false);
     let i64_ty = target.int("long", 8, true);
-    target.struct_("safe", 8, &[("count", u64_ty, 0)]);
-    target.struct_("unsafe", 8, &[("count", i64_ty, 0)]);
+    let t_safe = target.add_struct("safe", 8);
+    target.member(t_safe, "count", 0, u64_ty);
+    let t_unsafe = target.add_struct("unsafe", 8);
+    target.member(t_unsafe, "count", 0, i64_ty);
     let target_bytes = target.encode();
     let target_btf = Btf::parse(&target_bytes).unwrap();
 
@@ -284,16 +206,19 @@ fn size_change_adjusts_or_poisons_memory_access() {
 /// A target type with a `___flavor` suffix is still found by its essential name.
 #[test]
 fn flavor_suffix_matching() {
-    let mut local = TestBtf::new();
+    let mut local = BtfBuilder::new();
     let int_ty = local.int("int", 4, true);
-    let cfg = local.struct_("cfg", 4, &[("limit", int_ty, 0)]);
+    let cfg = local.add_struct("cfg", 4);
+    local.member(cfg, "limit", 0, int_ty);
     let r = relo(&mut local, cfg, "0:0", CoreReloKind::FieldByteOffset);
     let local_bytes = local.encode();
     let local_btf = Btf::parse(&local_bytes).unwrap();
 
-    let mut target = TestBtf::new();
+    let mut target = BtfBuilder::new();
     let t_int = target.int("int", 4, true);
-    target.struct_("cfg___v2", 8, &[("pad", t_int, 0), ("limit", t_int, 32)]);
+    let t_cfg = target.add_struct("cfg___v2", 8);
+    target.member(t_cfg, "pad", 0, t_int);
+    target.member(t_cfg, "limit", 4, t_int);
     let target_bytes = target.encode();
     let target_btf = Btf::parse(&target_bytes).unwrap();
 
@@ -305,17 +230,21 @@ fn flavor_suffix_matching() {
 /// Two target flavors that disagree on where a field landed make the relocation ambiguous.
 #[test]
 fn ambiguous_candidates_error() {
-    let mut local = TestBtf::new();
+    let mut local = BtfBuilder::new();
     let int_ty = local.int("int", 4, true);
-    let cfg = local.struct_("cfg", 4, &[("limit", int_ty, 0)]);
+    let cfg = local.add_struct("cfg", 4);
+    local.member(cfg, "limit", 0, int_ty);
     let r = relo(&mut local, cfg, "0:0", CoreReloKind::FieldByteOffset);
     let local_bytes = local.encode();
     let local_btf = Btf::parse(&local_bytes).unwrap();
 
-    let mut target = TestBtf::new();
+    let mut target = BtfBuilder::new();
     let t_int = target.int("int", 4, true);
-    target.struct_("cfg", 4, &[("limit", t_int, 0)]);
-    target.struct_("cfg___dup", 8, &[("pad", t_int, 0), ("limit", t_int, 32)]);
+    let t_cfg = target.add_struct("cfg", 4);
+    target.member(t_cfg, "limit", 0, t_int);
+    let t_cfg_dup = target.add_struct("cfg___dup", 8);
+    target.member(t_cfg_dup, "pad", 0, t_int);
+    target.member(t_cfg_dup, "limit", 4, t_int);
     let target_bytes = target.encode();
     let target_btf = Btf::parse(&target_bytes).unwrap();
 
@@ -327,14 +256,20 @@ fn ambiguous_candidates_error() {
 /// An enum value relocates to the target's value for the same (flavor-matched) variant.
 #[test]
 fn enum_value_relocation() {
-    let mut local = TestBtf::new();
-    let color = local.enum_("color", &[("RED", 0), ("GREEN", 1), ("BLUE", 2)]);
+    let mut local = BtfBuilder::new();
+    let color = local.add_enum("color", 4, false);
+    local.enumerator(color, "RED", 0);
+    local.enumerator(color, "GREEN", 1);
+    local.enumerator(color, "BLUE", 2);
     let r = relo(&mut local, color, "1", CoreReloKind::EnumvalValue); // GREEN
     let local_bytes = local.encode();
     let local_btf = Btf::parse(&local_bytes).unwrap();
 
-    let mut target = TestBtf::new();
-    target.enum_("color___v2", &[("RED", 10), ("GREEN", 11), ("BLUE", 12)]);
+    let mut target = BtfBuilder::new();
+    let t_color = target.add_enum("color___v2", 4, false);
+    target.enumerator(t_color, "RED", 10);
+    target.enumerator(t_color, "GREEN", 11);
+    target.enumerator(t_color, "BLUE", 12);
     let target_bytes = target.encode();
     let target_btf = Btf::parse(&target_bytes).unwrap();
 
@@ -346,17 +281,19 @@ fn enum_value_relocation() {
 /// `TYPE_ID_TARGET` resolves to the matched candidate's own type ID, not the local one.
 #[test]
 fn type_id_target_relocation() {
-    let mut local = TestBtf::new();
+    let mut local = BtfBuilder::new();
     let int_ty = local.int("int", 4, true);
-    let cfg = local.struct_("cfg", 4, &[("limit", int_ty, 0)]);
+    let cfg = local.add_struct("cfg", 4);
+    local.member(cfg, "limit", 0, int_ty);
     let r = relo(&mut local, cfg, "0", CoreReloKind::TypeIdTarget);
     let local_bytes = local.encode();
     let local_btf = Btf::parse(&local_bytes).unwrap();
 
-    let mut target = TestBtf::new();
+    let mut target = BtfBuilder::new();
     let t_int = target.int("int", 4, true);
     let _padding = target.int("padding filler", 1, false);
-    let t_cfg = target.struct_("cfg", 4, &[("limit", t_int, 0)]);
+    let t_cfg = target.add_struct("cfg", 4);
+    target.member(t_cfg, "limit", 0, t_int);
     let target_bytes = target.encode();
     let target_btf = Btf::parse(&target_bytes).unwrap();
 
@@ -371,17 +308,20 @@ fn type_id_target_relocation() {
 /// than poisoning).
 #[test]
 fn type_matches_true_and_false() {
-    let mut local = TestBtf::new();
+    let mut local = BtfBuilder::new();
     let int_ty = local.int("int", 4, true);
-    let a = local.struct_("a", 4, &[("x", int_ty, 0)]);
+    let a = local.add_struct("a", 4);
+    local.member(a, "x", 0, int_ty);
     let r_superset = relo(&mut local, a, "0", CoreReloKind::TypeMatches);
     let r_mismatched = relo(&mut local, a, "0", CoreReloKind::TypeMatches);
     let local_bytes = local.encode();
     let local_btf = Btf::parse(&local_bytes).unwrap();
 
-    let mut superset = TestBtf::new();
+    let mut superset = BtfBuilder::new();
     let s_int = superset.int("int", 4, true);
-    superset.struct_("a", 8, &[("x", s_int, 0), ("y", s_int, 32)]);
+    let s_a = superset.add_struct("a", 8);
+    superset.member(s_a, "x", 0, s_int);
+    superset.member(s_a, "y", 4, s_int);
     let superset_bytes = superset.encode();
     let superset_btf = Btf::parse(&superset_bytes).unwrap();
 
@@ -389,9 +329,10 @@ fn type_matches_true_and_false() {
     apply_core_relocations(&mut insns, &local_btf, &superset_btf, &[r_superset]).unwrap();
     assert_eq!(imm_of(insns[0]), 1);
 
-    let mut mismatched = TestBtf::new();
+    let mut mismatched = BtfBuilder::new();
     let m_int = mismatched.int("int", 4, true);
-    mismatched.struct_("a", 4, &[("z", m_int, 0)]);
+    let m_a = mismatched.add_struct("a", 4);
+    mismatched.member(m_a, "z", 0, m_int);
     let mismatched_bytes = mismatched.encode();
     let mismatched_btf = Btf::parse(&mismatched_bytes).unwrap();
 
@@ -405,9 +346,10 @@ fn type_matches_true_and_false() {
 /// type-based kind (not just `TYPE_EXISTS`/`TYPE_MATCHES`): libbpf never poisons those.
 #[test]
 fn missing_type_poisons_or_reads_as_absent() {
-    let mut local = TestBtf::new();
+    let mut local = BtfBuilder::new();
     let int_ty = local.int("int", 4, true);
-    let gone = local.struct_("gone", 4, &[("field", int_ty, 0)]);
+    let gone = local.add_struct("gone", 4);
+    local.member(gone, "field", 0, int_ty);
     let r_offset = relo(&mut local, gone, "0:0", CoreReloKind::FieldByteOffset);
     let r_exists = relo(&mut local, gone, "0:0", CoreReloKind::FieldExists);
     let r_size = relo(&mut local, gone, "0", CoreReloKind::TypeSize);
@@ -415,7 +357,7 @@ fn missing_type_poisons_or_reads_as_absent() {
     let local_bytes = local.encode();
     let local_btf = Btf::parse(&local_bytes).unwrap();
 
-    let target = TestBtf::new();
+    let target = BtfBuilder::new();
     let target_bytes = target.encode();
     let target_btf = Btf::parse(&target_bytes).unwrap();
 
@@ -425,7 +367,10 @@ fn missing_type_poisons_or_reads_as_absent() {
         unresolved,
         vec![Unresolved {
             insn_off: 0,
-            error: CoreReloError::NoMatchingTarget { type_name: "gone".to_string(), access_str: "0:0".to_string() },
+            error: CoreReloError::NoMatchingTarget {
+                type_name: "gone".to_string(),
+                access_str: "0:0".to_string()
+            },
         }]
     );
     assert_eq!(insns[0], 0x85 | u64::from(CORE_POISON_HELPER) << 32);
@@ -447,4 +392,53 @@ fn missing_type_poisons_or_reads_as_absent() {
     let unresolved = apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r_id_target]).unwrap();
     assert!(unresolved.is_empty());
     assert_eq!(imm_of(insns[0]), 0);
+}
+
+/// `FieldByteSize` on an array member is the whole array's size (element size times
+/// length), matching libbpf's `btf__resolve_size`, not just the element's size.
+#[test]
+fn array_field_byte_size_multiplies_by_length() {
+    let mut local = BtfBuilder::new();
+    let int_ty = local.int("int", 4, true);
+    let arr = local.array(int_ty, 4);
+    let s = local.add_struct("withArr", 16);
+    local.member(s, "arr", 0, arr);
+    let r = relo(&mut local, s, "0:0", CoreReloKind::FieldByteSize);
+    let local_bytes = local.encode();
+    let local_btf = Btf::parse(&local_bytes).unwrap();
+
+    let target_bytes = local.encode();
+    let target_btf = Btf::parse(&target_bytes).unwrap();
+
+    let mut insns = [insn(ALU64_MOV_K, 0, 0, 0, 16)];
+    let unresolved = apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r]).unwrap();
+    assert!(unresolved.is_empty());
+    assert_eq!(imm_of(insns[0]), 16);
+}
+
+/// A two-dimensional array's second-level index is scaled by the inner array's whole
+/// size, not just its element's: `a[i][j]`'s offset is `i * (inner_len * elem_sz) + j *
+/// elem_sz`.
+#[test]
+fn two_dimensional_array_offset() {
+    let mut local = BtfBuilder::new();
+    let int_ty = local.int("int", 4, true);
+    let inner = local.array(int_ty, 4);
+    let outer = local.array(inner, 3);
+    let s = local.add_struct("with2d", 52);
+    local.member(s, "before", 0, int_ty);
+    local.member(s, "grid", 4, outer);
+    // idx1 selects "grid" (the struct's second member), idx2 selects the outer
+    // dimension's element 1, idx3 selects the inner dimension's element 2.
+    let r = relo(&mut local, s, "0:1:1:2", CoreReloKind::FieldByteOffset);
+    let local_bytes = local.encode();
+    let local_btf = Btf::parse(&local_bytes).unwrap();
+
+    let target_bytes = local.encode();
+    let target_btf = Btf::parse(&target_bytes).unwrap();
+
+    let mut insns = [insn(LDX_W, 0, 1, 28, 0)];
+    apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r]).unwrap();
+    // 4 (before) + 1 * 16 (one full inner array) + 2 * 4 (one int)
+    assert_eq!(off_of(insns[0]), 28);
 }

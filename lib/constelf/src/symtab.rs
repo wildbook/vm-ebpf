@@ -14,19 +14,10 @@ pub struct ElfSymTab<'a> {
     pub raw: &'a [Elf64Sym],
 }
 
-impl<'a> ElfSymTab<'a> {
-    pub const fn new(raw: &'a [Elf64Sym]) -> Self {
-        Self { raw }
-    }
-}
-
 impl ElfSymTab<'_> {
+    #[allow(clippy::len_without_is_empty)] // `is_empty` had no callers; removed as dead API
     pub const fn len(&self) -> usize {
         self.raw.len()
-    }
-
-    pub const fn is_empty(&self) -> bool {
-        self.raw.is_empty()
     }
 
     pub const fn get(&self, idx: usize) -> Option<&Elf64Sym> {

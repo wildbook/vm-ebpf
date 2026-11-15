@@ -33,7 +33,7 @@ impl Debug for OpCode {
             | Class::Jmp64
             | Class::Jmp32 => {
                 dstr.field("opc", &self.jmp_opc())
-                    .field("src", &self.jmp_src());
+                    .field("src", &self.alu_src());
             },
 
             | Class::Alu32

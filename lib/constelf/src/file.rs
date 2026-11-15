@@ -5,7 +5,7 @@ use crate::err::{self, ElfError, ErrHeader};
 use crate::raw::Elf64Ehdr;
 use crate::relocs::ElfRelocs;
 use crate::sections::ElfSections;
-use crate::{ensure, relocs, tryres, util};
+use crate::{ensure, relocs, tryres};
 
 #[derive(Clone, Copy)]
 pub struct ElfFile<'a>(&'a [u8]);
@@ -48,10 +48,6 @@ impl<'a> ElfFile<'a> {
 
     pub const fn sections(self) -> ElfResult<ElfSections<'a>> {
         ElfSections::new(self, self.header())
-    }
-
-    pub const fn derva_slice(self, beg: usize, len: usize) -> ElfResult<&'a [u8]> {
-        util::derva_slice(self.image(), beg, len)
     }
 
     pub const fn relocs(self) -> relocs::ElfRelocs<'a> {

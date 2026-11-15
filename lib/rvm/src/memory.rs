@@ -237,18 +237,14 @@ impl VmMemory {
 
     /// Borrow `len` bytes at guest address `addr` (host access, ignores perms).
     pub fn bytes(&self, addr: u64, len: usize) -> Result<&[u8], MemoryError> {
-        let ptr = self
-            .resolve(addr, len, Perms::NONE)
-            .ok_or(MemoryError { addr, size: len })?;
-        // SAFETY: `resolve` checked the range lies inside a live region.
+        let ptr = self.host_ptr(addr, len, Perms::NONE)?;
+        // SAFETY: `host_ptr` checked the range lies inside a live region.
         Ok(unsafe { std::slice::from_raw_parts(ptr.as_ptr(), len) })
     }
 
     /// Mutably borrow `len` bytes at guest address `addr` (host access, ignores perms).
     pub fn bytes_mut(&mut self, addr: u64, len: usize) -> Result<&mut [u8], MemoryError> {
-        let ptr = self
-            .resolve(addr, len, Perms::NONE)
-            .ok_or(MemoryError { addr, size: len })?;
+        let ptr = self.host_ptr(addr, len, Perms::NONE)?;
         // SAFETY: as `bytes`; `&mut self` guarantees exclusive access.
         Ok(unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), len) })
     }
@@ -262,12 +258,8 @@ impl VmMemory {
     /// Copy `len` bytes from guest address `src` to `dst`, which may be in different
     /// regions or overlap (host access).
     pub fn copy(&mut self, src: u64, dst: u64, len: usize) -> Result<(), MemoryError> {
-        let src = self
-            .resolve(src, len, Perms::NONE)
-            .ok_or(MemoryError { addr: src, size: len })?;
-        let dst = self
-            .resolve(dst, len, Perms::NONE)
-            .ok_or(MemoryError { addr: dst, size: len })?;
+        let src = self.host_ptr(src, len, Perms::NONE)?;
+        let dst = self.host_ptr(dst, len, Perms::NONE)?;
         // SAFETY: both ranges are inside live regions; `copy` allows overlap.
         unsafe { std::ptr::copy(src.as_ptr(), dst.as_ptr(), len) };
         Ok(())

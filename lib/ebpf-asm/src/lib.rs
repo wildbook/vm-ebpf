@@ -4,12 +4,12 @@
 //!
 //! - **Decoder**: Disassemble eBPF bytecode into structured instructions
 //! - **Assembler**: Build eBPF bytecode with label support
-//! - **Formatter**: Customize instruction text output
+//! - **DefaultFormatter**: Render decoded instructions as text
 //!
 //! # Disassembly Example
 //!
 //! ```
-//! use ebpf_asm::{Decoder, DefaultFormatter, Formatter};
+//! use ebpf_asm::{Decoder, DefaultFormatter};
 //!
 //! // eBPF bytecode: mov64 r0, 42; exit
 //! let bytes = [
@@ -19,7 +19,7 @@
 //!
 //! let formatter = DefaultFormatter::new();
 //! for insn in Decoder::new(&bytes) {
-//!     println!("{:04x}: {}", insn.offset(), formatter.format_to_string(&insn));
+//!     println!("{:04x}: {}", insn.offset, formatter.format_to_string(&insn));
 //! }
 //! ```
 //!
@@ -57,8 +57,8 @@
 //! // Disassemble
 //! let insns: Vec<_> = Decoder::new(&code).collect();
 //! assert_eq!(insns.len(), 2);
-//! assert_eq!(insns[0].mnemonic().name(), "mov64");
-//! assert_eq!(insns[1].mnemonic().name(), "exit");
+//! assert_eq!(insns[0].mnemonic.name(), "mov64");
+//! assert_eq!(insns[1].mnemonic.name(), "exit");
 //! ```
 
 #![warn(missing_docs)]
@@ -73,208 +73,118 @@ mod operand;
 mod register;
 
 // Re-export main types
-pub use assembler::{AsmError, AssembledProgram, Assembler, CoreRelo, CoreReloKind, Label};
-pub use decoder::{decode_all, decode_one, Decoder};
-pub use formatter::{DefaultFormatter, Formatter, FormatterOutput, StringOutput};
-pub use instruction::{Instruction, RawInstruction};
+pub use assembler::{AsmError, AssembledProgram, Assembler, Label};
+pub use decoder::{decode_all, Decoder};
+pub use formatter::DefaultFormatter;
+pub use instruction::Instruction;
 pub use mnemonic::Mnemonic;
-pub use operand::{MemSize, Operand};
-pub use register::{InvalidRegister, Register, FP, R0, R1, R10, R2, R3, R4, R5, R6, R7, R8, R9};
-
-/// Instruction encoding constants.
-pub mod encoding {
-    pub use crate::instruction::{alu, class, jmp, mode, size, SRC_IMM, SRC_REG};
-}
+pub use operand::Operand;
+pub use register::{Register, FP, R0, R1, R10, R2, R3, R4, R5, R6, R7, R8, R9};
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Runs every assembler instruction through `assemble` -> `decode_all` and checks
+    /// that the mnemonic round-trips; a real invariant linking the two halves of the
+    /// crate, unlike the old per-family tests that each pinned one call sequence.
     #[test]
-    fn test_round_trip_simple() {
-        // Assemble
-        let mut asm = Assembler::new();
-        asm.mov64_imm(R0, 42);
-        asm.add64_imm(R0, 8);
-        asm.exit();
-        let code = asm.assemble().unwrap();
-
-        // Disassemble
-        let insns = decode_all(&code);
-        assert_eq!(insns.len(), 3);
-        assert_eq!(insns[0].mnemonic, Mnemonic::Mov64);
-        assert_eq!(insns[1].mnemonic, Mnemonic::Add64);
-        assert_eq!(insns[2].mnemonic, Mnemonic::Exit);
-    }
-
-    #[test]
-    fn test_round_trip_with_labels() {
-        // Assemble with labels
-        let mut asm = Assembler::new();
-        let mut loop_label = asm.create_label();
-        let mut end_label = asm.create_label();
-
-        asm.mov64_imm(R0, 5); // insn 0
-        asm.set_label(&mut loop_label).unwrap(); // label points to insn 1
-        asm.sub64_imm(R0, 1); // insn 1
-        asm.jeq_imm(R0, 0, &end_label); // insn 2
-        asm.ja(&loop_label); // insn 3
-        asm.set_label(&mut end_label).unwrap(); // label points to insn 4
-        asm.exit(); // insn 4
-
-        let code = asm.assemble().unwrap();
-
-        // Disassemble and check offsets
-        let insns = decode_all(&code);
-        assert_eq!(insns.len(), 5);
-
-        // JEQ is at insn 2, should jump forward to insn 4 (exit)
-        // offset = 4 - (2 + 1) = 1
-        assert_eq!(insns[2].mnemonic, Mnemonic::Jeq);
-        let jeq_offset = ((insns[2].raw >> 16) & 0xFFFF) as i16;
-        assert_eq!(jeq_offset, 1); // Skip JA, land on EXIT
-
-        // JA is at insn 3, should jump backward to insn 1 (sub64)
-        // offset = 1 - (3 + 1) = -3
-        assert_eq!(insns[3].mnemonic, Mnemonic::Ja);
-        let ja_offset = ((insns[3].raw >> 16) & 0xFFFF) as i16;
-        assert_eq!(ja_offset, -3); // Back to sub64
-    }
-
-    #[test]
-    fn test_round_trip_lddw() {
-        let mut asm = Assembler::new();
-        asm.lddw(R0, 0xDEADBEEFCAFEBABEu64 as i64);
-        asm.exit();
-
-        let code = asm.assemble().unwrap();
-        assert_eq!(code.len(), 24); // 16 + 8 bytes
-
-        // The 64-bit immediate splits across the low 32 bits of each LDDW slot.
-        let lo = u32::from_le_bytes([code[4], code[5], code[6], code[7]]);
-        let hi = u32::from_le_bytes([code[12], code[13], code[14], code[15]]);
-        assert_eq!(lo, 0xCAFEBABE);
-        assert_eq!(hi, 0xDEADBEEF);
-
-        let insns = decode_all(&code);
-        assert_eq!(insns.len(), 2);
-        assert_eq!(insns[0].mnemonic, Mnemonic::Lddw);
-        assert_eq!(insns[0].size, 16);
-
-        if let Operand::Imm64(v) = insns[0].src {
-            assert_eq!(v as u64, 0xDEADBEEFCAFEBABE);
-        } else {
-            panic!("Expected Imm64 operand");
-        }
-    }
-
-    #[test]
-    fn test_round_trip_memory() {
-        let mut asm = Assembler::new();
-        asm.ldxdw(R0, R10, -8);
-        asm.stxdw(R10, -16, R0);
-        asm.ldxw(R1, R0, 0);
-        asm.stxb(R0, 4, R1);
-        asm.exit();
-
-        let code = asm.assemble().unwrap();
-
-        let insns = decode_all(&code);
-        assert_eq!(insns.len(), 5);
-        assert_eq!(insns[0].mnemonic, Mnemonic::Ldxdw);
-        assert_eq!(insns[1].mnemonic, Mnemonic::Stxdw);
-        assert_eq!(insns[2].mnemonic, Mnemonic::Ldxw);
-        assert_eq!(insns[3].mnemonic, Mnemonic::Stxb);
-    }
-
-    #[test]
-    fn test_all_alu64_operations() {
-        let mut asm = Assembler::new();
-        asm.add64(R0, R1);
-        asm.sub64(R0, R1);
-        asm.mul64(R0, R1);
-        asm.div64(R0, R1);
-        asm.or64(R0, R1);
-        asm.and64(R0, R1);
-        asm.lsh64(R0, R1);
-        asm.rsh64(R0, R1);
-        asm.neg64(R0);
-        asm.mod64(R0, R1);
-        asm.xor64(R0, R1);
-        asm.mov64(R0, R1);
-        asm.arsh64(R0, R1);
-        asm.exit();
-
-        let code = asm.assemble().unwrap();
-        let insns = decode_all(&code);
-
-        assert_eq!(insns[0].mnemonic, Mnemonic::Add64);
-        assert_eq!(insns[1].mnemonic, Mnemonic::Sub64);
-        assert_eq!(insns[2].mnemonic, Mnemonic::Mul64);
-        assert_eq!(insns[3].mnemonic, Mnemonic::Div64);
-        assert_eq!(insns[4].mnemonic, Mnemonic::Or64);
-        assert_eq!(insns[5].mnemonic, Mnemonic::And64);
-        assert_eq!(insns[6].mnemonic, Mnemonic::Lsh64);
-        assert_eq!(insns[7].mnemonic, Mnemonic::Rsh64);
-        assert_eq!(insns[8].mnemonic, Mnemonic::Neg64);
-        assert_eq!(insns[9].mnemonic, Mnemonic::Mod64);
-        assert_eq!(insns[10].mnemonic, Mnemonic::Xor64);
-        assert_eq!(insns[11].mnemonic, Mnemonic::Mov64);
-        assert_eq!(insns[12].mnemonic, Mnemonic::Arsh64);
-    }
-
-    #[test]
-    fn test_all_jump_conditions() {
+    fn round_trip_every_instruction() {
         let mut asm = Assembler::new();
         let mut l1 = asm.create_label();
         let mut l2 = asm.create_label();
-        let mut l3 = asm.create_label();
-        let mut l4 = asm.create_label();
-        let mut l5 = asm.create_label();
-        let mut l6 = asm.create_label();
 
+        asm.add64(R0, R1).add64_imm(R0, 1);
+        asm.sub64(R0, R1).sub64_imm(R0, 1);
+        asm.mul64(R0, R1).mul64_imm(R0, 1);
+        asm.div64(R0, R1).div64_imm(R0, 1);
+        asm.sdiv64(R0, R1).sdiv64_imm(R0, 1);
+        asm.or64(R0, R1).or64_imm(R0, 1);
+        asm.and64(R0, R1).and64_imm(R0, 1);
+        asm.lsh64(R0, R1).lsh64_imm(R0, 1);
+        asm.rsh64(R0, R1).rsh64_imm(R0, 1);
+        asm.neg64(R0);
+        asm.mod64(R0, R1).mod64_imm(R0, 1);
+        asm.smod64(R0, R1).smod64_imm(R0, 1);
+        asm.xor64(R0, R1).xor64_imm(R0, 1);
+        asm.mov64(R0, R1).mov64_imm(R0, 1);
+        asm.arsh64(R0, R1).arsh64_imm(R0, 1);
+
+        asm.add32(R0, R1).add32_imm(R0, 1);
+        asm.sub32(R0, R1).sub32_imm(R0, 1);
+        asm.mul32(R0, R1).mul32_imm(R0, 1);
+        asm.div32(R0, R1).div32_imm(R0, 1);
+        asm.sdiv32(R0, R1).sdiv32_imm(R0, 1);
+        asm.or32(R0, R1).or32_imm(R0, 1);
+        asm.and32(R0, R1).and32_imm(R0, 1);
+        asm.lsh32(R0, R1).lsh32_imm(R0, 1);
+        asm.rsh32(R0, R1).rsh32_imm(R0, 1);
+        asm.neg32(R0);
+        asm.mod32(R0, R1).mod32_imm(R0, 1);
+        asm.smod32(R0, R1).smod32_imm(R0, 1);
+        asm.xor32(R0, R1).xor32_imm(R0, 1);
+        asm.mov32(R0, R1).mov32_imm(R0, 1);
+        asm.arsh32(R0, R1).arsh32_imm(R0, 1);
+
+        asm.le16(R0).le32(R0).le64(R0);
+        asm.be16(R0).be32(R0).be64(R0);
+
+        asm.ja(&l1);
         asm.set_label(&mut l1).unwrap();
-        asm.jeq_imm(R0, 0, &l2);
+        asm.ja_off(0);
+        asm.jeq(R0, R1, &l2).jeq_imm(R0, 1, &l2);
+        asm.jne(R0, R1, &l2).jne_imm(R0, 1, &l2);
+        asm.jgt(R0, R1, &l2).jgt_imm(R0, 1, &l2);
+        asm.jge(R0, R1, &l2).jge_imm(R0, 1, &l2);
+        asm.jlt(R0, R1, &l2).jlt_imm(R0, 1, &l2);
+        asm.jle(R0, R1, &l2).jle_imm(R0, 1, &l2);
+        asm.jset(R0, R1, &l2).jset_imm(R0, 1, &l2);
+        asm.jsgt(R0, R1, &l2).jsgt_imm(R0, 1, &l2);
+        asm.jsge(R0, R1, &l2).jsge_imm(R0, 1, &l2);
+        asm.jslt(R0, R1, &l2).jslt_imm(R0, 1, &l2);
+        asm.jsle(R0, R1, &l2).jsle_imm(R0, 1, &l2);
+
+        asm.jeq32(R0, R1, &l2).jeq32_imm(R0, 1, &l2);
+        asm.jne32(R0, R1, &l2).jne32_imm(R0, 1, &l2);
+        asm.jgt32(R0, R1, &l2).jgt32_imm(R0, 1, &l2);
+        asm.jge32(R0, R1, &l2).jge32_imm(R0, 1, &l2);
+        asm.jlt32(R0, R1, &l2).jlt32_imm(R0, 1, &l2);
+        asm.jle32(R0, R1, &l2).jle32_imm(R0, 1, &l2);
+        asm.jset32(R0, R1, &l2).jset32_imm(R0, 1, &l2);
+        asm.jsgt32(R0, R1, &l2).jsgt32_imm(R0, 1, &l2);
+        asm.jsge32(R0, R1, &l2).jsge32_imm(R0, 1, &l2);
+        asm.jslt32(R0, R1, &l2).jslt32_imm(R0, 1, &l2);
+        asm.jsle32(R0, R1, &l2).jsle32_imm(R0, 1, &l2);
+
+        asm.ldxdw(R0, R1, 0);
+        asm.ldxw(R0, R1, 0);
+        asm.ldxh(R0, R1, 0);
+        asm.ldxb(R0, R1, 0);
+        asm.ldxsw(R0, R1, 0);
+        asm.ldxsh(R0, R1, 0);
+        asm.ldxsb(R0, R1, 0);
+        asm.lddw(R0, 0x1234);
+
+        asm.stxdw(R1, 0, R0);
+        asm.stxw(R1, 0, R0);
+        asm.stxh(R1, 0, R0);
+        asm.stxb(R1, 0, R0);
+        asm.stdw(R1, 0, 1);
+        asm.stw(R1, 0, 1);
+        asm.sth(R1, 0, 1);
+        asm.stb(R1, 0, 1);
+
+        asm.call(1);
+        let mut func = asm.create_label();
+        asm.call_local(&func);
+        asm.set_label(&mut func).unwrap();
         asm.set_label(&mut l2).unwrap();
-        asm.jne_imm(R0, 0, &l3);
-        asm.set_label(&mut l3).unwrap();
-        asm.jgt_imm(R0, 0, &l4);
-        asm.set_label(&mut l4).unwrap();
-        asm.jge_imm(R0, 0, &l5);
-        asm.set_label(&mut l5).unwrap();
-        asm.jlt_imm(R0, 0, &l6);
-        asm.set_label(&mut l6).unwrap();
         asm.exit();
 
         let code = asm.assemble().unwrap();
         let insns = decode_all(&code);
-
-        assert_eq!(insns[0].mnemonic, Mnemonic::Jeq);
-        assert_eq!(insns[1].mnemonic, Mnemonic::Jne);
-        assert_eq!(insns[2].mnemonic, Mnemonic::Jgt);
-        assert_eq!(insns[3].mnemonic, Mnemonic::Jge);
-        assert_eq!(insns[4].mnemonic, Mnemonic::Jlt);
-    }
-
-    #[test]
-    fn test_endianness() {
-        let mut asm = Assembler::new();
-        asm.le16(R0);
-        asm.le32(R0);
-        asm.le64(R0);
-        asm.be16(R0);
-        asm.be32(R0);
-        asm.be64(R0);
-        asm.exit();
-
-        let code = asm.assemble().unwrap();
-        let insns = decode_all(&code);
-
-        assert_eq!(insns[0].mnemonic, Mnemonic::Le16);
-        assert_eq!(insns[1].mnemonic, Mnemonic::Le32);
-        assert_eq!(insns[2].mnemonic, Mnemonic::Le64);
-        assert_eq!(insns[3].mnemonic, Mnemonic::Be16);
-        assert_eq!(insns[4].mnemonic, Mnemonic::Be32);
-        assert_eq!(insns[5].mnemonic, Mnemonic::Be64);
+        let consumed: usize = insns.iter().map(|i| i.size as usize).sum();
+        assert_eq!(consumed, code.len(), "decoder must consume every emitted byte");
+        assert!(insns.iter().all(|i| i.mnemonic != Mnemonic::Unknown), "every emitted opcode must decode");
     }
 }

@@ -195,6 +195,9 @@ dependencies = [
 [[package]]
 name = "ebpf-asm"
 version = "0.1.0"
+dependencies = [
+ "btf",
+]
 
 [[package]]
 name = "either"
@@ -206,7 +209,6 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 name = "emu"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "constelf",
  "rvm",
 ]

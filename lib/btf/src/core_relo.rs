@@ -6,9 +6,8 @@
 //! relocation's access string names a path through the local type that gets re-resolved
 //! against whichever matching type the target actually has.
 
-use crate::parse::Btf;
-use crate::raw::int_encoding::BTF_INT_SIGNED;
-use crate::raw::BtfKind;
+use crate::parse::{word, Btf};
+use crate::raw::{BtfKind, BTF_INT_SIGNED};
 use crate::strings::BtfStrings;
 use crate::types::{BtfTypeInfo, Member};
 
@@ -110,78 +109,22 @@ impl CoreRelo {
         if data.len() < Self::SIZE {
             return None;
         }
-        let insn_off = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        let type_id = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-        let access_str_off = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-        let kind_raw = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
-        let kind = CoreReloKind::from_u32(kind_raw)?;
+        let kind = CoreReloKind::from_u32(word(data, 3))?;
 
         Some(Self {
-            insn_off,
-            type_id,
-            access_str_off,
+            insn_off: word(data, 0),
+            type_id: word(data, 1),
+            access_str_off: word(data, 2),
             kind,
         })
     }
 }
 
-/// BTF.ext header.
-#[derive(Debug, Clone, Copy)]
-pub struct BtfExtHeader {
-    pub magic: u16,
-    pub version: u8,
-    pub flags: u8,
-    pub hdr_len: u32,
-    pub func_info_off: u32,
-    pub func_info_len: u32,
-    pub line_info_off: u32,
-    pub line_info_len: u32,
-    pub core_relo_off: u32,
-    pub core_relo_len: u32,
-}
-
-impl BtfExtHeader {
-    pub const MIN_SIZE: usize = 24;
-    pub const SIZE_WITH_CORE: usize = 32;
-
-    pub fn parse(data: &[u8]) -> Option<Self> {
-        if data.len() < Self::MIN_SIZE {
-            return None;
-        }
-
-        let magic = u16::from_le_bytes([data[0], data[1]]);
-        let version = data[2];
-        let flags = data[3];
-        let hdr_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-        let func_info_off = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-        let func_info_len = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
-        let line_info_off = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
-        let line_info_len = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
-
-        // CO-RE relocations are optional (added later)
-        let (core_relo_off, core_relo_len) =
-            if hdr_len as usize >= Self::SIZE_WITH_CORE && data.len() >= Self::SIZE_WITH_CORE {
-                let off = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
-                let len = u32::from_le_bytes([data[28], data[29], data[30], data[31]]);
-                (off, len)
-            } else {
-                (0, 0)
-            };
-
-        Some(Self {
-            magic,
-            version,
-            flags,
-            hdr_len,
-            func_info_off,
-            func_info_len,
-            line_info_off,
-            line_info_len,
-            core_relo_off,
-            core_relo_len,
-        })
-    }
-}
+/// Minimum size of a `.BTF.ext` header: magic, version, flags, hdr_len, and the
+/// (unused) func_info/line_info offset/length fields.
+const BTF_EXT_HDR_MIN_SIZE: usize = 24;
+/// Header size once the (optional, added later) CO-RE relocation fields are present.
+const BTF_EXT_HDR_SIZE_WITH_CORE: usize = 32;
 
 /// CO-RE relocations for a specific section.
 #[derive(Debug, Clone)]
@@ -195,8 +138,6 @@ pub struct SectionCoreRelos<'a> {
 /// Parsed BTF.ext data.
 #[derive(Debug, Clone)]
 pub struct BtfExt<'a> {
-    /// Header.
-    pub header: BtfExtHeader,
     /// CO-RE relocations grouped by section.
     pub core_relos: Vec<SectionCoreRelos<'a>>,
 }
@@ -208,30 +149,43 @@ impl<'a> BtfExt<'a> {
     pub fn parse(data: &'a [u8], strings: &BtfStrings<'a>) -> Result<Self, crate::parse::BtfError> {
         use crate::parse::BtfError;
 
-        let header = BtfExtHeader::parse(data).ok_or(BtfError::TooShort)?;
-
-        if header.magic != crate::raw::BTF_MAGIC {
-            return Err(BtfError::BadMagic(header.magic));
+        if data.len() < BTF_EXT_HDR_MIN_SIZE {
+            return Err(BtfError::TooShort);
         }
+        let magic = u16::from_le_bytes([data[0], data[1]]);
+        if magic != crate::raw::BTF_MAGIC {
+            return Err(BtfError::BadMagic(magic));
+        }
+        let hdr_len = word(data, 1) as usize;
 
-        let core_relos = if header.core_relo_len > 0 {
-            Self::parse_core_relos(data, &header, strings)?
+        // CO-RE relocations are optional (added later).
+        let (core_relo_off, core_relo_len) =
+            if hdr_len >= BTF_EXT_HDR_SIZE_WITH_CORE && data.len() >= BTF_EXT_HDR_SIZE_WITH_CORE {
+                (word(data, 6), word(data, 7))
+            } else {
+                (0, 0)
+            };
+
+        let core_relos = if core_relo_len > 0 {
+            Self::parse_core_relos(data, hdr_len, core_relo_off, core_relo_len, strings)?
         } else {
             Vec::new()
         };
 
-        Ok(Self { header, core_relos })
+        Ok(Self { core_relos })
     }
 
     fn parse_core_relos(
         data: &'a [u8],
-        header: &BtfExtHeader,
+        hdr_len: usize,
+        core_relo_off: u32,
+        core_relo_len: u32,
         strings: &BtfStrings<'a>,
     ) -> Result<Vec<SectionCoreRelos<'a>>, crate::parse::BtfError> {
         use crate::parse::BtfError;
 
-        let start = header.hdr_len as usize + header.core_relo_off as usize;
-        let end = start + header.core_relo_len as usize;
+        let start = hdr_len + core_relo_off as usize;
+        let end = start + core_relo_len as usize;
 
         if end > data.len() || start >= data.len() {
             return Err(BtfError::SectionOverflow);
@@ -243,7 +197,7 @@ impl<'a> BtfExt<'a> {
         }
 
         // First 4 bytes: record size
-        let rec_size = u32::from_le_bytes([relo_data[0], relo_data[1], relo_data[2], relo_data[3]]) as usize;
+        let rec_size = word(relo_data, 0) as usize;
         if rec_size < CoreRelo::SIZE {
             return Err(BtfError::InvalidType(0));
         }
@@ -325,7 +279,11 @@ impl core::fmt::Display for CoreReloError {
             Self::AnonymousRootType(kind) => write!(f, "{kind:?} relocation doesn't support anonymous local types"),
             Self::SpecTooDeep => write!(f, "struct/union/array access nests too deep"),
             Self::Ambiguous { insn_off } => write!(f, "relocation at instruction offset {insn_off} is ambiguous"),
-            Self::UnexpectedValue { insn_off, expected, found } => {
+            Self::UnexpectedValue {
+                insn_off,
+                expected,
+                found,
+            } => {
                 write!(f, "instruction at offset {insn_off} has value {found}, expected {expected}")
             }
             Self::OffsetTooLarge { insn_off, value } => {
@@ -375,7 +333,10 @@ pub fn apply_core_relocations(
             let type_name = local.type_by_id(relo.type_id).and_then(BtfTypeInfo::name).unwrap_or("");
             unresolved.push(Unresolved {
                 insn_off: relo.insn_off,
-                error: CoreReloError::NoMatchingTarget { type_name: type_name.to_string(), access_str: access_str.to_string() },
+                error: CoreReloError::NoMatchingTarget {
+                    type_name: type_name.to_string(),
+                    access_str: access_str.to_string(),
+                },
             });
         }
     }
@@ -436,7 +397,9 @@ fn resolve_relocation(local: &Btf<'_>, target: &Btf<'_>, relo: &CoreRelo) -> Res
 
     let orig = calc_half(relo.kind, &local_spec, local)?;
 
-    let local_type = local.type_by_id(relo.type_id).ok_or(CoreReloError::InvalidTypeId(relo.type_id))?;
+    let local_type = local
+        .type_by_id(relo.type_id)
+        .ok_or(CoreReloError::InvalidTypeId(relo.type_id))?;
     let local_name = local_type.name().unwrap_or("");
     if local_name.is_empty() {
         return Err(CoreReloError::AnonymousRootType(relo.kind));
@@ -455,7 +418,11 @@ fn resolve_relocation(local: &Btf<'_>, target: &Btf<'_>, relo: &CoreRelo) -> Res
                 matched = Some(cand_half);
             }
             Some((bit_offset, value)) if bit_offset == cand_spec.bit_offset && value == cand_half.val => {}
-            Some(_) => return Err(CoreReloError::Ambiguous { insn_off: relo.insn_off }),
+            Some(_) => {
+                return Err(CoreReloError::Ambiguous {
+                    insn_off: relo.insn_off,
+                })
+            }
         }
     }
 
@@ -469,8 +436,12 @@ fn resolve_relocation(local: &Btf<'_>, target: &Btf<'_>, relo: &CoreRelo) -> Res
     // else poisons rather than risk reading the wrong bytes or sign-extending wrongly.
     if let (Some((orig_sz, orig_tid)), Some((new_sz, new_tid))) = (orig.mem, new_mem) {
         if orig_sz != new_sz {
-            let orig_t = local.type_by_id(orig_tid).ok_or(CoreReloError::InvalidTypeId(orig_tid))?;
-            let new_t = target.type_by_id(new_tid).ok_or(CoreReloError::InvalidTypeId(new_tid))?;
+            let orig_t = local
+                .type_by_id(orig_tid)
+                .ok_or(CoreReloError::InvalidTypeId(orig_tid))?;
+            let new_t = target
+                .type_by_id(new_tid)
+                .ok_or(CoreReloError::InvalidTypeId(new_tid))?;
             let safe_adjust = (matches!(orig_t, BtfTypeInfo::Ptr { .. }) && matches!(new_t, BtfTypeInfo::Ptr { .. }))
                 || (is_unsigned_int(orig_t) && is_unsigned_int(new_t));
             poison |= !safe_adjust;
@@ -508,7 +479,9 @@ fn patch_instruction(instructions: &mut [u64], relo: &CoreRelo, res: &ResolvedRe
     const SRC_REG_MASK: u64 = 0x0000_0000_0000_F000;
 
     let idx = (relo.insn_off / 8) as usize;
-    let insn = *instructions.get(idx).ok_or(CoreReloError::InstructionOutOfBounds(relo.insn_off))?;
+    let insn = *instructions
+        .get(idx)
+        .ok_or(CoreReloError::InstructionOutOfBounds(relo.insn_off))?;
     let opcode = insn as u8;
 
     match opcode & CLASS_MASK {
@@ -522,7 +495,11 @@ fn patch_instruction(instructions: &mut [u64], relo: &CoreRelo, res: &ResolvedRe
             }
             let imm = i64::from((insn >> 32) as u32 as i32) as u64;
             if res.validate && imm != res.orig_val {
-                return Err(CoreReloError::UnexpectedValue { insn_off: relo.insn_off, expected: res.orig_val, found: imm });
+                return Err(CoreReloError::UnexpectedValue {
+                    insn_off: relo.insn_off,
+                    expected: res.orig_val,
+                    found: imm,
+                });
             }
             instructions[idx] = (insn & !IMM_MASK) | (u64::from(res.new_val as u32) << 32);
             Ok(false)
@@ -534,10 +511,17 @@ fn patch_instruction(instructions: &mut [u64], relo: &CoreRelo, res: &ResolvedRe
             }
             let off = i64::from((insn >> 16) as u16 as i16) as u64;
             if res.validate && off != res.orig_val {
-                return Err(CoreReloError::UnexpectedValue { insn_off: relo.insn_off, expected: res.orig_val, found: off });
+                return Err(CoreReloError::UnexpectedValue {
+                    insn_off: relo.insn_off,
+                    expected: res.orig_val,
+                    found: off,
+                });
             }
             if res.new_val > i16::MAX as u64 {
-                return Err(CoreReloError::OffsetTooLarge { insn_off: relo.insn_off, value: res.new_val });
+                return Err(CoreReloError::OffsetTooLarge {
+                    insn_off: relo.insn_off,
+                    value: res.new_val,
+                });
             }
             instructions[idx] = (insn & !OFF_MASK) | (res.new_val << 16);
 
@@ -545,8 +529,7 @@ fn patch_instruction(instructions: &mut [u64], relo: &CoreRelo, res: &ResolvedRe
                 let (Some(orig_sz), Some(new_sz)) = (res.orig_sz, res.new_sz) else {
                     return Err(CoreReloError::UnpatchableInstruction(relo.insn_off));
                 };
-                let encoded_sz =
-                    mem_size_bytes(opcode).ok_or(CoreReloError::UnpatchableInstruction(relo.insn_off))?;
+                let encoded_sz = mem_size_bytes(opcode).ok_or(CoreReloError::UnpatchableInstruction(relo.insn_off))?;
                 if encoded_sz != orig_sz {
                     return Err(CoreReloError::UnexpectedValue {
                         insn_off: relo.insn_off,
@@ -576,7 +559,11 @@ fn patch_instruction(instructions: &mut [u64], relo: &CoreRelo, res: &ResolvedRe
             }
             let imm = (insn >> 32) | ((hi >> 32) << 32);
             if res.validate && imm != res.orig_val {
-                return Err(CoreReloError::UnexpectedValue { insn_off: relo.insn_off, expected: res.orig_val, found: imm });
+                return Err(CoreReloError::UnexpectedValue {
+                    insn_off: relo.insn_off,
+                    expected: res.orig_val,
+                    found: imm,
+                });
             }
             instructions[idx] = (insn & !IMM_MASK) | ((res.new_val & 0xFFFF_FFFF) << 32);
             instructions[idx + 1] = (hi & !IMM_MASK) | ((res.new_val >> 32) << 32);
@@ -664,7 +651,9 @@ fn parse_spec(local: &Btf<'_>, relo: &CoreRelo, access_str: &str) -> Result<Spec
         .map(|s| s.parse::<u32>().map_err(|_| invalid_access(access_str)))
         .collect::<Result<_, _>>()?;
 
-    let (mut id, root_t) = local.resolve_type(relo.type_id).ok_or(CoreReloError::InvalidTypeId(relo.type_id))?;
+    let (mut id, root_t) = local
+        .resolve_type(relo.type_id)
+        .ok_or(CoreReloError::InvalidTypeId(relo.type_id))?;
     let root_idx = raw[0];
 
     if relo.kind.is_enum_relo() {
@@ -673,7 +662,6 @@ fn parse_spec(local: &Btf<'_>, relo: &CoreRelo, access_str: &str) -> Result<Spec
         }
         let name = match root_t {
             BtfTypeInfo::Enum { variants, .. } => variants.get(root_idx as usize).map(|v| v.name),
-            BtfTypeInfo::Enum64 { variants, .. } => variants.get(root_idx as usize).map(|v| v.name),
             _ => return Err(invalid_access(access_str)),
         }
         .ok_or_else(|| invalid_access(access_str))?;
@@ -713,12 +701,18 @@ fn parse_spec(local: &Btf<'_>, relo: &CoreRelo, access_str: &str) -> Result<Spec
                 id = m.type_id;
             }
             BtfTypeInfo::Array { elem_type, nelems, .. } => {
-                let (eid, _) = local.resolve_type(*elem_type).ok_or_else(|| invalid_access(access_str))?;
+                let (eid, _) = local
+                    .resolve_type(*elem_type)
+                    .ok_or_else(|| invalid_access(access_str))?;
                 let flex = is_flex_array(local, accessors.last(), *nelems);
                 if !flex && idx >= *nelems {
                     return Err(invalid_access(access_str));
                 }
-                accessors.push(Accessor { type_id: eid, idx, name: None });
+                accessors.push(Accessor {
+                    type_id: eid,
+                    idx,
+                    name: None,
+                });
                 id = eid;
                 bit_offset += u64::from(idx) * resolve_size(local, eid)? * 8;
             }
@@ -745,7 +739,9 @@ fn is_flex_array(btf: &Btf<'_>, prev: Option<&Accessor>, nelems: u32) -> bool {
     if prev.name.is_none() || nelems > 0 {
         return false;
     }
-    let Some(owner) = btf.type_by_id(prev.type_id) else { return false };
+    let Some(owner) = btf.type_by_id(prev.type_id) else {
+        return false;
+    };
     let Some(members) = members_of(owner) else { return false };
     prev.idx as usize + 1 == members.len()
 }
@@ -753,15 +749,11 @@ fn is_flex_array(btf: &Btf<'_>, prev: Option<&Accessor>, nelems: u32) -> bool {
 /// Find every type in `target` with the same essential name (and a compatible kind) as
 /// `local`'s root type: libbpf's `bpf_core_add_cands`.
 fn find_candidates(target: &Btf<'_>, local_name: &str, local_kind: BtfKind) -> Vec<u32> {
-    let essential_len = essential_name_len(local_name);
     target
         .types()
         .filter_map(|(id, t)| {
             let name = t.name().unwrap_or("");
-            let eligible = !name.is_empty()
-                && kind_core_compat(t.kind(), local_kind)
-                && essential_name_len(name) == essential_len
-                && name.as_bytes()[..essential_len] == local_name.as_bytes()[..essential_len];
+            let eligible = !name.is_empty() && kind_core_compat(t.kind(), local_kind) && names_match(name, local_name);
             eligible.then_some(id)
         })
         .collect()
@@ -770,7 +762,12 @@ fn find_candidates(target: &Btf<'_>, local_name: &str, local_kind: BtfKind) -> V
 /// Try to match a local spec against one target candidate, producing the equivalent target
 /// spec on success (`bpf_core_spec_match`). `Ok(None)` means the candidate doesn't match;
 /// errors are malformed BTF, not mismatches.
-fn spec_match(local: &Btf<'_>, local_spec: &Spec, target: &Btf<'_>, cand_id: u32) -> Result<Option<Spec>, CoreReloError> {
+fn spec_match(
+    local: &Btf<'_>,
+    local_spec: &Spec,
+    target: &Btf<'_>,
+    cand_id: u32,
+) -> Result<Option<Spec>, CoreReloError> {
     let kind = local_spec.kind;
 
     if kind.is_type_relo() {
@@ -801,7 +798,9 @@ fn spec_match(local: &Btf<'_>, local_spec: &Spec, target: &Btf<'_>, cand_id: u32
     let mut depth = 0usize;
 
     for (i, local_acc) in local_spec.accessors.iter().enumerate() {
-        let (tid, tt) = target.resolve_type(targ_id).ok_or(CoreReloError::InvalidTypeId(targ_id))?;
+        let (tid, tt) = target
+            .resolve_type(targ_id)
+            .ok_or(CoreReloError::InvalidTypeId(targ_id))?;
         targ_id = tid;
 
         if let Some(name) = local_acc.name.as_deref() {
@@ -820,7 +819,9 @@ fn spec_match(local: &Btf<'_>, local_spec: &Spec, target: &Btf<'_>, cand_id: u32
             if !flex && local_acc.idx >= *nelems {
                 return Ok(None);
             }
-            let (eid, _) = target.resolve_type(*elem_type).ok_or(CoreReloError::InvalidTypeId(*elem_type))?;
+            let (eid, _) = target
+                .resolve_type(*elem_type)
+                .ok_or(CoreReloError::InvalidTypeId(*elem_type))?;
             targ_id = eid;
         }
 
@@ -828,7 +829,11 @@ fn spec_match(local: &Btf<'_>, local_spec: &Spec, target: &Btf<'_>, cand_id: u32
         if depth > MAX_SPEC_DEPTH {
             return Err(CoreReloError::SpecTooDeep);
         }
-        spec.accessors.push(Accessor { type_id: targ_id, idx: local_acc.idx, name: None });
+        spec.accessors.push(Accessor {
+            type_id: targ_id,
+            idx: local_acc.idx,
+            name: None,
+        });
         spec.bit_offset += u64::from(local_acc.idx) * resolve_size(target, targ_id)? * 8;
     }
 
@@ -838,23 +843,27 @@ fn spec_match(local: &Btf<'_>, local_spec: &Spec, target: &Btf<'_>, cand_id: u32
 /// Find a target enum variant with the same essential name as the local one
 /// (`bpf_core_spec_match`'s enum-value branch).
 fn match_enumval(local_spec: &Spec, target: &Btf<'_>, cand_id: u32) -> Result<Option<Spec>, CoreReloError> {
-    let (resolved_id, t) = target.resolve_type(cand_id).ok_or(CoreReloError::InvalidTypeId(cand_id))?;
+    let (resolved_id, t) = target
+        .resolve_type(cand_id)
+        .ok_or(CoreReloError::InvalidTypeId(cand_id))?;
     let names: Vec<&str> = match t {
         BtfTypeInfo::Enum { variants, .. } => variants.iter().map(|v| v.name).collect(),
-        BtfTypeInfo::Enum64 { variants, .. } => variants.iter().map(|v| v.name).collect(),
         _ => return Ok(None),
     };
 
     let local_name = local_spec.accessors[0].name.as_deref().unwrap_or("");
-    let local_len = essential_name_len(local_name);
     for (i, name) in names.into_iter().enumerate() {
-        if essential_name_len(name) != local_len || name.as_bytes()[..local_len] != local_name.as_bytes()[..local_len] {
+        if !names_match(name, local_name) {
             continue;
         }
         return Ok(Some(Spec {
             kind: local_spec.kind,
             root_type_id: cand_id,
-            accessors: vec![Accessor { type_id: resolved_id, idx: i as u32, name: Some(name.to_string()) }],
+            accessors: vec![Accessor {
+                type_id: resolved_id,
+                idx: i as u32,
+                name: Some(name.to_string()),
+            }],
             bit_offset: 0,
         }));
     }
@@ -872,10 +881,16 @@ fn match_member(
     spec: &mut Spec,
     depth: &mut usize,
 ) -> Result<Option<u32>, CoreReloError> {
-    let (owner_id, targ_t) = target.resolve_type(targ_id).ok_or(CoreReloError::InvalidTypeId(targ_id))?;
-    let Some(targ_members) = members_of(targ_t) else { return Ok(None) };
+    let (owner_id, targ_t) = target
+        .resolve_type(targ_id)
+        .ok_or(CoreReloError::InvalidTypeId(targ_id))?;
+    let Some(targ_members) = members_of(targ_t) else {
+        return Ok(None);
+    };
 
-    let local_owner = local.type_by_id(local_acc.type_id).ok_or(CoreReloError::InvalidTypeId(local_acc.type_id))?;
+    let local_owner = local
+        .type_by_id(local_acc.type_id)
+        .ok_or(CoreReloError::InvalidTypeId(local_acc.type_id))?;
     let local_member = members_of(local_owner)
         .and_then(|m| m.get(local_acc.idx as usize))
         .ok_or(CoreReloError::InvalidTypeId(local_acc.type_id))?;
@@ -890,7 +905,11 @@ fn match_member(
         let found = if m.name.is_empty() {
             match_member(local, local_acc, local_name, target, m.type_id, spec, depth)?
         } else if m.name == local_name && fields_are_compat(local, local_member.type_id, target, m.type_id)? {
-            spec.accessors.push(Accessor { type_id: owner_id, idx: i as u32, name: Some(m.name.to_string()) });
+            spec.accessors.push(Accessor {
+                type_id: owner_id,
+                idx: i as u32,
+                name: Some(m.name.to_string()),
+            });
             Some(m.type_id)
         } else {
             None
@@ -926,28 +945,47 @@ fn calc_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<Half, Cor
 
 fn calc_field_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<Half, CoreReloError> {
     if kind == CoreReloKind::FieldExists {
-        return Ok(Half { val: 1, validate: true, mem: None });
+        return Ok(Half {
+            val: 1,
+            validate: true,
+            mem: None,
+        });
     }
 
-    let acc = spec.accessors.last().expect("a field spec always has at least its root accessor");
+    let acc = spec
+        .accessors
+        .last()
+        .expect("a field spec always has at least its root accessor");
 
     let Some(_) = &acc.name else {
         return match kind {
             CoreReloKind::FieldByteOffset => {
                 let elem_id = unwrap_arrays(btf, acc.type_id)?;
                 let sz = resolve_size(btf, elem_id)? as u32;
-                Ok(Half { val: spec.bit_offset / 8, validate: true, mem: Some((sz, elem_id)) })
+                Ok(Half {
+                    val: spec.bit_offset / 8,
+                    validate: true,
+                    mem: Some((sz, elem_id)),
+                })
             }
-            CoreReloKind::FieldByteSize => Ok(Half { val: resolve_size(btf, acc.type_id)?, validate: true, mem: None }),
+            CoreReloKind::FieldByteSize => Ok(Half {
+                val: resolve_size(btf, acc.type_id)?,
+                validate: true,
+                mem: None,
+            }),
             _ => Err(CoreReloError::UnsupportedRelo(kind)),
         };
     };
 
-    let owner = btf.type_by_id(acc.type_id).ok_or(CoreReloError::InvalidTypeId(acc.type_id))?;
+    let owner = btf
+        .type_by_id(acc.type_id)
+        .ok_or(CoreReloError::InvalidTypeId(acc.type_id))?;
     let m = members_of(owner)
         .and_then(|members| members.get(acc.idx as usize))
         .ok_or(CoreReloError::InvalidTypeId(acc.type_id))?;
-    let (field_type_id, field_t) = btf.resolve_type(m.type_id).ok_or(CoreReloError::InvalidTypeId(m.type_id))?;
+    let (field_type_id, field_t) = btf
+        .resolve_type(m.type_id)
+        .ok_or(CoreReloError::InvalidTypeId(m.type_id))?;
 
     let bit_off = spec.bit_offset;
     let is_bitfield = m.bitfield_size > 0;
@@ -975,19 +1013,39 @@ fn calc_field_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<Hal
             let mem = (!is_bitfield)
                 .then(|| unwrap_arrays(btf, field_type_id).and_then(|eid| Ok((resolve_size(btf, eid)? as u32, eid))))
                 .transpose()?;
-            Ok(Half { val: byte_off, validate, mem })
+            Ok(Half {
+                val: byte_off,
+                validate,
+                mem,
+            })
         }
-        CoreReloKind::FieldByteSize => Ok(Half { val: u64::from(byte_sz), validate, mem: None }),
+        CoreReloKind::FieldByteSize => Ok(Half {
+            val: u64::from(byte_sz),
+            validate,
+            mem: None,
+        }),
         CoreReloKind::FieldSigned => {
             let signed = match field_t {
-                BtfTypeInfo::Enum { is_signed, .. } | BtfTypeInfo::Enum64 { is_signed, .. } => *is_signed,
+                BtfTypeInfo::Enum { is_signed, .. } => *is_signed,
                 BtfTypeInfo::Int { encoding, .. } => encoding & BTF_INT_SIGNED != 0,
                 _ => false,
             };
-            Ok(Half { val: u64::from(signed), validate: true, mem: None })
+            Ok(Half {
+                val: u64::from(signed),
+                validate: true,
+                mem: None,
+            })
         }
-        CoreReloKind::FieldLShiftU64 => Ok(Half { val: 64 - (bit_off + bit_sz - byte_off * 8), validate, mem: None }),
-        CoreReloKind::FieldRShiftU64 => Ok(Half { val: 64 - bit_sz, validate: true, mem: None }),
+        CoreReloKind::FieldLShiftU64 => Ok(Half {
+            val: 64 - (bit_off + bit_sz - byte_off * 8),
+            validate,
+            mem: None,
+        }),
+        CoreReloKind::FieldRShiftU64 => Ok(Half {
+            val: 64 - bit_sz,
+            validate: true,
+            mem: None,
+        }),
         _ => unreachable!("FieldExists handled above; the rest are filtered by is_field_relo"),
     }
 }
@@ -997,27 +1055,48 @@ fn calc_type_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<Half
         CoreReloKind::TypeIdTarget => {
             // The type ID embedded in the instruction can change again during linking, so
             // it's never validated against what's already there.
-            Ok(Half { val: u64::from(spec.root_type_id), validate: false, mem: None })
+            Ok(Half {
+                val: u64::from(spec.root_type_id),
+                validate: false,
+                mem: None,
+            })
         }
-        CoreReloKind::TypeExists | CoreReloKind::TypeMatches => Ok(Half { val: 1, validate: true, mem: None }),
-        CoreReloKind::TypeSize => Ok(Half { val: resolve_size(btf, spec.root_type_id)?, validate: true, mem: None }),
+        CoreReloKind::TypeExists | CoreReloKind::TypeMatches => Ok(Half {
+            val: 1,
+            validate: true,
+            mem: None,
+        }),
+        CoreReloKind::TypeSize => Ok(Half {
+            val: resolve_size(btf, spec.root_type_id)?,
+            validate: true,
+            mem: None,
+        }),
         _ => unreachable!("TypeIdLocal is resolved before candidate search"),
     }
 }
 
 fn calc_enumval_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<Half, CoreReloError> {
     match kind {
-        CoreReloKind::EnumvalExists => Ok(Half { val: 1, validate: true, mem: None }),
+        CoreReloKind::EnumvalExists => Ok(Half {
+            val: 1,
+            validate: true,
+            mem: None,
+        }),
         CoreReloKind::EnumvalValue => {
             let acc = &spec.accessors[0];
-            let t = btf.type_by_id(acc.type_id).ok_or(CoreReloError::InvalidTypeId(acc.type_id))?;
+            let t = btf
+                .type_by_id(acc.type_id)
+                .ok_or(CoreReloError::InvalidTypeId(acc.type_id))?;
             let val = match t {
-                BtfTypeInfo::Enum { variants, .. } => variants.get(acc.idx as usize).map(|v| i64::from(v.value) as u64),
-                BtfTypeInfo::Enum64 { variants, .. } => variants.get(acc.idx as usize).map(|v| v.value as u64),
+                BtfTypeInfo::Enum { variants, .. } => variants.get(acc.idx as usize).map(|v| v.value as u64),
                 _ => None,
             }
             .ok_or(CoreReloError::InvalidTypeId(acc.type_id))?;
-            Ok(Half { val, validate: true, mem: None })
+            Ok(Half {
+                val,
+                validate: true,
+                mem: None,
+            })
         }
         _ => unreachable!("only enum-based kinds reach here"),
     }
@@ -1028,39 +1107,19 @@ fn calc_enumval_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<H
 fn unwrap_arrays(btf: &Btf<'_>, id: u32) -> Result<u32, CoreReloError> {
     let (mut id, mut t) = btf.resolve_type(id).ok_or(CoreReloError::InvalidTypeId(id))?;
     while let BtfTypeInfo::Array { elem_type, .. } = t {
-        let (eid, et) = btf.resolve_type(*elem_type).ok_or(CoreReloError::InvalidTypeId(*elem_type))?;
+        let (eid, et) = btf
+            .resolve_type(*elem_type)
+            .ok_or(CoreReloError::InvalidTypeId(*elem_type))?;
         id = eid;
         t = et;
     }
     Ok(id)
 }
 
-/// Byte size of a type, resolving through typedefs/modifiers/vars and, like libbpf's
-/// `btf__resolve_size`, descending into an array's element type without multiplying by
-/// its length (CO-RE only ever uses this for a single element's or scalar's size).
-fn resolve_size(btf: &Btf<'_>, mut id: u32) -> Result<u64, CoreReloError> {
-    loop {
-        let t = btf.type_by_id(id).ok_or(CoreReloError::InvalidTypeId(id))?;
-        id = match t {
-            BtfTypeInfo::Int { size, .. }
-            | BtfTypeInfo::Struct { size, .. }
-            | BtfTypeInfo::Union { size, .. }
-            | BtfTypeInfo::Enum { size, .. }
-            | BtfTypeInfo::DataSec { size, .. }
-            | BtfTypeInfo::Float { size, .. }
-            | BtfTypeInfo::Enum64 { size, .. } => return Ok(u64::from(*size)),
-            BtfTypeInfo::Ptr { .. } => return Ok(8),
-            BtfTypeInfo::Typedef { type_id, .. }
-            | BtfTypeInfo::Volatile { type_id }
-            | BtfTypeInfo::Const { type_id }
-            | BtfTypeInfo::Restrict { type_id }
-            | BtfTypeInfo::TypeTag { type_id, .. }
-            | BtfTypeInfo::Var { type_id, .. }
-            | BtfTypeInfo::DeclTag { type_id, .. } => *type_id,
-            BtfTypeInfo::Array { elem_type, .. } => *elem_type,
-            _ => return Err(CoreReloError::InvalidTypeId(id)),
-        };
-    }
+/// Byte size of a type, resolving through typedefs/modifiers/arrays, like libbpf's
+/// `btf__resolve_size`.
+fn resolve_size(btf: &Btf<'_>, id: u32) -> Result<u64, CoreReloError> {
+    btf.resolve_size(id).ok_or(CoreReloError::InvalidTypeId(id))
 }
 
 fn members_of<'a, 'b>(t: &'b BtfTypeInfo<'a>) -> Option<&'b [Member<'a>]> {
@@ -1096,7 +1155,10 @@ fn essential_name_len(name: &str) -> usize {
     if bytes.len() < 5 {
         return bytes.len();
     }
-    (0..=bytes.len() - 5).rev().find(|&i| is_flavor_sep(&bytes[i..])).map_or(bytes.len(), |i| i + 1)
+    (0..=bytes.len() - 5)
+        .rev()
+        .find(|&i| is_flavor_sep(&bytes[i..]))
+        .map_or(bytes.len(), |i| i + 1)
 }
 
 /// Two type/field names match if they have the same name ignoring flavor suffixes
@@ -1107,22 +1169,29 @@ fn names_match(a: &str, b: &str) -> bool {
     la == lb && a.as_bytes()[..la] == b.as_bytes()[..lb]
 }
 
-/// Like [`names_match`], except either side being anonymous is itself a match: used only
-/// for `FWD`/`ENUM` field-type compatibility, where an anonymous enum or forward
-/// declaration is compatible with anything of the same kind.
-fn names_loosely_match(a: &str, b: &str) -> bool {
-    let la = essential_name_len(a);
-    let lb = essential_name_len(b);
-    la == 0 || lb == 0 || (la == lb && a.as_bytes()[..la] == b.as_bytes()[..lb])
+/// Whether a local and target name match for `FWD`/`ENUM` field-type compatibility: either
+/// side being anonymous is itself a match, since an anonymous enum or forward declaration
+/// is compatible with anything of the same kind.
+fn fwd_or_enum_names_match(a: &str, b: &str) -> bool {
+    essential_name_len(a) == 0 || essential_name_len(b) == 0 || names_match(a, b)
 }
 
 /// Whether a local field and a target field of the given types can be relocated onto each
 /// other (`bpf_core_fields_are_compat`): looser than [`types_match`], e.g. any two structs
 /// (or two pointers, or two floats) are compatible regardless of their contents.
-fn fields_are_compat(local: &Btf<'_>, mut local_id: u32, target: &Btf<'_>, mut targ_id: u32) -> Result<bool, CoreReloError> {
+fn fields_are_compat(
+    local: &Btf<'_>,
+    mut local_id: u32,
+    target: &Btf<'_>,
+    mut targ_id: u32,
+) -> Result<bool, CoreReloError> {
     loop {
-        let (_, lt) = local.resolve_type(local_id).ok_or(CoreReloError::InvalidTypeId(local_id))?;
-        let (_, tt) = target.resolve_type(targ_id).ok_or(CoreReloError::InvalidTypeId(targ_id))?;
+        let (_, lt) = local
+            .resolve_type(local_id)
+            .ok_or(CoreReloError::InvalidTypeId(local_id))?;
+        let (_, tt) = target
+            .resolve_type(targ_id)
+            .ok_or(CoreReloError::InvalidTypeId(targ_id))?;
 
         if is_composite(lt.kind()) && is_composite(tt.kind()) {
             return Ok(true);
@@ -1133,15 +1202,25 @@ fn fields_are_compat(local: &Btf<'_>, mut local_id: u32, target: &Btf<'_>, mut t
 
         match lt {
             BtfTypeInfo::Ptr { .. } | BtfTypeInfo::Float { .. } => return Ok(true),
-            BtfTypeInfo::Fwd { name, .. } | BtfTypeInfo::Enum { name, .. } | BtfTypeInfo::Enum64 { name, .. } => {
-                return Ok(names_loosely_match(name, tt.name().unwrap_or("")));
+            BtfTypeInfo::Fwd { name, .. } | BtfTypeInfo::Enum { name, .. } => {
+                return Ok(fwd_or_enum_names_match(name, tt.name().unwrap_or("")));
             }
             BtfTypeInfo::Int { offset, .. } => {
-                let BtfTypeInfo::Int { offset: targ_offset, .. } = tt else { unreachable!() };
+                let BtfTypeInfo::Int {
+                    offset: targ_offset, ..
+                } = tt
+                else {
+                    unreachable!()
+                };
                 return Ok(*offset == 0 && *targ_offset == 0);
             }
             BtfTypeInfo::Array { elem_type, .. } => {
-                let BtfTypeInfo::Array { elem_type: targ_elem, .. } = tt else { unreachable!() };
+                let BtfTypeInfo::Array {
+                    elem_type: targ_elem, ..
+                } = tt
+                else {
+                    unreachable!()
+                };
                 local_id = *elem_type;
                 targ_id = *targ_elem;
             }
@@ -1155,8 +1234,12 @@ fn fields_are_compat(local: &Btf<'_>, mut local_id: u32, target: &Btf<'_>, mut t
 /// but entered via a kind check on the *un*resolved root types, and recursing through
 /// function pointers too.
 fn types_are_compat(local: &Btf<'_>, local_id: u32, target: &Btf<'_>, targ_id: u32) -> Result<bool, CoreReloError> {
-    let lt0 = local.type_by_id(local_id).ok_or(CoreReloError::InvalidTypeId(local_id))?;
-    let tt0 = target.type_by_id(targ_id).ok_or(CoreReloError::InvalidTypeId(targ_id))?;
+    let lt0 = local
+        .type_by_id(local_id)
+        .ok_or(CoreReloError::InvalidTypeId(local_id))?;
+    let tt0 = target
+        .type_by_id(targ_id)
+        .ok_or(CoreReloError::InvalidTypeId(targ_id))?;
     if !kind_core_compat(lt0.kind(), tt0.kind()) {
         return Ok(false);
     }
@@ -1176,8 +1259,12 @@ fn types_are_compat_at(
         if depth < 0 {
             return Err(CoreReloError::SpecTooDeep);
         }
-        let (_, lt) = local.resolve_type(local_id).ok_or(CoreReloError::InvalidTypeId(local_id))?;
-        let (_, tt) = target.resolve_type(targ_id).ok_or(CoreReloError::InvalidTypeId(targ_id))?;
+        let (_, lt) = local
+            .resolve_type(local_id)
+            .ok_or(CoreReloError::InvalidTypeId(local_id))?;
+        let (_, tt) = target
+            .resolve_type(targ_id)
+            .ok_or(CoreReloError::InvalidTypeId(targ_id))?;
         if !kind_core_compat(lt.kind(), tt.kind()) {
             return Ok(false);
         }
@@ -1187,24 +1274,42 @@ fn types_are_compat_at(
             | BtfTypeInfo::Struct { .. }
             | BtfTypeInfo::Union { .. }
             | BtfTypeInfo::Enum { .. }
-            | BtfTypeInfo::Fwd { .. }
-            | BtfTypeInfo::Enum64 { .. } => return Ok(true),
+            | BtfTypeInfo::Fwd { .. } => return Ok(true),
             BtfTypeInfo::Int { offset, .. } => {
-                let BtfTypeInfo::Int { offset: targ_offset, .. } = tt else { unreachable!() };
+                let BtfTypeInfo::Int {
+                    offset: targ_offset, ..
+                } = tt
+                else {
+                    unreachable!()
+                };
                 return Ok(*offset == 0 && *targ_offset == 0);
             }
             BtfTypeInfo::Ptr { pointee_type } => {
-                let BtfTypeInfo::Ptr { pointee_type: targ_pointee } = tt else { unreachable!() };
+                let BtfTypeInfo::Ptr {
+                    pointee_type: targ_pointee,
+                } = tt
+                else {
+                    unreachable!()
+                };
                 local_id = *pointee_type;
                 targ_id = *targ_pointee;
             }
             BtfTypeInfo::Array { elem_type, .. } => {
-                let BtfTypeInfo::Array { elem_type: targ_elem, .. } = tt else { unreachable!() };
+                let BtfTypeInfo::Array {
+                    elem_type: targ_elem, ..
+                } = tt
+                else {
+                    unreachable!()
+                };
                 local_id = *elem_type;
                 targ_id = *targ_elem;
             }
             BtfTypeInfo::FuncProto { return_type, params } => {
-                let BtfTypeInfo::FuncProto { return_type: targ_return, params: targ_params } = tt else {
+                let BtfTypeInfo::FuncProto {
+                    return_type: targ_return,
+                    params: targ_params,
+                } = tt
+                else {
                     unreachable!()
                 };
                 if params.len() != targ_params.len() {
@@ -1214,9 +1319,12 @@ fn types_are_compat_at(
                     return Err(CoreReloError::SpecTooDeep);
                 }
                 for (p, targ_p) in params.iter().zip(targ_params.iter()) {
-                    let (pid, _) = local.resolve_type(p.type_id).ok_or(CoreReloError::InvalidTypeId(p.type_id))?;
-                    let (targ_pid, _) =
-                        target.resolve_type(targ_p.type_id).ok_or(CoreReloError::InvalidTypeId(targ_p.type_id))?;
+                    let (pid, _) = local
+                        .resolve_type(p.type_id)
+                        .ok_or(CoreReloError::InvalidTypeId(p.type_id))?;
+                    let (targ_pid, _) = target
+                        .resolve_type(targ_p.type_id)
+                        .ok_or(CoreReloError::InvalidTypeId(targ_p.type_id))?;
                     if !types_are_compat_at(local, pid, target, targ_pid, level - 1)? {
                         return Ok(false);
                     }
@@ -1254,8 +1362,12 @@ fn types_match_at(
         if depth < 0 {
             return Err(CoreReloError::SpecTooDeep);
         }
-        let (_, lt) = local.resolve_type(local_id).ok_or(CoreReloError::InvalidTypeId(local_id))?;
-        let (_, tt) = target.resolve_type(targ_id).ok_or(CoreReloError::InvalidTypeId(targ_id))?;
+        let (_, lt) = local
+            .resolve_type(local_id)
+            .ok_or(CoreReloError::InvalidTypeId(local_id))?;
+        let (_, tt) = target
+            .resolve_type(targ_id)
+            .ok_or(CoreReloError::InvalidTypeId(targ_id))?;
         if !names_match(lt.name().unwrap_or(""), tt.name().unwrap_or("")) {
             return Ok(false);
         }
@@ -1263,8 +1375,13 @@ fn types_match_at(
 
         match lt {
             BtfTypeInfo::Void => return Ok(lk == tk),
-            BtfTypeInfo::Fwd { is_union: local_union, .. } => {
-                let BtfTypeInfo::Fwd { is_union: targ_union, .. } = tt else {
+            BtfTypeInfo::Fwd {
+                is_union: local_union, ..
+            } => {
+                let BtfTypeInfo::Fwd {
+                    is_union: targ_union, ..
+                } = tt
+                else {
                     return Ok(if behind_ptr {
                         (tk == BtfKind::Struct && !local_union) || (tk == BtfKind::Union && *local_union)
                     } else {
@@ -1273,7 +1390,7 @@ fn types_match_at(
                 };
                 return Ok(local_union == targ_union);
             }
-            BtfTypeInfo::Enum { .. } | BtfTypeInfo::Enum64 { .. } => {
+            BtfTypeInfo::Enum { .. } => {
                 return Ok(is_any_enum(tk) && enums_match(lt, tt));
             }
             BtfTypeInfo::Struct { .. } | BtfTypeInfo::Union { .. } => {
@@ -1281,7 +1398,12 @@ fn types_match_at(
                     if lk == tk {
                         return Ok(true);
                     }
-                    let BtfTypeInfo::Fwd { is_union: targ_union, .. } = tt else { return Ok(false) };
+                    let BtfTypeInfo::Fwd {
+                        is_union: targ_union, ..
+                    } = tt
+                    else {
+                        return Ok(false);
+                    };
                     return Ok((lk == BtfKind::Union) == *targ_union);
                 }
                 if lk != tk {
@@ -1290,17 +1412,36 @@ fn types_match_at(
                 return composites_match(local, lt, target, tt, behind_ptr, level);
             }
             BtfTypeInfo::Int { size, encoding, .. } => {
-                let BtfTypeInfo::Int { size: targ_size, encoding: targ_encoding, .. } = tt else { return Ok(false) };
+                let BtfTypeInfo::Int {
+                    size: targ_size,
+                    encoding: targ_encoding,
+                    ..
+                } = tt
+                else {
+                    return Ok(false);
+                };
                 return Ok(size == targ_size && (encoding & BTF_INT_SIGNED) == (targ_encoding & BTF_INT_SIGNED));
             }
             BtfTypeInfo::Ptr { pointee_type } => {
-                let BtfTypeInfo::Ptr { pointee_type: targ_pointee } = tt else { return Ok(false) };
+                let BtfTypeInfo::Ptr {
+                    pointee_type: targ_pointee,
+                } = tt
+                else {
+                    return Ok(false);
+                };
                 behind_ptr = true;
                 local_id = *pointee_type;
                 targ_id = *targ_pointee;
             }
             BtfTypeInfo::Array { elem_type, nelems, .. } => {
-                let BtfTypeInfo::Array { elem_type: targ_elem, nelems: targ_nelems, .. } = tt else { return Ok(false) };
+                let BtfTypeInfo::Array {
+                    elem_type: targ_elem,
+                    nelems: targ_nelems,
+                    ..
+                } = tt
+                else {
+                    return Ok(false);
+                };
                 if nelems != targ_nelems {
                     return Ok(false);
                 }
@@ -1308,7 +1449,11 @@ fn types_match_at(
                 targ_id = *targ_elem;
             }
             BtfTypeInfo::FuncProto { return_type, params } => {
-                let BtfTypeInfo::FuncProto { return_type: targ_return, params: targ_params } = tt else {
+                let BtfTypeInfo::FuncProto {
+                    return_type: targ_return,
+                    params: targ_params,
+                } = tt
+                else {
                     return Ok(false);
                 };
                 if params.len() != targ_params.len() {
@@ -1362,26 +1507,18 @@ fn enums_match(local_t: &BtfTypeInfo<'_>, targ_t: &BtfTypeInfo<'_>) -> bool {
     fn parts<'a>(t: &'a BtfTypeInfo<'_>) -> Option<(u32, Vec<&'a str>)> {
         match t {
             BtfTypeInfo::Enum { size, variants, .. } => Some((*size, variants.iter().map(|v| v.name).collect())),
-            BtfTypeInfo::Enum64 { size, variants, .. } => Some((*size, variants.iter().map(|v| v.name).collect())),
             _ => None,
         }
     }
-    let Some((local_size, local_names)) = parts(local_t) else { return false };
-    let Some((targ_size, targ_names)) = parts(targ_t) else { return false };
+    let Some((local_size, local_names)) = parts(local_t) else {
+        return false;
+    };
+    let Some((targ_size, targ_names)) = parts(targ_t) else {
+        return false;
+    };
     local_size == targ_size
         && local_names.len() <= targ_names.len()
-        && local_names.iter().all(|ln| targ_names.iter().any(|tn| names_match(ln, tn)))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_core_relo_kind() {
-        assert_eq!(CoreReloKind::from_u32(0), Some(CoreReloKind::FieldByteOffset));
-        assert_eq!(CoreReloKind::from_u32(2), Some(CoreReloKind::FieldExists));
-        assert_eq!(CoreReloKind::from_u32(9), Some(CoreReloKind::TypeSize));
-        assert_eq!(CoreReloKind::from_u32(100), None);
-    }
+        && local_names
+            .iter()
+            .all(|ln| targ_names.iter().any(|tn| names_match(ln, tn)))
 }

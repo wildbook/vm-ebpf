@@ -92,7 +92,11 @@ fn main() -> Result<()> {
 fn print_module_info(module: &Module) {
     println!("\n=== Section map ===");
     for section in &module.sections {
-        let exec = if section.is_executable() { " [EXEC]" } else { "" };
+        let exec = if section.kind == rvm::SectionKind::Code {
+            " [EXEC]"
+        } else {
+            ""
+        };
         println!("  {section}{exec}");
     }
 
@@ -128,10 +132,9 @@ fn print_module_info(module: &Module) {
 /// Print the linked program's function table.
 fn print_function_table(program: &Program) {
     println!("\n=== Function table ===");
-    let mut functions: Vec<_> = program.functions().values().collect();
-    functions.sort_by_key(|f| f.pc);
-    for function in functions {
-        let name = &function.name;
+    let mut functions: Vec<_> = program.functions().iter().collect();
+    functions.sort_by_key(|(_, f)| f.pc);
+    for (name, function) in functions {
         let pc = function.pc;
         let size = function.size;
         println!("  {name:20} pc={pc:<6} size={size} bytes");

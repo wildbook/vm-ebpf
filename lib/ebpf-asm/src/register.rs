@@ -28,21 +28,6 @@ pub enum Register {
 }
 
 impl Register {
-    /// All registers in order.
-    pub const ALL: [Register; 11] = [
-        Register::R0,
-        Register::R1,
-        Register::R2,
-        Register::R3,
-        Register::R4,
-        Register::R5,
-        Register::R6,
-        Register::R7,
-        Register::R8,
-        Register::R9,
-        Register::R10,
-    ];
-
     /// Create a register from a 4-bit value (0-10).
     /// Returns `None` if the value is out of range.
     #[inline]
@@ -68,24 +53,6 @@ impl Register {
     pub const fn number(self) -> u8 {
         self as u8
     }
-
-    /// Check if this is the frame pointer register.
-    #[inline]
-    pub const fn is_frame_pointer(self) -> bool {
-        matches!(self, Register::R10)
-    }
-
-    /// Check if this is a callee-saved register (R6-R9).
-    #[inline]
-    pub const fn is_callee_saved(self) -> bool {
-        matches!(self, Register::R6 | Register::R7 | Register::R8 | Register::R9)
-    }
-
-    /// Check if this is an argument register (R1-R5).
-    #[inline]
-    pub const fn is_argument(self) -> bool {
-        matches!(self, Register::R1 | Register::R2 | Register::R3 | Register::R4 | Register::R5)
-    }
 }
 
 impl fmt::Display for Register {
@@ -93,27 +60,6 @@ impl fmt::Display for Register {
         write!(f, "r{}", self.number()) // number() not a simple variable
     }
 }
-
-impl TryFrom<u8> for Register {
-    type Error = InvalidRegister;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        Register::from_u8(value).ok_or(InvalidRegister(value))
-    }
-}
-
-/// Error returned when trying to create a register from an invalid value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InvalidRegister(pub u8);
-
-impl fmt::Display for InvalidRegister {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let n = self.0;
-        write!(f, "invalid register: {n}")
-    }
-}
-
-impl std::error::Error for InvalidRegister {}
 
 // Convenient register constants
 #[allow(missing_docs)]
@@ -140,17 +86,3 @@ pub const R9: Register = Register::R9;
 pub const R10: Register = Register::R10;
 /// Alias for the frame pointer register.
 pub const FP: Register = Register::R10;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_register_from_u8() {
-        for i in 0..=10 {
-            assert!(Register::from_u8(i).is_some());
-        }
-        assert!(Register::from_u8(11).is_none());
-        assert!(Register::from_u8(15).is_none());
-    }
-}

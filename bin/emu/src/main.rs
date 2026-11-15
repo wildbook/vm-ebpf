@@ -74,8 +74,69 @@ const fn gen_addrmap<const N: usize>(elf: ElfSections<'_>, base: u64) -> [AddrMa
     addrmap
 }
 
+struct Mem<const LEN: usize> {
+    data: [u8; LEN],
+}
+
+impl<const LEN: usize> Mem<LEN> {
+    fn at<const N: usize>(&self, addr: u64) -> Result<[u8; N], ()> {
+        self.data
+            .get(addr as usize..)
+            .and_then(|s| s.first_chunk::<N>())
+            .copied()
+            .ok_or(())
+    }
+
+    fn at_mut<const N: usize>(&mut self, addr: u64) -> Result<&mut [u8; N], ()> {
+        self.data
+            .get_mut(addr as usize..)
+            .and_then(|s| s.first_chunk_mut::<N>())
+            .ok_or(())
+    }
+}
+
+impl<const LEN: usize> Memory for Mem<LEN> {
+    type Err = ();
+
+    fn load_u8(&self, addr: u64) -> Result<u8, Self::Err> {
+        self.at::<1>(addr).map(|b| b[0])
+    }
+
+    fn load_u16(&self, addr: u64) -> Result<u16, Self::Err> {
+        self.at::<2>(addr).map(u16::from_le_bytes)
+    }
+
+    fn load_u32(&self, addr: u64) -> Result<u32, Self::Err> {
+        self.at::<4>(addr).map(u32::from_le_bytes)
+    }
+
+    fn load_u64(&self, addr: u64) -> Result<u64, Self::Err> {
+        self.at::<8>(addr).map(u64::from_le_bytes)
+    }
+
+    fn store_u8(&mut self, addr: u64, value: u8) -> Result<(), Self::Err> {
+        *self.at_mut::<1>(addr)? = value.to_le_bytes();
+        Ok(())
+    }
+
+    fn store_u16(&mut self, addr: u64, value: u16) -> Result<(), Self::Err> {
+        *self.at_mut::<2>(addr)? = value.to_le_bytes();
+        Ok(())
+    }
+
+    fn store_u32(&mut self, addr: u64, value: u32) -> Result<(), Self::Err> {
+        *self.at_mut::<4>(addr)? = value.to_le_bytes();
+        Ok(())
+    }
+
+    fn store_u64(&mut self, addr: u64, value: u64) -> Result<(), Self::Err> {
+        *self.at_mut::<8>(addr)? = value.to_le_bytes();
+        Ok(())
+    }
+}
+
 #[inline(never)]
-fn elfin() -> anyhow::Result<()> {
+fn elfin() {
     const fn ct_unwrap_opt<T: Copy /* !Drop */>(x: Option<T>) -> T {
         match x {
             Some(x) => x,
@@ -177,27 +238,10 @@ fn elfin() -> anyhow::Result<()> {
 
             let target_ent = MAP[target];
 
-            let rel = ct_unwrap_res(chunk.relocs());
-
-            // Handle both REL and RELA relocation types
-            // For simplicity, we process them the same way since BPF typically uses REL
-            // and the addend is usually embedded in the instruction
-            let (relocs, _has_addend): (&[_], bool) = match rel {
-                ElfRelocsChunk::Rel(r) => (r, false),
-                ElfRelocsChunk::Rela(r) => {
-                    // RELA relocations have explicit addends
-                    // Warning: RELA support is incomplete - addends are ignored
-                    // This may cause incorrect symbol resolution for some ELF files
-                    #[cfg(debug_assertions)]
-                    {
-                        // In debug builds, we can't easily print at const time
-                        // but this documents the limitation
-                    }
-                    // Skip RELA sections for now - they need different handling
-                    let _ = r; // suppress unused warning
-                    continue;
-                }
-                ElfRelocsChunk::None => continue,
+            let ElfRelocsChunk::Rel(relocs) = ct_unwrap_res(chunk.relocs()) else {
+                // RELA relocations carry an explicit addend that this loader does not
+                // apply; skip them rather than mis-relocate.
+                continue;
             };
 
             let mut i: usize = 0;
@@ -250,111 +294,17 @@ fn elfin() -> anyhow::Result<()> {
         flat
     };
 
-    struct Mem {
-        data: [u8; LEN],
-    }
-
-    impl Memory for Mem {
-        type Err = ();
-
-        fn load_u8(&self, addr: u64) -> Result<u8, Self::Err> {
-            let beg = addr as usize;
-            let end = beg.checked_add(1).ok_or(())?;
-            match self.data.get(beg..end) {
-                Some(s) => Ok(s[0]),
-                None => Err(()),
-            }
-        }
-
-        fn load_u16(&self, addr: u64) -> Result<u16, Self::Err> {
-            let beg = addr as usize;
-            let end = beg.checked_add(2).ok_or(())?;
-            match self.data.get(beg..end) {
-                Some(s) => Ok(u16::from_le_bytes([s[0], s[1]])),
-                None => Err(()),
-            }
-        }
-
-        fn load_u32(&self, addr: u64) -> Result<u32, Self::Err> {
-            let beg = addr as usize;
-            let end = beg.checked_add(4).ok_or(())?;
-            match self.data.get(beg..end) {
-                Some(s) => Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]])),
-                None => Err(()),
-            }
-        }
-
-        fn load_u64(&self, addr: u64) -> Result<u64, Self::Err> {
-            let beg = addr as usize;
-            let end = beg.checked_add(8).ok_or(())?;
-            match self.data.get(beg..end) {
-                Some(s) => Ok(u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])),
-                None => Err(()),
-            }
-        }
-
-        fn store_u8(&mut self, addr: u64, value: u8) -> Result<(), Self::Err> {
-            let beg = addr as usize;
-            let end = beg.checked_add(1).ok_or(())?;
-            match self.data.get_mut(beg..end) {
-                Some(slice) => {
-                    slice.copy_from_slice(&value.to_le_bytes());
-                    Ok(())
-                }
-                None => Err(()),
-            }
-        }
-
-        fn store_u16(&mut self, addr: u64, value: u16) -> Result<(), Self::Err> {
-            let beg = addr as usize;
-            let end = beg.checked_add(2).ok_or(())?;
-            match self.data.get_mut(beg..end) {
-                Some(slice) => {
-                    slice.copy_from_slice(&value.to_le_bytes());
-                    Ok(())
-                }
-                None => Err(()),
-            }
-        }
-
-        fn store_u32(&mut self, addr: u64, value: u32) -> Result<(), Self::Err> {
-            let beg = addr as usize;
-            let end = beg.checked_add(4).ok_or(())?;
-            match self.data.get_mut(beg..end) {
-                Some(slice) => {
-                    slice.copy_from_slice(&value.to_le_bytes());
-                    Ok(())
-                }
-                None => Err(()),
-            }
-        }
-
-        fn store_u64(&mut self, addr: u64, value: u64) -> Result<(), Self::Err> {
-            let beg = addr as usize;
-            let end = beg.checked_add(8).ok_or(())?;
-            match self.data.get_mut(beg..end) {
-                Some(slice) => {
-                    slice.copy_from_slice(&value.to_le_bytes());
-                    Ok(())
-                }
-                None => Err(()),
-            }
-        }
-    }
-
     let code_beg = CODE_ENT.addr as usize;
     let code_end = code_beg + CODE_ENT.size as usize;
     let code = rvm::instructions_from_bytes(&OUT[code_beg..code_end]);
     let mut mem = Mem { data: OUT };
-    let helpers = HelperRegistry::<Mem>::default();
+    let helpers = HelperRegistry::<Mem<LEN>>::default();
 
     // r10 (frame pointer) starts at the end of the stack.
     let res = Executor::new(&code, &mut mem, &helpers, STACK_END as u64).call(0, &[]);
     println!("res: {res:?}");
-
-    Ok(())
 }
 
 pub fn main() {
-    println!("{:?}", elfin().unwrap());
+    elfin();
 }

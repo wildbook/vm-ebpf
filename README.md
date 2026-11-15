@@ -22,7 +22,7 @@ clang -target bpf -O2 -g -c bpf/example.c -o bpf/example.o
 ```bash
 cargo run --bin loader   # loads and calls bpf/example.o
 cargo run --bin demo     # CO-RE relocation walkthrough
-cargo run --bin emu      # loads an ELF passed on the command line
+cargo run --bin emu      # runs bpf.o, embedded at compile time
 ```
 
 ## Crates
@@ -41,11 +41,12 @@ cargo run --bin emu      # loads an ELF passed on the command line
   with `BtfBuilder`; relocations patch field-access instructions compiled
   against a different layout to match, exactly as kernel CO-RE matches a BPF
   program's BTF against the kernel's.
-- `lib/ebpf-asm`: an assembler and disassembler used by tests and benchmarks
-  to build eBPF bytecode without a C toolchain.
+- `lib/ebpf-asm`: an assembler used by `bin/demo`, `lib/rvm`'s tests, benches and
+  examples to build eBPF bytecode without a C toolchain. Also has a disassembler,
+  used by its own examples and tests for debugging.
 - `bin/loader`, `bin/demo`, `bin/emu`: example programs. `loader` shows the
-  parse and link API; `demo` shows a CO-RE relocation; `emu` loads an
-  arbitrary ELF file.
+  parse and link API; `demo` shows a CO-RE relocation; `emu` runs an ELF
+  embedded at compile time, resolving relocations in a `const fn`.
 
 ## Using the runtime
 

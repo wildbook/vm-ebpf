@@ -5,7 +5,7 @@
 //!
 //! Run with: cargo run --example disassembly
 
-use ebpf_asm::{decode_all, Assembler, Decoder, DefaultFormatter, Formatter, Mnemonic, Operand, R0, R1, R10};
+use ebpf_asm::{decode_all, Assembler, Decoder, DefaultFormatter, Mnemonic, Operand, R0, R1, R10};
 
 fn main() {
     println!("=== eBPF Disassembly Example ===\n");
@@ -42,7 +42,7 @@ fn basic_disassembly() {
     println!("Offset  Instruction");
     println!("------  -----------");
     for insn in Decoder::new(&bytecode) {
-        let offset = insn.offset();
+        let offset = insn.offset;
         println!("{offset:04x}    {}", formatter.format_to_string(&insn));
     }
     println!();
@@ -95,7 +95,7 @@ fn inspect_instructions() {
         println!("Instruction {i}:");
         println!("  Mnemonic: {:?}", insn.mnemonic);
         let size = insn.size;
-        let offset = insn.offset();
+        let offset = insn.offset;
         println!("  Size: {size} bytes");
         println!("  Offset: 0x{offset:04x}");
 
@@ -151,7 +151,7 @@ fn disassemble_raw() {
     println!("\nDisassembled:");
     let formatter = DefaultFormatter::new();
     for insn in Decoder::new(&raw_bytecode) {
-        let offset = insn.offset();
+        let offset = insn.offset;
         println!("  {offset:04x}: {}", formatter.format_to_string(&insn));
     }
     println!();

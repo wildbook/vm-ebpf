@@ -1,9 +1,8 @@
 use std::fmt::Debug;
 use std::ops::ControlFlow;
 
-use opcode::{Class, OpCode};
+use opcode::{Class, MemMode, MemSize, OpCode};
 
-mod consts;
 mod debug;
 
 pub mod opcode;
@@ -90,14 +89,6 @@ pub enum Flow<C: Memory> {
     OutOfFuel,
     /// [`run`] reached a `pc` outside the code slice.
     BadPc,
-}
-
-pub trait Runner {
-    type Err;
-}
-
-impl Runner for () {
-    type Err = ();
 }
 
 pub trait Memory {
@@ -199,18 +190,6 @@ macro_rules! atomic_op_apply {
 
 atomic_op_apply!(u32, u64);
 
-impl Memory for () {
-    type Err = ();
-
-    fn load_u8(&self, _addr: u64) -> Result<u8, Self::Err> {
-        Err(())
-    }
-
-    fn store_u8(&mut self, _addr: u64, _value: u8) -> Result<(), Self::Err> {
-        Err(())
-    }
-}
-
 impl<M: Memory + ?Sized> Memory for &mut M {
     type Err = M::Err;
 
@@ -246,19 +225,13 @@ impl<M: Memory + ?Sized> Memory for &mut M {
     }
 }
 
-/// Scratch register index for storing first half of LD_IMM64 instruction.
-/// This is beyond the eBPF-defined registers (r0-r10) and must not be used elsewhere.
-pub const REG_SCRATCH_LD64: usize = 11;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Context<M: Memory> {
-    // Expose all 16 for now; the upper ones double as interpreter scratch state (e.g. r11 for LD_IMM64).
-
     // R0: return value from function calls, and exit value for eBPF programs
     // R1 - R5: arguments for function calls
     // R6 - R9: callee saved registers that function calls will preserve
     // R10: read-only frame pointer to access stack
-    // R11: scratch register for LD_IMM64 (internal use only, see REG_SCRATCH_LD64)
+    // R11 - R15: unused; a 4-bit register index into 16 slots needs no bounds check
     pub regs: [u64; 16],
     pub data: M,
 }
@@ -269,15 +242,16 @@ impl<M: Memory> Context<M> {
     }
 }
 
-pub const BITS_32: bool = false;
-pub const BITS_64: bool = true;
+/// `src_reg` of a `call` instruction targeting a program-local function.
+pub const BPF_PSEUDO_CALL: usize = 1;
+/// `src_reg` of a `call` instruction targeting the host's extern table.
+pub const BPF_PSEUDO_KFUNC_CALL: usize = 2;
 
 mod alu {
     use std::ops::{BitAnd, BitOr};
 
-    use crate::consts::jmp::{BPF_PSEUDO_CALL, BPF_PSEUDO_KFUNC_CALL};
     use crate::opcode::{AluEnd, AluOpc, JmpOpc, Source};
-    use crate::{Context, Flow, Instruction, Memory};
+    use crate::{Context, Flow, Instruction, Memory, BPF_PSEUDO_CALL, BPF_PSEUDO_KFUNC_CALL};
 
     pub const BITS_32: bool = false;
     pub const BITS_64: bool = true;
@@ -661,17 +635,13 @@ mod mem {
         Flow::Next
     }
 
-    pub fn ld64<M: Memory>(ctx: &mut Context<M>, instr: Instruction) -> ControlFlow<Flow<M>, Instruction> {
+    pub fn ld64<M: Memory>(_ctx: &mut Context<M>, instr: Instruction) -> ControlFlow<Flow<M>, Instruction> {
         let opc = instr.opcode();
         let size = opc.mem_size();
         let mode = opc.mem_mode();
 
         match (mode, size) {
-            (MemMode::Imm, MemSize::DWord) => {
-                // Store first instruction's imm (low 32 bits) in scratch register
-                ctx.regs[crate::REG_SCRATCH_LD64] = instr.imm() as u32 as u64;
-                ControlFlow::Continue(instr)
-            }
+            (MemMode::Imm, MemSize::DWord) => ControlFlow::Continue(instr),
             _ => ControlFlow::Break(Flow::Missing),
         }
     }
@@ -699,15 +669,15 @@ pub fn step<M: Memory>(ctx: &mut Context<M>, instr: Instruction) -> ControlFlow<
 
 #[inline(always)]
 pub fn step_ld64<M: Memory>(ctx: &mut Context<M>, instr: Instruction, second: Instruction) -> Flow<M> {
-    use consts::class;
-    use consts::mem::{mode, size};
-
-    debug_assert!(instr.opcode() == OpCode(class::BPF_LD | mode::BPF_IMM | size::BPF_DW));
+    debug_assert!(matches!(
+        (instr.opcode().class(), instr.opcode().mem_mode(), instr.opcode().mem_size()),
+        (Class::LdImm, MemMode::Imm, MemSize::DWord)
+    ));
 
     let dst = usize::from(instr.dst_reg());
 
-    // Combine low 32 bits (from scratch register, set by ld64) with high 32 bits (from second instruction)
-    let imm_lo = ctx.regs[REG_SCRATCH_LD64];
+    // the first slot carries the low 32 bits, the second the high 32 bits
+    let imm_lo = instr.imm() as u32 as u64;
     let imm_hi = second.imm() as u32 as u64;
     let imm64 = imm_lo | (imm_hi << 32);
 

@@ -138,12 +138,12 @@ impl std::error::Error for LinkError {}
 /// Execution errors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecError {
-    /// CPU fault (invalid instruction, etc.).
-    CpuFault(String),
+    /// Invalid instruction.
+    CpuFault,
     /// Memory fault.
     MemoryFault(String),
     /// Unimplemented instruction.
-    Unimplemented(String),
+    Unimplemented,
     /// Instruction limit exceeded.
     InstructionLimit(u64),
     /// Stack overflow.
@@ -157,9 +157,9 @@ pub enum ExecError {
 impl fmt::Display for ExecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CpuFault(msg) => write!(f, "CPU fault: {msg}"),
+            Self::CpuFault => write!(f, "CPU fault: invalid instruction"),
             Self::MemoryFault(msg) => write!(f, "memory fault: {msg}"),
-            Self::Unimplemented(msg) => write!(f, "unimplemented: {msg}"),
+            Self::Unimplemented => write!(f, "unimplemented: instruction not implemented"),
             Self::InstructionLimit(count) => write!(f, "instruction limit exceeded: {count}"),
             Self::StackOverflow => write!(f, "stack overflow"),
             Self::InvalidPc(pc) => write!(f, "invalid program counter: {pc}"),

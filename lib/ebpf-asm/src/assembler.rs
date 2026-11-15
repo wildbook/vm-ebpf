@@ -35,7 +35,8 @@
 //! # CO-RE Example
 //!
 //! ```
-//! use ebpf_asm::{Assembler, CoreReloKind, R1, R3};
+//! use btf::CoreReloKind;
+//! use ebpf_asm::{Assembler, R1, R3};
 //!
 //! let mut asm = Assembler::new();
 //!
@@ -54,6 +55,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use btf::{CoreRelo, CoreReloKind};
+
 use crate::instruction::{alu, class, jmp, mode, size, RawInstruction, SRC_IMM, SRC_REG};
 use crate::register::Register;
 
@@ -67,10 +70,6 @@ pub enum AsmError {
     /// Jump offset is out of range for i16.
     #[allow(missing_docs)]
     OffsetOutOfRange { from: usize, to: usize },
-    /// Immediate value out of range.
-    ImmediateOutOfRange(i64),
-    /// Invalid label reference.
-    InvalidLabel,
 }
 
 impl fmt::Display for AsmError {
@@ -81,76 +80,11 @@ impl fmt::Display for AsmError {
             AsmError::OffsetOutOfRange { from, to } => {
                 write!(f, "jump offset out of range: {from} -> {to}")
             }
-            AsmError::ImmediateOutOfRange(v) => write!(f, "immediate out of range: {v}"),
-            AsmError::InvalidLabel => write!(f, "invalid label reference"),
         }
     }
 }
 
 impl std::error::Error for AsmError {}
-
-// ============================================================================
-// CO-RE (Compile Once - Run Everywhere) Relocation Support
-// ============================================================================
-
-/// CO-RE relocation kind.
-///
-/// These match the BPF CO-RE relocation kinds used in BTF.ext sections.
-/// The assembler tracks these and produces them at assembly time with
-/// resolved byte offsets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u32)]
-pub enum CoreReloKind {
-    /// Field byte offset within a struct.
-    FieldByteOffset = 0,
-    /// Field byte size.
-    FieldByteSize = 1,
-    /// Field existence check (0 or 1).
-    FieldExists = 2,
-    /// Field signedness (0 or 1).
-    FieldSigned = 3,
-    /// Field left shift for bitfield reading.
-    FieldLShiftU64 = 4,
-    /// Field right shift for bitfield reading.
-    FieldRShiftU64 = 5,
-    /// Local BTF type ID.
-    TypeIdLocal = 6,
-    /// Target BTF type ID.
-    TypeIdTarget = 7,
-    /// Type existence check (0 or 1).
-    TypeExists = 8,
-    /// Type size in bytes.
-    TypeSize = 9,
-    /// Enum value existence check.
-    EnumvalExists = 10,
-    /// Enum value.
-    EnumvalValue = 11,
-    /// Type matches check.
-    TypeMatches = 12,
-}
-
-impl CoreReloKind {
-    /// Convert to raw u32 value.
-    pub fn as_u32(self) -> u32 {
-        self as u32
-    }
-}
-
-/// A CO-RE relocation entry produced by the assembler.
-///
-/// This contains all the information needed to apply a CO-RE relocation
-/// at load time. The `insn_off` is a byte offset (not instruction index).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CoreRelo {
-    /// Instruction byte offset from the start of the program.
-    pub insn_off: u32,
-    /// BTF type ID in the program's BTF.
-    pub type_id: u32,
-    /// Offset into BTF string table for the access string (field name).
-    pub access_str_off: u32,
-    /// The kind of relocation.
-    pub kind: CoreReloKind,
-}
 
 /// Pending CO-RE relocation (attached to an instruction index, not yet resolved to bytes).
 #[derive(Debug, Clone)]
@@ -201,24 +135,6 @@ impl Label {
             position: None,
         }
     }
-
-    fn named(id: usize, name: String) -> Self {
-        Self {
-            id,
-            name: Some(name),
-            position: None,
-        }
-    }
-
-    /// Check if this label has been bound to a position.
-    pub fn is_bound(&self) -> bool {
-        self.position.is_some()
-    }
-
-    /// Get the label's name, if any.
-    pub fn name(&self) -> Option<&str> {
-        self.name.as_deref()
-    }
 }
 
 /// A reference to a label that needs to be resolved.
@@ -234,10 +150,8 @@ struct LabelRef {
 
 #[derive(Debug, Clone, Copy)]
 enum LabelRefType {
-    /// Conditional jump - offset in bits 16-31.
-    ConditionalJump,
-    /// Unconditional jump (JA) - offset in bits 16-31.
-    UnconditionalJump,
+    /// Jump (conditional or JA) - offset in bits 16-31.
+    Jump,
     /// BPF-to-BPF call - offset in bits 32-63 (imm field).
     LocalCall,
 }
@@ -248,6 +162,108 @@ struct AsmInsn {
     raw: RawInstruction,
     /// Second instruction for LDDW.
     raw2: Option<RawInstruction>,
+}
+
+/// Emits a register/immediate pair of ALU instruction methods for one opcode. `$off`
+/// is the ALU `offset` nibble eBPF uses to pick the signed variant of DIV/MOD.
+macro_rules! alu_family {
+    ($class:ident; $( $name:ident, $name_imm:ident = $op:ident, $off:expr; )+) => {
+        $(
+            #[doc = concat!("`", stringify!($name), " dst, src`")]
+            pub fn $name(&mut self, dst: Register, src: Register) -> &mut Self {
+                let opcode = class::$class | alu::$op | SRC_REG;
+                self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), $off, 0));
+                self
+            }
+
+            #[doc = concat!("`", stringify!($name_imm), " dst, imm`")]
+            pub fn $name_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
+                let opcode = class::$class | alu::$op | SRC_IMM;
+                self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, $off, imm));
+                self
+            }
+        )+
+    };
+}
+
+/// Emits a register/immediate pair of conditional jump methods for one opcode.
+macro_rules! jmp_family {
+    ($class:ident; $( $name:ident, $name_imm:ident = $op:ident; )+) => {
+        $(
+            #[doc = concat!("`", stringify!($name), " dst, src, label`")]
+            pub fn $name(&mut self, dst: Register, src: Register, label: &Label) -> &mut Self {
+                let opcode = class::$class | jmp::$op | SRC_REG;
+                self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
+                self.add_label_ref(label, LabelRefType::Jump);
+                self
+            }
+
+            #[doc = concat!("`", stringify!($name_imm), " dst, imm, label`")]
+            pub fn $name_imm(&mut self, dst: Register, imm: i32, label: &Label) -> &mut Self {
+                let opcode = class::$class | jmp::$op | SRC_IMM;
+                self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
+                self.add_label_ref(label, LabelRefType::Jump);
+                self
+            }
+        )+
+    };
+}
+
+/// Emits one load-from-memory method per (mnemonic, size, mode) row.
+macro_rules! ldx_family {
+    ($( $name:ident = $size:ident, $mode:ident; )+) => {
+        $(
+            #[doc = concat!("`", stringify!($name), " dst, [src+off]`")]
+            pub fn $name(&mut self, dst: Register, src: Register, offset: i16) -> &mut Self {
+                let opcode = class::LDX | size::$size | mode::$mode;
+                self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, 0));
+                self
+            }
+        )+
+    };
+}
+
+/// Emits one store-to-memory-from-register method per size.
+macro_rules! stx_family {
+    ($( $name:ident = $size:ident );+) => {
+        $(
+            #[doc = concat!("`", stringify!($name), " [dst+off], src`")]
+            pub fn $name(&mut self, dst: Register, offset: i16, src: Register) -> &mut Self {
+                let opcode = class::STX | size::$size | mode::MEM;
+                self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, 0));
+                self
+            }
+        )+
+    };
+}
+
+/// Emits one store-immediate-to-memory method per size.
+macro_rules! st_family {
+    ($( $name:ident = $size:ident );+) => {
+        $(
+            #[doc = concat!("`", stringify!($name), " [dst+off], imm`")]
+            pub fn $name(&mut self, dst: Register, offset: i16, imm: i32) -> &mut Self {
+                let opcode = class::ST | size::$size | mode::MEM;
+                self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, offset, imm));
+                self
+            }
+        )+
+    };
+}
+
+/// Emits one byte-swap method per bit width, for a fixed source type (`le*` use
+/// `SRC_IMM`, `be*` use `SRC_REG`; the ISA distinguishes them that way).
+macro_rules! endian_family {
+    ($src:ident; $( $name:ident = $bits:expr ),+) => {
+        $(
+            #[doc = concat!("`", stringify!($name), " dst`")]
+            pub fn $name(&mut self, dst: Register) -> &mut Self {
+                let opcode = class::ALU32 | alu::END | $src;
+                self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, $bits));
+                self
+            }
+        )+
+    };
 }
 
 /// eBPF bytecode assembler.
@@ -279,88 +295,6 @@ impl Assembler {
         }
     }
 
-    /// Create with pre-allocated capacity.
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            instructions: Vec::with_capacity(capacity),
-            label_counter: 0,
-            label_positions: HashMap::new(),
-            label_refs: Vec::new(),
-            core_relos: Vec::new(),
-        }
-    }
-
-    /// Get the current instruction count.
-    ///
-    /// This is useful for CO-RE relocations where you need to track
-    /// instruction indices for patching.
-    pub fn len(&self) -> usize {
-        self.instructions.len()
-    }
-
-    /// Check if the assembler is empty.
-    pub fn is_empty(&self) -> bool {
-        self.instructions.is_empty()
-    }
-
-    /// Get the current instruction index (where the next instruction will be placed).
-    ///
-    /// This is an alias for `len()` but is more descriptive when used for
-    /// tracking instruction positions for CO-RE relocations.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use ebpf_asm::{Assembler, R0, R3};
-    ///
-    /// let mut asm = Assembler::new();
-    ///
-    /// // Track the index before emitting
-    /// let mov_idx = asm.current_index();
-    /// asm.mov64_imm(R3, 8);  // This instruction is at mov_idx
-    ///
-    /// // Now you can use mov_idx for CO-RE relocation
-    /// assert_eq!(mov_idx, 0);
-    /// ```
-    #[inline]
-    pub fn current_index(&self) -> usize {
-        self.instructions.len()
-    }
-
-    /// Get the byte offset for a given instruction index.
-    ///
-    /// CO-RE relocations use byte offsets, not instruction indices.
-    /// Wide instructions (LDDW) occupy 16 bytes.
-    ///
-    /// Indices past the end assume 8-byte instructions follow.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use ebpf_asm::Assembler;
-    ///
-    /// let asm = Assembler::new();
-    /// assert_eq!(asm.byte_offset(0), 0);
-    /// assert_eq!(asm.byte_offset(1), 8);
-    /// assert_eq!(asm.byte_offset(5), 40);
-    /// ```
-    #[inline]
-    pub fn byte_offset(&self, insn_index: usize) -> u32 {
-        let wide_before = self.instructions[..insn_index.min(self.instructions.len())]
-            .iter()
-            .filter(|insn| insn.raw2.is_some())
-            .count();
-        ((insn_index + wide_before) * 8) as u32
-    }
-
-    /// Get the byte offset for the current instruction position.
-    ///
-    /// This is equivalent to `byte_offset(current_index())`.
-    #[inline]
-    pub fn current_byte_offset(&self) -> u32 {
-        self.byte_offset(self.instructions.len())
-    }
-
     /// Slot index (8-byte units) of each instruction entry, plus the total at the end.
     fn slot_prefix(&self) -> Vec<usize> {
         let mut slots = Vec::with_capacity(self.instructions.len() + 1);
@@ -378,13 +312,6 @@ impl Assembler {
         let id = self.label_counter;
         self.label_counter += 1;
         Label::new(id)
-    }
-
-    /// Create a new named unbound label.
-    pub fn create_named_label(&mut self, name: impl Into<String>) -> Label {
-        let id = self.label_counter;
-        self.label_counter += 1;
-        Label::named(id, name.into())
     }
 
     /// Bind a label to the current position.
@@ -445,7 +372,7 @@ impl Assembler {
             let insn = &mut self.instructions[insn_index];
 
             match ref_type {
-                LabelRefType::ConditionalJump | LabelRefType::UnconditionalJump => {
+                LabelRefType::Jump => {
                     // Offset in bits 16-31 (i16)
                     if offset < i16::MIN as i64 || offset > i16::MAX as i64 {
                         return Err(AsmError::OffsetOutOfRange {
@@ -488,38 +415,6 @@ impl Assembler {
         Ok(code)
     }
 
-    /// Assemble to a vector of u64 instruction words.
-    ///
-    /// This is useful for integration with VMs that work with u64 instructions
-    /// rather than byte arrays.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use ebpf_asm::{Assembler, R0};
-    ///
-    /// let mut asm = Assembler::new();
-    /// asm.mov64_imm(R0, 42);
-    /// asm.exit();
-    ///
-    /// let instructions = asm.assemble_to_u64().unwrap();
-    /// assert_eq!(instructions.len(), 2);
-    /// ```
-    pub fn assemble_to_u64(&mut self) -> Result<Vec<u64>, AsmError> {
-        let bytes = self.assemble()?;
-        let (words, _) = bytes.as_chunks::<8>();
-        Ok(words.iter().map(|w| u64::from_le_bytes(*w)).collect())
-    }
-
-    /// Reset the assembler for reuse.
-    pub fn reset(&mut self) {
-        self.instructions.clear();
-        self.label_positions.clear();
-        self.label_refs.clear();
-        self.core_relos.clear();
-        // Don't reset label_counter to avoid ID collisions
-    }
-
     // ==================== CO-RE Relocation Methods ====================
 
     /// Mark the last emitted instruction with a CO-RE relocation.
@@ -534,7 +429,8 @@ impl Assembler {
     /// # Example
     ///
     /// ```
-    /// use ebpf_asm::{Assembler, CoreReloKind, R3};
+    /// use btf::CoreReloKind;
+    /// use ebpf_asm::{Assembler, R3};
     ///
     /// let mut asm = Assembler::new();
     ///
@@ -555,55 +451,6 @@ impl Assembler {
             kind,
         });
         self
-    }
-
-    /// Mark a specific instruction index with a CO-RE relocation.
-    ///
-    /// This is useful when you need to mark an instruction that isn't the last one.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `insn_index` is out of bounds.
-    pub fn mark_core_relo_at(
-        &mut self,
-        insn_index: usize,
-        kind: CoreReloKind,
-        type_id: u32,
-        access_str_off: u32,
-    ) -> &mut Self {
-        assert!(
-            insn_index < self.instructions.len(),
-            "mark_core_relo_at: index {} out of bounds (len={})",
-            insn_index,
-            self.instructions.len()
-        );
-        self.core_relos.push(PendingCoreRelo {
-            insn_index,
-            type_id,
-            access_str_off,
-            kind,
-        });
-        self
-    }
-
-    /// Convenience: Mark the last instruction as a field byte offset relocation.
-    pub fn mark_field_offset(&mut self, type_id: u32, access_str_off: u32) -> &mut Self {
-        self.mark_core_relo(CoreReloKind::FieldByteOffset, type_id, access_str_off)
-    }
-
-    /// Convenience: Mark the last instruction as a field exists relocation.
-    pub fn mark_field_exists(&mut self, type_id: u32, access_str_off: u32) -> &mut Self {
-        self.mark_core_relo(CoreReloKind::FieldExists, type_id, access_str_off)
-    }
-
-    /// Convenience: Mark the last instruction as a type size relocation.
-    pub fn mark_type_size(&mut self, type_id: u32) -> &mut Self {
-        self.mark_core_relo(CoreReloKind::TypeSize, type_id, 0)
-    }
-
-    /// Convenience: Mark the last instruction as an enum value relocation.
-    pub fn mark_enum_value(&mut self, type_id: u32, variant_str_off: u32) -> &mut Self {
-        self.mark_core_relo(CoreReloKind::EnumvalValue, type_id, variant_str_off)
     }
 
     /// Assemble the program with CO-RE relocation information.
@@ -631,336 +478,12 @@ impl Assembler {
         Ok(AssembledProgram { bytecode, relocations })
     }
 
-    // ==================== ALU64 Instructions ====================
-
-    /// `add64 dst, src` - 64-bit addition with register source.
-    pub fn add64(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU64 | alu::ADD | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self
-    }
-
-    /// `add64 dst, imm` - 64-bit addition with immediate.
-    pub fn add64_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU64 | alu::ADD | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self
-    }
-
-    /// `sub64 dst, src` - 64-bit subtraction with register source.
-    pub fn sub64(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU64 | alu::SUB | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self
-    }
-
-    /// `sub64 dst, imm` - 64-bit subtraction with immediate.
-    pub fn sub64_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU64 | alu::SUB | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self
-    }
-
-    /// `mul64 dst, src` - 64-bit multiplication with register source.
-    pub fn mul64(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU64 | alu::MUL | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self
-    }
-
-    /// `mul64 dst, imm` - 64-bit multiplication with immediate.
-    pub fn mul64_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU64 | alu::MUL | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self
-    }
-
-    /// `div64 dst, src` - 64-bit unsigned division with register source.
-    pub fn div64(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU64 | alu::DIV | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self
-    }
-
-    /// `div64 dst, imm` - 64-bit unsigned division with immediate.
-    pub fn div64_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU64 | alu::DIV | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self
-    }
-
-    /// `sdiv64 dst, src` - 64-bit signed division with register source.
-    pub fn sdiv64(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU64 | alu::DIV | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 1, 0));
-        self
-    }
-
-    /// `sdiv64 dst, imm` - 64-bit signed division with immediate.
-    pub fn sdiv64_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU64 | alu::DIV | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 1, imm));
-        self
-    }
-
-    /// `or64 dst, src` - 64-bit bitwise OR with register source.
-    pub fn or64(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU64 | alu::OR | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self
-    }
-
-    /// `or64 dst, imm` - 64-bit bitwise OR with immediate.
-    pub fn or64_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU64 | alu::OR | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self
-    }
-
-    /// `and64 dst, src` - 64-bit bitwise AND with register source.
-    pub fn and64(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU64 | alu::AND | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self
-    }
-
-    /// `and64 dst, imm` - 64-bit bitwise AND with immediate.
-    pub fn and64_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU64 | alu::AND | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self
-    }
-
-    /// `lsh64 dst, src` - 64-bit left shift with register source.
-    pub fn lsh64(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU64 | alu::LSH | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self
-    }
-
-    /// `lsh64 dst, imm` - 64-bit left shift with immediate.
-    pub fn lsh64_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU64 | alu::LSH | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self
-    }
-
-    /// `rsh64 dst, src` - 64-bit logical right shift with register source.
-    pub fn rsh64(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU64 | alu::RSH | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self
-    }
-
-    /// `rsh64 dst, imm` - 64-bit logical right shift with immediate.
-    pub fn rsh64_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU64 | alu::RSH | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self
-    }
+    // ==================== ALU Instructions ====================
 
     /// `neg64 dst` - 64-bit negation.
     pub fn neg64(&mut self, dst: Register) -> &mut Self {
         let opcode = class::ALU64 | alu::NEG | SRC_IMM;
         self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, 0));
-        self
-    }
-
-    /// `mod64 dst, src` - 64-bit unsigned modulo with register source.
-    pub fn mod64(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU64 | alu::MOD | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self
-    }
-
-    /// `mod64 dst, imm` - 64-bit unsigned modulo with immediate.
-    pub fn mod64_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU64 | alu::MOD | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self
-    }
-
-    /// `smod64 dst, src` - 64-bit signed modulo with register source.
-    pub fn smod64(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU64 | alu::MOD | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 1, 0));
-        self
-    }
-
-    /// `smod64 dst, imm` - 64-bit signed modulo with immediate.
-    pub fn smod64_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU64 | alu::MOD | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 1, imm));
-        self
-    }
-
-    /// `xor64 dst, src` - 64-bit bitwise XOR with register source.
-    pub fn xor64(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU64 | alu::XOR | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self
-    }
-
-    /// `xor64 dst, imm` - 64-bit bitwise XOR with immediate.
-    pub fn xor64_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU64 | alu::XOR | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self
-    }
-
-    /// `mov64 dst, src` - 64-bit move from register.
-    pub fn mov64(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU64 | alu::MOV | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self
-    }
-
-    /// `mov64 dst, imm` - 64-bit move immediate.
-    pub fn mov64_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU64 | alu::MOV | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self
-    }
-
-    /// `arsh64 dst, src` - 64-bit arithmetic right shift with register source.
-    pub fn arsh64(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU64 | alu::ARSH | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self
-    }
-
-    /// `arsh64 dst, imm` - 64-bit arithmetic right shift with immediate.
-    pub fn arsh64_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU64 | alu::ARSH | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self
-    }
-
-    // ==================== ALU32 Instructions ====================
-
-    /// `add32 dst, src` - 32-bit addition with register source.
-    pub fn add32(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU32 | alu::ADD | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self
-    }
-
-    /// `add32 dst, imm` - 32-bit addition with immediate.
-    pub fn add32_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU32 | alu::ADD | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self
-    }
-
-    /// `sub32 dst, src` - 32-bit subtraction with register source.
-    pub fn sub32(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU32 | alu::SUB | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self
-    }
-
-    /// `sub32 dst, imm` - 32-bit subtraction with immediate.
-    pub fn sub32_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU32 | alu::SUB | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self
-    }
-
-    /// `mul32 dst, src` - 32-bit multiplication with register source.
-    pub fn mul32(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU32 | alu::MUL | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self
-    }
-
-    /// `mul32 dst, imm` - 32-bit multiplication with immediate.
-    pub fn mul32_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU32 | alu::MUL | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self
-    }
-
-    /// `div32 dst, src` - 32-bit unsigned division with register source.
-    pub fn div32(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU32 | alu::DIV | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self
-    }
-
-    /// `div32 dst, imm` - 32-bit unsigned division with immediate.
-    pub fn div32_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU32 | alu::DIV | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self
-    }
-
-    /// `sdiv32 dst, src` - 32-bit signed division with register source.
-    pub fn sdiv32(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU32 | alu::DIV | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 1, 0));
-        self
-    }
-
-    /// `sdiv32 dst, imm` - 32-bit signed division with immediate.
-    pub fn sdiv32_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU32 | alu::DIV | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 1, imm));
-        self
-    }
-
-    /// `or32 dst, src` - 32-bit bitwise OR with register source.
-    pub fn or32(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU32 | alu::OR | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self
-    }
-
-    /// `or32 dst, imm` - 32-bit bitwise OR with immediate.
-    pub fn or32_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU32 | alu::OR | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self
-    }
-
-    /// `and32 dst, src` - 32-bit bitwise AND with register source.
-    pub fn and32(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU32 | alu::AND | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self
-    }
-
-    /// `and32 dst, imm` - 32-bit bitwise AND with immediate.
-    pub fn and32_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU32 | alu::AND | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self
-    }
-
-    /// `lsh32 dst, src` - 32-bit left shift with register source.
-    pub fn lsh32(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU32 | alu::LSH | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self
-    }
-
-    /// `lsh32 dst, imm` - 32-bit left shift with immediate.
-    pub fn lsh32_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU32 | alu::LSH | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self
-    }
-
-    /// `rsh32 dst, src` - 32-bit logical right shift with register source.
-    pub fn rsh32(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU32 | alu::RSH | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self
-    }
-
-    /// `rsh32 dst, imm` - 32-bit logical right shift with immediate.
-    pub fn rsh32_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU32 | alu::RSH | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
         self
     }
 
@@ -971,170 +494,56 @@ impl Assembler {
         self
     }
 
-    /// `mod32 dst, src` - 32-bit unsigned modulo with register source.
-    pub fn mod32(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU32 | alu::MOD | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self
-    }
+    alu_family!(ALU64;
+        add64, add64_imm = ADD, 0;
+        sub64, sub64_imm = SUB, 0;
+        mul64, mul64_imm = MUL, 0;
+        div64, div64_imm = DIV, 0;
+        sdiv64, sdiv64_imm = DIV, 1;
+        or64, or64_imm = OR, 0;
+        and64, and64_imm = AND, 0;
+        lsh64, lsh64_imm = LSH, 0;
+        rsh64, rsh64_imm = RSH, 0;
+        mod64, mod64_imm = MOD, 0;
+        smod64, smod64_imm = MOD, 1;
+        xor64, xor64_imm = XOR, 0;
+        mov64, mov64_imm = MOV, 0;
+        arsh64, arsh64_imm = ARSH, 0;
+    );
 
-    /// `mod32 dst, imm` - 32-bit unsigned modulo with immediate.
-    pub fn mod32_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU32 | alu::MOD | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self
-    }
-
-    /// `smod32 dst, src` - 32-bit signed modulo with register source.
-    pub fn smod32(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU32 | alu::MOD | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 1, 0));
-        self
-    }
-
-    /// `smod32 dst, imm` - 32-bit signed modulo with immediate.
-    pub fn smod32_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU32 | alu::MOD | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 1, imm));
-        self
-    }
-
-    /// `xor32 dst, src` - 32-bit bitwise XOR with register source.
-    pub fn xor32(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU32 | alu::XOR | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self
-    }
-
-    /// `xor32 dst, imm` - 32-bit bitwise XOR with immediate.
-    pub fn xor32_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU32 | alu::XOR | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self
-    }
-
-    /// `mov32 dst, src` - 32-bit move from register.
-    pub fn mov32(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU32 | alu::MOV | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self
-    }
-
-    /// `mov32 dst, imm` - 32-bit move immediate.
-    pub fn mov32_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU32 | alu::MOV | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self
-    }
-
-    /// `arsh32 dst, src` - 32-bit arithmetic right shift with register source.
-    pub fn arsh32(&mut self, dst: Register, src: Register) -> &mut Self {
-        let opcode = class::ALU32 | alu::ARSH | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self
-    }
-
-    /// `arsh32 dst, imm` - 32-bit arithmetic right shift with immediate.
-    pub fn arsh32_imm(&mut self, dst: Register, imm: i32) -> &mut Self {
-        let opcode = class::ALU32 | alu::ARSH | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self
-    }
+    alu_family!(ALU32;
+        add32, add32_imm = ADD, 0;
+        sub32, sub32_imm = SUB, 0;
+        mul32, mul32_imm = MUL, 0;
+        div32, div32_imm = DIV, 0;
+        sdiv32, sdiv32_imm = DIV, 1;
+        or32, or32_imm = OR, 0;
+        and32, and32_imm = AND, 0;
+        lsh32, lsh32_imm = LSH, 0;
+        rsh32, rsh32_imm = RSH, 0;
+        mod32, mod32_imm = MOD, 0;
+        smod32, smod32_imm = MOD, 1;
+        xor32, xor32_imm = XOR, 0;
+        mov32, mov32_imm = MOV, 0;
+        arsh32, arsh32_imm = ARSH, 0;
+    );
 
     // ==================== Endianness Instructions ====================
 
-    /// `le16 dst` - Convert to little-endian 16-bit.
-    pub fn le16(&mut self, dst: Register) -> &mut Self {
-        let opcode = class::ALU32 | alu::END | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, 16));
-        self
-    }
-
-    /// `le32 dst` - Convert to little-endian 32-bit.
-    pub fn le32(&mut self, dst: Register) -> &mut Self {
-        let opcode = class::ALU32 | alu::END | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, 32));
-        self
-    }
-
-    /// `le64 dst` - Convert to little-endian 64-bit.
-    pub fn le64(&mut self, dst: Register) -> &mut Self {
-        let opcode = class::ALU32 | alu::END | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, 64));
-        self
-    }
-
-    /// `be16 dst` - Convert to big-endian 16-bit.
-    pub fn be16(&mut self, dst: Register) -> &mut Self {
-        let opcode = class::ALU32 | alu::END | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, 16));
-        self
-    }
-
-    /// `be32 dst` - Convert to big-endian 32-bit.
-    pub fn be32(&mut self, dst: Register) -> &mut Self {
-        let opcode = class::ALU32 | alu::END | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, 32));
-        self
-    }
-
-    /// `be64 dst` - Convert to big-endian 64-bit.
-    pub fn be64(&mut self, dst: Register) -> &mut Self {
-        let opcode = class::ALU32 | alu::END | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, 64));
-        self
-    }
+    endian_family!(SRC_IMM; le16 = 16, le32 = 32, le64 = 64);
+    endian_family!(SRC_REG; be16 = 16, be32 = 32, be64 = 64);
 
     // ==================== Memory Load Instructions ====================
 
-    /// `ldxdw dst, [src+off]` - Load 64-bit from memory.
-    pub fn ldxdw(&mut self, dst: Register, src: Register, offset: i16) -> &mut Self {
-        let opcode = class::LDX | size::DW | mode::MEM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, 0));
-        self
-    }
-
-    /// `ldxw dst, [src+off]` - Load 32-bit from memory.
-    pub fn ldxw(&mut self, dst: Register, src: Register, offset: i16) -> &mut Self {
-        let opcode = class::LDX | size::W | mode::MEM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, 0));
-        self
-    }
-
-    /// `ldxh dst, [src+off]` - Load 16-bit from memory.
-    pub fn ldxh(&mut self, dst: Register, src: Register, offset: i16) -> &mut Self {
-        let opcode = class::LDX | size::H | mode::MEM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, 0));
-        self
-    }
-
-    /// `ldxb dst, [src+off]` - Load 8-bit from memory.
-    pub fn ldxb(&mut self, dst: Register, src: Register, offset: i16) -> &mut Self {
-        let opcode = class::LDX | size::B | mode::MEM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, 0));
-        self
-    }
-
-    /// `ldxsw dst, [src+off]` - Load 32-bit with sign extension.
-    pub fn ldxsw(&mut self, dst: Register, src: Register, offset: i16) -> &mut Self {
-        let opcode = class::LDX | size::W | mode::MEMSX;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, 0));
-        self
-    }
-
-    /// `ldxsh dst, [src+off]` - Load 16-bit with sign extension.
-    pub fn ldxsh(&mut self, dst: Register, src: Register, offset: i16) -> &mut Self {
-        let opcode = class::LDX | size::H | mode::MEMSX;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, 0));
-        self
-    }
-
-    /// `ldxsb dst, [src+off]` - Load 8-bit with sign extension.
-    pub fn ldxsb(&mut self, dst: Register, src: Register, offset: i16) -> &mut Self {
-        let opcode = class::LDX | size::B | mode::MEMSX;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, 0));
-        self
-    }
+    ldx_family!(
+        ldxdw = DW, MEM;
+        ldxw = W, MEM;
+        ldxh = H, MEM;
+        ldxb = B, MEM;
+        ldxsw = W, MEMSX;
+        ldxsh = H, MEMSX;
+        ldxsb = B, MEMSX;
+    );
 
     /// `lddw dst, imm64` - Load 64-bit immediate.
     pub fn lddw(&mut self, dst: Register, imm: i64) -> &mut Self {
@@ -1149,61 +558,8 @@ impl Assembler {
 
     // ==================== Memory Store Instructions ====================
 
-    /// `stxdw [dst+off], src` - Store 64-bit to memory from register.
-    pub fn stxdw(&mut self, dst: Register, offset: i16, src: Register) -> &mut Self {
-        let opcode = class::STX | size::DW | mode::MEM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, 0));
-        self
-    }
-
-    /// `stxw [dst+off], src` - Store 32-bit to memory from register.
-    pub fn stxw(&mut self, dst: Register, offset: i16, src: Register) -> &mut Self {
-        let opcode = class::STX | size::W | mode::MEM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, 0));
-        self
-    }
-
-    /// `stxh [dst+off], src` - Store 16-bit to memory from register.
-    pub fn stxh(&mut self, dst: Register, offset: i16, src: Register) -> &mut Self {
-        let opcode = class::STX | size::H | mode::MEM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, 0));
-        self
-    }
-
-    /// `stxb [dst+off], src` - Store 8-bit to memory from register.
-    pub fn stxb(&mut self, dst: Register, offset: i16, src: Register) -> &mut Self {
-        let opcode = class::STX | size::B | mode::MEM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, 0));
-        self
-    }
-
-    /// `stdw [dst+off], imm` - Store 64-bit immediate to memory.
-    pub fn stdw(&mut self, dst: Register, offset: i16, imm: i32) -> &mut Self {
-        let opcode = class::ST | size::DW | mode::MEM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, offset, imm));
-        self
-    }
-
-    /// `stw [dst+off], imm` - Store 32-bit immediate to memory.
-    pub fn stw(&mut self, dst: Register, offset: i16, imm: i32) -> &mut Self {
-        let opcode = class::ST | size::W | mode::MEM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, offset, imm));
-        self
-    }
-
-    /// `sth [dst+off], imm` - Store 16-bit immediate to memory.
-    pub fn sth(&mut self, dst: Register, offset: i16, imm: i32) -> &mut Self {
-        let opcode = class::ST | size::H | mode::MEM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, offset, imm));
-        self
-    }
-
-    /// `stb [dst+off], imm` - Store 8-bit immediate to memory.
-    pub fn stb(&mut self, dst: Register, offset: i16, imm: i32) -> &mut Self {
-        let opcode = class::ST | size::B | mode::MEM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, offset, imm));
-        self
-    }
+    stx_family!(stxdw = DW; stxw = W; stxh = H; stxb = B);
+    st_family!(stdw = DW; stw = W; sth = H; stb = B);
 
     // ==================== Jump Instructions with Labels ====================
 
@@ -1211,7 +567,7 @@ impl Assembler {
     pub fn ja(&mut self, label: &Label) -> &mut Self {
         let opcode = class::JMP64 | jmp::JA;
         self.emit(RawInstruction::from_parts(opcode, 0, 0, 0, 0));
-        self.add_label_ref(label, LabelRefType::UnconditionalJump);
+        self.add_label_ref(label, LabelRefType::Jump);
         self
     }
 
@@ -1222,359 +578,33 @@ impl Assembler {
         self
     }
 
-    /// `jeq dst, src, label` - Jump if equal (register).
-    pub fn jeq(&mut self, dst: Register, src: Register, label: &Label) -> &mut Self {
-        let opcode = class::JMP64 | jmp::JEQ | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
+    jmp_family!(JMP64;
+        jeq, jeq_imm = JEQ;
+        jne, jne_imm = JNE;
+        jgt, jgt_imm = JGT;
+        jge, jge_imm = JGE;
+        jlt, jlt_imm = JLT;
+        jle, jle_imm = JLE;
+        jset, jset_imm = JSET;
+        jsgt, jsgt_imm = JSGT;
+        jsge, jsge_imm = JSGE;
+        jslt, jslt_imm = JSLT;
+        jsle, jsle_imm = JSLE;
+    );
 
-    /// `jeq dst, imm, label` - Jump if equal (immediate).
-    pub fn jeq_imm(&mut self, dst: Register, imm: i32, label: &Label) -> &mut Self {
-        let opcode = class::JMP64 | jmp::JEQ | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jne dst, src, label` - Jump if not equal (register).
-    pub fn jne(&mut self, dst: Register, src: Register, label: &Label) -> &mut Self {
-        let opcode = class::JMP64 | jmp::JNE | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jne dst, imm, label` - Jump if not equal (immediate).
-    pub fn jne_imm(&mut self, dst: Register, imm: i32, label: &Label) -> &mut Self {
-        let opcode = class::JMP64 | jmp::JNE | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jgt dst, src, label` - Jump if greater than (unsigned, register).
-    pub fn jgt(&mut self, dst: Register, src: Register, label: &Label) -> &mut Self {
-        let opcode = class::JMP64 | jmp::JGT | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jgt dst, imm, label` - Jump if greater than (unsigned, immediate).
-    pub fn jgt_imm(&mut self, dst: Register, imm: i32, label: &Label) -> &mut Self {
-        let opcode = class::JMP64 | jmp::JGT | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jge dst, src, label` - Jump if greater or equal (unsigned, register).
-    pub fn jge(&mut self, dst: Register, src: Register, label: &Label) -> &mut Self {
-        let opcode = class::JMP64 | jmp::JGE | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jge dst, imm, label` - Jump if greater or equal (unsigned, immediate).
-    pub fn jge_imm(&mut self, dst: Register, imm: i32, label: &Label) -> &mut Self {
-        let opcode = class::JMP64 | jmp::JGE | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jlt dst, src, label` - Jump if less than (unsigned, register).
-    pub fn jlt(&mut self, dst: Register, src: Register, label: &Label) -> &mut Self {
-        let opcode = class::JMP64 | jmp::JLT | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jlt dst, imm, label` - Jump if less than (unsigned, immediate).
-    pub fn jlt_imm(&mut self, dst: Register, imm: i32, label: &Label) -> &mut Self {
-        let opcode = class::JMP64 | jmp::JLT | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jle dst, src, label` - Jump if less or equal (unsigned, register).
-    pub fn jle(&mut self, dst: Register, src: Register, label: &Label) -> &mut Self {
-        let opcode = class::JMP64 | jmp::JLE | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jle dst, imm, label` - Jump if less or equal (unsigned, immediate).
-    pub fn jle_imm(&mut self, dst: Register, imm: i32, label: &Label) -> &mut Self {
-        let opcode = class::JMP64 | jmp::JLE | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jset dst, src, label` - Jump if bits set.
-    pub fn jset(&mut self, dst: Register, src: Register, label: &Label) -> &mut Self {
-        let opcode = class::JMP64 | jmp::JSET | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jset dst, imm, label` - Jump if bits set (immediate).
-    pub fn jset_imm(&mut self, dst: Register, imm: i32, label: &Label) -> &mut Self {
-        let opcode = class::JMP64 | jmp::JSET | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jsgt dst, src, label` - Jump if signed greater than.
-    pub fn jsgt(&mut self, dst: Register, src: Register, label: &Label) -> &mut Self {
-        let opcode = class::JMP64 | jmp::JSGT | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jsgt dst, imm, label` - Jump if signed greater than (immediate).
-    pub fn jsgt_imm(&mut self, dst: Register, imm: i32, label: &Label) -> &mut Self {
-        let opcode = class::JMP64 | jmp::JSGT | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jsge dst, src, label` - Jump if signed greater or equal.
-    pub fn jsge(&mut self, dst: Register, src: Register, label: &Label) -> &mut Self {
-        let opcode = class::JMP64 | jmp::JSGE | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jsge dst, imm, label` - Jump if signed greater or equal (immediate).
-    pub fn jsge_imm(&mut self, dst: Register, imm: i32, label: &Label) -> &mut Self {
-        let opcode = class::JMP64 | jmp::JSGE | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jslt dst, src, label` - Jump if signed less than.
-    pub fn jslt(&mut self, dst: Register, src: Register, label: &Label) -> &mut Self {
-        let opcode = class::JMP64 | jmp::JSLT | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jslt dst, imm, label` - Jump if signed less than (immediate).
-    pub fn jslt_imm(&mut self, dst: Register, imm: i32, label: &Label) -> &mut Self {
-        let opcode = class::JMP64 | jmp::JSLT | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jsle dst, src, label` - Jump if signed less or equal.
-    pub fn jsle(&mut self, dst: Register, src: Register, label: &Label) -> &mut Self {
-        let opcode = class::JMP64 | jmp::JSLE | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jsle dst, imm, label` - Jump if signed less or equal (immediate).
-    pub fn jsle_imm(&mut self, dst: Register, imm: i32, label: &Label) -> &mut Self {
-        let opcode = class::JMP64 | jmp::JSLE | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    // ==================== JMP32 Instructions ====================
-
-    /// `jeq32 dst, src, label` - Jump if equal (32-bit comparison, register).
-    pub fn jeq32(&mut self, dst: Register, src: Register, label: &Label) -> &mut Self {
-        let opcode = class::JMP32 | jmp::JEQ | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jeq32 dst, imm, label` - Jump if equal (32-bit comparison, immediate).
-    pub fn jeq32_imm(&mut self, dst: Register, imm: i32, label: &Label) -> &mut Self {
-        let opcode = class::JMP32 | jmp::JEQ | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jne32 dst, src, label` - Jump if not equal (32-bit comparison, register).
-    pub fn jne32(&mut self, dst: Register, src: Register, label: &Label) -> &mut Self {
-        let opcode = class::JMP32 | jmp::JNE | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jne32 dst, imm, label` - Jump if not equal (32-bit comparison, immediate).
-    pub fn jne32_imm(&mut self, dst: Register, imm: i32, label: &Label) -> &mut Self {
-        let opcode = class::JMP32 | jmp::JNE | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jgt32 dst, src, label` - Jump if greater than (32-bit unsigned, register).
-    pub fn jgt32(&mut self, dst: Register, src: Register, label: &Label) -> &mut Self {
-        let opcode = class::JMP32 | jmp::JGT | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jgt32 dst, imm, label` - Jump if greater than (32-bit unsigned, immediate).
-    pub fn jgt32_imm(&mut self, dst: Register, imm: i32, label: &Label) -> &mut Self {
-        let opcode = class::JMP32 | jmp::JGT | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jge32 dst, src, label` - Jump if greater or equal (32-bit unsigned, register).
-    pub fn jge32(&mut self, dst: Register, src: Register, label: &Label) -> &mut Self {
-        let opcode = class::JMP32 | jmp::JGE | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jge32 dst, imm, label` - Jump if greater or equal (32-bit unsigned, immediate).
-    pub fn jge32_imm(&mut self, dst: Register, imm: i32, label: &Label) -> &mut Self {
-        let opcode = class::JMP32 | jmp::JGE | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jlt32 dst, src, label` - Jump if less than (32-bit unsigned, register).
-    pub fn jlt32(&mut self, dst: Register, src: Register, label: &Label) -> &mut Self {
-        let opcode = class::JMP32 | jmp::JLT | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jlt32 dst, imm, label` - Jump if less than (32-bit unsigned, immediate).
-    pub fn jlt32_imm(&mut self, dst: Register, imm: i32, label: &Label) -> &mut Self {
-        let opcode = class::JMP32 | jmp::JLT | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jle32 dst, src, label` - Jump if less or equal (32-bit unsigned, register).
-    pub fn jle32(&mut self, dst: Register, src: Register, label: &Label) -> &mut Self {
-        let opcode = class::JMP32 | jmp::JLE | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jle32 dst, imm, label` - Jump if less or equal (32-bit unsigned, immediate).
-    pub fn jle32_imm(&mut self, dst: Register, imm: i32, label: &Label) -> &mut Self {
-        let opcode = class::JMP32 | jmp::JLE | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jset32 dst, src, label` - Jump if bits set (32-bit, register).
-    pub fn jset32(&mut self, dst: Register, src: Register, label: &Label) -> &mut Self {
-        let opcode = class::JMP32 | jmp::JSET | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jset32 dst, imm, label` - Jump if bits set (32-bit, immediate).
-    pub fn jset32_imm(&mut self, dst: Register, imm: i32, label: &Label) -> &mut Self {
-        let opcode = class::JMP32 | jmp::JSET | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jsgt32 dst, src, label` - Jump if signed greater than (32-bit, register).
-    pub fn jsgt32(&mut self, dst: Register, src: Register, label: &Label) -> &mut Self {
-        let opcode = class::JMP32 | jmp::JSGT | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jsgt32 dst, imm, label` - Jump if signed greater than (32-bit, immediate).
-    pub fn jsgt32_imm(&mut self, dst: Register, imm: i32, label: &Label) -> &mut Self {
-        let opcode = class::JMP32 | jmp::JSGT | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jsge32 dst, src, label` - Jump if signed greater or equal (32-bit, register).
-    pub fn jsge32(&mut self, dst: Register, src: Register, label: &Label) -> &mut Self {
-        let opcode = class::JMP32 | jmp::JSGE | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jsge32 dst, imm, label` - Jump if signed greater or equal (32-bit, immediate).
-    pub fn jsge32_imm(&mut self, dst: Register, imm: i32, label: &Label) -> &mut Self {
-        let opcode = class::JMP32 | jmp::JSGE | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jslt32 dst, src, label` - Jump if signed less than (32-bit, register).
-    pub fn jslt32(&mut self, dst: Register, src: Register, label: &Label) -> &mut Self {
-        let opcode = class::JMP32 | jmp::JSLT | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jslt32 dst, imm, label` - Jump if signed less than (32-bit, immediate).
-    pub fn jslt32_imm(&mut self, dst: Register, imm: i32, label: &Label) -> &mut Self {
-        let opcode = class::JMP32 | jmp::JSLT | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jsle32 dst, src, label` - Jump if signed less or equal (32-bit, register).
-    pub fn jsle32(&mut self, dst: Register, src: Register, label: &Label) -> &mut Self {
-        let opcode = class::JMP32 | jmp::JSLE | SRC_REG;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
-
-    /// `jsle32 dst, imm, label` - Jump if signed less or equal (32-bit, immediate).
-    pub fn jsle32_imm(&mut self, dst: Register, imm: i32, label: &Label) -> &mut Self {
-        let opcode = class::JMP32 | jmp::JSLE | SRC_IMM;
-        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
-        self.add_label_ref(label, LabelRefType::ConditionalJump);
-        self
-    }
+    jmp_family!(JMP32;
+        jeq32, jeq32_imm = JEQ;
+        jne32, jne32_imm = JNE;
+        jgt32, jgt32_imm = JGT;
+        jge32, jge32_imm = JGE;
+        jlt32, jlt32_imm = JLT;
+        jle32, jle32_imm = JLE;
+        jset32, jset32_imm = JSET;
+        jsgt32, jsgt32_imm = JSGT;
+        jsge32, jsge32_imm = JSGE;
+        jslt32, jslt32_imm = JSLT;
+        jsle32, jsle32_imm = JSLE;
+    );
 
     // ==================== Call / Exit ====================
 
@@ -1598,14 +628,6 @@ impl Assembler {
     pub fn exit(&mut self) -> &mut Self {
         let opcode = class::JMP64 | jmp::EXIT;
         self.emit(RawInstruction::from_parts(opcode, 0, 0, 0, 0));
-        self
-    }
-
-    // ==================== Raw Instruction ====================
-
-    /// Emit a raw instruction.
-    pub fn raw(&mut self, opcode: u8, dst: u8, src: u8, offset: i16, imm: i32) -> &mut Self {
-        self.emit(RawInstruction::from_parts(opcode, dst, src, offset, imm));
         self
     }
 }
@@ -1757,7 +779,7 @@ mod tests {
 
         // Second relocation, at a later instruction
         asm.mov64_imm(R4, 1);
-        asm.mark_field_exists(1, 25); // debug_flags exists check
+        asm.mark_core_relo(CoreReloKind::FieldExists, 1, 25); // debug_flags exists check
 
         asm.exit();
 
@@ -1783,7 +805,7 @@ mod tests {
 
         // Instruction after LDDW should be at byte offset 16, not 8
         asm.mov64_imm(R1, 42);
-        asm.mark_type_size(2);
+        asm.mark_core_relo(CoreReloKind::TypeSize, 2, 0);
 
         asm.exit();
 
@@ -1868,10 +890,10 @@ mod tests {
         asm.ja(&back); // slot 3
         asm.set_label(&mut fwd).unwrap();
         asm.exit(); // slot 4
-        assert_eq!(asm.current_byte_offset(), 40);
-        assert_eq!(asm.byte_offset(2), 24);
 
-        let insns = asm.assemble_to_u64().unwrap();
+        let code = asm.assemble().unwrap();
+        let (words, _) = code.as_chunks::<8>();
+        let insns: Vec<u64> = words.iter().map(|w| u64::from_le_bytes(*w)).collect();
         let off = |i: usize| (insns[i] >> 16) as i16;
         assert_eq!(off(0), 3); // 0 + 1 + 3 = 4 (exit)
         assert_eq!(off(3), -4); // 3 + 1 - 4 = 0

@@ -1,4 +1,3 @@
-#[macro_export]
 macro_rules! tryres {
     ($e:expr) => {
         match $e {
@@ -8,7 +7,6 @@ macro_rules! tryres {
     };
 }
 
-#[macro_export]
 macro_rules! tryopt {
     ($e:expr) => {
         match $e {
@@ -18,7 +16,6 @@ macro_rules! tryopt {
     };
 }
 
-#[macro_export]
 macro_rules! ensure {
     (None, $expression:expr) => {
         if !$expression {
@@ -32,7 +29,6 @@ macro_rules! ensure {
     };
 }
 
-#[macro_export]
 macro_rules! ensure_matches {
     ($err:expr, $expression:expr, $pattern:pat $(if $guard:expr)? $(,)?) => {
         if !matches!($expression, $pattern $(if $guard)?) {
@@ -40,8 +36,7 @@ macro_rules! ensure_matches {
         }
     };
 }
-
-pub use ensure;
-pub use ensure_matches;
-pub use tryopt;
-pub use tryres;
+pub(crate) use ensure;
+pub(crate) use ensure_matches;
+pub(crate) use tryopt;
+pub(crate) use tryres;

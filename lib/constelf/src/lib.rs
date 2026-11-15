@@ -4,7 +4,8 @@ pub mod err;
 pub mod raw;
 
 pub mod file;
-pub mod macros;
+mod macros;
+pub(crate) use macros::{ensure, ensure_matches, tryopt, tryres};
 pub mod relocs;
 pub mod sections;
 pub mod symtab;
