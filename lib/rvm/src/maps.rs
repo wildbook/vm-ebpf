@@ -19,8 +19,12 @@
 
 use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::ptr::NonNull;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+use hashbrown::hash_table::Entry;
+use hashbrown::HashTable;
 
 use btf::{Btf, BtfTypeInfo};
 
@@ -119,35 +123,75 @@ enum Index {
     Shared(Arc<SharedMap>),
 }
 
-#[derive(Debug, Clone, Default)]
+/// Fixed-capacity hash index: keys live in one preallocated block at their value's
+/// slot, and the table holds slot numbers, so inserts never allocate.
+#[derive(Debug, Clone)]
 struct HashIndex {
-    slots: HashMap<Box<[u8]>, u32>,
+    table: HashTable<u32>,
+    keys: Box<[u8]>,
+    key_size: usize,
     free: Vec<u32>,
+    hasher: foldhash::fast::RandomState,
 }
 
 impl HashIndex {
-    fn new(max_entries: u32) -> Self {
+    fn new(key_size: u32, max_entries: u32) -> Self {
+        let key_size = key_size as usize;
         Self {
-            slots: HashMap::with_capacity(max_entries as usize),
+            table: HashTable::with_capacity(max_entries as usize),
+            keys: vec![0; key_size * max_entries as usize].into(),
+            key_size,
             free: (0..max_entries).rev().collect(),
+            hasher: Default::default(),
         }
     }
 
+    fn key_at(keys: &[u8], key_size: usize, slot: u32) -> &[u8] {
+        &keys[slot as usize * key_size..][..key_size]
+    }
+
+    #[inline]
+    fn get(&self, key: &[u8]) -> Option<u32> {
+        let hash = self.hasher.hash_one(key);
+        self.table
+            .find(hash, |&slot| Self::key_at(&self.keys, self.key_size, slot) == key)
+            .copied()
+    }
+
     fn upsert(&mut self, key: &[u8], flags: u64) -> std::result::Result<u32, MapError> {
-        match (self.slots.get(key), flags) {
-            (Some(_), BPF_NOEXIST) => Err(MapError::Exists),
-            (Some(&slot), _) => Ok(slot),
-            (None, BPF_EXIST) => Err(MapError::NotFound),
-            (None, _) => {
-                let slot = self.free.pop().ok_or(MapError::Full)?;
-                self.slots.insert(key.into(), slot);
+        let Self {
+            table,
+            keys,
+            key_size,
+            free,
+            hasher,
+        } = self;
+        let hash = hasher.hash_one(key);
+        match table.entry(
+            hash,
+            |&slot| Self::key_at(keys, *key_size, slot) == key,
+            |&slot| hasher.hash_one(Self::key_at(keys, *key_size, slot)),
+        ) {
+            Entry::Occupied(_) if flags == BPF_NOEXIST => Err(MapError::Exists),
+            Entry::Occupied(entry) => Ok(*entry.get()),
+            Entry::Vacant(_) if flags == BPF_EXIST => Err(MapError::NotFound),
+            Entry::Vacant(entry) => {
+                let slot = free.pop().ok_or(MapError::Full)?;
+                keys[slot as usize * *key_size..][..*key_size].copy_from_slice(key);
+                entry.insert(slot);
                 Ok(slot)
             }
         }
     }
 
     fn remove(&mut self, key: &[u8]) -> std::result::Result<u32, MapError> {
-        let slot = self.slots.remove(key).ok_or(MapError::NotFound)?;
+        let hash = self.hasher.hash_one(key);
+        let (keys, key_size) = (&self.keys, self.key_size);
+        let entry = self
+            .table
+            .find_entry(hash, |&slot| Self::key_at(keys, key_size, slot) == key)
+            .map_err(|_| MapError::NotFound)?;
+        let (slot, _) = entry.remove();
         self.free.push(slot);
         Ok(slot)
     }
@@ -168,7 +212,7 @@ impl Maps {
                     len = (len + stride * u64::from(def.max_entries)).next_multiple_of(CACHE_LINE);
                     let index = match def.kind {
                         MapKind::Array => Index::Array,
-                        MapKind::Hash => Index::Hash(HashIndex::new(def.max_entries)),
+                        MapKind::Hash => Index::Hash(HashIndex::new(def.key_size, def.max_entries)),
                     };
                     (base, stride, index)
                 }
@@ -218,7 +262,26 @@ impl Maps {
         map.slot(key).map(|slot| map.addr(slot))
     }
 
-    /// Insert or replace the value for `key`; `flags` is `BPF_ANY`, `BPF_NOEXIST` or `BPF_EXIST`.
+    /// Find or create the slot for `key` and return its guest address; the caller
+    /// writes the value. `flags` is `BPF_ANY`, `BPF_NOEXIST` or `BPF_EXIST`.
+    pub fn upsert(&mut self, handle: u32, key: &[u8], flags: u64) -> std::result::Result<u64, MapError> {
+        let map = self.maps.get_mut(handle as usize).ok_or(MapError::Invalid)?;
+        if flags > BPF_EXIST {
+            return Err(MapError::Invalid);
+        }
+        let slot = map.upsert(key, flags)?;
+        Ok(map.addr(slot))
+    }
+
+    /// Remove `key` and return the guest address of its freed value. Array maps
+    /// don't support deletion.
+    pub fn remove(&mut self, handle: u32, key: &[u8]) -> std::result::Result<u64, MapError> {
+        let map = self.maps.get_mut(handle as usize).ok_or(MapError::Invalid)?;
+        let slot = map.with_hash(|index| index.remove(key)).ok_or(MapError::Invalid)??;
+        Ok(map.addr(slot))
+    }
+
+    /// Insert or replace the value for `key`; see [`Maps::upsert`] for `flags`.
     pub fn update(
         &mut self,
         mem: &mut VmMemory,
@@ -227,20 +290,18 @@ impl Maps {
         value: &[u8],
         flags: u64,
     ) -> std::result::Result<(), MapError> {
-        let map = self.maps.get_mut(handle as usize).ok_or(MapError::Invalid)?;
-        if value.len() != map.def.value_size as usize || flags > BPF_EXIST {
+        if self.def(handle).is_none_or(|def| value.len() != def.value_size as usize) {
             return Err(MapError::Invalid);
         }
-        let slot = map.upsert(key, flags)?;
-        mem.write_bytes(map.addr(slot), value).expect("map slots are mapped");
+        let addr = self.upsert(handle, key, flags)?;
+        mem.write_bytes(addr, value).expect("map slots are mapped");
         Ok(())
     }
 
-    /// Remove `key`. Array maps don't support deletion.
+    /// Remove `key` and zero its value.
     pub fn delete(&mut self, mem: &mut VmMemory, handle: u32, key: &[u8]) -> std::result::Result<(), MapError> {
-        let map = self.maps.get_mut(handle as usize).ok_or(MapError::Invalid)?;
-        let slot = map.with_hash(|index| index.remove(key)).ok_or(MapError::Invalid)??;
-        let (addr, len) = (map.addr(slot), map.def.value_size as usize);
+        let addr = self.remove(handle, key)?;
+        let len = self.maps[handle as usize].def.value_size as usize;
         mem.bytes_mut(addr, len).expect("map slots are mapped").fill(0);
         Ok(())
     }
@@ -256,17 +317,18 @@ impl Map {
         match &mut self.index {
             Index::Array => None,
             Index::Hash(index) => Some(f(index)),
-            Index::Shared(shared) => shared.index.as_ref().map(|index| f(&mut lock(index))),
+            Index::Shared(shared) => shared.index.as_ref().map(|index| f(&mut write(index))),
         }
     }
 
+    #[inline]
     fn slot(&self, key: &[u8]) -> Option<u32> {
         match &self.index {
             Index::Array => self.array_slot(key).ok(),
-            Index::Hash(index) => index.slots.get(key).copied(),
+            Index::Hash(index) => index.get(key),
             Index::Shared(shared) => match &shared.index {
                 None => self.array_slot(key).ok(),
-                Some(index) => lock(index).slots.get(key).copied(),
+                Some(index) => read(index).get(key),
             },
         }
     }
@@ -292,6 +354,14 @@ impl Map {
         }
         Ok(idx)
     }
+}
+
+fn read<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|e| e.into_inner())
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -323,7 +393,7 @@ pub struct SharedMap {
     region: usize,
     stride: u64,
     storage: Storage,
-    index: Option<Mutex<HashIndex>>,
+    index: Option<RwLock<HashIndex>>,
 }
 
 impl SharedMap {
@@ -368,7 +438,7 @@ impl SharedMaps {
             region,
             stride,
             storage: Storage::new((stride * u64::from(def.max_entries)) as usize),
-            index: (def.kind == MapKind::Hash).then(|| Mutex::new(HashIndex::new(def.max_entries))),
+            index: (def.kind == MapKind::Hash).then(|| RwLock::new(HashIndex::new(def.key_size, def.max_entries))),
         });
         state.next_region += 1;
         state.bound.insert(def.name.clone(), map.clone());
@@ -521,11 +591,6 @@ pub fn register_helpers(helpers: &mut HelperRegistry) {
     }
 }
 
-/// Copy `len` guest bytes at `addr`, or `None` if they aren't mapped.
-fn guest_bytes(mem: &VmMemory, addr: u64, len: u32) -> Option<Vec<u8>> {
-    mem.bytes(addr, len as usize).ok().map(<[u8]>::to_vec)
-}
-
 fn lookup_elem(ctx: &mut HelperContext) -> i64 {
     let (Some(mem), Some(maps)) = (ctx.memory.as_deref(), ctx.maps.as_deref()) else {
         return 0;
@@ -548,15 +613,21 @@ fn update_elem(ctx: &mut HelperContext) -> i64 {
     let Some(def) = maps.def(handle) else {
         return -EINVAL;
     };
-    let (Some(key), Some(value)) =
-        (guest_bytes(mem, ctx.args.r2, def.key_size), guest_bytes(mem, ctx.args.r3, def.value_size))
-    else {
+    let (key_size, value_size) = (def.key_size as usize, def.value_size as usize);
+
+    // check the value before inserting the key, so a bad pointer changes nothing
+    if mem.bytes(ctx.args.r3, value_size).is_err() {
+        return -EINVAL;
+    }
+    let Ok(key) = mem.bytes(ctx.args.r2, key_size) else {
         return -EINVAL;
     };
-    match maps.update(mem, handle, &key, &value, ctx.args.r4) {
-        Ok(()) => 0,
-        Err(e) => -e.errno(),
-    }
+    let addr = match maps.upsert(handle, key, ctx.args.r4) {
+        Ok(addr) => addr,
+        Err(e) => return -e.errno(),
+    };
+    mem.copy(ctx.args.r3, addr, value_size).expect("value checked above");
+    0
 }
 
 fn delete_elem(ctx: &mut HelperContext) -> i64 {
@@ -567,11 +638,15 @@ fn delete_elem(ctx: &mut HelperContext) -> i64 {
     let Some(def) = maps.def(handle) else {
         return -EINVAL;
     };
-    let Some(key) = guest_bytes(mem, ctx.args.r2, def.key_size) else {
+    let value_size = def.value_size as usize;
+    let Ok(key) = mem.bytes(ctx.args.r2, def.key_size as usize) else {
         return -EINVAL;
     };
-    match maps.delete(mem, handle, &key) {
-        Ok(()) => 0,
+    match maps.remove(handle, key) {
+        Ok(addr) => {
+            mem.bytes_mut(addr, value_size).expect("map slots are mapped").fill(0);
+            0
+        }
         Err(e) => -e.errno(),
     }
 }

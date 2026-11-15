@@ -3,7 +3,7 @@
 //! disabled one fails to link.
 
 use std::cell::Cell;
-use std::hash::{BuildHasher, RandomState};
+use std::hash::BuildHasher;
 use std::sync::LazyLock;
 use std::time::Instant;
 
@@ -41,7 +41,8 @@ pub fn register_time(helpers: &mut HelperRegistry) {
 /// Not cryptographically secure, like the kernel's.
 pub fn register_random(helpers: &mut HelperRegistry) {
     thread_local! {
-        static STATE: Cell<u64> = Cell::new(RandomState::new().hash_one(0u64) | 1);
+        // foldhash seeds from address-space layout, so this needs no OS randomness
+        static STATE: Cell<u64> = Cell::new(foldhash::fast::RandomState::default().hash_one(0u64) | 1);
     }
     helpers.register(BPF_FUNC_GET_PRANDOM_U32, |_: ()| {
         STATE.with(|state| {

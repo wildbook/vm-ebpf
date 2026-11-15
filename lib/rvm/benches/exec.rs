@@ -95,6 +95,18 @@ fn bench(c: &mut Criterion) {
         });
     }
     group.finish();
+
+    // Map helpers from a compiled object; each call runs N operations in a guest loop.
+    let elf = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/map_bench.o")).unwrap();
+    let mut program = rvm::Vm::new().load_elf(&elf).unwrap();
+    program.call("hash_update", &[N as u64]).unwrap(); // fill all keys before timing lookups
+
+    let mut group = c.benchmark_group("maps");
+    group.throughput(Throughput::Elements(N as u64));
+    for name in ["hash_update", "hash_lookup", "array_lookup"] {
+        group.bench_function(name, |b| b.iter(|| program.call(name, black_box(&[N as u64])).unwrap()));
+    }
+    group.finish();
 }
 
 criterion_group!(benches, bench);
