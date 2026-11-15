@@ -106,6 +106,12 @@ fn bench(c: &mut Criterion) {
     for name in ["hash_update", "hash_lookup", "array_lookup"] {
         group.bench_function(name, |b| b.iter(|| program.call(name, black_box(&[N as u64])).unwrap()));
     }
+
+    // Same guest loop with helper 1 replaced by a stub: the cost outside the map code.
+    let vm = rvm::Vm::new();
+    vm.register_helper(1, |_: ()| 0u64);
+    let mut stub = vm.load_elf(&elf).unwrap();
+    group.bench_function("lookup_stub", |b| b.iter(|| stub.call("array_lookup", black_box(&[N as u64])).unwrap()));
     group.finish();
 }
 

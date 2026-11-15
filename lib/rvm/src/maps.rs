@@ -242,6 +242,7 @@ impl Maps {
     }
 
     /// Definition of the map with `handle`.
+    #[inline]
     pub fn def(&self, handle: u32) -> Option<&MapDef> {
         self.maps.get(handle as usize).map(|m| &m.def)
     }
@@ -257,6 +258,7 @@ impl Maps {
     }
 
     /// Guest address of the value for `key`, if present.
+    #[inline]
     pub fn lookup(&self, handle: u32, key: &[u8]) -> Option<u64> {
         let map = self.maps.get(handle as usize)?;
         map.slot(key).map(|slot| map.addr(slot))
@@ -308,6 +310,7 @@ impl Maps {
 }
 
 impl Map {
+    #[inline]
     fn addr(&self, slot: u32) -> u64 {
         self.base + u64::from(slot) * self.stride
     }
@@ -347,6 +350,7 @@ impl Map {
             .expect("hash map has an index")
     }
 
+    #[inline]
     fn array_slot(&self, key: &[u8]) -> std::result::Result<u32, MapError> {
         let idx = u32::from_le_bytes(key.try_into().map_err(|_| MapError::Invalid)?);
         if idx >= self.def.max_entries {
@@ -578,16 +582,15 @@ fn invalid(msg: String) -> VmError {
 /// Bind helpers 1 to 3 to the built-in map implementation unless the host registered
 /// its own under those IDs.
 pub fn register_helpers(helpers: &mut HelperRegistry) {
-    type Builtin = fn(&mut HelperContext) -> i64;
-    let builtins: [(u32, Builtin); 3] = [
-        (BPF_FUNC_MAP_LOOKUP_ELEM, lookup_elem),
-        (BPF_FUNC_MAP_UPDATE_ELEM, update_elem),
-        (BPF_FUNC_MAP_DELETE_ELEM, delete_elem),
-    ];
-    for (id, f) in builtins {
-        if !helpers.has(id) {
-            helpers.register_with_ctx(id, f);
-        }
+    // one closure type per helper, so each slot calls its body directly
+    if !helpers.has(BPF_FUNC_MAP_LOOKUP_ELEM) {
+        helpers.register_with_ctx(BPF_FUNC_MAP_LOOKUP_ELEM, |ctx: &mut HelperContext| lookup_elem(ctx));
+    }
+    if !helpers.has(BPF_FUNC_MAP_UPDATE_ELEM) {
+        helpers.register_with_ctx(BPF_FUNC_MAP_UPDATE_ELEM, |ctx: &mut HelperContext| update_elem(ctx));
+    }
+    if !helpers.has(BPF_FUNC_MAP_DELETE_ELEM) {
+        helpers.register_with_ctx(BPF_FUNC_MAP_DELETE_ELEM, |ctx: &mut HelperContext| delete_elem(ctx));
     }
 }
 
