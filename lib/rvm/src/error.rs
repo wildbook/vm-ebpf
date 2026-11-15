@@ -159,7 +159,10 @@ impl fmt::Display for LinkError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnresolvedSymbol(name) => write!(f, "unresolved symbol: {name}"),
-            Self::UnknownHelper(id) => write!(f, "call to unregistered helper {id}"),
+            Self::UnknownHelper(id) => match crate::std_helpers::helper_name(*id) {
+                Some(name) => write!(f, "call to unregistered helper {id} ({name})"),
+                None => write!(f, "call to unregistered helper {id}"),
+            },
             Self::SignatureMismatch { name, declared, host } => {
                 write!(f, "extern {name} declares {declared} parameters but the host function takes {host}")
             }

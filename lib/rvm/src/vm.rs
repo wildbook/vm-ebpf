@@ -38,6 +38,7 @@ use crate::helper::{DynHelper, FromArgs, HelperRegistry, IntoReturn};
 use crate::linker::Linker;
 use crate::module::Module;
 use crate::program::Program;
+use crate::std_helpers;
 use crate::types::TypeRegistry;
 
 /// Configuration for the VM.
@@ -158,6 +159,21 @@ impl Vm {
         R: IntoReturn + 'static,
     {
         self.helpers.register_fn(name, func);
+    }
+
+    /// Enable `ktime_get_ns` (helper 5).
+    pub fn enable_time(&mut self) {
+        std_helpers::register_time(&mut self.helpers);
+    }
+
+    /// Enable `get_prandom_u32` (helper 7).
+    pub fn enable_random(&mut self) {
+        std_helpers::register_random(&mut self.helpers);
+    }
+
+    /// Enable `trace_printk` (helper 6); each formatted line goes to `sink`.
+    pub fn enable_print(&mut self, sink: impl Fn(&str) + Send + Sync + 'static) {
+        std_helpers::register_print(&mut self.helpers, sink);
     }
 
     /// Get the helper registry.

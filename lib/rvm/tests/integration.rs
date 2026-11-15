@@ -270,6 +270,29 @@ fn test_maps() {
     assert_eq!(program.call("recall", &[9]).unwrap(), 99);
 }
 
+/// The standard helpers only link once enabled, and trace_printk formats like the kernel.
+#[test]
+fn test_std_helpers() {
+    use std::sync::{Arc, Mutex};
+
+    let elf = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/std_helpers.o")).unwrap();
+
+    let err = Vm::new().load_elf(&elf).unwrap_err().to_string();
+    assert!(err.contains("ktime_get_ns"), "{err}");
+
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let mut vm = Vm::new();
+    vm.enable_time();
+    vm.enable_random();
+    let sink = lines.clone();
+    vm.enable_print(move |line| sink.lock().unwrap().push(line.to_string()));
+    let mut program = vm.load_elf(&elf).unwrap();
+
+    program.call("report", &[300]).unwrap();
+    assert_eq!(*lines.lock().unwrap(), ["x=300 neg=-300 hex=12c"]);
+    assert_eq!(program.call("draws_differ", &[]).unwrap(), 1);
+}
+
 // ==================== Memory Safety Tests ====================
 
 mod memory_safety {

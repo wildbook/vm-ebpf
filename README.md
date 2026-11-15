@@ -111,6 +111,11 @@ call-heavy loops built with `ebpf-asm`.
 Not implemented: kfunc BTF ID resolution, and the legacy packet access modes
 `BPF_ABS` and `BPF_IND`, which return `Flow::Missing`.
 
+Helpers that touch host state are off by default. `Vm::enable_time` adds
+`ktime_get_ns` (5), `Vm::enable_random` adds `get_prandom_u32` (7), and
+`Vm::enable_print(sink)` adds `trace_printk` (6), passing each line to `sink`.
+A program that calls a helper the host didn't enable fails to link.
+
 Maps: array and hash maps declared libbpf style in `.maps` (`__uint(type, ...)`,
 `__type(key, ...)`, `__type(value, ...)`, `max_entries`). Helpers 1 to 3
 (`map_lookup_elem`, `map_update_elem`, `map_delete_elem`) are built in unless the

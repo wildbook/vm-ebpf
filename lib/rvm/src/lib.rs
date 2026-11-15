@@ -105,6 +105,7 @@ mod memory;
 mod module;
 mod program;
 mod section;
+mod std_helpers;
 mod symbol;
 mod types;
 mod vm;
@@ -134,6 +135,7 @@ pub use module::Module;
 pub use program::{FunctionInfo, Program};
 pub use rvm_core::{instructions_from_bytes, AtomicOp, Instruction};
 pub use section::{Section, SectionKind};
+pub use std_helpers::{BPF_FUNC_GET_PRANDOM_U32, BPF_FUNC_KTIME_GET_NS, BPF_FUNC_TRACE_PRINTK};
 pub use symbol::{Export, Import, Symbol, SymbolBinding, SymbolKind};
 // Types (CO-RE)
 pub use types::TypeRegistry;
