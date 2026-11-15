@@ -140,7 +140,64 @@ pub trait Memory {
         self.store_u32(addr, value as u32)?;
         self.store_u32(addr + 4, (value >> 32) as u32)
     }
+
+    /// Apply `op` to the `u32` at `addr` and return the previous value.
+    ///
+    /// The default is a load followed by a store, which is atomic for memory only
+    /// this executor can reach. Override it for memory shared with other threads.
+    fn atomic_u32(&mut self, addr: u64, op: AtomicOp<u32>) -> Result<u32, Self::Err> {
+        let old = self.load_u32(addr)?;
+        if let Some(new) = op.apply(old) {
+            self.store_u32(addr, new)?;
+        }
+        Ok(old)
+    }
+
+    /// Apply `op` to the `u64` at `addr` and return the previous value. See [`Memory::atomic_u32`].
+    fn atomic_u64(&mut self, addr: u64, op: AtomicOp<u64>) -> Result<u64, Self::Err> {
+        let old = self.load_u64(addr)?;
+        if let Some(new) = op.apply(old) {
+            self.store_u64(addr, new)?;
+        }
+        Ok(old)
+    }
 }
+
+/// A read-modify-write operation for [`Memory::atomic_u32`] and [`Memory::atomic_u64`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AtomicOp<T> {
+    Add(T),
+    Or(T),
+    And(T),
+    Xor(T),
+    Xchg(T),
+    /// Store `new` if the current value equals `expected`.
+    CmpXchg {
+        expected: T,
+        new: T,
+    },
+}
+
+macro_rules! atomic_op_apply {
+    ($($ty:ty),*) => {$(
+        impl AtomicOp<$ty> {
+            /// The value to store given the current value `old`, or `None` to leave it.
+            #[inline(always)]
+            pub fn apply(self, old: $ty) -> Option<$ty> {
+                Some(match self {
+                    Self::Add(v) => old.wrapping_add(v),
+                    Self::Or(v) => old | v,
+                    Self::And(v) => old & v,
+                    Self::Xor(v) => old ^ v,
+                    Self::Xchg(v) => v,
+                    Self::CmpXchg { expected, new } => return (old == expected).then_some(new),
+                })
+            }
+        }
+    )*};
+}
+
+atomic_op_apply!(u32, u64);
 
 impl Memory for () {
     type Err = ();
@@ -180,6 +237,12 @@ impl<M: Memory + ?Sized> Memory for &mut M {
     }
     fn store_u64(&mut self, addr: u64, value: u64) -> Result<(), Self::Err> {
         (**self).store_u64(addr, value)
+    }
+    fn atomic_u32(&mut self, addr: u64, op: AtomicOp<u32>) -> Result<u32, Self::Err> {
+        (**self).atomic_u32(addr, op)
+    }
+    fn atomic_u64(&mut self, addr: u64, op: AtomicOp<u64>) -> Result<u64, Self::Err> {
+        (**self).atomic_u64(addr, op)
     }
 }
 
@@ -457,7 +520,7 @@ mod mem {
     use std::ops::ControlFlow;
 
     use crate::opcode::{MemMode, MemSize};
-    use crate::{Context, Flow, Instruction, Memory};
+    use crate::{AtomicOp, Context, Flow, Instruction, Memory};
 
     pub const WITH_REG: bool = true;
     pub const WITH_IMM: bool = false;
@@ -502,22 +565,70 @@ mod mem {
         let size = opc.mem_size();
         let mode = opc.mem_mode();
 
-        match match mode {
+        let result = match mode {
             MemMode::Mem => mem_store(&mut ctx.data, size, addr, val),
-            MemMode::MemSX => mem_store(&mut ctx.data, size, addr, val),
+            MemMode::Atomic if X => return atomic(ctx, instr, size, addr, val),
 
             MemMode::Imm => return Flow::Missing,
             MemMode::Abs => return Flow::Missing,
             MemMode::Ind => return Flow::Missing,
-            MemMode::Atomic => return Flow::Missing,
 
-            MemMode::UndefA => return Flow::FailCpu,
-            MemMode::UndefE => return Flow::FailCpu,
-        } {
-            Ok(()) => (),
-            Err(err) => return Flow::FailMem(err),
+            MemMode::MemSX | MemMode::Atomic | MemMode::UndefA | MemMode::UndefE => return Flow::FailCpu,
+        };
+        if let Err(err) = result {
+            return Flow::FailMem(err);
         }
 
+        Flow::Next
+    }
+
+    /// `STX | ATOMIC`: `imm` selects the operation; W and DW sizes only.
+    fn atomic<M: Memory>(ctx: &mut Context<M>, instr: Instruction, size: MemSize, addr: u64, src: u64) -> Flow<M> {
+        const FETCH: i32 = 0x01;
+        const ADD: i32 = 0x00;
+        const OR: i32 = 0x40;
+        const AND: i32 = 0x50;
+        const XOR: i32 = 0xa0;
+        const XCHG: i32 = 0xe0 | FETCH;
+        const CMPXCHG: i32 = 0xf0 | FETCH;
+
+        let src_reg = usize::from(instr.src_reg());
+        let imm = instr.imm();
+
+        // `CmpXchg` compares against r0 and writes the old value there instead of `src`.
+        macro_rules! run {
+            ($ty:ty, $method:ident) => {{
+                let v = src as $ty;
+                let op = match imm & !FETCH {
+                    _ if imm == XCHG => AtomicOp::Xchg(v),
+                    _ if imm == CMPXCHG => AtomicOp::CmpXchg {
+                        expected: ctx.regs[0] as $ty,
+                        new: v,
+                    },
+                    ADD => AtomicOp::Add(v),
+                    OR => AtomicOp::Or(v),
+                    AND => AtomicOp::And(v),
+                    XOR => AtomicOp::Xor(v),
+                    _ => return Flow::FailCpu,
+                };
+                match ctx.data.$method(addr, op) {
+                    Ok(old) => old as u64,
+                    Err(err) => return Flow::FailMem(err),
+                }
+            }};
+        }
+
+        let old = match size {
+            MemSize::Word => run!(u32, atomic_u32),
+            MemSize::DWord => run!(u64, atomic_u64),
+            MemSize::Byte | MemSize::Half => return Flow::FailCpu,
+        };
+
+        match imm {
+            CMPXCHG => ctx.regs[0] = old,
+            _ if imm & FETCH != 0 => ctx.regs[src_reg] = old,
+            _ => {}
+        }
         Flow::Next
     }
 

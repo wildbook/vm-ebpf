@@ -127,7 +127,7 @@ pub use memory::{region_base, Memory, Perms, Scalar, VmMemory, MAX_REGIONS, MAX_
 pub use module::Module;
 // Program and execution
 pub use program::{FunctionInfo, Program};
-pub use rvm_core::{instructions_from_bytes, Instruction};
+pub use rvm_core::{instructions_from_bytes, AtomicOp, Instruction};
 pub use section::{Section, SectionKind};
 pub use symbol::{Export, Import, Symbol, SymbolBinding, SymbolKind};
 // Types (CO-RE)

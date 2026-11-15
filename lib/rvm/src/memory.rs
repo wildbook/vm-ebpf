@@ -11,7 +11,10 @@
 
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::ptr::NonNull;
+use std::sync::atomic::Ordering::SeqCst;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 
+use rvm_core::AtomicOp;
 // Re-export the Memory trait from rvm-core
 pub use rvm_core::Memory;
 
@@ -269,6 +272,33 @@ macro_rules! guest_access {
     };
 }
 
+/// Guest atomic: a real host atomic, so regions shared with other threads stay
+/// coherent. Misaligned addresses fault, as the BPF verifier would reject them.
+macro_rules! guest_atomic {
+    ($name:ident, $ty:ty, $atomic:ident) => {
+        #[inline(always)]
+        fn $name(&mut self, addr: u64, op: AtomicOp<$ty>) -> Result<$ty, u64> {
+            let ptr = self.resolve(addr, size_of::<$ty>(), Perms::RW).ok_or(addr)?;
+            if !ptr.cast::<$ty>().is_aligned() {
+                return Err(addr);
+            }
+            // SAFETY: in bounds and aligned; other threads only reach this memory through
+            // atomics or under the `map_host` contract.
+            let cell = unsafe { $atomic::from_ptr(ptr.as_ptr().cast()) };
+            Ok(match op {
+                AtomicOp::Add(v) => cell.fetch_add(v, SeqCst),
+                AtomicOp::Or(v) => cell.fetch_or(v, SeqCst),
+                AtomicOp::And(v) => cell.fetch_and(v, SeqCst),
+                AtomicOp::Xor(v) => cell.fetch_xor(v, SeqCst),
+                AtomicOp::Xchg(v) => cell.swap(v, SeqCst),
+                AtomicOp::CmpXchg { expected, new } => cell
+                    .compare_exchange(expected, new, SeqCst, SeqCst)
+                    .unwrap_or_else(|old| old),
+            })
+        }
+    };
+}
+
 impl Memory for VmMemory {
     type Err = u64;
 
@@ -276,6 +306,9 @@ impl Memory for VmMemory {
     guest_access!(load_u16, store_u16, u16);
     guest_access!(load_u32, store_u32, u32);
     guest_access!(load_u64, store_u64, u64);
+
+    guest_atomic!(atomic_u32, u32, AtomicU32);
+    guest_atomic!(atomic_u64, u64, AtomicU64);
 }
 
 /// Fixed-size little-endian scalar for host-side [`VmMemory::read`]/[`VmMemory::write`].

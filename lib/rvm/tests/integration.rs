@@ -220,6 +220,20 @@ mod linking {
     }
 }
 
+/// Every atomic form clang emits (bpf/atomics.c), with the expected values worked
+/// out by hand from the RFC 9669 semantics.
+#[test]
+fn test_clang_atomics() {
+    let elf = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/atomics.o")).unwrap();
+    let mut program = Vm::new().load_elf(&elf).unwrap();
+
+    assert_eq!(program.call("run", &[5]).unwrap(), 1058);
+
+    let bss = rvm::region_base(rvm::DATA_REGION);
+    assert_eq!(program.memory().read::<u64>(bss).unwrap(), 9);
+    assert_eq!(program.memory().read::<u32>(bss + 8).unwrap(), 0xFFFF_FFFF);
+}
+
 // ==================== Memory Safety Tests ====================
 
 mod memory_safety {

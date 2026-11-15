@@ -107,8 +107,10 @@ call-heavy loops built with `ebpf-asm`.
 
 ## Scope
 
-Loads and links are limited to what the interpreter actually implements:
-there is no `BPF_XADD`/atomic support, no BPF map support, and no kfunc BTF
-ID resolution. Only the plain and sign-extending memory addressing modes
-(`BPF_MEM`, `BPF_MEMSX`) are implemented; `BPF_ABS`, `BPF_IND`, and
-`BPF_ATOMIC` return `Flow::Missing`.
+Not implemented: BPF maps, kfunc BTF ID resolution, and the legacy packet
+access modes `BPF_ABS` and `BPF_IND`, which return `Flow::Missing`.
+
+Atomics (`BPF_ATOMIC` add, or, and, xor with and without fetch, xchg and
+cmpxchg, 32 and 64 bit) go through `Memory::atomic_u32` and
+`Memory::atomic_u64`. `VmMemory` uses real host atomics and faults on
+misaligned addresses; the trait's default is a plain load and store.
