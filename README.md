@@ -51,20 +51,35 @@ cargo run --bin emu      # loads an ELF passed on the command line
 ```rust
 use rvm::Vm;
 
-let mut vm = Vm::new();
+let vm = Vm::new();
 
 // Numeric helper, called from the guest via `call <id>` with src_reg 0.
-vm.register_helper(1, |x: u64| x * 2);
+// IDs 1 to 3 are the built-in map helpers.
+vm.register_helper(100, |x: u64| x * 2);
 
-// Named extern, called from the guest via a kfunc-style call.
-vm.register_fn("host_add", |a: u64, b: u64| a + b);
+// Named extern, imported by the guest as `extern u64 host_add(u64, u64);`.
+vm.register_fn("host_add", |(a, b): (u64, u64)| a + b);
 
-let program = vm.load_elf(&elf_bytes)?;
+let mut program = vm.load_elf(&elf_bytes)?;
 let result = program.call("run", &[42])?;
 ```
 
 `load_elf` parses and links a single module. For multi-module programs, call
 `Vm::load_module` for each object and `Vm::link` with the set of modules.
+
+Registering a helper again replaces it everywhere: programs linked earlier
+pick up the change at their next call, and helper calls themselves take no
+lock.
+
+## Plugins
+
+`Vm::load_plugin` links a program behind a lock, and `Vm::export(&plugin, "f")`
+publishes its function `f` as a named extern that programs linked afterwards can
+import. The call runs in the exporting plugin with its own memory and maps;
+arguments and the result are plain values, since a pointer means nothing in
+another plugin's memory. `Plugin::replace` swaps in a new build, and importers
+use it from their next call. A call into a plugin that is already running fails
+with `VmError::PluginBusy` instead of deadlocking.
 
 ## Linking
 

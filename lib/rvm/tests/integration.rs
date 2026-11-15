@@ -156,10 +156,10 @@ mod linking {
         std::fs::read(format!("{}/../../bpf/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
     }
 
-    /// Vm with everything link_main.o imports: helper 1 and `host_add`.
+    /// Vm with everything link_main.o imports: helper 100 and `host_add`.
     fn full_vm() -> Vm {
-        let mut vm = Vm::new();
-        vm.register_helper(1, |x: u64| x * 2);
+        let vm = Vm::new();
+        vm.register_helper(100, |x: u64| x * 2);
         vm.register_fn("host_add", |(a, b): (u64, u64)| a + b);
         vm
     }
@@ -180,8 +180,8 @@ mod linking {
 
     #[test]
     fn missing_extern_fails_link() {
-        let mut vm = Vm::new();
-        vm.register_helper(1, |x: u64| x * 2);
+        let vm = Vm::new();
+        vm.register_helper(100, |x: u64| x * 2);
         assert!(matches!(
             link(&vm).unwrap_err(),
             VmError::Link(LinkError::UnresolvedSymbol(name)) if name == "host_add"
@@ -190,15 +190,15 @@ mod linking {
 
     #[test]
     fn missing_helper_fails_link() {
-        let mut vm = Vm::new();
+        let vm = Vm::new();
         vm.register_fn("host_add", |(a, b): (u64, u64)| a + b);
-        assert!(matches!(link(&vm).unwrap_err(), VmError::Link(LinkError::UnknownHelper(1))));
+        assert!(matches!(link(&vm).unwrap_err(), VmError::Link(LinkError::UnknownHelper(100))));
     }
 
     #[test]
     fn extern_arity_mismatch_fails_link() {
-        let mut vm = Vm::new();
-        vm.register_helper(1, |x: u64| x * 2);
+        let vm = Vm::new();
+        vm.register_helper(100, |x: u64| x * 2);
         vm.register_fn("host_add", |x: u64| x);
         assert!(matches!(
             link(&vm).unwrap_err(),
@@ -210,13 +210,67 @@ mod linking {
         ));
     }
 
+    /// Re-registering a function reaches already linked programs at their next call.
     #[test]
     fn replacing_extern_rebinds_linked_calls() {
-        let mut program = link(&full_vm()).unwrap();
-        program
-            .helpers_mut()
-            .register_fn("host_add", |(a, b): (u64, u64)| a * b);
+        let vm = full_vm();
+        let mut program = link(&vm).unwrap();
+        assert_eq!(program.call("run", &[7]).unwrap(), 21 + 14);
+        vm.register_fn("host_add", |(a, b): (u64, u64)| a * b);
         assert_eq!(program.call("run", &[7]).unwrap(), 21 * 14);
+    }
+}
+
+mod plugins {
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use rvm::{LinkError, Plugin, Vm, VmError};
+
+    fn read(name: &str) -> Vec<u8> {
+        std::fs::read(format!("{}/../../bpf/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    }
+
+    #[test]
+    fn plugin_calls_export_and_survives_reload() {
+        let vm = Vm::new();
+        vm.register_fn("host_reenter", |x: u64| x);
+
+        // B imports a_scale, so it links only after A exports it.
+        assert!(matches!(
+            vm.load_plugin("b", &read("plugin_b.o")).unwrap_err(),
+            VmError::Link(LinkError::UnresolvedSymbol(name)) if name == "a_scale"
+        ));
+
+        let a = vm.load_plugin("a", &read("plugin_a.o")).unwrap();
+        vm.export(&a, "a_scale").unwrap();
+        let b = vm.load_plugin("b", &read("plugin_b.o")).unwrap();
+        assert_eq!(b.call("b_run", &[5]).unwrap(), 11);
+
+        // Replacing A's code is picked up by B's next call without relinking B.
+        a.replace(vm.load_elf(&read("plugin_a3.o")).unwrap());
+        assert_eq!(b.call("b_run", &[5]).unwrap(), 16);
+    }
+
+    #[test]
+    fn reentrant_call_fails_instead_of_deadlocking() {
+        let vm = Vm::new();
+        let a = vm.load_plugin("a", &read("plugin_a.o")).unwrap();
+        vm.export(&a, "a_scale").unwrap();
+
+        // host_reenter calls back into b while b is running.
+        let b_slot: Arc<OnceLock<Plugin>> = Arc::default();
+        let error = Arc::new(Mutex::new(None));
+        let (slot, err) = (b_slot.clone(), error.clone());
+        vm.register_fn("host_reenter", move |x: u64| {
+            let result = slot.get().unwrap().call("b_run", &[x]);
+            *err.lock().unwrap() = result.as_ref().err().map(ToString::to_string);
+            result
+        });
+        let b = b_slot.get_or_init(|| vm.load_plugin("b", &read("plugin_b.o")).unwrap());
+
+        assert_eq!(b.call("b_reenter", &[5]).unwrap(), u64::MAX);
+        assert_eq!(error.lock().unwrap().as_deref(), Some("plugin b is already running a call"));
+        assert_eq!(b.call("b_run", &[5]).unwrap(), 11);
     }
 }
 
@@ -281,7 +335,7 @@ fn test_std_helpers() {
     assert!(err.contains("ktime_get_ns"), "{err}");
 
     let lines = Arc::new(Mutex::new(Vec::new()));
-    let mut vm = Vm::new();
+    let vm = Vm::new();
     vm.enable_time();
     vm.enable_random();
     let sink = lines.clone();

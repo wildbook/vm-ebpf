@@ -103,6 +103,7 @@ mod linker;
 mod maps;
 mod memory;
 mod module;
+mod plugin;
 mod program;
 mod section;
 mod std_helpers;
@@ -119,7 +120,7 @@ pub use executor::{Executor, DEFAULT_FRAME_SIZE, MAX_CALL_DEPTH};
 // Helper functions
 pub use helper::{
     into_dyn_helper, into_dyn_helper_with_ctx, DynHelper, FromArgs, HelperArgs, HelperContext, HelperFn,
-    HelperRegistry, IntoReturn,
+    HelperRegistry, IntoReturn, SharedHelpers,
 };
 // Low-level re-exports for advanced users
 pub use linker::{Linker, DATA_REGION, FIRST_FREE_REGION, RODATA_REGION, STACK_REGION};
@@ -131,6 +132,7 @@ pub use maps::{
 pub use memory::{region_base, Memory, Perms, Scalar, VmMemory, MAX_REGIONS, MAX_REGION_LEN, REGION_SHIFT};
 // Module loading
 pub use module::Module;
+pub use plugin::Plugin;
 // Program and execution
 pub use program::{FunctionInfo, Program};
 pub use rvm_core::{instructions_from_bytes, AtomicOp, Instruction};

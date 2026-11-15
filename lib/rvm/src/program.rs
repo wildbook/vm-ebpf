@@ -4,12 +4,13 @@
 //! It contains the executable code, data, and function table.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use rvm_core::Instruction;
 
 use crate::error::{Result, VmError};
 use crate::executor::Executor;
-use crate::helper::HelperRegistry;
+use crate::helper::{HelperRegistry, SharedHelpers};
 use crate::maps::{MapRef, Maps};
 use crate::memory::VmMemory;
 
@@ -51,8 +52,10 @@ pub struct Program {
     functions: HashMap<String, FunctionInfo>,
     /// Stack top address (r10 initial value).
     stack_top: u64,
-    /// Helpers available to the program (snapshot of the VM's registry at link time).
+    /// The VM's extern table, and this program's copy of it at `helpers_version`.
+    shared_helpers: Arc<SharedHelpers>,
     helpers: HelperRegistry,
+    helpers_version: u64,
     /// Maximum instructions per call (0 = unlimited).
     instruction_limit: u64,
     /// Stack bytes per call frame.
@@ -68,7 +71,9 @@ impl Program {
         maps: Maps,
         functions: HashMap<String, FunctionInfo>,
         stack_top: u64,
+        shared_helpers: Arc<SharedHelpers>,
         helpers: HelperRegistry,
+        helpers_version: u64,
         instruction_limit: u64,
         frame_size: u64,
     ) -> Self {
@@ -78,7 +83,9 @@ impl Program {
             maps,
             functions,
             stack_top,
+            shared_helpers,
             helpers,
+            helpers_version,
             instruction_limit,
             frame_size,
         }
@@ -87,11 +94,6 @@ impl Program {
     /// The program's instructions.
     pub fn code(&self) -> &[Instruction] {
         &self.code
-    }
-
-    /// Get the program's helper registry.
-    pub fn helpers_mut(&mut self) -> &mut HelperRegistry {
-        &mut self.helpers
     }
 
     /// Get guest memory.
@@ -162,6 +164,10 @@ impl Program {
     }
 
     fn call_pc(&mut self, pc: u64, args: &[u64]) -> Result<u64> {
+        if self.shared_helpers.version() != self.helpers_version {
+            (self.helpers, self.helpers_version) = self.shared_helpers.snapshot();
+        }
+
         let mut executor = Executor::new(&self.code, &mut self.memory, &self.helpers, self.stack_top);
         executor.set_instruction_limit(self.instruction_limit);
         executor.set_frame_size(self.frame_size);

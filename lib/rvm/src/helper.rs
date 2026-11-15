@@ -17,7 +17,8 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
 
 use crate::error::HelperError;
 use crate::maps::Maps;
@@ -516,6 +517,44 @@ impl<M> std::fmt::Debug for HelperRegistry<M> {
             .field("ids", &self.by_id)
             .field("names", &self.by_name)
             .finish()
+    }
+}
+
+/// The extern table a [`crate::Vm`] shares with the programs it links.
+///
+/// Every change bumps a version. A program keeps its own copy of the table and
+/// re-copies it on entry when the version moved, so helper calls never touch a lock
+/// and a change takes effect at each program's next call.
+#[derive(Debug, Default)]
+pub struct SharedHelpers {
+    registry: RwLock<HelperRegistry>,
+    version: AtomicU64,
+}
+
+impl SharedHelpers {
+    /// Apply `f` to the table and publish the result.
+    pub fn update<R>(&self, f: impl FnOnce(&mut HelperRegistry) -> R) -> R {
+        let mut registry = self.registry.write().unwrap_or_else(PoisonError::into_inner);
+        let result = f(&mut registry);
+        self.version.fetch_add(1, Ordering::Release);
+        result
+    }
+
+    /// Read the table.
+    pub fn read(&self) -> RwLockReadGuard<'_, HelperRegistry> {
+        self.registry.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The current version.
+    #[inline]
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    /// A copy of the table and the version it belongs to.
+    pub fn snapshot(&self) -> (HelperRegistry, u64) {
+        let registry = self.read();
+        (registry.clone(), self.version())
     }
 }
 

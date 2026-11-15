@@ -18,6 +18,7 @@
 //! | [`FIRST_FREE_REGION`].. | free for the host | - |
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use btf::{apply_core_relocations, Btf, BtfTypeInfo};
 use constelf::raw::reloc;
@@ -25,7 +26,7 @@ use rvm_core::instructions_from_bytes;
 
 use crate::error::{LinkError, Result, VmError};
 use crate::executor::MAX_CALL_DEPTH;
-use crate::helper::HelperRegistry;
+use crate::helper::{HelperRegistry, SharedHelpers};
 use crate::maps::{self, map_defs, MapDef, Maps, MAPS_REGION};
 use crate::memory::{region_base, Perms, VmMemory};
 use crate::module::{Module, Relocation};
@@ -96,14 +97,14 @@ impl Image {
 
 /// Linker for eBPF modules.
 pub struct Linker<'a> {
-    helpers: &'a HelperRegistry,
+    helpers: &'a Arc<SharedHelpers>,
     types: &'a TypeRegistry,
     config: &'a VmConfig,
 }
 
 impl<'a> Linker<'a> {
     /// Create a new linker.
-    pub fn new(helpers: &'a HelperRegistry, types: &'a TypeRegistry, config: &'a VmConfig) -> Self {
+    pub fn new(helpers: &'a Arc<SharedHelpers>, types: &'a TypeRegistry, config: &'a VmConfig) -> Self {
         Self { helpers, types, config }
     }
 
@@ -113,9 +114,12 @@ impl<'a> Linker<'a> {
             return Err(VmError::InvalidArgument("no modules to link".to_string()));
         }
 
+        // Bind against one version of the table; the program refreshes from there.
+        let (helpers, version) = self.helpers.snapshot();
+
         let (mut image, layouts) = Self::lay_out(modules);
         let global_symbols = Self::build_symbol_table(modules, &layouts)?;
-        self.check_extern_signatures(modules)?;
+        Self::check_extern_signatures(&helpers, modules)?;
 
         let mut defs = Vec::new();
         for module in modules {
@@ -127,11 +131,6 @@ impl<'a> Linker<'a> {
             }
         }
         let (maps, maps_len) = Maps::new(defs);
-
-        let mut helpers = self.helpers.clone();
-        if !maps.is_empty() {
-            maps::register_helpers(&mut helpers);
-        }
 
         // Relocations bind maps and named externs; then numeric helper calls.
         for (module, layout) in modules.iter().zip(&layouts) {
@@ -159,7 +158,9 @@ impl<'a> Linker<'a> {
             maps,
             functions,
             stack_top,
+            self.helpers.clone(),
             helpers,
+            version,
             self.config.instruction_limit,
             self.config.stack_size as u64,
         ))
@@ -206,7 +207,7 @@ impl<'a> Linker<'a> {
     /// Compare each host-bound extern's BTF prototype with the registered function's
     /// argument count. Modules without BTF and host functions without a known arity
     /// (raw and context helpers) are not checked.
-    fn check_extern_signatures(&self, modules: &[&Module]) -> Result<()> {
+    fn check_extern_signatures(helpers: &HelperRegistry, modules: &[&Module]) -> Result<()> {
         const BTF_FUNC_EXTERN: u16 = 2;
 
         for module in modules {
@@ -222,11 +223,7 @@ impl<'a> Linker<'a> {
                 else {
                     continue;
                 };
-                let Some(host) = self
-                    .helpers
-                    .slot_of_name(name)
-                    .and_then(|slot| self.helpers.arity(slot))
-                else {
+                let Some(host) = helpers.slot_of_name(name).and_then(|slot| helpers.arity(slot)) else {
                     continue;
                 };
                 let Some(BtfTypeInfo::FuncProto { params, .. }) = btf.type_by_id(*proto_type) else {

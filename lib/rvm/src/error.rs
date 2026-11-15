@@ -40,6 +40,12 @@ pub enum VmError {
 
     /// Invalid argument.
     InvalidArgument(String),
+
+    /// The plugin is already running a call.
+    PluginBusy(String),
+
+    /// An export outlived the plugin it calls into.
+    PluginUnloaded(String),
 }
 
 impl fmt::Display for VmError {
@@ -56,6 +62,8 @@ impl fmt::Display for VmError {
             Self::FunctionNotFound(name) => write!(f, "function not found: {name}"),
             Self::SymbolNotFound(name) => write!(f, "symbol not found: {name}"),
             Self::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
+            Self::PluginBusy(name) => write!(f, "plugin {name} is already running a call"),
+            Self::PluginUnloaded(name) => write!(f, "plugin {name} was unloaded"),
         }
     }
 }

@@ -32,14 +32,16 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::error::{Result, VmError};
-use crate::helper::{DynHelper, FromArgs, HelperRegistry, IntoReturn};
+use crate::helper::{DynHelper, FromArgs, IntoReturn, SharedHelpers};
 use crate::linker::Linker;
 use crate::module::Module;
+use crate::plugin::Plugin;
 use crate::program::Program;
-use crate::std_helpers;
 use crate::types::TypeRegistry;
+use crate::{maps, std_helpers};
 
 /// Configuration for the VM.
 #[derive(Debug, Clone)]
@@ -71,8 +73,8 @@ impl Default for VmConfig {
 ///
 /// Use it to load modules and link them into executable programs.
 pub struct Vm {
-    /// Helper function registry.
-    helpers: HelperRegistry,
+    /// Extern table shared with every program this VM links.
+    helpers: Arc<SharedHelpers>,
     /// Type registry for CO-RE.
     types: TypeRegistry,
     /// VM configuration.
@@ -90,18 +92,17 @@ impl Default for Vm {
 impl Vm {
     /// Create a new VM with default configuration.
     pub fn new() -> Self {
-        Self {
-            helpers: HelperRegistry::new(),
-            types: TypeRegistry::new(),
-            config: VmConfig::default(),
-            modules: HashMap::new(),
-        }
+        Self::with_config(VmConfig::default())
     }
 
     /// Create a new VM with custom configuration.
+    ///
+    /// Only the map helpers (1 to 3) are registered; they touch nothing outside the VM.
     pub fn with_config(config: VmConfig) -> Self {
+        let helpers = Arc::new(SharedHelpers::default());
+        helpers.update(maps::register_helpers);
         Self {
-            helpers: HelperRegistry::new(),
+            helpers,
             types: TypeRegistry::new(),
             config,
             modules: HashMap::new(),
@@ -121,6 +122,9 @@ impl Vm {
     // =========================================================================
     // Helper Registration
     // =========================================================================
+    //
+    // Changes reach programs linked earlier at their next call. Replacing a
+    // function keeps its slot, so linked call sites stay valid.
 
     /// Register a helper function with type-safe argument extraction.
     ///
@@ -136,54 +140,49 @@ impl Vm {
     /// // No arguments
     /// vm.register_helper(3, |_: ()| 42u64);
     /// ```
-    pub fn register_helper<F, A, R>(&mut self, id: u32, func: F)
+    pub fn register_helper<F, A, R>(&self, id: u32, func: F)
     where
         F: Fn(A) -> R + Send + Sync + 'static,
         A: FromArgs + 'static,
         R: IntoReturn + 'static,
     {
-        self.helpers.register(id, func);
+        self.helpers.update(|h| h.register(id, func));
     }
 
     /// Register a raw dynamic helper function.
-    pub fn register_helper_raw(&mut self, id: u32, helper: DynHelper) {
-        self.helpers.register_raw(id, helper);
+    pub fn register_helper_raw(&self, id: u32, helper: DynHelper) {
+        self.helpers.update(|h| h.register_raw(id, helper));
     }
 
     /// Register an extern function that programs import by name
     /// (`extern u64 name(...);` in C). Unresolved names fail at link time.
-    pub fn register_fn<F, A, R>(&mut self, name: impl Into<String>, func: F)
+    pub fn register_fn<F, A, R>(&self, name: impl Into<String>, func: F)
     where
         F: Fn(A) -> R + Send + Sync + 'static,
         A: FromArgs + 'static,
         R: IntoReturn + 'static,
     {
-        self.helpers.register_fn(name, func);
+        self.helpers.update(|h| h.register_fn(name, func));
     }
 
     /// Enable `ktime_get_ns` (helper 5).
-    pub fn enable_time(&mut self) {
-        std_helpers::register_time(&mut self.helpers);
+    pub fn enable_time(&self) {
+        self.helpers.update(std_helpers::register_time);
     }
 
     /// Enable `get_prandom_u32` (helper 7).
-    pub fn enable_random(&mut self) {
-        std_helpers::register_random(&mut self.helpers);
+    pub fn enable_random(&self) {
+        self.helpers.update(std_helpers::register_random);
     }
 
     /// Enable `trace_printk` (helper 6); each formatted line goes to `sink`.
-    pub fn enable_print(&mut self, sink: impl Fn(&str) + Send + Sync + 'static) {
-        std_helpers::register_print(&mut self.helpers, sink);
+    pub fn enable_print(&self, sink: impl Fn(&str) + Send + Sync + 'static) {
+        self.helpers.update(|h| std_helpers::register_print(h, sink));
     }
 
-    /// Get the helper registry.
-    pub fn helpers(&self) -> &HelperRegistry {
+    /// The extern table shared with linked programs.
+    pub fn helpers(&self) -> &SharedHelpers {
         &self.helpers
-    }
-
-    /// Get a mutable reference to the helper registry.
-    pub fn helpers_mut(&mut self) -> &mut HelperRegistry {
-        &mut self.helpers
     }
 
     // =========================================================================
@@ -296,6 +295,29 @@ impl Vm {
         let module = self.parse_module("main", elf_bytes)?;
         self.link_one(&module)
     }
+
+    // =========================================================================
+    // Plugins
+    // =========================================================================
+
+    /// Load an ELF file as a plugin that other programs can call into.
+    pub fn load_plugin(&self, name: &str, elf_bytes: &[u8]) -> Result<Plugin> {
+        let module = self.parse_module(name, elf_bytes)?;
+        Ok(Plugin::new(name, self.link_one(&module)?))
+    }
+
+    /// Publish `func` from `plugin` as an extern of the same name.
+    ///
+    /// Programs linked afterwards can import it; programs that already import it pick
+    /// up the new target at their next call.
+    pub fn export(&self, plugin: &Plugin, func: &str) -> Result<()> {
+        if !plugin.lock()?.has_function(func) {
+            return Err(VmError::FunctionNotFound(format!("{}::{func}", plugin.name())));
+        }
+        let helper = plugin.export_fn(func);
+        self.helpers.update(|h| h.register_fn_raw(func, helper));
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for Vm {
@@ -312,24 +334,6 @@ impl std::fmt::Debug for Vm {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_vm_creation() {
-        let vm = Vm::new();
-        assert_eq!(vm.helpers().len(), 0);
-    }
-
-    #[test]
-    fn test_helper_registration() {
-        let mut vm = Vm::new();
-
-        vm.register_helper(1, |x: u64| x * 2);
-        vm.register_helper(2, |(a, b): (u64, u64)| a + b);
-
-        assert!(vm.helpers().has(1));
-        assert!(vm.helpers().has(2));
-        assert!(!vm.helpers().has(3));
-    }
 
     #[test]
     fn test_type_registration() {
