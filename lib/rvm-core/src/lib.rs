@@ -678,20 +678,35 @@ pub fn step<M: Memory>(ctx: &mut Context<M>, instr: Instruction) -> ControlFlow<
 /// [`step`] behind one jump on the full opcode byte. Each arm runs `step` with the
 /// opcode as a constant, so the class, operation, source, mode and size matches fold
 /// away at compile time instead of being decoded and dispatched on per instruction.
+///
+/// A taken jump moves `*pc` to the slot before its target and returns [`Flow::Next`],
+/// so the caller advances by one for both. Applying the offset inside the arm keeps it
+/// in a register; returned through the shared `Flow`, it goes through a stack slot.
 #[inline(always)]
-fn step_by_opcode<M: Memory>(ctx: &mut Context<M>, instr: Instruction) -> ControlFlow<Flow<M>, Instruction> {
+fn step_by_opcode<M: Memory>(
+    ctx: &mut Context<M>,
+    instr: Instruction,
+    pc: &mut u64,
+) -> ControlFlow<Flow<M>, Instruction> {
     #[inline(always)]
     fn with_opcode<M: Memory, const OP: u8>(
         ctx: &mut Context<M>,
         instr: Instruction,
+        pc: &mut u64,
     ) -> ControlFlow<Flow<M>, Instruction> {
-        step(ctx, Instruction(instr.0 & !0xFF | OP as u64))
+        match step(ctx, Instruction(instr.0 & !0xFF | OP as u64)) {
+            ControlFlow::Break(Flow::Jump(offset)) => {
+                *pc = pc.wrapping_add_signed(offset);
+                ControlFlow::Break(Flow::Next)
+            }
+            other => other,
+        }
     }
 
     macro_rules! dispatch {
         ($($op:literal)*) => {
             match instr.0 as u8 {
-                $($op => with_opcode::<M, $op>(ctx, instr),)*
+                $($op => with_opcode::<M, $op>(ctx, instr, pc),)*
             }
         };
     }
@@ -758,7 +773,7 @@ pub fn run<M: Memory>(ctx: &mut Context<M>, code: &[Instruction], pc: &mut u64, 
         };
         f -= 1;
 
-        let flow = match step_by_opcode(ctx, insn) {
+        let flow = match step_by_opcode(ctx, insn, &mut p) {
             ControlFlow::Break(flow) => flow,
             ControlFlow::Continue(first) => {
                 p += 1;
@@ -771,9 +786,8 @@ pub fn run<M: Memory>(ctx: &mut Context<M>, code: &[Instruction], pc: &mut u64, 
         };
 
         match flow {
-            Flow::Next => p += 1,
-            // a negative target wraps to a huge pc and fails the next fetch
-            Flow::Jump(offset) => p = p.wrapping_add_signed(offset + 1),
+            // a negative jump target wraps to a huge pc and fails the next fetch
+            Flow::Next => p = p.wrapping_add(1),
             other => break other,
         }
     };
