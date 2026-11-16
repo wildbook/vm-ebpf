@@ -1,9 +1,30 @@
+cargo-features = ["profile-rustflags"]
+
 [workspace]
 resolver = "2"
 members = ["bin/*", "lib/*"]
 
 [profile.release]
 codegen-units = 1
-opt-level = 3
+opt-level = "s"
 debug = "full"
 lto = "fat"
+panic = "abort"
+
+# The interpreter is generic and inlines into rvm (`Program::call`), so rvm alone
+# needs full optimization; `s` there costs guest code 17-24%.
+[profile.release.package.rvm]
+opt-level = 3
+
+# Smallest binary for embedding: no panic locations and names-only `Debug`.
+[profile.implant]
+inherits = "release"
+debug = false
+strip = true
+rustflags = [
+    "-Zlocation-detail=none",
+    "-Zfmt-debug=shallow",
+]
+
+[profile.implant.package.rvm]
+opt-level = 3
