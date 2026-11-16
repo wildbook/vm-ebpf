@@ -5,7 +5,9 @@
 //! slots maps a byte range with its own permissions. Region 0 is never mapped,
 //! so null pointers (and small offsets from them) fault.
 //!
-//! A guest access costs one table index, a permission test and a bounds check.
+//! A guest load or store costs one table index and one bounds check: each region
+//! keeps a readable and a writable length, which is 0 when its permissions deny
+//! that access.
 //! Host-side accessors ([`VmMemory::read`], [`VmMemory::bytes_mut`], ...) are
 //! trusted and ignore permissions.
 
@@ -55,23 +57,8 @@ impl Perms {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Region {
-    ptr: NonNull<u8>,
-    len: usize,
-    perms: Perms,
-    /// Allocated by this `VmMemory` (freed on unmap/drop) vs. borrowed host memory.
-    owned: bool,
-}
-
-impl Region {
-    const EMPTY: Self = Self {
-        ptr: NonNull::dangling(),
-        len: 0,
-        perms: Perms::NONE,
-        owned: false,
-    };
-}
+// The owned-region bitmask has one bit per slot.
+const _: () = assert!(MAX_REGIONS <= 64);
 
 /// Region-mapped guest memory.
 ///
@@ -88,7 +75,16 @@ impl Region {
 /// assert!(mem.read::<u8>(0).is_err()); // region 0 is never mapped
 /// ```
 pub struct VmMemory {
-    regions: [Region; MAX_REGIONS],
+    // Guest loads and stores read only `ptrs` and the end arrays. Invariant: each
+    // end is its region's length or 0, so it never exceeds the region's allocation.
+    ptrs: [NonNull<u8>; MAX_REGIONS],
+    read_end: [usize; MAX_REGIONS],
+    write_end: [usize; MAX_REGIONS],
+
+    lens: [usize; MAX_REGIONS],
+    perms: [Perms; MAX_REGIONS],
+    // bit `idx` set: region `idx` was allocated by `map` and is freed on unmap/drop
+    owned: u64,
     // buffer behind each region mapped with `map_shared`, kept alive while mapped
     shared: [Option<Arc<SharedBuffer>>; MAX_REGIONS],
 }
@@ -109,7 +105,12 @@ impl VmMemory {
     /// Create memory with no regions mapped.
     pub const fn new() -> Self {
         Self {
-            regions: [Region::EMPTY; MAX_REGIONS],
+            ptrs: [NonNull::dangling(); MAX_REGIONS],
+            read_end: [0; MAX_REGIONS],
+            write_end: [0; MAX_REGIONS],
+            lens: [0; MAX_REGIONS],
+            perms: [Perms::NONE; MAX_REGIONS],
+            owned: 0,
             shared: [const { None }; MAX_REGIONS],
         }
     }
@@ -129,15 +130,7 @@ impl VmMemory {
             let raw = unsafe { alloc_zeroed(Self::layout(len)) };
             NonNull::new(raw).unwrap_or_else(|| std::alloc::handle_alloc_error(Self::layout(len)))
         };
-        self.set(
-            idx,
-            Region {
-                ptr,
-                len,
-                perms,
-                owned: true,
-            },
-        )
+        self.set(idx, ptr, len, perms, true)
     }
 
     /// Map region `idx` with `len` bytes, initialized from `init` (rest zeroed).
@@ -162,15 +155,7 @@ impl VmMemory {
     /// while the VM runs, and must be usable from any thread that uses this memory.
     pub unsafe fn map_host(&mut self, idx: usize, ptr: NonNull<u8>, len: usize, perms: Perms) -> u64 {
         assert!(len <= MAX_REGION_LEN, "region too large: {len}");
-        self.set(
-            idx,
-            Region {
-                ptr,
-                len,
-                perms,
-                owned: false,
-            },
-        )
+        self.set(idx, ptr, len, perms, false)
     }
 
     /// Map `buffer` as region `idx`. This memory keeps the buffer alive while it is
@@ -192,26 +177,37 @@ impl VmMemory {
 
     /// Unmap region `idx`, freeing it if it was allocated by [`map`](Self::map).
     pub fn unmap(&mut self, idx: usize) {
-        self.set(idx, Region::EMPTY);
+        self.set(idx, NonNull::dangling(), 0, Perms::NONE, false);
     }
 
     /// Length of region `idx` (0 if unmapped).
     pub fn region_len(&self, idx: usize) -> usize {
-        self.regions.get(idx).map_or(0, |r| r.len)
+        self.lens.get(idx).copied().unwrap_or(0)
     }
 
-    fn set(&mut self, idx: usize, region: Region) -> u64 {
+    fn set(&mut self, idx: usize, ptr: NonNull<u8>, len: usize, perms: Perms, owned: bool) -> u64 {
         assert!(idx != 0 && idx < MAX_REGIONS, "invalid region index {idx}");
-        let old = std::mem::replace(&mut self.regions[idx], region);
-        Self::free(old);
+        self.free(idx);
+
+        self.ptrs[idx] = ptr;
+        self.read_end[idx] = if perms.allows(Perms::R) { len } else { 0 };
+        self.write_end[idx] = if perms.allows(Perms::W) { len } else { 0 };
+        self.lens[idx] = len;
+        self.perms[idx] = perms;
+        if owned {
+            self.owned |= 1 << idx;
+        } else {
+            self.owned &= !(1 << idx);
+        }
         self.shared[idx] = None;
         region_base(idx)
     }
 
-    fn free(region: Region) {
-        if region.owned && region.len != 0 {
+    fn free(&self, idx: usize) {
+        let len = self.lens[idx];
+        if self.owned & (1 << idx) != 0 && len != 0 {
             // SAFETY: allocated in `map` with this exact layout and not freed since.
-            unsafe { dealloc(region.ptr.as_ptr(), Self::layout(region.len)) };
+            unsafe { dealloc(self.ptrs[idx].as_ptr(), Self::layout(len)) };
         }
     }
 
@@ -222,11 +218,26 @@ impl VmMemory {
     /// Resolve `addr..addr+len` to a host pointer if region perms include `need`.
     #[inline(always)]
     fn resolve(&self, addr: u64, len: usize, need: Perms) -> Option<NonNull<u8>> {
-        let region = self.regions.get((addr >> REGION_SHIFT) as usize)?;
+        let idx = (addr >> REGION_SHIFT) as usize;
+        let region_len = *self.lens.get(idx)?;
         let off = addr as u32 as usize;
-        (region.perms.allows(need) && len <= region.len && off <= region.len - len)
+        (self.perms[idx].allows(need) && len <= region_len && off <= region_len - len)
             // SAFETY: in bounds of the region's allocation.
-            .then(|| unsafe { region.ptr.add(off) })
+            .then(|| unsafe { self.ptrs[idx].add(off) })
+    }
+
+    /// Resolve a guest access of `size` bytes, 1 to 8, against `ends`, which is
+    /// `read_end` or `write_end`.
+    #[inline(always)]
+    fn guest_ptr(&self, addr: u64, size: usize, ends: &[usize; MAX_REGIONS]) -> Option<NonNull<u8>> {
+        let idx = (addr >> REGION_SHIFT) as usize;
+        let end = *ends.get(idx)?;
+        let off = addr as u32 as usize;
+        // `off` is below 2^32, so the sum can't overflow
+        (off + size <= end)
+            // SAFETY: `end` never exceeds the region's length, so the access lies inside
+            // its allocation.
+            .then(|| unsafe { self.ptrs[idx].add(off) })
     }
 
     /// Host pointer to `len` bytes at guest address `addr` whose region allows `need`.
@@ -279,8 +290,8 @@ impl VmMemory {
 
 impl Drop for VmMemory {
     fn drop(&mut self) {
-        for region in self.regions {
-            Self::free(region);
+        for idx in 0..MAX_REGIONS {
+            self.free(idx);
         }
     }
 }
@@ -375,14 +386,18 @@ macro_rules! guest_access {
     ($load:ident, $store:ident, $ty:ty) => {
         #[inline(always)]
         fn $load(&self, addr: u64) -> Result<$ty, u64> {
-            let ptr = self.resolve(addr, size_of::<$ty>(), Perms::R).ok_or(addr)?;
-            // SAFETY: `resolve` checked bounds; guest memory has no alignment guarantee.
+            let ptr = self
+                .guest_ptr(addr, size_of::<$ty>(), &self.read_end)
+                .ok_or(addr)?;
+            // SAFETY: `guest_ptr` checked bounds; guest memory has no alignment guarantee.
             Ok(<$ty>::from_le(unsafe { ptr.cast::<$ty>().read_unaligned() }))
         }
 
         #[inline(always)]
         fn $store(&mut self, addr: u64, value: $ty) -> Result<(), u64> {
-            let ptr = self.resolve(addr, size_of::<$ty>(), Perms::W).ok_or(addr)?;
+            let ptr = self
+                .guest_ptr(addr, size_of::<$ty>(), &self.write_end)
+                .ok_or(addr)?;
             // SAFETY: as above.
             unsafe { ptr.cast::<$ty>().write_unaligned(value.to_le()) };
             Ok(())
@@ -457,12 +472,9 @@ scalar!(u8, u16, u32, u64, i8, i16, i32, i64);
 
 impl std::fmt::Debug for VmMemory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mapped = self
-            .regions
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.len != 0 || r.perms != Perms::NONE)
-            .map(|(i, r)| (i, r.len, r.perms));
+        let mapped = (0..MAX_REGIONS)
+            .filter(|&i| self.lens[i] != 0 || self.perms[i] != Perms::NONE)
+            .map(|i| (i, self.lens[i], self.perms[i]));
         f.debug_list().entries(mapped).finish()
     }
 }
@@ -520,5 +532,110 @@ mod tests {
         assert_eq!(mem.load_u8(base), Err(base));
         drop(mem);
         assert_eq!(buf, [0, 0, 0, 0, 0xDD, 0xCC, 0xBB, 0xAA]);
+    }
+
+    type Table = [(NonNull<u8>, usize, Perms); MAX_REGIONS];
+
+    const PERMS: [Perms; 4] = [Perms::NONE, Perms::R, Perms::W, Perms::RW];
+
+    // regions 1..=MAPPED cover every tested length with every perms
+    const MAPPED: usize = 6 * PERMS.len();
+
+    // Guest loads and stores check per-region ends with the perms folded in. Every
+    // access path must agree with a plain perms and bounds check on the region edges.
+    #[test]
+    fn access_checks_match_reference() {
+        // a 2^32 byte region reaches the largest offset; Miri can't allocate that much
+        let large = if cfg!(miri) { 64 } else { MAX_REGION_LEN };
+        let mut buf = vec![0u8; large];
+        let host = NonNull::new(buf.as_mut_ptr()).unwrap();
+        let mut mem = VmMemory::new();
+        let mut table: Table = [(NonNull::dangling(), 0, Perms::NONE); MAX_REGIONS];
+
+        let lens: [usize; MAPPED / PERMS.len()] = [0, 1, 7, 8, 9, large];
+        let regions = lens.into_iter().flat_map(|len| PERMS.map(|p| (len, p)));
+        for (idx, (len, perms)) in (1..).zip(regions) {
+            // SAFETY: `buf` outlives `mem` and is only accessed through it.
+            unsafe { mem.map_host(idx, host, len, perms) };
+            table[idx] = (host, len, perms);
+        }
+        check_regions(&mut mem, &table);
+
+        // replace owned regions with host ones of other perms, or unmap them
+        for (idx, region) in table.iter_mut().enumerate().skip(1).take(MAPPED) {
+            mem.map(idx, 16, Perms::RW);
+            if idx % 5 == 0 {
+                mem.unmap(idx);
+                *region = (NonNull::dangling(), 0, Perms::NONE);
+            } else {
+                let (ptr, len, perms) = *region;
+                let perms = PERMS[(perms.0 as usize + 1) % 4];
+                // SAFETY: as above.
+                unsafe { mem.map_host(idx, ptr, len, perms) };
+                region.2 = perms;
+            }
+        }
+        check_regions(&mut mem, &table);
+    }
+
+    /// Sweep offsets around 0, the region end, 2^31 and 2^32 in every mapped region,
+    /// an unmapped one and indices past the table.
+    fn check_regions(mem: &mut VmMemory, table: &Table) {
+        // Miri is too slow for the full sweep
+        let span = if cfg!(miri) { 2 } else { 16 };
+        let max_off = u32::MAX as usize;
+        let indices = (0..=MAPPED + 1).chain([MAX_REGIONS, MAX_REGIONS + 1, 1 << 26, max_off]);
+        for idx in indices {
+            let len = table.get(idx).map_or(0, |r| r.1);
+            let offsets = (0..=span)
+                .chain(len.saturating_sub(span)..=len + span)
+                .chain((1 << 31) - span..=(1 << 31) + span)
+                .chain(max_off - span..=max_off);
+            for off in offsets.filter(|&off| off <= max_off) {
+                check_addr(mem, table, region_base(idx) | off as u64);
+            }
+        }
+    }
+
+    fn check_addr(mem: &mut VmMemory, table: &Table, addr: u64) {
+        let expect = |len, need| reference(table, addr, len, need);
+        let fault = |len, need| expect(len, need).map(drop).ok_or(addr);
+
+        for size in [1, 2, 4, 8] {
+            let load = mem.guest_ptr(addr, size, &mem.read_end);
+            assert_eq!(load, expect(size, Perms::R), "load {size} at {addr:#x}");
+            let store = mem.guest_ptr(addr, size, &mem.write_end);
+            assert_eq!(store, expect(size, Perms::W), "store {size} at {addr:#x}");
+        }
+        assert_eq!(mem.load_u8(addr).map(drop), fault(1, Perms::R));
+        assert_eq!(mem.load_u16(addr).map(drop), fault(2, Perms::R));
+        assert_eq!(mem.load_u32(addr).map(drop), fault(4, Perms::R));
+        assert_eq!(mem.load_u64(addr).map(drop), fault(8, Perms::R));
+        assert_eq!(mem.store_u8(addr, 0), fault(1, Perms::W));
+        assert_eq!(mem.store_u16(addr, 0), fault(2, Perms::W));
+        assert_eq!(mem.store_u32(addr, 0), fault(4, Perms::W));
+        assert_eq!(mem.store_u64(addr, 0), fault(8, Perms::W));
+
+        let atomic = |size| expect(size, Perms::RW).filter(|p| p.as_ptr().addr() % size == 0);
+        assert_eq!(mem.atomic_u32(addr, AtomicOp::Add(0)).map(drop), atomic(4).map(drop).ok_or(addr));
+        assert_eq!(mem.atomic_u64(addr, AtomicOp::Add(0)).map(drop), atomic(8).map(drop).ok_or(addr));
+
+        let host_lens = [0, 1, 2, 7, 8, 9, MAX_REGION_LEN - 1, MAX_REGION_LEN, MAX_REGION_LEN + 1];
+        for len in host_lens.into_iter().chain([usize::MAX - 7, usize::MAX]) {
+            for need in PERMS {
+                let ptr = mem.host_ptr(addr, len, need).ok();
+                assert_eq!(ptr, expect(len, need), "host_ptr {len} {need:?} at {addr:#x}");
+            }
+            let bytes = mem.bytes(addr, len).ok().map(|b| NonNull::from(b).cast());
+            assert_eq!(bytes, expect(len, Perms::NONE), "bytes {len} at {addr:#x}");
+        }
+    }
+
+    /// The perms test and overflow-safe bounds check the folded ends must agree with.
+    fn reference(table: &Table, addr: u64, len: usize, need: Perms) -> Option<NonNull<u8>> {
+        let &(ptr, region_len, perms) = table.get((addr >> REGION_SHIFT) as usize)?;
+        let off = addr as u32 as usize;
+        let ok = perms.0 & need.0 == need.0 && len <= region_len && off <= region_len - len;
+        ok.then(|| NonNull::new(ptr.as_ptr().wrapping_add(off)).unwrap())
     }
 }
