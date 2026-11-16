@@ -16,8 +16,8 @@ panic = "abort"
 [profile.release.package.rvm]
 opt-level = 3
 
-# Smallest binary for embedding: no panic locations and names-only `Debug`.
-[profile.implant]
+# Smallest binary for embedding rvm in a host: no panic locations and names-only `Debug`.
+[profile.embedded]
 inherits = "release"
 debug = false
 strip = true
@@ -26,5 +26,5 @@ rustflags = [
     "-Zfmt-debug=shallow",
 ]
 
-[profile.implant.package.rvm]
+[profile.embedded.package.rvm]
 opt-level = 3
