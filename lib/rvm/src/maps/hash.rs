@@ -7,6 +7,15 @@ use hashbrown::HashTable;
 
 use super::{MapError, BPF_EXIST, BPF_NOEXIST};
 
+// The default seed comes from address-space layout, which Windows randomizes per
+// executable per boot: two builds of the same source then probe differently, which
+// changes guest timing and PGO profiles. Benchmarks fix it; a fixed seed lets guest
+// code choose colliding keys, so production builds keep the random one.
+#[cfg(feature = "fixed-hash-seed")]
+type Seed = foldhash::fast::FixedState;
+#[cfg(not(feature = "fixed-hash-seed"))]
+type Seed = foldhash::fast::RandomState;
+
 /// Fixed-capacity hash index: keys live in one preallocated block at their value's
 /// slot, and the table holds slot numbers, so inserts never allocate.
 #[derive(Debug, Clone)]
@@ -15,7 +24,7 @@ pub struct HashIndex {
     keys: Box<[u8]>,
     key_size: usize,
     free: Vec<u32>,
-    hasher: foldhash::fast::RandomState,
+    hasher: Seed,
 }
 
 impl HashIndex {

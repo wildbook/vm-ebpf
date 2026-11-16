@@ -12,6 +12,10 @@ btf = { path = "../btf" }
 hashbrown = { version = "0.17.1", default-features = false, features = ["default-hasher"] }
 foldhash = { version = "0.2.0", default-features = false }
 
+[features]
+# Guest hash maps use a fixed hash seed (reproducible benchmarks and PGO profiles).
+fixed-hash-seed = []
+
 [dev-dependencies]
 criterion = "0.7"
 ebpf-asm = { path = "../ebpf-asm" }
