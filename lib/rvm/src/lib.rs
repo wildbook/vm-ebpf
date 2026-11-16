@@ -59,6 +59,8 @@
 //! - `fixed-hash-seed`: guest hash maps use a fixed hash seed, for reproducible
 //!   benchmarks.
 
+#![feature(fn_align)]
+
 mod error;
 mod executor;
 mod helper;
