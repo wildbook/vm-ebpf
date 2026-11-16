@@ -681,6 +681,13 @@ impl Assembler {
         self
     }
 
+    /// `gotox dst` - Jump to the code address in `dst`.
+    pub fn gotox(&mut self, dst: Register) -> &mut Self {
+        let opcode = class::JMP64 | jmp::JA | SRC_REG;
+        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, 0));
+        self
+    }
+
     jmp_family!(JMP64;
         jeq, jeq_imm = JEQ;
         jne, jne_imm = JNE;
@@ -724,6 +731,13 @@ impl Assembler {
         // src_reg = 1 indicates BPF-to-BPF call
         self.emit(RawInstruction::from_parts(opcode, 0, 1, 0, 0));
         self.add_label_ref(label, LabelRefType::Imm32);
+        self
+    }
+
+    /// `callx dst` - Call the function whose address is in `dst`.
+    pub fn callx(&mut self, dst: Register) -> &mut Self {
+        let opcode = class::JMP64 | jmp::CALL | SRC_REG;
+        self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, 0));
         self
     }
 

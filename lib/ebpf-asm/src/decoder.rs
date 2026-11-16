@@ -214,6 +214,10 @@ fn decode_jmp(
                 _ => (Mnemonic::Call, Operand::Imm(imm), Operand::None, 8, None),
             };
         }
+        // `gotox`: the target is in dst_reg
+        jmp::JA if is_64 && src_type == SRC_REG => {
+            return (Mnemonic::Gotox, Operand::Reg(dst), Operand::None, 8, None);
+        }
         jmp::JA => {
             // JMP64 `ja` jumps by `off`, JMP32 `ja32` (`gotol`) by the 32-bit `imm`
             let (mnemonic, target) = match is_64 {

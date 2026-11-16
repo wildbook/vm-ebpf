@@ -1,7 +1,7 @@
-//! Clang-compiled programs exercising atomics, maps, data relocations, CO-RE and the
-//! standard helpers.
+//! Clang-compiled programs exercising atomics, maps, data relocations, function
+//! pointers, CO-RE and the standard helpers.
 
-use rvm::{ExecError, Perms, Vm, VmError, FIRST_FREE_REGION};
+use rvm::{region_base, ExecError, Perms, Vm, VmError, CODE_REGION, DATA_REGION, FIRST_FREE_REGION, REGION_SHIFT};
 
 use crate::common::object;
 
@@ -24,6 +24,54 @@ fn test_clang_atomics() {
 fn data_pointers_are_relocated() {
     let mut program = Vm::new().load_elf(&object("data_ptrs.o")).unwrap();
     assert_eq!(program.call("deref", &[]).unwrap(), 42 + 10 + 30);
+}
+
+/// Function pointers (bpf/func_ptr.c): callback tables in `.rodata` and `.data`, a
+/// callback passed as an argument, a switch lowered to a `gotox` jump table, and
+/// `callx` faulting on anything but an instruction in the program.
+#[test]
+fn function_pointers_and_jump_tables() {
+    let mut program = Vm::new().load_elf(&object("func_ptr.o")).unwrap();
+
+    assert_eq!(program.call("call_ro", &[1, 10, 3]).unwrap(), 7);
+    assert_eq!(program.call("call_ro", &[2, 10, 3]).unwrap(), 30);
+    assert_eq!(program.call("call_rw", &[1, 10, 3]).unwrap(), 13);
+    assert_eq!(program.call("pass_callback", &[10, 3]).unwrap(), 30 + 7);
+
+    let y = 10u64;
+    let expected = [
+        y + 3,
+        y ^ 7,
+        y * 5,
+        y - 9,
+        y << 2,
+        y | 0x40,
+        y >> 1,
+        y & 0xf0,
+        y * y,
+        y + 100,
+        !y,
+        y / 3,
+        y % 7,
+        y << 9,
+        y.wrapping_sub(1000),
+        y * 11 + 1,
+        0,
+    ];
+    for (x, want) in expected.into_iter().enumerate() {
+        assert_eq!(program.call("dense_switch", &[x as u64, y]).unwrap(), want, "case {x}");
+    }
+
+    let add = program.call("addr_of_add", &[]).unwrap();
+    assert_eq!(add >> REGION_SHIFT, CODE_REGION as u64);
+    assert_eq!(program.call("call_ptr", &[add, 2, 3]).unwrap(), 5);
+    let misaligned = add + 4;
+    let past_end = region_base(CODE_REGION) + (1 << 20);
+    let data = region_base(DATA_REGION);
+    for bad in [misaligned, past_end, data] {
+        let err = program.call("call_ptr", &[bad, 2, 3]).unwrap_err();
+        assert!(matches!(err, VmError::Exec(ExecError::BadCodeAddress { target, .. }) if target == bad), "{err}");
+    }
 }
 
 /// CO-RE against a host whose `struct event` moved `pid` and lacks `flags`

@@ -152,6 +152,9 @@ pub enum ExecError {
     InvalidPc(u64),
     /// Ran an instruction whose CO-RE relocation the host couldn't resolve.
     UnresolvedCoreRelo { pc: u64 },
+    /// `callx` or `gotox` at `pc` targeted something other than an instruction in the
+    /// program (or, for `callx`, a helper ID).
+    BadCodeAddress { pc: u64, target: u64 },
 }
 
 impl fmt::Display for ExecError {
@@ -165,6 +168,9 @@ impl fmt::Display for ExecError {
             Self::InvalidPc(pc) => write!(f, "invalid program counter: {pc}"),
             Self::UnresolvedCoreRelo { pc } => {
                 write!(f, "instruction {pc} uses a type or field the host doesn't have (CO-RE)")
+            }
+            Self::BadCodeAddress { pc, target } => {
+                write!(f, "instruction {pc} branches to {target:#x}, which is not an instruction in the program")
             }
         }
     }

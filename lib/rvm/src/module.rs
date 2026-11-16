@@ -104,8 +104,9 @@ impl Module {
                 _ => {}
             }
 
-            // Skip non-ALLOC sections (except we already handled BTF)
-            if (header.sh_flags & shf::ALLOC as u64) == 0 {
+            // Skip non-ALLOC sections (except we already handled BTF); clang emits
+            // `.jumptables` without the flag
+            if (header.sh_flags & shf::ALLOC as u64) == 0 && kind != SectionKind::JumpTable {
                 continue;
             }
 

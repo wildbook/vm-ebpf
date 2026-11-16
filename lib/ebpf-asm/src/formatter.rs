@@ -54,7 +54,8 @@ impl DefaultFormatter {
             | Mnemonic::Call
             | Mnemonic::CallLocal
             | Mnemonic::CallKfunc
-            | Mnemonic::Callx => {
+            | Mnemonic::Callx
+            | Mnemonic::Gotox => {
                 write!(out, " {}", insn.dst).unwrap();
             }
             _ if insn.mnemonic.is_conditional_jump() => {

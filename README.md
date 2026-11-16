@@ -128,6 +128,7 @@ A guest address is `(region << 32) | offset`. `rvm::VmMemory` holds
 | `FIRST_FREE_REGION` (5) to 26 | free for the host, `Vm::share_region` | - |
 | `BORROW_FIRST_REGION` (27) to 31 | buffers borrowed during a plugin call | per tag |
 | `SHARED_MAPS_FIRST_REGION` (32) to 63 | shared maps, one region each | RW |
+| `CODE_REGION` (64) | code addresses, never mapped | - |
 
 Host code maps its own regions with `VmMemory::map` (zeroed) or
 `VmMemory::map_bytes` (host-owned buffer), and can map existing host memory
@@ -203,3 +204,14 @@ Atomics (`BPF_ATOMIC` add, or, and, xor with and without fetch, xchg and
 cmpxchg, 32 and 64 bit) go through `Memory::atomic_u32` and
 `Memory::atomic_u64`. `VmMemory` uses real host atomics and faults on
 misaligned addresses; the trait's default is a plain load and store.
+
+Function pointers: a code address is `region_base(CODE_REGION)` plus a byte
+offset into the linked program's code, so loads and stores through it fault.
+The linker writes one wherever clang takes a function's address (`lddw` and
+pointers in `.data` or `.rodata`). `callx` (`call` with the register bit set,
+target in `dst_reg`) calls one with a new stack frame, and faults unless the
+target is an instruction in the program. A target below 2^32 is a helper ID
+instead, matching libbpf's `(void *)BPF_FUNC_*` helper declarations. Clang 22
+at `-mcpu=v4` lowers a dense `switch` of 13 or more cases to `gotox` through a
+`.jumptables` table; the linker copies each table into `.rodata` as code
+addresses, and `gotox` checks its target the same way.

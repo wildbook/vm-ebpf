@@ -15,6 +15,9 @@ pub enum SectionKind {
     Bss,
     /// Maps section.
     Maps,
+    /// Jump tables for `gotox` (`.jumptables`): byte offsets into the code section
+    /// that references them.
+    JumpTable,
     /// Other/unknown.
     Other,
 }
@@ -71,6 +74,9 @@ pub fn section_kind_from_name(name: &str) -> SectionKind {
     }
     if name == ".maps" || name == "maps" {
         return SectionKind::Maps;
+    }
+    if name == ".jumptables" {
+        return SectionKind::JumpTable;
     }
 
     // eBPF programs often use section names like "prog", "xdp", "kprobe", etc.

@@ -5,9 +5,11 @@
 //!
 //! Code and data live in separate address spaces. Code sections are concatenated
 //! into one instruction array (addressed by byte offset during linking, by
-//! instruction index at runtime) that the guest cannot read or write. Data
-//! sections go into guest memory regions; see [`crate::layout`] for the complete
-//! table.
+//! instruction index at runtime) that the guest cannot read or write. A function
+//! pointer or jump table entry is a byte offset into that array in
+//! [`CODE_REGION`], which `callx` and `gotox` accept and loads and stores reject.
+//! Data sections go into guest memory regions; see [`crate::layout`] for the
+//! complete table.
 
 use std::sync::Arc;
 
@@ -19,7 +21,7 @@ use rvm_core::{instructions_from_bytes, BPF_PSEUDO_KFUNC_CALL};
 use crate::error::{LinkError, Result, VmError};
 use crate::executor::MAX_CALL_DEPTH;
 use crate::helper::{HelperRegistry, SharedHelpers};
-use crate::layout::{DATA_REGION, MAPS_REGION, RODATA_REGION, STACK_REGION};
+use crate::layout::{CODE_REGION, DATA_REGION, MAPS_REGION, RODATA_REGION, STACK_REGION};
 use crate::maps::{map_defs, MapDef, Maps, SharedMaps};
 use crate::memory::{region_base, Perms, SharedRegion, VmMemory, REGION_SHIFT};
 use crate::module::{Module, Relocation};
@@ -49,12 +51,23 @@ impl Addr {
             Self::Data(a) => Self::Data(a + by),
         }
     }
+
+    /// The address the guest sees.
+    fn guest(self) -> u64 {
+        match self {
+            Self::Code(a) => region_base(CODE_REGION).wrapping_add(a),
+            Self::Data(a) => a,
+        }
+    }
 }
 
 /// Memory layout information for a module: original section index -> address.
 #[derive(Debug, Clone, Default)]
 struct ModuleLayout {
     sections: HashMap<usize, Addr>,
+    /// (code section, `.jumptables` section) -> copy of the tables in `.rodata` with
+    /// each entry turned into a guest code address.
+    jump_tables: HashMap<(usize, usize), Addr>,
 }
 
 /// Linked image before it becomes a [`Program`].
@@ -197,10 +210,43 @@ fn lay_out(modules: &[&Module]) -> (Image, Vec<ModuleLayout>) {
                 };
                 layout.sections.insert(idx, addr);
             }
+            lay_out_jump_tables(module, &mut layout, &mut image.rodata);
             layout
         })
         .collect();
     (image, layouts)
+}
+
+/// Copy each jump table section that `module`'s code loads into `rodata`, once per
+/// code section that loads it. Entries are byte offsets into that code section; the
+/// copy holds guest code addresses, which `gotox` takes.
+fn lay_out_jump_tables(module: &Module, layout: &mut ModuleLayout, rodata: &mut Vec<u8>) {
+    for reloc in &module.relocations {
+        let Some(&Addr::Code(code)) = layout.sections.get(&reloc.section_idx) else {
+            continue;
+        };
+        let Some(table_idx) = module.symbol_by_idx(reloc.symbol_idx).and_then(|s| s.section_idx) else {
+            continue;
+        };
+        let table = &module.sections[table_idx];
+        let key = (reloc.section_idx, table_idx);
+        if reloc.rel_type != reloc::bpf::BPF_64_64
+            || table.kind != SectionKind::JumpTable
+            || layout.jump_tables.contains_key(&key)
+        {
+            continue;
+        }
+
+        let at = rodata.len().next_multiple_of(8);
+        rodata.resize(at, 0);
+        for entry in table.data.as_chunks::<8>().0 {
+            let target = Addr::Code(code.wrapping_add(u64::from_le_bytes(*entry)));
+            rodata.extend_from_slice(&target.guest().to_le_bytes());
+        }
+        layout
+            .jump_tables
+            .insert(key, Addr::Data(region_base(RODATA_REGION) + at as u64));
+    }
 }
 
 /// Compare each host-bound extern's BTF prototype with the registered function's
@@ -293,8 +339,9 @@ fn apply_relocation(
 
     let sym_addr = if let Some(sym_section_idx) = symbol.section_idx {
         let section_addr = layout
-            .sections
-            .get(&sym_section_idx)
+            .jump_tables
+            .get(&(reloc.section_idx, sym_section_idx))
+            .or_else(|| layout.sections.get(&sym_section_idx))
             .ok_or_else(|| LinkError::InvalidReference(format!("symbol section {sym_section_idx}")))?;
         section_addr.offset(symbol.value)
     } else if let Some(&addr) = global_symbols.get(&symbol.name) {
@@ -313,9 +360,9 @@ fn apply_relocation(
     let bad_target = || LinkError::InvalidReference(format!("relocation type {} -> {}", reloc.rel_type, symbol.name));
 
     match (reloc.rel_type, patch, sym_addr) {
-        (reloc::bpf::BPF_64_64, Addr::Code(at), Addr::Data(addr)) => {
+        (reloc::bpf::BPF_64_64, Addr::Code(at), target) => {
             // LD_IMM64: split the address across the imm fields of both slots.
-            let addr = addr.wrapping_add_signed(reloc.addend);
+            let addr = target.guest().wrapping_add_signed(reloc.addend);
             image.insn_mut(at)?[4..8].copy_from_slice(&(addr as u32).to_le_bytes());
             image.insn_mut(at + 8)?[4..8].copy_from_slice(&((addr >> 32) as u32).to_le_bytes());
         }
@@ -325,13 +372,12 @@ fn apply_relocation(
             let rel = ((target as i64 - (at + 8) as i64) / 8) as i32;
             image.insn_mut(at)?[4..8].copy_from_slice(&rel.to_le_bytes());
         }
-        (reloc::bpf::BPF_64_ABS64, Addr::Data(at), Addr::Data(addr)) => {
-            // a pointer stored in global data
-            let addr = addr.wrapping_add_signed(reloc.addend);
+        (reloc::bpf::BPF_64_ABS64, Addr::Data(at), target) => {
+            // a data or function pointer stored in global data
+            let addr = target.guest().wrapping_add_signed(reloc.addend);
             image.data_mut(at, 8)?.copy_from_slice(&addr.to_le_bytes());
         }
-        // Code addresses aren't guest-visible, so function pointers and calls into data
-        // can't be resolved; nor can relocation types a loaded section shouldn't carry.
+        // calls into data, and relocation types a loaded section shouldn't carry
         _ => return Err(bad_target().into()),
     }
 

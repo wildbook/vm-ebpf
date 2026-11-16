@@ -66,7 +66,7 @@ mnemonics! {
     Stdw = "stdw", Stw = "stw", Sth = "sth", Stb = "stb",
 
     // Special instructions
-    Lddw = "lddw", Call = "call", CallLocal = "call", CallKfunc = "call kfunc", Callx = "callx",
+    Lddw = "lddw", Call = "call", CallLocal = "call", CallKfunc = "call kfunc", Callx = "callx", Gotox = "gotox",
     Exit = "exit",
 
     // Atomic operations

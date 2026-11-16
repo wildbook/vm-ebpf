@@ -9,8 +9,9 @@ use rvm_core::{run, Context, Flow, Instruction, Memory};
 
 use crate::error::{ExecError, HelperError, Result};
 use crate::helper::{HelperArgs, HelperContext, HelperRegistry};
+use crate::layout::CODE_REGION;
 use crate::maps::Maps;
-use crate::memory::VmMemory;
+use crate::memory::{region_base, VmMemory};
 
 /// Maximum nesting of BPF-to-BPF calls below the entry frame.
 pub const MAX_CALL_DEPTH: usize = 8;
@@ -88,8 +89,11 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
         }
         ctx.regs[10] = self.stack_top;
 
-        let mut call_stack = [Frame::default(); MAX_CALL_DEPTH];
-        let mut depth = 0;
+        let mut stack = CallStack {
+            frames: [Frame::default(); MAX_CALL_DEPTH],
+            depth: 0,
+            frame_size: self.frame_size,
+        };
         let mut pc = pc;
         let limit = match self.instruction_limit {
             0 => u64::MAX,
@@ -100,23 +104,13 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
         loop {
             pc = match run(&mut ctx, self.code, &mut pc, &mut fuel) {
                 Flow::Call(offset) => {
-                    if depth == MAX_CALL_DEPTH {
-                        return Err(ExecError::StackOverflow.into());
-                    }
-                    let regs = &mut ctx.regs;
-                    let callee_fp = regs[10].checked_sub(self.frame_size).ok_or(ExecError::StackOverflow)?;
-                    call_stack[depth] = Frame {
-                        regs: [regs[6], regs[7], regs[8], regs[9], regs[10]],
-                        return_pc: pc + 1,
-                    };
-                    depth += 1;
-                    regs[10] = callee_fp;
+                    stack.push(&mut ctx.regs, pc + 1)?;
                     pc.wrapping_add_signed(offset + 1)
                 }
-                Flow::Exit if depth == 0 => return Ok(ctx.regs[0]),
+                Flow::Exit if stack.depth == 0 => return Ok(ctx.regs[0]),
                 Flow::Exit => {
-                    depth -= 1;
-                    let frame = &call_stack[depth];
+                    stack.depth -= 1;
+                    let frame = &stack.frames[stack.depth];
                     ctx.regs[6..=10].copy_from_slice(&frame.regs);
                     frame.return_pc
                 }
@@ -141,11 +135,83 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
                     return Err(ExecError::MemoryFault(format!("access at {err:#x?} (pc {pc})")).into())
                 }
                 Flow::Missing => return Err(ExecError::Unimplemented.into()),
+                Flow::CallIndirect(target) => {
+                    let maps = self.maps.as_deref_mut();
+                    call_indirect(target, pc, self.code, self.helpers, &mut ctx, maps, &mut stack)?
+                }
+                Flow::JumpIndirect(target) => jump_indirect(target, pc, self.code)?,
                 // `run` handles these internally
                 Flow::Next | Flow::Jump(_) => unreachable!(),
             };
         }
     }
+}
+
+/// Caller frames of the BPF-to-BPF calls in progress.
+struct CallStack {
+    frames: [Frame; MAX_CALL_DEPTH],
+    depth: usize,
+    /// Bytes r10 moves down per nested call.
+    frame_size: u64,
+}
+
+impl CallStack {
+    /// Save the caller's state and give the callee its stack frame.
+    #[inline(always)]
+    fn push(&mut self, regs: &mut [u64; 16], return_pc: u64) -> Result<()> {
+        if self.depth == MAX_CALL_DEPTH {
+            return Err(ExecError::StackOverflow.into());
+        }
+        let callee_fp = regs[10].checked_sub(self.frame_size).ok_or(ExecError::StackOverflow)?;
+        self.frames[self.depth] = Frame {
+            regs: [regs[6], regs[7], regs[8], regs[9], regs[10]],
+            return_pc,
+        };
+        self.depth += 1;
+        regs[10] = callee_fp;
+        Ok(())
+    }
+}
+
+/// `callx` at `pc`: enter the function at code address `target`, or call the helper
+/// whose ID is `target`. Returns the next pc. Kept out of line so the call and exit
+/// paths in [`Executor::call`] compile as they would without it.
+#[cold]
+#[inline(never)]
+fn call_indirect<M: Memory<Err: Debug> + 'static>(
+    target: u64,
+    pc: u64,
+    code: &[Instruction],
+    helpers: &HelperRegistry<M>,
+    ctx: &mut Context<&mut M>,
+    maps: Option<&mut Maps>,
+    stack: &mut CallStack,
+) -> Result<u64> {
+    if let Some(callee) = code_index(target, code) {
+        stack.push(&mut ctx.regs, pc + 1)?;
+        return Ok(callee);
+    }
+
+    // A helper's address is its ID, as in libbpf's `(void *)BPF_FUNC_*` helper
+    // declarations.
+    let id = u32::try_from(target).map_err(|_| ExecError::BadCodeAddress { pc, target })?;
+    let slot = helpers.slot_of_id(id).ok_or(HelperError::UnknownHelper(id))?;
+    ctx.regs[0] = call_slot(helpers, slot, ctx, maps)?;
+    Ok(pc + 1)
+}
+
+/// `gotox` at `pc`: the instruction index of code address `target`.
+#[cold]
+#[inline(never)]
+fn jump_indirect(target: u64, pc: u64, code: &[Instruction]) -> Result<u64> {
+    code_index(target, code).ok_or_else(|| ExecError::BadCodeAddress { pc, target }.into())
+}
+
+/// Instruction index of the guest code address `addr`, if it is an instruction
+/// boundary inside `code`.
+fn code_index(addr: u64, code: &[Instruction]) -> Option<u64> {
+    let offset = addr.checked_sub(region_base(CODE_REGION))?;
+    (offset % 8 == 0 && offset / 8 < code.len() as u64).then_some(offset / 8)
 }
 
 /// Call the extern table entry at `slot` with the arguments in `ctx.regs[1..=5]`.

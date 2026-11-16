@@ -385,10 +385,10 @@ fn emit(
         "call" if ops[0] == "local" => {
             asm.call_local(label_operand(&ops[1])?);
         }
+        "call" if ops[0] == "helper" && ops[1].starts_with('%') => {
+            asm.callx(reg(&ops[1])?);
+        }
         "call" if ops[0] == "helper" => {
-            if ops[1].starts_with('%') {
-                return Err("register-indirect helper call is not supported".to_string());
-            }
             asm.call(imm32(&ops[1])?);
         }
         "lock" => {

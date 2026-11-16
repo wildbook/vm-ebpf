@@ -17,11 +17,7 @@ use rvm::{Executor, HelperRegistry, Perms, VmMemory, FIRST_FREE_REGION, STACK_RE
 const STACK_SIZE: usize = 8192;
 
 /// Files that exercise something rvm deliberately does not implement, with why.
-const SKIP: &[(&str, &str)] = &[(
-    "callx.data",
-    "`callx` (helper id in a register) is a Linux extension RFC 9669 does not define; rvm \
-     rejects it as unimplemented",
-)];
+const SKIP: &[(&str, &str)] = &[];
 
 #[test]
 fn bpf_conformance_suite() {
@@ -65,8 +61,9 @@ fn run_one(text: &str) -> Result<(), String> {
 
     let mut helpers = HelperRegistry::new();
     // Helper 5 is "unwind" in the classic interpreter test ABI that call_unwind_fail.data
-    // exercises: the test only checks that calling it doesn't abort the program, not what
-    // it returns, since `mov %r0, 2` overwrites r0 right after the call either way.
+    // and callx.data (through a register holding the ID) exercise: the tests only check
+    // that calling it doesn't abort the program, not what it returns, since `mov %r0, 2`
+    // overwrites r0 right after the call either way.
     helpers.register(5, |_: ()| 0u64);
 
     let mut exec = Executor::new(&code, &mut memory, &helpers, stack_top);

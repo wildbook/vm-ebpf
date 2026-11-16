@@ -89,6 +89,11 @@ pub enum Flow<C: Memory> {
     OutOfFuel,
     /// [`run`] reached a `pc` outside the code slice.
     BadPc,
+
+    /// `callx`: call through the address in `dst_reg`, which the runtime decodes.
+    CallIndirect(u64),
+    /// `gotox`: jump to the address in `dst_reg`, which the runtime decodes.
+    JumpIndirect(u64),
 }
 
 pub trait Memory {
@@ -444,6 +449,8 @@ mod alu {
         };
 
         let cond = match jmp_opc {
+            // `gotox`: JMP64 class only, target in dst_reg
+            JmpOpc::Ja if BITS == BITS_64 && jmp_src == Source::Reg => return Flow::JumpIndirect(d),
             // JA in JMP64 class uses offset field, JA in JMP32 class uses imm field
             JmpOpc::Ja => {
                 return match BITS {
@@ -475,8 +482,7 @@ mod alu {
                 BITS_32 => (d as i32) <= (s as i32),
             },
 
-            // `callx` (target in a register) is a Linux extension rvm doesn't implement
-            JmpOpc::Call if jmp_src == Source::Reg => return Flow::Missing,
+            JmpOpc::Call if jmp_src == Source::Reg => return Flow::CallIndirect(d),
             JmpOpc::Call if src_reg == 0 => return Flow::CallHelper(imm as u32),
             JmpOpc::Call if src_reg == BPF_PSEUDO_CALL => return Flow::Call(i64::from(imm)), // program-local function
             JmpOpc::Call if src_reg == BPF_PSEUDO_KFUNC_CALL => return Flow::CallKfunc(imm as u32),
@@ -756,10 +762,10 @@ pub fn step_ld64<M: Memory>(ctx: &mut Context<M>, instr: Instruction, second: In
 /// Execute from `*pc` until an instruction the caller must handle.
 ///
 /// Plain ALU, memory and jump instructions stay inside this loop, so each one costs a
-/// single dispatch. The loop returns [`Flow::Call`], [`Flow::Exit`], helper calls and
-/// faults with `*pc` at the instruction that produced them, and [`Flow::OutOfFuel`] or
-/// [`Flow::BadPc`] with `*pc` at the instruction that could not run. Each executed
-/// instruction (both slots of LD_IMM64) consumes one unit of `fuel`.
+/// single dispatch. The loop returns calls (local, helper and indirect), indirect jumps,
+/// [`Flow::Exit`] and faults with `*pc` at the instruction that produced them, and
+/// [`Flow::OutOfFuel`] or [`Flow::BadPc`] with `*pc` at the instruction that could not
+/// run. Each executed instruction (both slots of LD_IMM64) consumes one unit of `fuel`.
 #[inline]
 pub fn run<M: Memory>(ctx: &mut Context<M>, code: &[Instruction], pc: &mut u64, fuel: &mut u64) -> Flow<M> {
     // locals, written back once on exit, so the loop never stores through the pointers

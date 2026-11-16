@@ -68,8 +68,8 @@ pub use error::{ExecError, HelperError, LinkError, MemoryError, Result, VmError}
 pub use executor::{Executor, DEFAULT_FRAME_SIZE, MAX_CALL_DEPTH};
 pub use helper::{FromArgs, HelperArgs, HelperContext, HelperRegistry, IntoReturn, SharedHelpers};
 pub use layout::{
-    BORROW_FIRST_REGION, DATA_REGION, FIRST_FREE_REGION, MAPS_REGION, RODATA_REGION, SHARED_MAPS_FIRST_REGION,
-    STACK_REGION,
+    BORROW_FIRST_REGION, CODE_REGION, DATA_REGION, FIRST_FREE_REGION, MAPS_REGION, RODATA_REGION,
+    SHARED_MAPS_FIRST_REGION, STACK_REGION,
 };
 pub use maps::{
     MapDef, MapError, MapKind, MapRef, Maps, BPF_ANY, BPF_EXIST, BPF_FUNC_MAP_DELETE_ELEM, BPF_FUNC_MAP_LOOKUP_ELEM,

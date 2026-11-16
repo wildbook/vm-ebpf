@@ -175,6 +175,8 @@ mod tests {
         asm.stb(R1, 0, 1);
 
         asm.call(1);
+        asm.callx(R1);
+        asm.gotox(R1);
         let mut func = asm.create_label();
         asm.call_local(&func);
         asm.set_label(&mut func).unwrap();
@@ -201,6 +203,7 @@ mod tests {
             .movsx3264(R0, R1);
         asm.bswap16(R0).bswap32(R0).bswap64(R0).le16(R0).be64(R0);
         asm.ja32(&far);
+        asm.gotox(R1).callx(R2);
         asm.ldxdw(R0, R1, i16::MIN).jeq_imm(R0, i32::MIN, &far);
         asm.set_label(&mut far).unwrap();
         asm.exit();
@@ -223,7 +226,9 @@ mod tests {
                 "bswap64 r0",
                 "le16 r0",
                 "be64 r0",
-                "ja32 +2",
+                "ja32 +4",
+                "gotox r1",
+                "callx r2",
                 "ldxdw r0, [r1-0x8000]",
                 "jeq r0, -0x80000000, +0",
                 "exit",
