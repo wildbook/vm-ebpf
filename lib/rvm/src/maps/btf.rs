@@ -2,7 +2,7 @@
 
 use btf::{Btf, BtfTypeInfo};
 
-use super::{invalid, MapDef, MapKind};
+use super::{check_def, invalid, MapDef, MapKind};
 use crate::error::Result;
 use crate::module::Module;
 use crate::section::SectionKind;
@@ -73,20 +73,16 @@ fn parse_def(btf: &Btf<'_>, name: &str, type_id: u32) -> Result<MapDef> {
     let key_size = key_size.ok_or_else(|| bad("missing key"))?;
     let value_size = value_size.ok_or_else(|| bad("missing value"))?;
     let max_entries = max_entries.ok_or_else(|| bad("missing max_entries"))?;
-    if kind == MapKind::Array && key_size != 4 {
-        return Err(bad("array map keys must be 4 bytes"));
-    }
-    if value_size == 0 || max_entries == 0 {
-        return Err(bad("zero value size or max_entries"));
-    }
 
-    Ok(MapDef {
+    let def = MapDef {
         name: name.to_string(),
         kind,
         key_size,
         value_size,
         max_entries,
-    })
+    };
+    check_def(&def)?;
+    Ok(def)
 }
 
 fn resolve<'a, 'b>(btf: &'b Btf<'a>, id: u32) -> Option<&'b BtfTypeInfo<'a>> {

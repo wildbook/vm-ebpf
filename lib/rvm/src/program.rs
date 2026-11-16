@@ -1,7 +1,7 @@
 //! Linked eBPF program ready for execution.
 //!
-//! A `Program` is the result of linking one or more `Module`s together.
-//! It contains the executable code, data, and function table.
+//! A `Program` is a loaded [`crate::Image`]: the executable code, data, maps and
+//! function table.
 
 use std::sync::Arc;
 
@@ -17,7 +17,7 @@ use crate::memory::{region_base, VmMemory};
 use crate::vm::VmConfig;
 
 /// Information about an executable function.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionInfo {
     /// Program counter (instruction index) where the function starts.
     pub pc: u64,
@@ -56,7 +56,7 @@ pub struct Borrow {
 pub struct Program {
     /// Instructions; not addressable by the guest.
     code: Box<[Instruction]>,
-    /// Guest memory regions (stack, data, maps). See [`crate::linker`] for the layout.
+    /// Guest memory regions (stack, data, maps). See [`crate::layout`] for the layout.
     memory: VmMemory,
     maps: Maps,
     /// Function table: name -> function info.
@@ -74,7 +74,7 @@ pub struct Program {
 }
 
 impl Program {
-    /// Create a new program. The linker is the usual caller.
+    /// Create a new program. Loading an image is the usual caller.
     pub fn new(
         code: Box<[Instruction]>,
         memory: VmMemory,

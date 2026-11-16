@@ -1,7 +1,7 @@
 //! Linker for combining multiple eBPF modules.
 //!
 //! The linker resolves symbol references between modules, applies relocations,
-//! and produces a linked program ready for execution.
+//! and produces an [`Image`] for [`crate::image::load`] to bind and allocate.
 //!
 //! Code and data live in separate address spaces. Code sections are concatenated
 //! into one instruction array (addressed by byte offset during linking, by
@@ -11,29 +11,22 @@
 //! Data sections go into guest memory regions; see [`crate::layout`] for the
 //! complete table.
 
-use std::sync::Arc;
-
 use btf::{apply_core_relocations, Btf, BtfBuilder, BtfTypeInfo};
 use constelf::raw::reloc;
 use hashbrown::HashMap;
-use rvm_core::{instructions_from_bytes, BPF_PSEUDO_KFUNC_CALL};
 
 use crate::error::{LinkError, Result, VmError};
-use crate::executor::MAX_CALL_DEPTH;
-use crate::helper::{HelperRegistry, SharedHelpers};
-use crate::layout::{CODE_REGION, DATA_REGION, MAPS_REGION, RODATA_REGION, STACK_REGION};
-use crate::maps::{map_defs, MapDef, Maps, SharedMaps};
-use crate::memory::{region_base, Perms, SharedRegion, VmMemory, REGION_SHIFT};
+use crate::executor::CORE_POISON_HELPER;
+use crate::helper::HelperRegistry;
+use crate::image::{set_slot_call, Image, Import};
+use crate::layout::{CODE_REGION, DATA_REGION, RODATA_REGION};
+use crate::maps::map_defs;
+use crate::memory::{region_base, MAX_REGION_LEN, REGION_SHIFT};
 use crate::module::{Module, Relocation};
-use crate::program::{Borrow, FunctionInfo, Program};
+use crate::program::{Borrow, FunctionInfo};
 use crate::section::{Section, SectionKind};
-use crate::vm::VmConfig;
 
-/// Turn a call instruction into a call to extern-table `slot`.
-fn set_slot_call(insn: &mut [u8; 8], slot: u32) {
-    insn[1] = (insn[1] & 0x0F) | ((BPF_PSEUDO_KFUNC_CALL as u8) << 4);
-    insn[4..8].copy_from_slice(&slot.to_le_bytes());
-}
+const _: () = assert!(CORE_POISON_HELPER == btf::CORE_POISON_HELPER);
 
 /// Where a section or symbol lives after linking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,20 +63,13 @@ struct ModuleLayout {
     jump_tables: HashMap<(usize, usize), Addr>,
 }
 
-/// Linked image before it becomes a [`Program`].
-struct Image {
-    code: Vec<u8>,
-    rodata: Vec<u8>,
-    data: Vec<u8>,
-}
-
 impl Image {
     /// The 8-byte instruction at code offset `at`.
     fn insn_mut(&mut self, at: u64) -> Result<&mut [u8; 8]> {
         let at = at as usize;
         self.code
-            .get_mut(at..at + 8)
-            .map(|s| s.try_into().unwrap())
+            .get_mut(at..)
+            .and_then(|s| s.first_chunk_mut())
             .ok_or_else(|| LinkError::InvalidReference(format!("code offset {at:#x}")).into())
     }
 
@@ -101,21 +87,12 @@ impl Image {
     }
 }
 
-/// Link multiple modules into a single program.
-pub fn link<'m>(
-    helpers: &Arc<SharedHelpers>,
-    shared_maps: &SharedMaps,
-    shared_regions: &[SharedRegion],
-    types: &BtfBuilder,
-    config: &VmConfig,
-    modules: &[&'m Module],
-) -> Result<Program> {
+/// Link modules into an image, binding extern calls against `helpers` and CO-RE
+/// relocations against `types`.
+pub fn link<'m>(helpers: &HelperRegistry, types: &BtfBuilder, modules: &[&'m Module]) -> Result<Image> {
     if modules.is_empty() {
         return Err(VmError::InvalidArgument("no modules to link".to_string()));
     }
-
-    // Bind against one version of the table; the program refreshes from there.
-    let (helper_table, version) = helpers.snapshot();
 
     // Each module's BTF, parsed once and shared by every pass below.
     let btfs = modules
@@ -129,53 +106,45 @@ pub fn link<'m>(
     let target = Btf::parse(&target_bytes)?;
 
     let (mut image, layouts) = lay_out(modules);
+    if [&image.code, &image.rodata, &image.data]
+        .iter()
+        .any(|b| b.len() > MAX_REGION_LEN)
+    {
+        return Err(VmError::InvalidArgument(format!("program exceeds {MAX_REGION_LEN} bytes")));
+    }
     let global_symbols = build_symbol_table(modules, &layouts)?;
-    check_extern_signatures(&helper_table, &btfs)?;
+    check_extern_signatures(helpers, &btfs)?;
 
-    let mut defs = Vec::new();
     for (module, btf) in modules.iter().zip(&btfs) {
         for def in map_defs(module, btf.as_ref())? {
-            if defs.iter().any(|d: &MapDef| d.name == def.name) {
+            if image.maps.iter().any(|d| d.name == def.name) {
                 return Err(LinkError::DuplicateSymbol(def.name).into());
             }
-            defs.push(def);
+            image.maps.push(def);
         }
     }
-    let (maps, maps_len) = Maps::new(defs, shared_maps)?;
 
     // Relocations bind maps and named externs; then numeric helper calls.
     for (module, layout) in modules.iter().zip(&layouts) {
         for reloc in &module.relocations {
-            apply_relocation(&helper_table, &maps, module, layout, &global_symbols, reloc, &mut image)?;
+            apply_relocation(helpers, module, layout, &global_symbols, reloc, &mut image)?;
         }
     }
-    bind_helper_calls(&helper_table, &mut image)?;
+    mark_helper_calls(helpers, &mut image)?;
     apply_core_relocations_pass(modules, &layouts, &btfs, &target, &mut image)?;
 
-    let functions = build_function_table(modules, &layouts, &btfs)?;
+    image.functions = build_function_table(modules, &layouts, &btfs)?.into_iter().collect();
+    image.functions.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    image.rodata_len = trim_zeros(&mut image.rodata);
+    image.data_len = trim_zeros(&mut image.data);
+    Ok(image)
+}
 
-    let mut memory = VmMemory::new();
-    let stack_len = config.frame_size * (MAX_CALL_DEPTH + 1);
-    memory.map(STACK_REGION, stack_len, Perms::RW);
-    memory.map_bytes(RODATA_REGION, &image.rodata, image.rodata.len(), Perms::R);
-    memory.map_bytes(DATA_REGION, &image.data, image.data.len(), Perms::RW);
-    if maps_len != 0 {
-        memory.map(MAPS_REGION, maps_len, Perms::RW);
-    }
-    // SAFETY: the callers of `Vm::share_map`/`Vm::share_region` accepted the
-    // `map_shared` contract.
-    unsafe {
-        for shared in maps.shared() {
-            memory.map_shared(shared.region, shared.storage.clone(), Perms::RW);
-        }
-        for shared in shared_regions {
-            memory.map_shared(shared.region(), shared.buffer().clone(), shared.perms());
-        }
-    }
-
-    let code = instructions_from_bytes(&image.code);
-
-    Ok(Program::new(code, memory, maps, functions, helpers.clone(), (helper_table, version), config))
+/// Drop trailing zero bytes, which loading restores, and return the original length.
+fn trim_zeros(bytes: &mut Vec<u8>) -> usize {
+    let len = bytes.len();
+    bytes.truncate(bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1));
+    len
 }
 
 /// Place every allocatable section and copy its contents into the image.
@@ -188,11 +157,7 @@ fn lay_out(modules: &[&Module]) -> (Image, Vec<ModuleLayout>) {
         at as u64
     }
 
-    let mut image = Image {
-        code: Vec::new(),
-        rodata: Vec::new(),
-        data: Vec::new(),
-    };
+    let mut image = Image::default();
     let layouts = modules
         .iter()
         .map(|module| {
@@ -312,7 +277,6 @@ fn build_symbol_table(modules: &[&Module], layouts: &[ModuleLayout]) -> Result<H
 /// Apply a single relocation.
 fn apply_relocation(
     helpers: &HelperRegistry,
-    maps: &Maps,
     module: &Module,
     layout: &ModuleLayout,
     global_symbols: &HashMap<String, Addr>,
@@ -330,10 +294,11 @@ fn apply_relocation(
         LinkError::InvalidReference(format!("symbol index {idx}"))
     })?;
 
-    // `lddw rX, map`: the guest gets the map's handle.
-    if let (reloc::bpf::BPF_64_64, Addr::Code(at), Some(handle)) = (reloc.rel_type, patch, maps.handle(&symbol.name)) {
-        image.insn_mut(at)?[4..8].copy_from_slice(&handle.to_le_bytes());
-        image.insn_mut(at + 8)?[4..8].copy_from_slice(&0u32.to_le_bytes());
+    // `lddw rX, map`: the guest gets the map's handle, its index in the image.
+    let map = image.maps.iter().position(|d| d.name == symbol.name);
+    if let (reloc::bpf::BPF_64_64, Addr::Code(at), Some(handle)) = (reloc.rel_type, patch, map) {
+        image.insn_mut(at)?[4..].copy_from_slice(&(handle as u32).to_le_bytes());
+        image.insn_mut(at + 8)?[4..].copy_from_slice(&0u32.to_le_bytes());
         return Ok(());
     }
 
@@ -347,11 +312,11 @@ fn apply_relocation(
     } else if let Some(&addr) = global_symbols.get(&symbol.name) {
         addr
     } else if let (reloc::bpf::BPF_64_32, Addr::Code(at)) = (reloc.rel_type, patch) {
-        // Call to an extern function: bind it to its slot in the extern table.
-        let slot = helpers
-            .slot_of_name(&symbol.name)
-            .ok_or_else(|| LinkError::UnresolvedSymbol(symbol.name.clone()))?;
-        set_slot_call(image.insn_mut(at)?, slot);
+        // Call to an extern function, bound to its slot in the extern table on load.
+        if helpers.slot_of_name(&symbol.name).is_none() {
+            return Err(LinkError::UnresolvedSymbol(symbol.name.clone()).into());
+        }
+        mark_extern(image, at, Import::Name(symbol.name.clone()))?;
         return Ok(());
     } else {
         return Err(LinkError::UnresolvedSymbol(symbol.name.clone()).into());
@@ -384,27 +349,35 @@ fn apply_relocation(
     Ok(())
 }
 
-/// Rewrite every `call <helper id>` into a slot call, so linked programs never
-/// look helpers up at runtime. Unregistered IDs fail the link.
-fn bind_helper_calls(helpers: &HelperRegistry, image: &mut Image) -> Result<()> {
+/// Record every `call <helper id>` as an extern, so loaded programs never look
+/// helpers up at runtime. Unregistered IDs fail the link.
+fn mark_helper_calls(helpers: &HelperRegistry, image: &mut Image) -> Result<()> {
     const BPF_CALL: u8 = 0x85;
     const BPF_LD_IMM64: u8 = 0x18;
 
-    let (insns, _) = image.code.as_chunks_mut::<8>();
     let mut i = 0;
-    while i < insns.len() {
-        let insn = &mut insns[i];
+    while let Some(insn) = image.code.as_chunks::<8>().0.get(i) {
         if insn[0] == BPF_LD_IMM64 {
             i += 2;
             continue;
         }
         if insn[0] == BPF_CALL && insn[1] >> 4 == 0 {
-            let id = u32::from_le_bytes(insn[4..8].try_into().unwrap());
-            let slot = helpers.slot_of_id(id).ok_or(LinkError::UnknownHelper(id))?;
-            set_slot_call(insn, slot);
+            let id = u32::from_le_bytes(insn[4..].try_into().unwrap());
+            if helpers.slot_of_id(id).is_none() {
+                return Err(LinkError::UnknownHelper(id).into());
+            }
+            mark_extern(image, i as u64 * 8, Import::Helper(id))?;
         }
         i += 1;
     }
+    Ok(())
+}
+
+/// Record the call at code offset `at` as an extern. Until loading binds it, it
+/// calls a slot no table has.
+fn mark_extern(image: &mut Image, at: u64, import: Import) -> Result<()> {
+    set_slot_call(image.insn_mut(at)?, u32::MAX);
+    image.externs.push(((at / 8) as u32, import));
     Ok(())
 }
 

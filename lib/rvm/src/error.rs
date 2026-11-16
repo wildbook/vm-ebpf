@@ -9,10 +9,15 @@ pub type Result<T> = std::result::Result<T, VmError>;
 #[derive(Debug)]
 pub enum VmError {
     /// ELF parsing error.
+    #[cfg(feature = "link")]
     Elf(String),
 
     /// BTF parsing error.
+    #[cfg(feature = "link")]
     Btf(btf::BtfError),
+
+    /// A malformed image, or one written by another rvm version.
+    InvalidImage(String),
 
     /// Linking error.
     Link(LinkError),
@@ -42,8 +47,11 @@ pub enum VmError {
 impl fmt::Display for VmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            #[cfg(feature = "link")]
             Self::Elf(msg) => write!(f, "ELF error: {msg}"),
+            #[cfg(feature = "link")]
             Self::Btf(e) => write!(f, "BTF error: {e}"),
+            Self::InvalidImage(msg) => write!(f, "invalid image: {msg}"),
             Self::Link(e) => write!(f, "link error: {e}"),
             Self::Exec(e) => write!(f, "execution error: {e}"),
             Self::Helper(e) => write!(f, "helper error: {e}"),
@@ -58,13 +66,15 @@ impl fmt::Display for VmError {
 
 impl std::error::Error for VmError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Btf(e) => Some(e),
-            _ => None,
+        #[cfg(feature = "link")]
+        if let Self::Btf(e) = self {
+            return Some(e);
         }
+        None
     }
 }
 
+#[cfg(feature = "link")]
 impl From<btf::BtfError> for VmError {
     fn from(e: btf::BtfError) -> Self {
         Self::Btf(e)
@@ -111,6 +121,7 @@ pub enum LinkError {
     /// Invalid reference.
     InvalidReference(String),
     /// A malformed or unsupported CO-RE relocation.
+    #[cfg(feature = "link")]
     CoreRelo(btf::CoreReloError),
 }
 
@@ -128,6 +139,7 @@ impl fmt::Display for LinkError {
             Self::MapMismatch(name) => write!(f, "shared map {name} is declared with a different layout"),
             Self::DuplicateSymbol(name) => write!(f, "duplicate symbol: {name}"),
             Self::InvalidReference(msg) => write!(f, "invalid reference: {msg}"),
+            #[cfg(feature = "link")]
             Self::CoreRelo(e) => write!(f, "CO-RE relocation: {e}"),
         }
     }

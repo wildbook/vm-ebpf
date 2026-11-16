@@ -23,13 +23,15 @@ use hashbrown::HashMap;
 
 use crate::error::{LinkError, Result, VmError};
 use crate::layout::MAPS_REGION;
-use crate::memory::{region_base, VmMemory};
+use crate::memory::{region_base, VmMemory, MAX_REGION_LEN};
 
+#[cfg(feature = "link")]
 mod btf;
 mod hash;
 mod helpers;
 mod shared;
 
+#[cfg(feature = "link")]
 pub use btf::map_defs;
 use hash::HashIndex;
 pub use helpers::{register_helpers, BPF_FUNC_MAP_DELETE_ELEM, BPF_FUNC_MAP_LOOKUP_ELEM, BPF_FUNC_MAP_UPDATE_ELEM};
@@ -123,12 +125,19 @@ impl Maps {
         let mut maps = Self::default();
         let mut len = 0;
         for def in defs {
+            check_def(&def)?;
+            if maps.by_name.insert(def.name.clone(), maps.maps.len() as u32).is_some() {
+                return Err(LinkError::DuplicateSymbol(def.name).into());
+            }
             let (base, stride, index) = match shared.bind(&def)? {
                 Some(map) => (region_base(map.region), map.stride, Index::Shared(map)),
                 None => {
                     let stride = u64::from(def.value_size).next_multiple_of(8);
                     let base = region_base(MAPS_REGION) + len;
                     len = (len + stride * u64::from(def.max_entries)).next_multiple_of(CACHE_LINE);
+                    if len > MAX_REGION_LEN as u64 {
+                        return Err(invalid(format!("map {}: maps exceed {MAX_REGION_LEN} bytes", def.name)));
+                    }
                     let index = match def.kind {
                         MapKind::Array => Index::Array,
                         MapKind::Hash => Index::Hash(HashIndex::new(def.key_size, def.max_entries)),
@@ -136,7 +145,6 @@ impl Maps {
                     (base, stride, index)
                 }
             };
-            maps.by_name.insert(def.name.clone(), maps.maps.len() as u32);
             maps.maps.push(Map {
                 def,
                 base,
@@ -281,6 +289,24 @@ impl Map {
         }
         Ok(idx)
     }
+}
+
+/// Reject a map no program can use, or whose values or keys don't fit in a region
+/// with values padded to a cache line, as shared maps may be.
+pub fn check_def(def: &MapDef) -> Result<()> {
+    let bad = |what: &str| Err(invalid(format!("map {}: {what}", def.name)));
+    if def.value_size == 0 || def.max_entries == 0 {
+        return bad("zero value size or max_entries");
+    }
+    if def.kind == MapKind::Array && def.key_size != 4 {
+        return bad("array map keys must be 4 bytes");
+    }
+    let entries = u64::from(def.max_entries);
+    let values = u64::from(def.value_size).next_multiple_of(CACHE_LINE) * entries;
+    if values.max(u64::from(def.key_size) * entries) > MAX_REGION_LEN as u64 {
+        return bad("too large");
+    }
+    Ok(())
 }
 
 fn invalid(msg: String) -> VmError {

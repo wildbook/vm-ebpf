@@ -19,6 +19,10 @@ pub const MAX_CALL_DEPTH: usize = 8;
 /// Default stack bytes reserved per call frame (eBPF's `MAX_BPF_STACK`).
 pub const DEFAULT_FRAME_SIZE: u64 = 512;
 
+/// Helper ID of the call the linker plants for a CO-RE relocation the host can't
+/// resolve (`btf::CORE_POISON_HELPER`).
+pub const CORE_POISON_HELPER: u32 = 0xbad2310;
+
 /// Caller state saved across a BPF-to-BPF call.
 #[derive(Clone, Copy, Default)]
 struct Frame {
@@ -116,7 +120,7 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
                 }
                 // Raw bytecode path: look the helper ID up. Linked programs only use slots,
                 // except for calls the linker planted for unresolved CO-RE relocations.
-                Flow::CallHelper(btf::CORE_POISON_HELPER) => {
+                Flow::CallHelper(CORE_POISON_HELPER) => {
                     return Err(ExecError::UnresolvedCoreRelo { pc }.into());
                 }
                 Flow::CallHelper(id) => {

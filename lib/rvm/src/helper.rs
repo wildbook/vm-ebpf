@@ -3,7 +3,7 @@
 //! This module provides type-safe helper function registration and dispatch.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
 
 use hashbrown::HashMap;
 
@@ -371,9 +371,14 @@ impl SharedHelpers {
         self.version.load(Ordering::Acquire)
     }
 
+    /// Read access to the current table.
+    pub fn read(&self) -> RwLockReadGuard<'_, HelperRegistry> {
+        self.registry.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// A copy of the table and the version it belongs to.
     pub fn snapshot(&self) -> (HelperRegistry, u64) {
-        let registry = self.registry.read().unwrap_or_else(PoisonError::into_inner);
+        let registry = self.read();
         (registry.clone(), self.version())
     }
 }

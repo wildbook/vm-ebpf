@@ -27,7 +27,7 @@ numbers reflect clang's current ISA: sign-extending loads, `movsx`, `sdiv`/`smod
 ```bash
 cargo run --bin loader   # loads and calls bpf/example.o
 cargo run --bin demo     # CO-RE relocation walkthrough
-cargo run --bin emu      # runs bpf.o, embedded at compile time
+cargo run --bin emu      # runs bpf.o, linked into an image at build time
 ```
 
 ## Crates
@@ -39,8 +39,7 @@ cargo run --bin emu      # runs bpf.o, embedded at compile time
 - `lib/rvm`: the embeddable runtime built on `rvm-core`. Parses ELF objects,
   links them into executable programs, manages guest memory, and dispatches
   helper calls.
-- `lib/constelf`: a `const fn` ELF reader used by `rvm` and by `bin/emu`'s
-  compile-time address resolution.
+- `lib/constelf`: a `const fn` ELF reader used by `rvm`'s linker.
 - `lib/btf`: BTF (BPF Type Format) parsing and CO-RE (Compile Once, Run
   Everywhere) relocations. The host describes its actual struct layouts as BTF,
   with `BtfBuilder`; relocations patch field-access instructions compiled
@@ -50,8 +49,8 @@ cargo run --bin emu      # runs bpf.o, embedded at compile time
   examples to build eBPF bytecode without a C toolchain. Also has a disassembler,
   used by its own examples and tests for debugging.
 - `bin/loader`, `bin/demo`, `bin/emu`: example programs. `loader` shows the
-  parse and link API; `demo` shows a CO-RE relocation; `emu` runs an ELF
-  embedded at compile time, resolving relocations in a `const fn`.
+  parse and link API; `demo` shows a CO-RE relocation; `emu` loads an image
+  its build script prepares, with rvm built without the linker.
 
 ## Using the runtime
 
@@ -105,13 +104,31 @@ runs.
 ## Linking
 
 `Vm::link` places code and data sections, resolves relocations between
-modules, binds the remaining calls to numeric helper IDs, and applies CO-RE
-relocations. A call is bound to a slot in the program's extern table at link
-time; linking fails if a named extern has no matching helper or module
-export, if a numeric helper ID is never registered, or if a host extern's
-declared argument count does not match the registered helper's arity
-(checked against the module's BTF, when present). There is no late binding:
-an unresolved call is a link error, not a runtime one.
+modules, records the remaining calls to numeric helper IDs and named externs,
+and applies CO-RE relocations. Loading then binds each recorded call to a slot
+in the program's extern table. Linking fails if a named extern has no matching
+helper or module export, if a numeric helper ID is never registered, or if a
+host extern's declared argument count does not match the registered helper's
+arity (checked against the module's BTF, when present). There is no late
+binding: an unresolved call is a link or load error, not a runtime one.
+
+## Prepared images
+
+`Vm::prepare(&elf)` (or `Vm::prepare_modules`) links ahead of time and returns
+an `rvm::Image`: the final code with every relocation applied, the initial data,
+map declarations, exported functions and the calls to bind on load.
+`Image::to_bytes` serializes it, and `Vm::load_image(&bytes)` or
+`Vm::load_plugin_image(name, &bytes)` turns it into a program in any VM that
+registers the same externs and helper IDs. Loading binds each extern by name or
+ID, allocates memory and maps, and maps the VM's shared maps and regions. An
+image loads only into the rvm version that wrote it, and loading checks every
+length, index and map definition, so images may come from untrusted files.
+
+The linker sits behind rvm's default `link` feature, together with ELF parsing,
+BTF and CO-RE (`Module`, `BtfBuilder`, `Vm::types`, `Vm::prepare`,
+`Vm::load_elf`, `Vm::load_plugin`). A host that ships prepared images can depend
+on rvm with `default-features = false` and prepare them in a build script or a
+separate tool, as `bin/emu` does.
 
 ## Guest memory
 
