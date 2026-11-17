@@ -28,7 +28,7 @@ const MAGIC: &[u8; 4] = b"RVMI";
 const FORMAT_VERSION: u32 = 1;
 const RVM_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub(crate) const BPF_CALL: u8 = 0x85;
+pub const BPF_CALL: u8 = 0x85;
 
 /// A linked program, ready to load into a [`crate::Vm`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -37,9 +37,11 @@ pub struct Image {
     pub code: Vec<u8>,
     /// Initial bytes of the `.rodata` region; the rest of its `rodata_len` bytes are zero.
     pub rodata: Vec<u8>,
+    /// Size of the `.rodata` region in bytes.
     pub rodata_len: usize,
     /// Initial bytes of the `.data` and `.bss` region; the rest of its `data_len` bytes are zero.
     pub data: Vec<u8>,
+    /// Size of the `.data` and `.bss` region in bytes.
     pub data_len: usize,
     /// Maps in handle order: the `lddw` that loads a map holds its index here.
     pub maps: Vec<MapDef>,
@@ -256,18 +258,33 @@ pub fn load(
     let functions = functions
         .into_iter()
         .map(|(name, info)| {
-            if info.pc >= insn_count || !info.borrows.iter().all(Borrow::in_range) {
+            // each borrow maps its own region, so the pointer parameters must differ
+            let borrows = &info.borrows;
+            let distinct = borrows
+                .iter()
+                .enumerate()
+                .all(|(i, b)| borrows[..i].iter().all(|o| o.arg != b.arg));
+            if info.pc >= insn_count || !borrows.iter().all(Borrow::in_range) || !distinct {
                 return Err(invalid(format!("function {name}: entry or borrows out of range")));
             }
             Ok((name, info))
         })
         .collect::<Result<HashMap<_, _>>>()?;
 
+    let stack_len = config
+        .frame_size
+        .checked_mul(MAX_CALL_DEPTH as u64 + 1)
+        .filter(|&len| len <= MAX_REGION_LEN as u64)
+        .ok_or_else(|| {
+            let frame_size = config.frame_size;
+            let msg = format!("frame size {frame_size} makes the stack larger than {MAX_REGION_LEN} bytes");
+            VmError::InvalidArgument(msg)
+        })?;
+
     let (maps, maps_len) = Maps::new(maps, shared_maps, bad_map)?;
 
     let mut memory = VmMemory::new();
-    let stack_len = config.frame_size * (MAX_CALL_DEPTH + 1);
-    memory.map(STACK_REGION, stack_len, Perms::RW);
+    memory.map(STACK_REGION, stack_len as usize, Perms::RW);
     memory.map_bytes(RODATA_REGION, &rodata, rodata_len, Perms::R);
     memory.map_bytes(DATA_REGION, &data, data_len, Perms::RW);
     if maps_len != 0 {

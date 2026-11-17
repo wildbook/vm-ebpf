@@ -8,9 +8,9 @@
 //! exported function tags the parameter as a borrow (see [`Borrow`]). Then the caller's buffer is mapped into the
 //! callee at a [`BORROW_FIRST_REGION`] slot for the duration of the call, and the callee gets that address instead. A
 //! call into a plugin that is already running, from the host or through a chain of plugin calls, fails with
-//! [`VmError::PluginBusy`] instead of deadlocking.
+//! [`VmError::PluginBusy`] instead of deadlocking. So does [`Plugin::replace`] while the plugin runs.
 
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError, Weak};
 
 use crate::error::{HelperError, Result, VmError};
 use crate::helper::HelperContext;
@@ -26,6 +26,7 @@ pub struct Plugin {
 }
 
 impl Plugin {
+    /// Wrap `program` as the plugin `name`; errors from calls into it carry the name.
     pub fn new(name: impl Into<Arc<str>>, program: Program) -> Self {
         Self {
             name: name.into(),
@@ -33,6 +34,7 @@ impl Plugin {
         }
     }
 
+    /// The name given to [`Plugin::new`].
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -70,10 +72,10 @@ impl Plugin {
     }
 
     /// Swap in a new build of this plugin. Exports keep working; they find their function by name in the new program.
-    /// Blocks until a running call finishes.
-    pub fn replace(&self, program: Program) {
-        *self.program.lock().unwrap_or_else(|e| e.into_inner()) = program;
-        self.program.clear_poison();
+    /// Fails with [`VmError::PluginBusy`] while a call into the plugin runs, on any thread.
+    pub fn replace(&self, program: Program) -> Result<()> {
+        *self.lock()? = program;
+        Ok(())
     }
 
     /// A handle that doesn't keep the plugin alive. Host functions that call back into a plugin should hold this: they
@@ -85,32 +87,48 @@ impl Plugin {
         }
     }
 
-    /// The extern that calls `func` in this plugin.
+    /// The extern that calls `func` in this plugin. Fails with [`VmError::FunctionNotFound`] if the plugin lacks it.
     pub fn export_fn(
         &self,
         func: &str,
-    ) -> impl Fn(&mut HelperContext) -> std::result::Result<u64, HelperError> + Send + Sync + 'static {
+    ) -> Result<impl Fn(&mut HelperContext) -> std::result::Result<u64, HelperError> + Send + Sync + 'static> {
+        let target = ExportTarget::find(&*self.lock()?, func)
+            .ok_or_else(|| VmError::FunctionNotFound(format!("{}::{func}", self.name)))?;
+        let target = Mutex::new(target);
         let program: Weak<Mutex<Program>> = Arc::downgrade(&self.program);
         let name = self.name.clone();
         let func: Arc<str> = func.into();
 
-        move |ctx: &mut HelperContext| -> std::result::Result<u64, HelperError> {
-            let failed = |e: VmError| HelperError::Failed(format!("{name}::{func}: {e}"));
+        Ok(move |ctx: &mut HelperContext| -> std::result::Result<u64, HelperError> {
+            let failed = |error: VmError| HelperError::Plugin {
+                plugin: name.to_string(),
+                func: func.to_string(),
+                error: Box::new(error),
+            };
             let program = program
                 .upgrade()
                 .ok_or_else(|| failed(VmError::PluginUnloaded(name.to_string())))?;
             let mut program = try_lock(&program, &name).map_err(failed)?;
 
+            // only touched under the plugin lock, so this never waits
+            let target = {
+                let mut target = target.lock().unwrap_or_else(PoisonError::into_inner);
+                if !program.owns(target.entry) {
+                    *target = ExportTarget::find(&program, &func)
+                        .ok_or_else(|| failed(VmError::FunctionNotFound(func.to_string())))?;
+                }
+                *target
+            };
+
             let a = ctx.args;
             let mut args = [a.r1, a.r2, a.r3, a.r4, a.r5];
-            let borrows = program.function(&func).map(|f| f.borrows.clone()).unwrap_or_default();
-            if borrows.is_empty() {
-                return program.call(&func, &args).map_err(failed);
+            if target.borrow_count == 0 {
+                return program.call_func(target.entry, &args).map_err(failed);
             }
 
             let caller = &*ctx.memory;
             let mut mapped = Ok(());
-            for &Borrow { arg, len_arg, writable } in &borrows {
+            for &Borrow { arg, len_arg, writable } in target.borrows() {
                 let (addr, len) = (args[arg as usize], args[len_arg as usize] as usize);
                 // the caller must itself be allowed what the callee gets
                 let perms = if writable { Perms::RW } else { Perms::R };
@@ -128,12 +146,43 @@ impl Plugin {
                 args[arg as usize] = region_base(region);
             }
 
-            let result = mapped.and_then(|()| program.call(&func, &args).map_err(failed));
-            for borrow in &borrows {
+            let result = mapped.and_then(|()| program.call_func(target.entry, &args).map_err(failed));
+            for borrow in target.borrows() {
                 program.memory_mut().unmap(BORROW_FIRST_REGION + borrow.arg as usize);
             }
             result
-        }
+        })
+    }
+}
+
+/// An exported function as found in one program, kept until [`Plugin::replace`] swaps the program.
+#[derive(Clone, Copy)]
+struct ExportTarget {
+    entry: Func,
+    /// Image loading checks that borrowed parameters are distinct argument registers, so there are at most 5.
+    borrows: [Borrow; BORROW_REGIONS],
+    borrow_count: usize,
+}
+
+impl ExportTarget {
+    fn find(program: &Program, func: &str) -> Option<Self> {
+        let (entry, info) = program.func_with_info(func)?;
+        let unused = Borrow {
+            arg: 0,
+            len_arg: 0,
+            writable: false,
+        };
+        let mut borrows = [unused; BORROW_REGIONS];
+        borrows[..info.borrows.len()].copy_from_slice(&info.borrows);
+        Some(Self {
+            entry,
+            borrows,
+            borrow_count: info.borrows.len(),
+        })
+    }
+
+    fn borrows(&self) -> &[Borrow] {
+        &self.borrows[..self.borrow_count]
     }
 }
 
@@ -190,5 +239,11 @@ fn try_lock<'a>(program: &'a Mutex<Program>, name: &str) -> Result<MutexGuard<'a
 impl std::fmt::Debug for Plugin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Plugin").field("name", &self.name).finish()
+    }
+}
+
+impl std::fmt::Debug for WeakPlugin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeakPlugin").field("name", &self.name).finish()
     }
 }

@@ -10,8 +10,8 @@
 
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::ptr::NonNull;
-use std::sync::atomic::Ordering::{Relaxed, SeqCst};
-use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release, SeqCst};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8};
 use std::sync::Arc;
 
 pub use rvm_core::Memory;
@@ -164,9 +164,9 @@ impl VmMemory {
     ///
     /// While a reference from [`bytes`](Self::bytes) or [`bytes_mut`](Self::bytes_mut) into the buffer is alive,
     /// neither another memory that maps it nor a [`SharedRegion`] over it may access it. Code on different threads may
-    /// only touch bytes another thread writes concurrently with atomics; guest stores, map helper writes and host
-    /// writes all count as plain stores, and host reads, including [`GuestMemory`] and [`SharedRegion`] copies, as
-    /// plain loads.
+    /// only touch bytes another thread writes concurrently with atomics, guest load-acquire and store-release among
+    /// them; other guest stores, map helper writes and host writes all count as plain stores, and host reads,
+    /// including [`GuestMemory`] and [`SharedRegion`] copies, as plain loads.
     pub unsafe fn map_shared(&mut self, idx: usize, buffer: Arc<SharedBuffer>, perms: Perms) -> u64 {
         // SAFETY: `self.shared[idx]` keeps the buffer alive until the region is replaced.
         let base = unsafe { self.map_host(idx, buffer.as_ptr(), buffer.len(), perms) };
@@ -303,6 +303,7 @@ pub struct GuestMemory<'a> {
 }
 
 impl<'a> GuestMemory<'a> {
+    /// The guest's view of `memory`.
     pub fn new(memory: &'a mut VmMemory) -> Self {
         Self { memory }
     }
@@ -381,10 +382,12 @@ impl SharedBuffer {
         Self { ptr, len }
     }
 
+    /// Start of the buffer, valid until the buffer is dropped.
     pub fn as_ptr(&self) -> NonNull<u8> {
         self.ptr
     }
 
+    /// Length in bytes.
     pub fn len(&self) -> usize {
         self.len
     }
@@ -580,6 +583,39 @@ macro_rules! guest_atomic {
     };
 }
 
+/// Guest load-acquire and store-release: real host atomics behind the same region and permission checks as plain
+/// loads and stores. Misaligned addresses fault, as they do for the read-modify-write atomics.
+macro_rules! guest_ordered {
+    ($load:ident, $store:ident, $ty:ty, $atomic:ident) => {
+        #[inline(always)]
+        fn $load(&self, addr: u64) -> Result<$ty, u64> {
+            let ptr = self
+                .guest_ptr(addr, size_of::<$ty>(), &self.read_end)
+                .ok_or(addr)?;
+            if !ptr.cast::<$ty>().is_aligned() {
+                return Err(addr);
+            }
+            // SAFETY: as `guest_atomic`.
+            let cell = unsafe { $atomic::from_ptr(ptr.as_ptr().cast()) };
+            Ok(<$ty>::from_le(cell.load(Acquire)))
+        }
+
+        #[inline(always)]
+        fn $store(&mut self, addr: u64, value: $ty) -> Result<(), u64> {
+            let ptr = self
+                .guest_ptr(addr, size_of::<$ty>(), &self.write_end)
+                .ok_or(addr)?;
+            if !ptr.cast::<$ty>().is_aligned() {
+                return Err(addr);
+            }
+            // SAFETY: as `guest_atomic`.
+            let cell = unsafe { $atomic::from_ptr(ptr.as_ptr().cast()) };
+            cell.store(value.to_le(), Release);
+            Ok(())
+        }
+    };
+}
+
 impl Memory for VmMemory {
     type Err = u64;
 
@@ -590,6 +626,11 @@ impl Memory for VmMemory {
 
     guest_atomic!(atomic_u32, u32, AtomicU32);
     guest_atomic!(atomic_u64, u64, AtomicU64);
+
+    guest_ordered!(load_acquire_u8, store_release_u8, u8, AtomicU8);
+    guest_ordered!(load_acquire_u16, store_release_u16, u16, AtomicU16);
+    guest_ordered!(load_acquire_u32, store_release_u32, u32, AtomicU32);
+    guest_ordered!(load_acquire_u64, store_release_u64, u64, AtomicU64);
 
     fn window(&self, addr: u64) -> Window {
         let idx = (addr >> REGION_SHIFT) as usize;

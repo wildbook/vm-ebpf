@@ -202,7 +202,7 @@ impl fmt::Display for ExecError {
 impl std::error::Error for ExecError {}
 
 /// Helper function errors.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum HelperError {
     /// Unknown helper ID.
     UnknownHelper(u32),
@@ -210,6 +210,12 @@ pub enum HelperError {
     UnknownSlot(u32),
     /// Helper returned an error.
     Failed(String),
+    /// A call into a function another plugin exports failed.
+    Plugin {
+        plugin: String,
+        func: String,
+        error: Box<VmError>,
+    },
 }
 
 impl fmt::Display for HelperError {
@@ -218,11 +224,19 @@ impl fmt::Display for HelperError {
             Self::UnknownHelper(id) => write!(f, "unknown helper: {id}"),
             Self::UnknownSlot(slot) => write!(f, "unknown extern slot: {slot}"),
             Self::Failed(msg) => write!(f, "helper failed: {msg}"),
+            Self::Plugin { plugin, func, error } => write!(f, "{plugin}::{func}: {error}"),
         }
     }
 }
 
-impl std::error::Error for HelperError {}
+impl std::error::Error for HelperError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Plugin { error, .. } => Some(&**error),
+            _ => None,
+        }
+    }
+}
 
 /// Guest memory access outside the mapped regions or their permissions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

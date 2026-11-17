@@ -5,7 +5,7 @@ use std::mem::ManuallyDrop;
 
 use rvm_core::{run, CallStack, Code, Context, Flow, Host, Memory};
 
-use crate::error::{ExecError, HelperError, Result};
+use crate::error::{ExecError, HelperError, Result, VmError};
 use crate::helper::{HelperArgs, HelperContext, HelperRegistry};
 use crate::layout::CODE_REGION;
 use crate::maps::Maps;
@@ -67,12 +67,15 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
         self.maps = Some(maps);
     }
 
-    /// Call the function at `pc` (instruction index) with `args` in r1-r5; returns r0.
+    /// Call the function at `pc` (instruction index) with `args` in r1-r5; returns r0. More than 5 arguments fail with
+    /// [`VmError::InvalidArgument`].
     pub fn call(&mut self, pc: u64, args: &[u64]) -> Result<u64> {
-        let mut ctx = Context::new(&mut *self.memory);
-        for (i, &arg) in args.iter().take(5).enumerate() {
-            ctx.regs[i + 1] = arg;
+        if args.len() > 5 {
+            let msg = format!("{} arguments, but eBPF functions take at most 5", args.len());
+            return Err(VmError::InvalidArgument(msg));
         }
+        let mut ctx = Context::new(&mut *self.memory);
+        ctx.regs[1..=args.len()].copy_from_slice(args);
         ctx.regs[10] = self.stack_top;
 
         let helpers = Helpers {
@@ -221,7 +224,7 @@ mod tests {
     use ebpf_asm::{Assembler, R0, R1, R10, R2, R6, R7};
 
     use super::*;
-    use crate::error::{MemoryError, VmError};
+    use crate::error::MemoryError;
     use crate::memory::{GuestMemory, Perms};
 
     fn run(asm: &mut Assembler, args: &[u64]) -> Result<u64> {
@@ -242,8 +245,8 @@ mod tests {
     #[test]
     fn test_instruction_limit() {
         let mut asm = Assembler::new();
-        let mut loop_label = asm.create_label();
-        asm.set_label(&mut loop_label).unwrap();
+        let loop_label = asm.create_label();
+        asm.set_label(&loop_label).unwrap();
         asm.ja(&loop_label);
         let result = run_with(&mut asm, &[], |executor| executor.set_instruction_limit(10));
         assert!(matches!(result, Err(VmError::Exec(ExecError::InstructionLimit(_)))));
@@ -256,11 +259,19 @@ mod tests {
         assert!(matches!(run(&mut asm, &[]), Err(VmError::Exec(ExecError::InvalidPc(1)))));
     }
 
+    /// Load-acquire writes its `dst`, and r10 is read-only.
+    #[test]
+    fn test_load_acquire_into_r10_faults() {
+        let mut asm = Assembler::new();
+        asm.mov64(R1, R10).load_acquire64(R10, R1, -8).exit();
+        assert!(matches!(run(&mut asm, &[]), Err(VmError::Exec(ExecError::CpuFault))));
+    }
+
     #[test]
     fn test_stack_overflow_deep_recursion() {
         let mut asm = Assembler::new();
-        let mut func_start = asm.create_label();
-        asm.set_label(&mut func_start).unwrap();
+        let func_start = asm.create_label();
+        asm.set_label(&func_start).unwrap();
         asm.call_local(&func_start);
         asm.exit();
         assert!(matches!(run(&mut asm, &[]), Err(VmError::Exec(ExecError::StackOverflow))));
@@ -269,7 +280,7 @@ mod tests {
     #[test]
     fn test_callee_saved_registers_survive_a_local_call() {
         let mut asm = Assembler::new();
-        let mut callee = asm.create_label();
+        let callee = asm.create_label();
 
         asm.mov64_imm(R6, 100);
         asm.mov64_imm(R7, 200);
@@ -278,7 +289,7 @@ mod tests {
         asm.add64(R0, R7);
         asm.exit();
 
-        asm.set_label(&mut callee).unwrap();
+        asm.set_label(&callee).unwrap();
         asm.mov64_imm(R6, 0);
         asm.mov64_imm(R7, 0);
         asm.exit();

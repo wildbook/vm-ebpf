@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rvm::{LinkError, Vm, VmError, WeakPlugin};
+use rvm::{LinkError, Program, Vm, VmError, WeakPlugin};
 
 use crate::common::object;
 
@@ -25,7 +25,7 @@ fn plugin_calls_export_and_survives_reload() {
     assert_eq!(a.call_func(scale, &[5]).unwrap(), a.call("a_scale", &[5]).unwrap());
 
     // Replacing A's code is picked up by B's next call without relinking B.
-    a.replace(vm.load_elf(&object("plugin_a3.o")).unwrap());
+    a.replace(vm.load_elf(&object("plugin_a3.o")).unwrap()).unwrap();
     assert_eq!(b.call("b_run", &[5]).unwrap(), 16);
     // A handle into the replaced program fails instead of running the new one at its pc.
     assert!(matches!(a.call_func(scale, &[5]), Err(VmError::InvalidArgument(_))));
@@ -38,37 +38,42 @@ fn named_func_follows_replace() {
     let scale = a.named_func("a_scale").unwrap();
     assert_eq!(scale.call(&[5]).unwrap(), 10);
 
-    a.replace(vm.load_elf(&object("plugin_a3.o")).unwrap());
+    a.replace(vm.load_elf(&object("plugin_a3.o")).unwrap()).unwrap();
     assert_eq!(scale.call(&[5]).unwrap(), 15);
 
     // A program without the function fails the call, and the handle recovers when a later program has it again.
-    a.replace(vm.load_elf(&object("maps.o")).unwrap());
+    a.replace(vm.load_elf(&object("maps.o")).unwrap()).unwrap();
     assert!(matches!(scale.call(&[5]), Err(VmError::FunctionNotFound(name)) if name == "a_scale"));
-    a.replace(vm.load_elf(&object("plugin_a.o")).unwrap());
+    a.replace(vm.load_elf(&object("plugin_a.o")).unwrap()).unwrap();
     assert_eq!(scale.call(&[5]).unwrap(), 10);
 }
 
 #[test]
-fn reentrant_call_fails_instead_of_deadlocking() {
+fn reentrant_call_and_replace_fail_instead_of_deadlocking() {
     let vm = Vm::new();
     let a = vm.load_plugin("a", &object("plugin_a.o")).unwrap();
     vm.export(&a, "a_scale").unwrap();
 
-    // host_reenter calls back into b while b is running. It holds b weakly: a strong handle inside the Vm's own helper
-    // table would never be freed.
+    // host_reenter calls back into b, and tries to replace it, while b is running. It holds b weakly: a strong handle
+    // inside the Vm's own helper table would never be freed.
     let b_slot: Arc<OnceLock<WeakPlugin>> = Arc::default();
-    let reentrant_busy = Arc::new(Mutex::new(false));
-    let (slot, busy) = (b_slot.clone(), reentrant_busy.clone());
+    let spare: Arc<Mutex<Option<Program>>> = Arc::default();
+    let busy = Arc::new(Mutex::new((false, false)));
+    let (slot, next, seen) = (b_slot.clone(), spare.clone(), busy.clone());
     vm.register_fn("host_reenter", move |x: u64| {
-        let result = slot.get().unwrap().upgrade().unwrap().call("b_run", &[x]);
-        *busy.lock().unwrap() = matches!(&result, Err(VmError::PluginBusy(n)) if n == "b");
-        result
+        let b = slot.get().unwrap().upgrade().unwrap();
+        let call = b.call("b_run", &[x]);
+        let replace = b.replace(next.lock().unwrap().take().unwrap());
+        let is_busy = |e: Option<&VmError>| matches!(e, Some(VmError::PluginBusy(n)) if n == "b");
+        *seen.lock().unwrap() = (is_busy(call.as_ref().err()), is_busy(replace.as_ref().err()));
+        call
     });
     let b = vm.load_plugin("b", &object("plugin_b.o")).unwrap();
-    b_slot.set(b.downgrade()).ok().unwrap();
+    b_slot.set(b.downgrade()).unwrap();
+    *spare.lock().unwrap() = Some(vm.load_elf(&object("plugin_b.o")).unwrap());
 
     assert_eq!(b.call("b_reenter", &[5]).unwrap(), u64::MAX);
-    assert!(*reentrant_busy.lock().unwrap());
+    assert_eq!(*busy.lock().unwrap(), (true, true));
     assert_eq!(b.call("b_run", &[5]).unwrap(), 11);
 }
 
@@ -127,6 +132,46 @@ fn shared_region_is_visible_to_every_plugin() {
     assert_eq!(rw.read::<u64>(8).unwrap(), 42);
 
     assert!(matches!(x.call("put", &[ro.base(), 1]).unwrap_err(), VmError::Exec(rvm::ExecError::MemoryFault(_))));
+}
+
+/// Two plugins on two threads pass messages through a shared region (bpf/acq_rel.c): the producer writes a payload and
+/// publishes it with store-release, the consumer reads it after a load-acquire and acknowledges it the same way.
+/// Acquire and release accesses that aren't aligned fault.
+#[test]
+fn shared_region_acquire_release() {
+    const N: u64 = 2_000;
+    const WORDS: u64 = 6;
+    let vm = Vm::new();
+    // SAFETY: each plugin touches the payload only after a load-acquire shows the other one is done with it.
+    let region = unsafe { vm.share_region(rvm::FIRST_FREE_REGION, 128, rvm::Perms::RW) }.unwrap();
+    let [producer, consumer] = ["x", "y"].map(|name| vm.load_plugin(name, &object("acq_rel.o")).unwrap());
+    let mailbox = region.base();
+
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            for n in 1..=N {
+                while producer.call("publish", &[mailbox, n]).unwrap() == 0 {
+                    std::hint::spin_loop();
+                }
+            }
+        });
+        for n in 1..=N {
+            let sum = loop {
+                match consumer.call("consume", &[mailbox, n]).unwrap() {
+                    0 => std::hint::spin_loop(),
+                    sum => break sum,
+                }
+            };
+            assert_eq!(sum, n * WORDS * WORDS + WORDS * (WORDS - 1) / 2, "message {n}");
+        }
+    });
+
+    let scratch = mailbox + 64;
+    let misaligned: [(&str, &[u64]); 2] = [("load_u64", &[scratch + 4]), ("store_u16", &[scratch + 1, 7])];
+    for (func, args) in misaligned {
+        let err = consumer.call(func, args).unwrap_err();
+        assert!(matches!(err, VmError::Exec(rvm::ExecError::MemoryFault(_))), "{func}: {err}");
+    }
 }
 
 /// Buffers tagged `borrow`/`borrow_ro` cross plugins for the duration of a call.

@@ -31,8 +31,11 @@ pub struct FunctionInfo {
 /// length in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Borrow {
+    /// Index of the pointer parameter, 0 for r1.
     pub arg: u8,
+    /// Index of the parameter that holds the length.
     pub len_arg: u8,
+    /// Whether the callee may write the buffer (`borrow`) or only read it (`borrow_ro`).
     pub writable: bool,
 }
 
@@ -118,7 +121,7 @@ impl Program {
             helpers_version,
             #[cfg(feature = "fuel")]
             instruction_limit: config.instruction_limit,
-            frame_size: config.frame_size as u64,
+            frame_size: config.frame_size,
         }
     }
 
@@ -163,14 +166,27 @@ impl Program {
     /// The function called `name`, for [`Program::call_func`].
     #[inline]
     pub fn func(&self, name: &str) -> Result<Func> {
-        let info = self
-            .functions
-            .get(name)
+        let (func, _) = self
+            .func_with_info(name)
             .ok_or_else(|| VmError::FunctionNotFound(name.to_string()))?;
-        Ok(Func {
+        Ok(func)
+    }
+
+    /// The function called `name` and its table entry.
+    #[inline]
+    pub(crate) fn func_with_info(&self, name: &str) -> Option<(Func, &FunctionInfo)> {
+        let info = self.functions.get(name)?;
+        let func = Func {
             program: self.id,
             pc: info.pc,
-        })
+        };
+        Some((func, info))
+    }
+
+    /// Whether `func` was looked up in this program.
+    #[inline]
+    pub(crate) fn owns(&self, func: Func) -> bool {
+        func.program == self.id
     }
 
     /// Call a function looked up with [`Program::func`]; arguments go in r1-r5.
@@ -178,7 +194,7 @@ impl Program {
     /// A handle from another program fails with [`VmError::InvalidArgument`].
     #[inline]
     pub fn call_func(&mut self, func: Func, args: &[u64]) -> Result<u64> {
-        if func.program != self.id {
+        if !self.owns(func) {
             let msg = "function handle belongs to another program; look the function up again";
             return Err(VmError::InvalidArgument(msg.to_string()));
         }

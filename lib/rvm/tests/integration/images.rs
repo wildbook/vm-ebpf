@@ -91,7 +91,7 @@ fn plugins_from_images() {
     let b = vm.load_plugin_image("b", &b_image).unwrap();
     assert_eq!(b.call("b_run", &[5]).unwrap(), 11);
 
-    a.replace(vm.load_image(&image("plugin_a3.o")).unwrap());
+    a.replace(vm.load_image(&image("plugin_a3.o")).unwrap()).unwrap();
     assert_eq!(b.call("b_run", &[5]).unwrap(), 16);
 
     // a VM without the export can't bind b's import

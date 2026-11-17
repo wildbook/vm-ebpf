@@ -26,8 +26,9 @@ pub struct VmConfig {
     /// Maximum number of instructions to execute (0 = no limit).
     #[cfg(feature = "fuel")]
     pub instruction_limit: u64,
-    /// Stack bytes reserved per call frame.
-    pub frame_size: usize,
+    /// Stack bytes reserved per call frame. Loading fails with [`VmError::InvalidArgument`] if the stack for
+    /// [`MAX_CALL_DEPTH`](crate::MAX_CALL_DEPTH) nested calls exceeds [`MAX_REGION_LEN`] bytes.
+    pub frame_size: u64,
 }
 
 impl Default for VmConfig {
@@ -35,7 +36,7 @@ impl Default for VmConfig {
         Self {
             #[cfg(feature = "fuel")]
             instruction_limit: 1_000_000,
-            frame_size: DEFAULT_FRAME_SIZE as usize,
+            frame_size: DEFAULT_FRAME_SIZE,
         }
     }
 }
@@ -97,13 +98,13 @@ impl Vm {
     ///
     /// ```ignore
     /// // Single argument
-    /// vm.register_helper(1, |x: u64| x * 2);
+    /// vm.register_helper(100, |x: u64| x * 2);
     ///
     /// // Multiple arguments
-    /// vm.register_helper(2, |(a, b): (u64, u64)| a + b);
+    /// vm.register_helper(101, |(a, b): (u64, u64)| a + b);
     ///
     /// // No arguments
-    /// vm.register_helper(3, |_: ()| 42u64);
+    /// vm.register_helper(102, |_: ()| 42u64);
     /// ```
     pub fn register_helper<F, A, R>(&self, id: u32, func: F)
     where
@@ -184,9 +185,15 @@ impl Vm {
     /// As [`VmMemory::map_shared`](crate::VmMemory::map_shared), for every program linked afterwards.
     pub unsafe fn share_region(&self, region: usize, len: usize, perms: Perms) -> Result<SharedRegion> {
         let mut regions = self.shared_regions.lock().unwrap_or_else(|e| e.into_inner());
-        let usable = (FIRST_FREE_REGION..BORROW_FIRST_REGION).contains(&region);
-        if !usable || regions.iter().any(|r| r.region() == region) || len == 0 || len > MAX_REGION_LEN {
-            return Err(VmError::InvalidArgument(format!("cannot share region {region} with {len} bytes")));
+        let invalid = |msg: String| Err(VmError::InvalidArgument(msg));
+        if !(FIRST_FREE_REGION..BORROW_FIRST_REGION).contains(&region) {
+            return invalid(format!("region {region} is outside {FIRST_FREE_REGION}..{BORROW_FIRST_REGION}"));
+        }
+        if regions.iter().any(|r| r.region() == region) {
+            return invalid(format!("region {region} is already shared"));
+        }
+        if len == 0 || len > MAX_REGION_LEN {
+            return invalid(format!("region length {len} is not in 1..={MAX_REGION_LEN}"));
         }
         let buffer = Arc::new(SharedBuffer::new(len));
         // SAFETY: the VM only maps its own handle and never reads or writes through it.
@@ -224,10 +231,7 @@ impl Vm {
     /// Programs linked afterwards can import it; programs that already import it pick up the new target at their next
     /// call.
     pub fn export(&self, plugin: &Plugin, func: &str) -> Result<()> {
-        if plugin.lock()?.function(func).is_none() {
-            return Err(VmError::FunctionNotFound(format!("{}::{func}", plugin.name())));
-        }
-        let helper = plugin.export_fn(func);
+        let helper = plugin.export_fn(func)?;
         self.helpers.update(|h| h.register_fn_raw(func, helper));
         Ok(())
     }

@@ -1,10 +1,16 @@
 //! Standard map helpers (`map_lookup_elem`, `map_update_elem`, `map_delete_elem`).
+//!
+//! Keys and values come from guest pointers, read with the guest's own permissions, so a helper reads no memory the
+//! program couldn't load from itself.
 
 use crate::helper::{HelperContext, HelperRegistry};
+use crate::memory::{Perms, VmMemory};
 
-/// Standard helper IDs bound to the built-in map implementation.
+/// Helper ID of `void *map_lookup_elem(void *map, const void *key)`.
 pub const BPF_FUNC_MAP_LOOKUP_ELEM: u32 = 1;
+/// Helper ID of `long map_update_elem(void *map, const void *key, const void *value, u64 flags)`.
 pub const BPF_FUNC_MAP_UPDATE_ELEM: u32 = 2;
+/// Helper ID of `long map_delete_elem(void *map, const void *key)`.
 pub const BPF_FUNC_MAP_DELETE_ELEM: u32 = 3;
 
 pub const ENOENT: i64 = 2;
@@ -34,7 +40,7 @@ fn lookup_elem(ctx: &mut HelperContext) -> i64 {
     let Some(def) = maps.def(handle) else {
         return 0;
     };
-    let Ok(key) = ctx.memory.bytes(ctx.args.r2, def.key_size as usize) else {
+    let Some(key) = readable(ctx.memory, ctx.args.r2, def.key_size as usize) else {
         return 0;
     };
     maps.lookup(handle, key).unwrap_or(0) as i64
@@ -51,10 +57,10 @@ fn update_elem(ctx: &mut HelperContext) -> i64 {
     let (key_size, value_size) = (def.key_size as usize, def.value_size as usize);
 
     // check the value before inserting the key, so a bad pointer changes nothing
-    if ctx.memory.bytes(ctx.args.r3, value_size).is_err() {
+    if readable(ctx.memory, ctx.args.r3, value_size).is_none() {
         return -EINVAL;
     }
-    let Ok(key) = ctx.memory.bytes(ctx.args.r2, key_size) else {
+    let Some(key) = readable(ctx.memory, ctx.args.r2, key_size) else {
         return -EINVAL;
     };
     let addr = match maps.upsert(handle, key, ctx.args.r4) {
@@ -76,7 +82,7 @@ fn delete_elem(ctx: &mut HelperContext) -> i64 {
         return -EINVAL;
     };
     let value_size = def.value_size as usize;
-    let Ok(key) = ctx.memory.bytes(ctx.args.r2, def.key_size as usize) else {
+    let Some(key) = readable(ctx.memory, ctx.args.r2, def.key_size as usize) else {
         return -EINVAL;
     };
     match maps.remove(handle, key) {
@@ -89,4 +95,11 @@ fn delete_elem(ctx: &mut HelperContext) -> i64 {
         }
         Err(e) => -e.errno(),
     }
+}
+
+/// `len` bytes at guest address `addr`, if the guest may read them.
+fn readable(memory: &VmMemory, addr: u64, len: usize) -> Option<&[u8]> {
+    let ptr = memory.host_ptr(addr, len, Perms::R).ok()?;
+    // SAFETY: `host_ptr` checked that the range lies inside a live region, which the borrow of `memory` keeps mapped.
+    Some(unsafe { std::slice::from_raw_parts(ptr.as_ptr(), len) })
 }

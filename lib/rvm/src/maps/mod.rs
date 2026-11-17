@@ -36,9 +36,11 @@ pub use helpers::{register_helpers, BPF_FUNC_MAP_DELETE_ELEM, BPF_FUNC_MAP_LOOKU
 use shared::{read, write};
 pub use shared::{SharedMap, SharedMaps};
 
-/// `map_update_elem` flags.
+/// `map_update_elem` flag: insert the key or replace its value.
 pub const BPF_ANY: u64 = 0;
+/// `map_update_elem` flag: insert the key only if it is absent.
 pub const BPF_NOEXIST: u64 = 1;
+/// `map_update_elem` flag: replace the value only if the key is present.
 pub const BPF_EXIST: u64 = 2;
 
 const CACHE_LINE: u64 = 64;
@@ -212,7 +214,8 @@ impl Maps {
 }
 
 impl<'a> MapRef<'a> {
-    pub fn new(maps: &'a mut Maps, memory: &'a mut VmMemory, handle: u32) -> Self {
+    /// `handle` must be a map in `maps`, whose slots `memory` maps.
+    pub(crate) fn new(maps: &'a mut Maps, memory: &'a mut VmMemory, handle: u32) -> Self {
         Self { maps, memory, handle }
     }
 

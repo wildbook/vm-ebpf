@@ -24,9 +24,9 @@ fn load_bytes(bytes: &[u8]) -> (Code, VmMemory, u64) {
 /// r0 += r1 * 3 ^ r1, N times: pure ALU + one conditional branch per iteration.
 fn alu_loop() -> Assembler {
     let mut asm = Assembler::new();
-    let mut top = asm.create_label();
+    let top = asm.create_label();
     asm.mov64_imm(R0, 0).mov64_imm(R1, 0);
-    asm.set_label(&mut top).unwrap();
+    asm.set_label(&top).unwrap();
     asm.mov64(R2, R1)
         .mul64_imm(R2, 3)
         .xor64(R2, R1)
@@ -40,9 +40,9 @@ fn alu_loop() -> Assembler {
 /// Store then load a stack slot each iteration: two memory accesses per iteration.
 fn mem_loop() -> Assembler {
     let mut asm = Assembler::new();
-    let mut top = asm.create_label();
+    let top = asm.create_label();
     asm.mov64_imm(R0, 0).mov64_imm(R1, 0);
-    asm.set_label(&mut top).unwrap();
+    asm.set_label(&top).unwrap();
     asm.stxdw(R10, -8, R1).ldxdw(R2, R10, -8).add64(R0, R2).add64_imm(R1, 1);
     asm.jlt_imm(R1, N, &top);
     asm.exit();
@@ -52,9 +52,9 @@ fn mem_loop() -> Assembler {
 /// Call helper 1 (identity) each iteration; r6 is the callee-saved counter.
 fn helper_loop() -> Assembler {
     let mut asm = Assembler::new();
-    let mut top = asm.create_label();
+    let top = asm.create_label();
     asm.mov64_imm(R0, 0).mov64_imm(R6, 0);
-    asm.set_label(&mut top).unwrap();
+    asm.set_label(&top).unwrap();
     asm.mov64(R1, R6).call(1).add64_imm(R6, 1);
     asm.jlt_imm(R6, N, &top);
     asm.exit();

@@ -75,3 +75,14 @@ fn replacing_extern_rebinds_linked_calls() {
     vm.register_fn("host_add", |(a, b): (u64, u64)| a * b);
     assert_eq!(program.call("run", &[7]).unwrap(), 21 * 14);
 }
+
+/// A global in one module named like a map in another stays a global.
+#[test]
+fn global_named_like_a_map_is_data() {
+    let vm = Vm::new();
+    let counter = vm.parse_module("counter", &object("shared_counter.o")).unwrap();
+    let global = vm.parse_module("global", &object("global_hits.o")).unwrap();
+    let mut program = vm.link(&[&counter, &global]).unwrap();
+    assert_eq!(program.call("get", &[]).unwrap(), 5);
+    assert_eq!(program.call("bump", &[]).unwrap(), 1);
+}

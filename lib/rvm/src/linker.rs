@@ -297,8 +297,12 @@ fn apply_relocation(
         LinkError::InvalidReference(format!("symbol index {idx}"))
     })?;
 
-    // `lddw rX, map`: the guest gets the map's handle, its index in the image.
-    let map = image.maps.iter().position(|d| d.name == symbol.name);
+    // `lddw rX, map`: the guest gets the map's handle, its index in the image. Only a symbol in `.maps`, or an undefined
+    // one, names a map; a global of the same name in another module is plain data.
+    let in_maps = symbol
+        .section_idx
+        .is_none_or(|i| module.sections[i].kind == SectionKind::Maps);
+    let map = image.maps.iter().position(|d| in_maps && d.name == symbol.name);
     if let (reloc::bpf::BPF_64_64, Addr::Code(at), Some(handle)) = (reloc.rel_type, patch, map) {
         image.insn_mut(at)?[4..].copy_from_slice(&(handle as u32).to_le_bytes());
         image.insn_mut(at + 8)?[4..].copy_from_slice(&0u32.to_le_bytes());
@@ -410,7 +414,7 @@ fn apply_core_relocations_pass(
                 continue;
             };
 
-            let bytes = &mut image.code[at as usize..(at + section.size) as usize];
+            let bytes = &mut image.code[at as usize..][..section.size as usize];
             let mut insns: Vec<u64> = bytes
                 .as_chunks::<8>()
                 .0

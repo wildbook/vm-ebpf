@@ -1,4 +1,4 @@
-//! # rvm - Embeddable eBPF Runtime
+//! # rvm: embeddable eBPF runtime
 //!
 //! `rvm` is an embeddable eBPF virtual machine library for Rust.
 //!
@@ -10,8 +10,8 @@
 //! // Create a VM and register helpers
 //! let vm = Vm::new();
 //!
-//! // Register a helper function (type-safe)
-//! vm.register_helper(1, |x: u64| {
+//! // Register a helper function (type-safe); IDs 1 to 7 are the standard helpers
+//! vm.register_helper(100, |x: u64| {
 //!     println!("eBPF called helper with: {}", x);
 //!     x * 2
 //! });

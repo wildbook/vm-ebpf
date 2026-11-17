@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use crate::helper::{HelperContext, HelperRegistry};
 use crate::maps::{BPF_FUNC_MAP_DELETE_ELEM, BPF_FUNC_MAP_LOOKUP_ELEM, BPF_FUNC_MAP_UPDATE_ELEM};
-use crate::memory::VmMemory;
+use crate::memory::GuestMemory;
 
 /// `u64 bpf_ktime_get_ns(void)`
 pub const BPF_FUNC_KTIME_GET_NS: u32 = 5;
@@ -30,7 +30,7 @@ pub fn helper_name(id: u32) -> Option<&'static str> {
     })
 }
 
-/// Register `ktime_get_ns`: monotonic nanoseconds since the first call in this process.
+/// Register `ktime_get_ns`: monotonic nanoseconds since the first time any VM in this process registered it.
 pub fn register_time(helpers: &mut HelperRegistry) {
     static START: LazyLock<Instant> = LazyLock::new(Instant::now);
     let start = *START;
@@ -59,20 +59,22 @@ pub fn register_random(helpers: &mut HelperRegistry) {
 /// Register `trace_printk`, passing each formatted line to `sink`.
 ///
 /// Supports the kernel's conversions: `%d %i %u %x %X %p %c %s %%` with `l`/`ll` length modifiers, and up to three
-/// arguments. Returns the formatted length, or -EINVAL if the format string isn't readable.
+/// arguments. Returns the formatted length, or -EINVAL if the format string isn't readable. The format string and `%s`
+/// arguments are read with the guest's permissions.
 pub fn register_print(helpers: &mut HelperRegistry, sink: impl Fn(&str) + Send + Sync + 'static) {
     helpers.register_with_ctx(BPF_FUNC_TRACE_PRINTK, move |ctx: &mut HelperContext| -> i64 {
         const EINVAL: i64 = 22;
-        let Ok(fmt) = ctx.memory.bytes(ctx.args.r1, ctx.args.r2 as usize) else {
+        let mem = GuestMemory::new(ctx.memory);
+        let Ok(fmt) = mem.read_vec(ctx.args.r1, ctx.args.r2 as usize) else {
             return -EINVAL;
         };
-        let line = format(ctx.memory, fmt, [ctx.args.r3, ctx.args.r4, ctx.args.r5]);
+        let line = format(&mem, &fmt, [ctx.args.r3, ctx.args.r4, ctx.args.r5]);
         sink(line.trim_end_matches('\n'));
         line.len() as i64
     });
 }
 
-fn format(mem: &VmMemory, fmt: &[u8], args: [u64; 3]) -> String {
+fn format(mem: &GuestMemory, fmt: &[u8], args: [u64; 3]) -> String {
     let fmt = fmt.split(|&b| b == 0).next().unwrap_or_default();
     let mut args = args.into_iter();
     let mut out = String::new();
@@ -124,9 +126,9 @@ fn format(mem: &VmMemory, fmt: &[u8], args: [u64; 3]) -> String {
 }
 
 /// A NUL-terminated guest string, at most 256 bytes; unreadable bytes end it.
-fn guest_str(mem: &VmMemory, addr: u64) -> String {
+fn guest_str(mem: &GuestMemory, addr: u64) -> String {
     let bytes: Vec<u8> = (0..256)
-        .map_while(|i| mem.read::<u8>(addr + i).ok())
+        .map_while(|i| mem.read::<u8>(addr.wrapping_add(i)).ok())
         .take_while(|&b| b != 0)
         .collect();
     String::from_utf8_lossy(&bytes).into_owned()
