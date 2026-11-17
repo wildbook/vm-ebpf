@@ -414,17 +414,8 @@ fn apply_core_relocations_pass(
                 continue;
             };
 
-            let bytes = &mut image.code[at as usize..][..section.size as usize];
-            let mut insns: Vec<u64> = bytes
-                .as_chunks::<8>()
-                .0
-                .iter()
-                .map(|w| u64::from_le_bytes(*w))
-                .collect();
-            apply_core_relocations(&mut insns, btf, target, relos).map_err(LinkError::CoreRelo)?;
-            for (dst, insn) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(&insns) {
-                *dst = insn.to_le_bytes();
-            }
+            let (insns, _) = image.code[at as usize..][..section.size as usize].as_chunks_mut::<8>();
+            apply_core_relocations(insns, btf, target, relos).map_err(LinkError::CoreRelo)?;
         }
     }
     Ok(())

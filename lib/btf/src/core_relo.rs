@@ -1,236 +1,14 @@
-//! CO-RE (Compile Once - Run Everywhere) relocation support.
+//! CO-RE (Compile Once - Run Everywhere) relocation resolution.
 //!
-//! This module parses `.BTF.ext` sections and applies CO-RE relocations to eBPF instructions the way libbpf does
-//! against kernel BTF: the host's types are a "target" BTF, the eBPF program's own debug info is the "local" BTF, and a
-//! relocation's access string names a path through the local type that gets re-resolved against whichever matching type
-//! the target actually has.
+//! This module applies CO-RE relocations to eBPF instructions the way libbpf does against kernel BTF: the host's types
+//! are a "target" BTF, the eBPF program's own debug info is the "local" BTF, and a relocation's access string names a
+//! path through the local type that gets re-resolved against whichever matching type the target actually has.
 
-use crate::parse::{word, Btf, BtfError, MAX_RESOLVE_DEPTH};
+use crate::ext::{CoreRelo, CoreReloKind};
+use crate::parse::{Btf, MAX_RESOLVE_DEPTH};
+use crate::patch::patch_instruction;
 use crate::raw::{BtfKind, BTF_INT_SIGNED};
-use crate::strings::BtfStrings;
 use crate::types::{BtfTypeInfo, Member};
-
-/// CO-RE relocation kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u32)]
-pub enum CoreReloKind {
-    /// Field byte offset.
-    FieldByteOffset = 0,
-    /// Field byte size.
-    FieldByteSize = 1,
-    /// Field existence (0 or 1).
-    FieldExists = 2,
-    /// Field signedness (0 or 1).
-    FieldSigned = 3,
-    /// Field left shift for reading/writing.
-    FieldLShiftU64 = 4,
-    /// Field right shift for reading/writing.
-    FieldRShiftU64 = 5,
-    /// Type ID (local BTF).
-    TypeIdLocal = 6,
-    /// Type ID (target BTF).
-    TypeIdTarget = 7,
-    /// Type existence (0 or 1).
-    TypeExists = 8,
-    /// Type size.
-    TypeSize = 9,
-    /// Enum value existence.
-    EnumvalExists = 10,
-    /// Enum value.
-    EnumvalValue = 11,
-    /// Type matches (0 or 1).
-    TypeMatches = 12,
-}
-
-impl CoreReloKind {
-    /// Parse from raw value.
-    pub fn from_u32(val: u32) -> Option<Self> {
-        match val {
-            0 => Some(Self::FieldByteOffset),
-            1 => Some(Self::FieldByteSize),
-            2 => Some(Self::FieldExists),
-            3 => Some(Self::FieldSigned),
-            4 => Some(Self::FieldLShiftU64),
-            5 => Some(Self::FieldRShiftU64),
-            6 => Some(Self::TypeIdLocal),
-            7 => Some(Self::TypeIdTarget),
-            8 => Some(Self::TypeExists),
-            9 => Some(Self::TypeSize),
-            10 => Some(Self::EnumvalExists),
-            11 => Some(Self::EnumvalValue),
-            12 => Some(Self::TypeMatches),
-            _ => None,
-        }
-    }
-
-    /// Check if this is a field-based relocation.
-    pub fn is_field_relo(self) -> bool {
-        matches!(
-            self,
-            Self::FieldByteOffset
-                | Self::FieldByteSize
-                | Self::FieldExists
-                | Self::FieldSigned
-                | Self::FieldLShiftU64
-                | Self::FieldRShiftU64
-        )
-    }
-
-    /// Check if this is a type-based relocation.
-    pub fn is_type_relo(self) -> bool {
-        matches!(self, Self::TypeIdLocal | Self::TypeIdTarget | Self::TypeExists | Self::TypeSize | Self::TypeMatches)
-    }
-
-    /// Check if this is an enum-based relocation.
-    pub fn is_enum_relo(self) -> bool {
-        matches!(self, Self::EnumvalExists | Self::EnumvalValue)
-    }
-}
-
-/// A single CO-RE relocation entry.
-#[derive(Debug, Clone)]
-pub struct CoreRelo {
-    /// Instruction offset (in bytes from section start).
-    pub insn_off: u32,
-    /// BTF type ID in the local (program) BTF.
-    pub type_id: u32,
-    /// Access string offset in BTF strings.
-    pub access_str_off: u32,
-    /// Relocation kind.
-    pub kind: CoreReloKind,
-}
-
-impl CoreRelo {
-    pub const SIZE: usize = 16;
-
-    /// Parse from bytes. Fails on a relocation kind this crate doesn't know, since skipping it would leave the
-    /// instruction with its compile-time value.
-    pub fn parse(data: &[u8]) -> Result<Self, BtfError> {
-        if data.len() < Self::SIZE {
-            return Err(BtfError::TooShort);
-        }
-        let raw_kind = word(data, 3);
-        let kind = CoreReloKind::from_u32(raw_kind).ok_or(BtfError::UnknownReloKind(raw_kind))?;
-
-        Ok(Self {
-            insn_off: word(data, 0),
-            type_id: word(data, 1),
-            access_str_off: word(data, 2),
-            kind,
-        })
-    }
-}
-
-/// Minimum size of a `.BTF.ext` header: magic, version, flags, hdr_len, and the (unused) func_info/line_info
-/// offset/length fields.
-const BTF_EXT_HDR_MIN_SIZE: usize = 24;
-/// Header size once the (optional, added later) CO-RE relocation fields are present.
-const BTF_EXT_HDR_SIZE_WITH_CORE: usize = 32;
-
-/// CO-RE relocations for a specific section.
-#[derive(Debug, Clone)]
-pub struct SectionCoreRelos<'a> {
-    /// Section name.
-    pub section_name: &'a str,
-    /// Relocations for this section.
-    pub relos: Vec<CoreRelo>,
-}
-
-/// Parsed BTF.ext data.
-#[derive(Debug, Clone)]
-pub struct BtfExt<'a> {
-    /// CO-RE relocations grouped by section.
-    pub core_relos: Vec<SectionCoreRelos<'a>>,
-}
-
-impl<'a> BtfExt<'a> {
-    /// Parse BTF.ext from raw bytes.
-    ///
-    /// Requires the BTF strings table for resolving section names.
-    pub fn parse(data: &'a [u8], strings: &BtfStrings<'a>) -> Result<Self, BtfError> {
-        if data.len() < BTF_EXT_HDR_MIN_SIZE {
-            return Err(BtfError::TooShort);
-        }
-        let magic = u16::from_le_bytes([data[0], data[1]]);
-        if magic != crate::raw::BTF_MAGIC {
-            return Err(BtfError::BadMagic(magic));
-        }
-        let hdr_len = word(data, 1) as usize;
-
-        // older headers end before the CO-RE relocation fields
-        let (core_relo_off, core_relo_len) =
-            if hdr_len >= BTF_EXT_HDR_SIZE_WITH_CORE && data.len() >= BTF_EXT_HDR_SIZE_WITH_CORE {
-                (word(data, 6), word(data, 7))
-            } else {
-                (0, 0)
-            };
-
-        let core_relos = if core_relo_len > 0 {
-            Self::parse_core_relos(data, hdr_len, core_relo_off, core_relo_len, strings)?
-        } else {
-            Vec::new()
-        };
-
-        Ok(Self { core_relos })
-    }
-
-    fn parse_core_relos(
-        data: &'a [u8],
-        hdr_len: usize,
-        core_relo_off: u32,
-        core_relo_len: u32,
-        strings: &BtfStrings<'a>,
-    ) -> Result<Vec<SectionCoreRelos<'a>>, BtfError> {
-        let start = hdr_len + core_relo_off as usize;
-        if core_relo_len as usize > data.len().saturating_sub(start) || start >= data.len() {
-            return Err(BtfError::SectionOverflow);
-        }
-
-        let relo_data = &data[start..][..core_relo_len as usize];
-        if relo_data.len() < 4 {
-            return Ok(Vec::new());
-        }
-
-        // First 4 bytes: record size
-        let rec_size = word(relo_data, 0) as usize;
-        if rec_size < CoreRelo::SIZE {
-            return Err(BtfError::InvalidType(0));
-        }
-
-        let mut offset = 4;
-        let mut sections = Vec::new();
-
-        while offset + 8 <= relo_data.len() {
-            // Section header: sec_name_off (4) + num_info (4)
-            let sec_name_off = u32::from_le_bytes(relo_data[offset..][..4].try_into().unwrap());
-            let num_info = u32::from_le_bytes(relo_data[offset + 4..][..4].try_into().unwrap());
-            offset += 8;
-
-            let section_name = strings.get_or_empty(sec_name_off);
-            let records = (num_info as usize)
-                .checked_mul(rec_size)
-                .filter(|&len| len <= relo_data.len() - offset)
-                .ok_or(BtfError::SectionOverflow)?;
-            let relos = relo_data[offset..][..records]
-                .chunks_exact(rec_size)
-                .map(CoreRelo::parse)
-                .collect::<Result<_, _>>()?;
-            offset += records;
-
-            sections.push(SectionCoreRelos { section_name, relos });
-        }
-
-        Ok(sections)
-    }
-
-    /// Get CO-RE relocations for a specific section.
-    pub fn relos_for_section(&self, section_name: &str) -> Option<&[CoreRelo]> {
-        self.core_relos
-            .iter()
-            .find(|s| s.section_name == section_name)
-            .map(|s| s.relos.as_slice())
-    }
-}
 
 /// Error during CO-RE relocation application.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,10 +78,6 @@ impl core::fmt::Display for CoreReloError {
 
 impl std::error::Error for CoreReloError {}
 
-/// Helper ID that unresolved relocations call, as in libbpf: running such an instruction must fail, while a program
-/// that never reaches it still works.
-pub const CORE_POISON_HELPER: u32 = 0xbad2310;
-
 /// A relocation whose instruction was poisoned: either the target BTF had nothing matching the local type (and field,
 /// for field relocations), or a matching field had an incompatible type or size. The program still loads; only running
 /// the instruction fails.
@@ -318,7 +92,7 @@ pub struct Unresolved {
 /// Apply CO-RE relocations to eBPF instructions, resolving `local`'s access paths against the matching types in
 /// `target` (the host's types), exactly as libbpf resolves a BPF program's debug BTF against the kernel's BTF.
 pub fn apply_core_relocations(
-    instructions: &mut [u64],
+    insns: &mut [[u8; 8]],
     local: &Btf<'_>,
     target: &Btf<'_>,
     relos: &[CoreRelo],
@@ -326,7 +100,7 @@ pub fn apply_core_relocations(
     let mut unresolved = Vec::new();
     for relo in relos {
         let res = resolve_relocation(local, target, relo)?;
-        if patch_instruction(instructions, relo, &res)? {
+        if patch_instruction(insns, relo, &res)? {
             let access_str = local.strings().get(relo.access_str_off).unwrap_or("");
             let type_name = local.type_by_id(relo.type_id).and_then(BtfTypeInfo::name).unwrap_or("");
             let (type_name, access_str) = (type_name.to_string(), access_str.to_string());
@@ -346,21 +120,21 @@ pub fn apply_core_relocations(
 
 /// The two values and flags a relocation resolves to, mirroring libbpf's `bpf_core_relo_res`: `orig_val` is what the
 /// instruction should already encode (given `local`), `new_val` is what it gets patched to (given `target`).
-struct ResolvedRelo {
-    orig_val: u64,
-    new_val: u64,
+pub struct ResolvedRelo {
+    pub orig_val: u64,
+    pub new_val: u64,
     /// The field, type, or enum value this relocation refers to doesn't exist in `target`, so the instruction is
     /// poisoned instead of patched.
-    poison: bool,
+    pub poison: bool,
     /// The field's size changed in a way a memory access can't be adjusted for (libbpf's `fail_memsz_adjust`). Only a
     /// load or store is poisoned for this; an instruction that only computes the offset is patched as usual.
-    fail_memsz_adjust: bool,
+    pub fail_memsz_adjust: bool,
     /// Whether `orig_val` must match what's already encoded in the instruction.
-    validate: bool,
+    pub validate: bool,
     /// For `FieldByteOffset`, the memory access size (and its BTF type) implied by `local`.
-    orig_sz: Option<u32>,
+    pub orig_sz: Option<u32>,
     /// Same, implied by whichever target candidate matched.
-    new_sz: Option<u32>,
+    pub new_sz: Option<u32>,
 }
 
 /// Relocations that resolve to "does it exist" patch to `0` when nothing in `target` matches, rather than poisoning the
@@ -464,151 +238,6 @@ fn resolve_relocation(local: &Btf<'_>, target: &Btf<'_>, relo: &CoreRelo) -> Res
 
 fn is_unsigned_int(t: &BtfTypeInfo<'_>) -> bool {
     matches!(t, BtfTypeInfo::Int { encoding, .. } if encoding & BTF_INT_SIGNED == 0)
-}
-
-/// Patch the relocated value into an instruction, as libbpf's `bpf_core_patch_insn` does. Returns whether the
-/// instruction was poisoned instead (for the caller's `Unresolved` list).
-fn patch_instruction(instructions: &mut [u64], relo: &CoreRelo, res: &ResolvedRelo) -> Result<bool, CoreReloError> {
-    const CLASS_MASK: u8 = 0x07;
-    const ALU: u8 = 0x04;
-    const ALU64: u8 = 0x07;
-    const LDX: u8 = 0x01;
-    const ST: u8 = 0x02;
-    const STX: u8 = 0x03;
-    const LD: u8 = 0x00;
-    const BPF_SRC_X: u8 = 0x08;
-    const BPF_LD_IMM64: u8 = 0x18;
-    const IMM_MASK: u64 = 0xFFFF_FFFF_0000_0000;
-    const OFF_MASK: u64 = 0x0000_0000_FFFF_0000;
-    const SRC_REG_MASK: u64 = 0x0000_0000_0000_F000;
-
-    if relo.insn_off % 8 != 0 {
-        return Err(CoreReloError::InstructionOutOfBounds(relo.insn_off));
-    }
-    let idx = (relo.insn_off / 8) as usize;
-    let insn = *instructions
-        .get(idx)
-        .ok_or(CoreReloError::InstructionOutOfBounds(relo.insn_off))?;
-    let opcode = insn as u8;
-
-    match opcode & CLASS_MASK {
-        ALU | ALU64 => {
-            if opcode & BPF_SRC_X != 0 {
-                return Err(CoreReloError::UnpatchableInstruction(relo.insn_off));
-            }
-            if res.poison {
-                poison_insn(instructions, idx, 1);
-                return Ok(true);
-            }
-            let imm = i64::from((insn >> 32) as u32 as i32) as u64;
-            if res.validate && imm != res.orig_val {
-                return Err(CoreReloError::UnexpectedValue {
-                    insn_off: relo.insn_off,
-                    expected: res.orig_val,
-                    found: imm,
-                });
-            }
-            instructions[idx] = (insn & !IMM_MASK) | (u64::from(res.new_val as u32) << 32);
-            Ok(false)
-        }
-        LDX | ST | STX => {
-            if res.poison {
-                poison_insn(instructions, idx, 1);
-                return Ok(true);
-            }
-            let off = i64::from((insn >> 16) as u16 as i16) as u64;
-            if res.validate && off != res.orig_val {
-                return Err(CoreReloError::UnexpectedValue {
-                    insn_off: relo.insn_off,
-                    expected: res.orig_val,
-                    found: off,
-                });
-            }
-            if res.new_val > i16::MAX as u64 {
-                return Err(CoreReloError::OffsetTooLarge {
-                    insn_off: relo.insn_off,
-                    value: res.new_val,
-                });
-            }
-            if res.fail_memsz_adjust {
-                poison_insn(instructions, idx, 1);
-                return Ok(true);
-            }
-            instructions[idx] = (insn & !OFF_MASK) | (res.new_val << 16);
-
-            if res.new_sz != res.orig_sz {
-                let (Some(orig_sz), Some(new_sz)) = (res.orig_sz, res.new_sz) else {
-                    return Err(CoreReloError::UnpatchableInstruction(relo.insn_off));
-                };
-                let encoded_sz = mem_size_bytes(opcode).ok_or(CoreReloError::UnpatchableInstruction(relo.insn_off))?;
-                if encoded_sz != orig_sz {
-                    return Err(CoreReloError::UnexpectedValue {
-                        insn_off: relo.insn_off,
-                        expected: u64::from(orig_sz),
-                        found: u64::from(encoded_sz),
-                    });
-                }
-                let new_mode_size =
-                    bytes_to_mem_size(new_sz).ok_or(CoreReloError::UnpatchableInstruction(relo.insn_off))?;
-                let new_opcode = (opcode & 0xE0) | new_mode_size | (opcode & CLASS_MASK);
-                instructions[idx] = (instructions[idx] & !0xFF) | u64::from(new_opcode);
-            }
-            Ok(false)
-        }
-        LD => {
-            let hi = *instructions
-                .get(idx + 1)
-                .ok_or(CoreReloError::InstructionOutOfBounds(relo.insn_off + 8))?;
-            let well_formed =
-                opcode == BPF_LD_IMM64 && insn & SRC_REG_MASK == 0 && insn & OFF_MASK == 0 && hi & 0xFFFF_FFFF == 0;
-            if !well_formed {
-                return Err(CoreReloError::UnpatchableInstruction(relo.insn_off));
-            }
-            if res.poison {
-                poison_insn(instructions, idx, 2);
-                return Ok(true);
-            }
-            let imm = (insn >> 32) | ((hi >> 32) << 32);
-            if res.validate && imm != res.orig_val {
-                return Err(CoreReloError::UnexpectedValue {
-                    insn_off: relo.insn_off,
-                    expected: res.orig_val,
-                    found: imm,
-                });
-            }
-            instructions[idx] = (insn & !IMM_MASK) | ((res.new_val & 0xFFFF_FFFF) << 32);
-            instructions[idx + 1] = (hi & !IMM_MASK) | ((res.new_val >> 32) << 32);
-            Ok(false)
-        }
-        _ => Err(CoreReloError::UnpatchableInstruction(relo.insn_off)),
-    }
-}
-
-fn poison_insn(instructions: &mut [u64], idx: usize, count: usize) {
-    const BPF_CALL: u64 = 0x85;
-    for slot in &mut instructions[idx..][..count] {
-        *slot = BPF_CALL | (u64::from(CORE_POISON_HELPER) << 32);
-    }
-}
-
-fn mem_size_bytes(opcode: u8) -> Option<u32> {
-    match opcode & 0x18 {
-        0x18 => Some(8),
-        0x00 => Some(4),
-        0x08 => Some(2),
-        0x10 => Some(1),
-        _ => None,
-    }
-}
-
-fn bytes_to_mem_size(bytes: u32) -> Option<u8> {
-    match bytes {
-        8 => Some(0x18),
-        4 => Some(0x00),
-        2 => Some(0x08),
-        1 => Some(0x10),
-        _ => None,
-    }
 }
 
 /// One step of a resolved access path: a named struct/union field, or an unnamed array index (including the implicit

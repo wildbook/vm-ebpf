@@ -1,5 +1,7 @@
 //! BTF string table parsing.
 
+use core::ffi::CStr;
+
 /// BTF string table.
 ///
 /// The string table is a sequence of null-terminated strings. The first string is always empty (null).
@@ -16,17 +18,10 @@ impl<'a> BtfStrings<'a> {
 
     /// Get a string by offset.
     ///
-    /// Returns None if the offset is out of bounds or the string is not valid UTF-8.
+    /// Returns None if the offset is out of bounds or the string is unterminated or not valid UTF-8.
     pub fn get(&self, offset: u32) -> Option<&'a str> {
-        let offset = offset as usize;
-        if offset >= self.data.len() {
-            return None;
-        }
-
-        let slice = &self.data[offset..];
-        let end = slice.iter().position(|&b| b == 0)?;
-
-        core::str::from_utf8(&slice[..end]).ok()
+        let tail = self.data.get(offset as usize..)?;
+        CStr::from_bytes_until_nul(tail).ok()?.to_str().ok()
     }
 
     /// Get a string by offset, or `""` if it is missing or invalid.

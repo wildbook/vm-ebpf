@@ -37,19 +37,18 @@
 
 mod builder;
 mod core_relo;
+mod ext;
 mod parse;
+mod patch;
 mod raw;
 mod strings;
 mod types;
 
-#[cfg(test)]
-mod integration_tests;
-
 pub use builder::BtfBuilder;
-pub use core_relo::{
-    apply_core_relocations, BtfExt, CoreRelo, CoreReloError, CoreReloKind, Unresolved, CORE_POISON_HELPER,
-};
+pub use core_relo::{apply_core_relocations, CoreReloError, Unresolved};
+pub use ext::{BtfExt, CoreRelo, CoreReloKind};
 pub use parse::{Btf, BtfError};
+pub use patch::CORE_POISON_HELPER;
 pub use raw::*;
 pub use strings::BtfStrings;
 pub use types::*;

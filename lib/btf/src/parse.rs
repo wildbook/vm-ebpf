@@ -21,6 +21,8 @@ pub enum BtfError {
     UnknownKind(u8),
     /// Unknown CO-RE relocation kind in `.BTF.ext`.
     UnknownReloKind(u32),
+    /// `.BTF.ext` CO-RE relocation records are smaller than the fields this crate reads.
+    BadRecordSize(u32),
 }
 
 impl core::fmt::Display for BtfError {
@@ -33,6 +35,7 @@ impl core::fmt::Display for BtfError {
             Self::InvalidType(id) => write!(f, "invalid BTF type at id {id}"),
             Self::UnknownKind(k) => write!(f, "unknown BTF kind: {k}"),
             Self::UnknownReloKind(k) => write!(f, "unknown CO-RE relocation kind: {k}"),
+            Self::BadRecordSize(n) => write!(f, "CO-RE relocation record size {n} is too small"),
         }
     }
 }
@@ -50,6 +53,31 @@ pub fn word(b: &[u8], i: usize) -> u32 {
     u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
 }
 
+/// Check the magic and version that `.BTF` and `.BTF.ext` headers share, and return the header length that section
+/// offsets count from. `min_len` is the shortest header the caller reads, at least 8 bytes.
+pub fn check_header(data: &[u8], min_len: usize) -> Result<usize, BtfError> {
+    if data.len() < min_len {
+        return Err(BtfError::TooShort);
+    }
+    let magic = u16::from_le_bytes([data[0], data[1]]);
+    if magic != BTF_MAGIC {
+        return Err(BtfError::BadMagic(magic));
+    }
+    let version = data[2];
+    if version != BTF_VERSION {
+        return Err(BtfError::BadVersion(version));
+    }
+    Ok(word(data, 1) as usize)
+}
+
+/// The `len` bytes at `off` past a header of `hdr_len` bytes.
+pub fn section(data: &[u8], hdr_len: usize, off: u32, len: u32) -> Result<&[u8], BtfError> {
+    let start = data.get(hdr_len + off as usize..);
+    start
+        .and_then(|s| s.get(..len as usize))
+        .ok_or(BtfError::SectionOverflow)
+}
+
 /// Parsed BTF data.
 #[derive(Debug, Clone)]
 pub struct Btf<'a> {
@@ -62,26 +90,9 @@ pub struct Btf<'a> {
 impl<'a> Btf<'a> {
     /// Parse BTF from raw section bytes.
     pub fn parse(data: &'a [u8]) -> Result<Self, BtfError> {
-        if data.len() < 24 {
-            return Err(BtfError::TooShort);
-        }
-        let magic = u16::from_le_bytes([data[0], data[1]]);
-        let version = data[2];
-        if magic != BTF_MAGIC {
-            return Err(BtfError::BadMagic(magic));
-        }
-        if version != BTF_VERSION {
-            return Err(BtfError::BadVersion(version));
-        }
-        let hdr_len = word(data, 1) as usize;
-        let type_off = word(data, 2) as usize;
-        let type_len = word(data, 3) as usize;
-        let str_off = word(data, 4) as usize;
-        let str_len = word(data, 5) as usize;
-
-        let section = |off: usize, len: usize| data.get(hdr_len + off..)?.get(..len);
-        let type_data = section(type_off, type_len).ok_or(BtfError::SectionOverflow)?;
-        let str_data = section(str_off, str_len).ok_or(BtfError::SectionOverflow)?;
+        let hdr_len = check_header(data, 24)?;
+        let type_data = section(data, hdr_len, word(data, 2), word(data, 3))?;
+        let str_data = section(data, hdr_len, word(data, 4), word(data, 5))?;
         let strings = BtfStrings::new(str_data);
 
         let types = Self::parse_types(type_data, &strings)?;
