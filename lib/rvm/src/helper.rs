@@ -1,13 +1,14 @@
 //! Host functions callable from eBPF: typed registration and slot dispatch.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 use hashbrown::HashMap;
 
 use crate::error::HelperError;
 use crate::maps::Maps;
 use crate::memory::{GuestMemory, VmMemory};
+use crate::sync::{read, write};
 
 /// Registers r1-r5 at the time of a helper call.
 #[derive(Debug, Clone, Copy)]
@@ -371,7 +372,7 @@ pub struct SharedHelpers {
 impl SharedHelpers {
     /// Apply `f` to the table and publish the result.
     pub fn update<R>(&self, f: impl FnOnce(&mut HelperRegistry) -> R) -> R {
-        let mut registry = self.registry.write().unwrap_or_else(PoisonError::into_inner);
+        let mut registry = write(&self.registry);
         let result = f(&mut registry);
         self.version.fetch_add(1, Ordering::Release);
         result
@@ -385,7 +386,7 @@ impl SharedHelpers {
 
     /// Read access to the current table.
     pub fn read(&self) -> RwLockReadGuard<'_, HelperRegistry> {
-        self.registry.read().unwrap_or_else(PoisonError::into_inner)
+        read(&self.registry)
     }
 
     /// A copy of the table and the version it belongs to.

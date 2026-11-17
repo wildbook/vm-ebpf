@@ -10,7 +10,7 @@ pub type Result<T> = std::result::Result<T, VmError>;
 pub enum VmError {
     /// ELF parsing error.
     #[cfg(feature = "link")]
-    Elf(String),
+    Elf(constelf::err::ElfError),
 
     /// BTF parsing error.
     #[cfg(feature = "link")]
@@ -51,7 +51,7 @@ impl fmt::Display for VmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             #[cfg(feature = "link")]
-            Self::Elf(msg) => write!(f, "ELF error: {msg}"),
+            Self::Elf(e) => write!(f, "ELF error: {e}"),
             #[cfg(feature = "link")]
             Self::Btf(e) => write!(f, "BTF error: {e}"),
             Self::InvalidImage(msg) => write!(f, "invalid image: {msg}"),
@@ -73,10 +73,19 @@ impl fmt::Display for VmError {
 impl std::error::Error for VmError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         #[cfg(feature = "link")]
-        if let Self::Btf(e) = self {
-            return Some(e);
+        match self {
+            Self::Elf(e) => return Some(e),
+            Self::Btf(e) => return Some(e),
+            _ => {}
         }
         None
+    }
+}
+
+#[cfg(feature = "link")]
+impl From<constelf::err::ElfError> for VmError {
+    fn from(e: constelf::err::ElfError) -> Self {
+        Self::Elf(e)
     }
 }
 

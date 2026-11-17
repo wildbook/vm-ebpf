@@ -71,6 +71,7 @@ mod section;
 mod std_helpers;
 #[cfg(feature = "link")]
 mod symbol;
+mod sync;
 mod vm;
 
 #[cfg(feature = "link")]

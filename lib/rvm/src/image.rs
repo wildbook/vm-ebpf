@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use hashbrown::HashMap;
+use rvm_core::opcode::{JmpOpc, OpCode, Source};
 use rvm_core::{instructions_from_bytes, BPF_PSEUDO_KFUNC_CALL, MAX_CALL_DEPTH};
 
 use crate::error::{LinkError, Result, VmError};
@@ -28,7 +29,8 @@ const MAGIC: &[u8; 4] = b"RVMI";
 const FORMAT_VERSION: u32 = 1;
 const RVM_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub const BPF_CALL: u8 = 0x85;
+/// Opcode byte of `call`.
+pub const CALL: u8 = OpCode::jmp64_from_parts(JmpOpc::Call, Source::Imm).0;
 
 /// A linked program, ready to load into a [`crate::Vm`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -200,15 +202,13 @@ impl Image {
     }
 }
 
-/// Check `image`, bind its extern calls to `helpers`, and allocate its memory and maps. Map definitions that can't be
-/// laid out fail with `bad_map`.
+/// Check `image`, bind its extern calls to `helpers`, and allocate its memory and maps.
 pub fn load(
     image: Image,
     helpers: &Arc<SharedHelpers>,
     shared_maps: &SharedMaps,
     shared_regions: &[SharedRegion],
     config: &VmConfig,
-    bad_map: fn(String) -> VmError,
 ) -> Result<Program> {
     let Image {
         mut code,
@@ -243,7 +243,7 @@ pub fn load(
     for (at, import) in &externs {
         let insn = insns
             .get_mut(*at as usize)
-            .filter(|insn| insn[0] == BPF_CALL)
+            .filter(|insn| insn[0] == CALL)
             .ok_or_else(|| invalid(format!("extern at instruction {at} is not a call")))?;
         let slot = match import {
             Import::Name(name) => table
@@ -281,7 +281,7 @@ pub fn load(
             VmError::InvalidArgument(msg)
         })?;
 
-    let (maps, maps_len) = Maps::new(maps, shared_maps, bad_map)?;
+    let (maps, maps_len) = Maps::new(maps, shared_maps)?;
 
     let mut memory = VmMemory::new();
     memory.map(STACK_REGION, stack_len as usize, Perms::RW);
@@ -307,7 +307,18 @@ pub fn load(
 /// Turn a call instruction into a call to extern-table `slot`.
 pub fn set_slot_call(insn: &mut [u8; 8], slot: u32) {
     insn[1] = (insn[1] & 0x0F) | (BPF_PSEUDO_KFUNC_CALL << 4);
-    insn[4..].copy_from_slice(&slot.to_le_bytes());
+    set_imm(insn, slot);
+}
+
+/// The `imm` field of `insn`.
+#[cfg(feature = "link")]
+pub fn imm(insn: &[u8; 8]) -> u32 {
+    let [.., a, b, c, d] = *insn;
+    u32::from_le_bytes([a, b, c, d])
+}
+
+pub fn set_imm(insn: &mut [u8; 8], imm: u32) {
+    insn[4..].copy_from_slice(&imm.to_le_bytes());
 }
 
 fn invalid(msg: impl Into<String>) -> VmError {

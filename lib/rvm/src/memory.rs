@@ -25,6 +25,9 @@ pub const MAX_REGIONS: usize = 64;
 /// Bit position of the region index in a guest address.
 pub const REGION_SHIFT: u32 = 32;
 
+// address splits take the offset as `addr as u32`
+const _: () = assert!(REGION_SHIFT == 32);
+
 /// Largest region (offsets are 32 bits).
 pub const MAX_REGION_LEN: usize = 1 << REGION_SHIFT;
 
@@ -246,8 +249,13 @@ impl VmMemory {
 
     /// Borrow `len` bytes at guest address `addr` (host access, ignores perms).
     pub fn bytes(&self, addr: u64, len: usize) -> Result<&[u8], MemoryError> {
-        let ptr = self.host_ptr(addr, len, Perms::NONE)?;
-        // SAFETY: `host_ptr` checked the range lies inside a live region.
+        self.slice(addr, len, Perms::NONE)
+    }
+
+    /// Borrow `len` bytes at guest address `addr` whose region allows `need`.
+    pub(crate) fn slice(&self, addr: u64, len: usize, need: Perms) -> Result<&[u8], MemoryError> {
+        let ptr = self.host_ptr(addr, len, need)?;
+        // SAFETY: `host_ptr` checked the range lies inside a live region, which the borrow of `self` keeps mapped.
         Ok(unsafe { std::slice::from_raw_parts(ptr.as_ptr(), len) })
     }
 
@@ -699,19 +707,16 @@ pub unsafe trait Pod: Copy + 'static {
     }
 }
 
-// SAFETY: primitives without padding or invalid bit patterns, and arrays of `Pod`.
-unsafe impl Pod for u8 {}
-unsafe impl Pod for u16 {}
-unsafe impl Pod for u32 {}
-unsafe impl Pod for u64 {}
-unsafe impl Pod for u128 {}
-unsafe impl Pod for i8 {}
-unsafe impl Pod for i16 {}
-unsafe impl Pod for i32 {}
-unsafe impl Pod for i64 {}
-unsafe impl Pod for i128 {}
-unsafe impl Pod for f32 {}
-unsafe impl Pod for f64 {}
+macro_rules! pod {
+    ($($t:ty),*) => {
+        // SAFETY: primitives without padding or invalid bit patterns.
+        $(unsafe impl Pod for $t {})*
+    };
+}
+
+pod!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f32, f64);
+
+// SAFETY: arrays of `Pod` have no padding between elements.
 unsafe impl<T: Pod, const N: usize> Pod for [T; N] {}
 
 impl std::fmt::Debug for VmMemory {

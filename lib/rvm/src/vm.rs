@@ -18,6 +18,7 @@ use crate::memory::{GuestMemory, Perms, SharedBuffer, SharedRegion, MAX_REGION_L
 use crate::module::Module;
 use crate::plugin::Plugin;
 use crate::program::Program;
+use crate::sync::lock;
 use crate::{maps, std_helpers};
 
 /// Configuration for the VM.
@@ -184,7 +185,7 @@ impl Vm {
     ///
     /// As [`VmMemory::map_shared`](crate::VmMemory::map_shared), for every program linked afterwards.
     pub unsafe fn share_region(&self, region: usize, len: usize, perms: Perms) -> Result<SharedRegion> {
-        let mut regions = self.shared_regions.lock().unwrap_or_else(|e| e.into_inner());
+        let mut regions = lock(&self.shared_regions);
         let invalid = |msg: String| Err(VmError::InvalidArgument(msg));
         if !(FIRST_FREE_REGION..BORROW_FIRST_REGION).contains(&region) {
             return invalid(format!("region {region} is outside {FIRST_FREE_REGION}..{BORROW_FIRST_REGION}"));
@@ -213,7 +214,7 @@ impl Vm {
     /// and regions this VM shares. Fails on a malformed image, one written by another rvm version, or an extern this VM
     /// lacks.
     pub fn load_image(&self, bytes: &[u8]) -> Result<Program> {
-        self.load(Image::from_bytes(bytes)?, VmError::InvalidImage)
+        self.load(Image::from_bytes(bytes)?)
     }
 
     /// Load an image as a plugin that other programs can call into.
@@ -221,9 +222,8 @@ impl Vm {
         Ok(Plugin::new(name, self.load_image(bytes)?))
     }
 
-    fn load(&self, image: Image, bad_map: fn(String) -> VmError) -> Result<Program> {
-        let shared_regions = self.shared_regions.lock().unwrap_or_else(|e| e.into_inner());
-        image::load(image, &self.helpers, &self.shared_maps, &shared_regions, &self.config, bad_map)
+    fn load(&self, image: Image) -> Result<Program> {
+        image::load(image, &self.helpers, &self.shared_maps, &lock(&self.shared_regions), &self.config)
     }
 
     /// Publish `func` from `plugin` as an extern of the same name.
@@ -254,7 +254,7 @@ impl Vm {
     /// rvm::host_struct!(vm.types(), Event as "event" { timestamp, pid });
     /// ```
     pub fn types(&self) -> std::sync::MutexGuard<'_, BtfBuilder> {
-        self.types.lock().unwrap_or_else(|e| e.into_inner())
+        lock(&self.types)
     }
 
     /// Parse a module from ELF bytes, for [`Vm::link`] or [`Vm::prepare_modules`].
@@ -286,7 +286,7 @@ impl Vm {
     /// let program = vm.link(&[&utils, &main])?;
     /// ```
     pub fn link(&self, modules: &[&Module]) -> Result<Program> {
-        self.load(self.prepare_modules(modules)?, invalid_map)
+        self.load(self.prepare_modules(modules)?)
     }
 
     /// Link a single module into a program.
@@ -303,7 +303,7 @@ impl Vm {
     /// let result = program.call("main", &[])?;
     /// ```
     pub fn load_elf(&self, elf_bytes: &[u8]) -> Result<Program> {
-        self.load(self.prepare(elf_bytes)?, invalid_map)
+        self.load(self.prepare(elf_bytes)?)
     }
 
     /// Load an ELF file as a plugin that other programs can call into.
@@ -311,11 +311,6 @@ impl Vm {
         let module = self.parse_module(name, elf_bytes)?;
         Ok(Plugin::new(name, self.link_one(&module)?))
     }
-}
-
-#[cfg(feature = "link")]
-fn invalid_map(msg: String) -> VmError {
-    crate::error::LinkError::InvalidMap(msg).into()
 }
 
 impl std::fmt::Debug for Vm {

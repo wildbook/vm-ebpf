@@ -19,9 +19,10 @@ use std::sync::{Arc, RwLockReadGuard};
 
 use hashbrown::{hash_table, HashMap};
 
-use crate::error::{Result, VmError};
+use crate::error::{LinkError, Result};
 use crate::layout::MAPS_REGION;
 use crate::memory::{region_base, Pod, VmMemory, MAX_REGION_LEN};
+use crate::sync::{read, write};
 
 #[cfg(feature = "link")]
 mod btf;
@@ -33,7 +34,6 @@ mod shared;
 pub use btf::map_defs;
 use hash::HashIndex;
 pub use helpers::{register_helpers, BPF_FUNC_MAP_DELETE_ELEM, BPF_FUNC_MAP_LOOKUP_ELEM, BPF_FUNC_MAP_UPDATE_ELEM};
-use shared::{read, write};
 pub use shared::{SharedMap, SharedMaps};
 
 /// `map_update_elem` flag: insert the key or replace its value.
@@ -133,23 +133,24 @@ enum Index {
 
 impl Maps {
     /// Lay out `defs`, binding those declared shared to the VM-wide instance, and return the maps and the size of the
-    /// private region they need. Definitions that can't be laid out fail with `bad_map`.
-    pub fn new(defs: Vec<MapDef>, shared: &SharedMaps, bad_map: fn(String) -> VmError) -> Result<(Self, usize)> {
+    /// private region they need.
+    pub fn new(defs: Vec<MapDef>, shared: &SharedMaps) -> Result<(Self, usize)> {
         let mut maps = Self::default();
         let mut len = 0;
         for def in defs {
-            check_def(&def).map_err(bad_map)?;
+            check_def(&def)?;
             if maps.by_name.insert(def.name.clone(), maps.maps.len() as u32).is_some() {
-                return Err(bad_map(format!("map {}: declared twice", def.name)));
+                return Err(LinkError::InvalidMap(format!("map {}: declared twice", def.name)).into());
             }
-            let (base, stride, index) = match shared.bind(&def, bad_map)? {
+            let (base, stride, index) = match shared.bind(&def)? {
                 Some(map) => (region_base(map.region), map.stride, Index::Shared(map)),
                 None => {
                     let stride = u64::from(def.value_size).next_multiple_of(8);
                     let base = region_base(MAPS_REGION) + len;
                     len = (len + stride * u64::from(def.max_entries)).next_multiple_of(CACHE_LINE);
                     if len > MAX_REGION_LEN as u64 {
-                        return Err(bad_map(format!("map {}: maps exceed {MAX_REGION_LEN} bytes", def.name)));
+                        let msg = format!("map {}: maps exceed {MAX_REGION_LEN} bytes", def.name);
+                        return Err(LinkError::InvalidMap(msg).into());
                     }
                     let index = match def.kind {
                         MapKind::Array => Index::Array,
@@ -444,8 +445,8 @@ impl Map {
 
 /// Reject a map no program can use, or whose values or keys don't fit in a region with values padded to a cache line,
 /// as shared maps may be.
-pub fn check_def(def: &MapDef) -> std::result::Result<(), String> {
-    let bad = |what: &str| Err(format!("map {}: {what}", def.name));
+pub fn check_def(def: &MapDef) -> Result<()> {
+    let bad = |what: &str| Err(LinkError::InvalidMap(format!("map {}: {what}", def.name)).into());
     if def.value_size == 0 || def.max_entries == 0 {
         return bad("zero value size or max_entries");
     }
@@ -482,7 +483,7 @@ mod tests {
             max_entries: 3,
         };
         let defs = vec![def("hash", MapKind::Hash, 8, 8), def("array", MapKind::Array, 4, 16)];
-        let (mut maps, len) = Maps::new(defs, &SharedMaps::default(), VmError::InvalidImage).unwrap();
+        let (mut maps, len) = Maps::new(defs, &SharedMaps::default()).unwrap();
         let mut memory = VmMemory::new();
         memory.map(MAPS_REGION, len, Perms::RW);
 

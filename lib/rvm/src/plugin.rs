@@ -10,13 +10,14 @@
 //! call into a plugin that is already running, from the host or through a chain of plugin calls, fails with
 //! [`VmError::PluginBusy`] instead of deadlocking. So does [`Plugin::replace`] while the plugin runs.
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
 
 use crate::error::{HelperError, Result, VmError};
 use crate::helper::HelperContext;
 use crate::layout::{BORROW_FIRST_REGION, BORROW_REGIONS};
 use crate::memory::{region_base, Perms};
 use crate::program::{Borrow, Func, FuncSlot, Program};
+use crate::sync::lock;
 
 /// A linked program that other programs can call into.
 #[derive(Clone)]
@@ -112,7 +113,7 @@ impl Plugin {
 
             // only touched under the plugin lock, so this never waits
             let target = {
-                let mut target = target.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut target = lock(&target);
                 if !program.owns(target.entry) {
                     *target = ExportTarget::find(&program, &func)
                         .ok_or_else(|| failed(VmError::FunctionNotFound(func.to_string())))?;

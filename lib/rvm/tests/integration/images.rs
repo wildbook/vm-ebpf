@@ -146,7 +146,7 @@ fn malformed_images_fail_to_load() {
     let mut image = good.clone();
     image.maps[0].max_entries = u32::MAX;
     let err = load(&image).unwrap_err();
-    assert!(matches!(&err, VmError::InvalidImage(msg) if msg.contains("too large")), "{err}");
+    assert!(matches!(&err, VmError::Link(LinkError::InvalidMap(msg)) if msg.contains("too large")), "{err}");
 
     let mut image = good.clone();
     image.data_len = MAX_REGION_LEN + 1;

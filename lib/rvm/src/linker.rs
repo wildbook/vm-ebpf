@@ -12,11 +12,13 @@
 use btf::{apply_core_relocations, Btf, BtfBuilder, BtfTypeInfo};
 use constelf::raw::reloc;
 use hashbrown::HashMap;
+use rvm_core::opcode::{Class, MemMode, MemSize, OpCode};
+use rvm_core::Instruction;
 
 use crate::error::{LinkError, Result, VmError};
 use crate::executor::CORE_POISON_HELPER;
 use crate::helper::HelperRegistry;
-use crate::image::{set_slot_call, Image, Import, BPF_CALL};
+use crate::image::{imm, set_imm, set_slot_call, Image, Import, CALL};
 use crate::layout::{CODE_REGION, DATA_REGION, RODATA_REGION};
 use crate::maps::map_defs;
 use crate::memory::{region_base, MAX_REGION_LEN, REGION_SHIFT};
@@ -25,6 +27,8 @@ use crate::program::{Borrow, FunctionInfo};
 use crate::section::{Section, SectionKind};
 
 const _: () = assert!(CORE_POISON_HELPER == btf::CORE_POISON_HELPER);
+
+const LD_IMM64: u8 = OpCode(Class::LdImm as u8 | MemMode::Imm as u8 | MemSize::DWord as u8).0;
 
 /// Where a section or symbol lives after linking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +88,13 @@ impl Image {
         buf.get_mut(at..)
             .and_then(|b| b.get_mut(..len))
             .ok_or_else(|| LinkError::InvalidReference(format!("data address {addr:#x}")).into())
+    }
+
+    /// Split `value` across the `imm` fields of the `lddw` at code offset `at` and its second slot.
+    fn set_ld_imm64(&mut self, at: u64, value: u64) -> Result<()> {
+        set_imm(self.insn_mut(at)?, value as u32);
+        set_imm(self.insn_mut(at + 8)?, (value >> 32) as u32);
+        Ok(())
     }
 }
 
@@ -304,8 +315,7 @@ fn apply_relocation(
         .is_none_or(|i| module.sections[i].kind == SectionKind::Maps);
     let map = image.maps.iter().position(|d| in_maps && d.name == symbol.name);
     if let (reloc::bpf::BPF_64_64, Addr::Code(at), Some(handle)) = (reloc.rel_type, patch, map) {
-        image.insn_mut(at)?[4..].copy_from_slice(&(handle as u32).to_le_bytes());
-        image.insn_mut(at + 8)?[4..].copy_from_slice(&0u32.to_le_bytes());
+        image.set_ld_imm64(at, handle as u64)?;
         return Ok(());
     }
 
@@ -333,16 +343,13 @@ fn apply_relocation(
 
     match (reloc.rel_type, patch, sym_addr) {
         (reloc::bpf::BPF_64_64, Addr::Code(at), target) => {
-            // LD_IMM64: split the address across the imm fields of both slots.
-            let addr = target.guest().wrapping_add_signed(reloc.addend);
-            image.insn_mut(at)?[4..8].copy_from_slice(&(addr as u32).to_le_bytes());
-            image.insn_mut(at + 8)?[4..8].copy_from_slice(&((addr >> 32) as u32).to_le_bytes());
+            image.set_ld_imm64(at, target.guest().wrapping_add_signed(reloc.addend))?;
         }
         (reloc::bpf::BPF_64_32, Addr::Code(at), Addr::Code(target)) => {
             // BPF-to-BPF call: imm becomes the instruction offset from the next instruction.
             let target = target.wrapping_add_signed(reloc.addend);
             let rel = (target.wrapping_sub(at.wrapping_add(8)) as i64 / 8) as i32;
-            image.insn_mut(at)?[4..8].copy_from_slice(&rel.to_le_bytes());
+            set_imm(image.insn_mut(at)?, rel as u32);
         }
         (reloc::bpf::BPF_64_ABS64, Addr::Data(at), target) => {
             // a data or function pointer stored in global data
@@ -359,16 +366,14 @@ fn apply_relocation(
 /// Record every `call <helper id>` as an extern, so loaded programs never look helpers up at runtime. Unregistered IDs
 /// fail the link.
 fn mark_helper_calls(helpers: &HelperRegistry, image: &mut Image) -> Result<()> {
-    const BPF_LD_IMM64: u8 = 0x18;
-
     let mut i = 0;
     while let Some(insn) = image.code.as_chunks::<8>().0.get(i) {
-        if insn[0] == BPF_LD_IMM64 {
+        if insn[0] == LD_IMM64 {
             i += 2;
             continue;
         }
-        if insn[0] == BPF_CALL && insn[1] >> 4 == 0 {
-            let id = u32::from_le_bytes(insn[4..].try_into().unwrap());
+        if insn[0] == CALL && Instruction(u64::from_le_bytes(*insn)).src_reg() == 0 {
+            let id = imm(insn);
             if helpers.slot_of_id(id).is_none() {
                 return Err(LinkError::UnknownHelper(id).into());
             }

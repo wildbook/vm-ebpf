@@ -80,7 +80,7 @@ fn parse_def(btf: &Btf<'_>, name: &str, type_id: u32) -> Result<MapDef> {
         value_size,
         max_entries,
     };
-    check_def(&def).map_err(LinkError::InvalidMap)?;
+    check_def(&def)?;
     Ok(def)
 }
 
