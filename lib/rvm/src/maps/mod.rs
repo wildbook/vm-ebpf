@@ -22,7 +22,7 @@ use std::sync::{Arc, RwLockReadGuard};
 
 use hashbrown::{hash_table, HashMap};
 
-use crate::error::{LinkError, Result, VmError};
+use crate::error::{Result, VmError};
 use crate::layout::MAPS_REGION;
 use crate::memory::{region_base, Pod, VmMemory, MAX_REGION_LEN};
 
@@ -134,23 +134,24 @@ enum Index {
 
 impl Maps {
     /// Lay out `defs`, binding those declared shared to the VM-wide instance, and
-    /// return the maps and the size of the private region they need.
-    pub fn new(defs: Vec<MapDef>, shared: &SharedMaps) -> Result<(Self, usize)> {
+    /// return the maps and the size of the private region they need. Definitions that
+    /// can't be laid out fail with `bad_map`.
+    pub fn new(defs: Vec<MapDef>, shared: &SharedMaps, bad_map: fn(String) -> VmError) -> Result<(Self, usize)> {
         let mut maps = Self::default();
         let mut len = 0;
         for def in defs {
-            check_def(&def)?;
+            check_def(&def).map_err(bad_map)?;
             if maps.by_name.insert(def.name.clone(), maps.maps.len() as u32).is_some() {
-                return Err(LinkError::DuplicateSymbol(def.name).into());
+                return Err(bad_map(format!("map {}: declared twice", def.name)));
             }
-            let (base, stride, index) = match shared.bind(&def)? {
+            let (base, stride, index) = match shared.bind(&def, bad_map)? {
                 Some(map) => (region_base(map.region), map.stride, Index::Shared(map)),
                 None => {
                     let stride = u64::from(def.value_size).next_multiple_of(8);
                     let base = region_base(MAPS_REGION) + len;
                     len = (len + stride * u64::from(def.max_entries)).next_multiple_of(CACHE_LINE);
                     if len > MAX_REGION_LEN as u64 {
-                        return Err(invalid(format!("map {}: maps exceed {MAX_REGION_LEN} bytes", def.name)));
+                        return Err(bad_map(format!("map {}: maps exceed {MAX_REGION_LEN} bytes", def.name)));
                     }
                     let index = match def.kind {
                         MapKind::Array => Index::Array,
@@ -449,8 +450,8 @@ impl Map {
 
 /// Reject a map no program can use, or whose values or keys don't fit in a region
 /// with values padded to a cache line, as shared maps may be.
-pub fn check_def(def: &MapDef) -> Result<()> {
-    let bad = |what: &str| Err(invalid(format!("map {}: {what}", def.name)));
+pub fn check_def(def: &MapDef) -> std::result::Result<(), String> {
+    let bad = |what: &str| Err(format!("map {}: {what}", def.name));
     if def.value_size == 0 || def.max_entries == 0 {
         return bad("zero value size or max_entries");
     }
@@ -472,10 +473,6 @@ fn check_sizes<K: Pod, V: Pod>(def: &MapDef) -> std::result::Result<(), MapError
     Ok(())
 }
 
-fn invalid(msg: String) -> VmError {
-    LinkError::InvalidReference(msg).into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,7 +488,7 @@ mod tests {
             max_entries: 3,
         };
         let defs = vec![def("hash", MapKind::Hash, 8, 8), def("array", MapKind::Array, 4, 16)];
-        let (mut maps, len) = Maps::new(defs, &SharedMaps::default()).unwrap();
+        let (mut maps, len) = Maps::new(defs, &SharedMaps::default(), VmError::InvalidImage).unwrap();
         let mut memory = VmMemory::new();
         memory.map(MAPS_REGION, len, Perms::RW);
 

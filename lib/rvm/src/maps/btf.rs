@@ -2,8 +2,8 @@
 
 use btf::{Btf, BtfTypeInfo};
 
-use super::{check_def, invalid, MapDef, MapKind};
-use crate::error::Result;
+use super::{check_def, MapDef, MapKind};
+use crate::error::{LinkError, Result, VmError};
 use crate::module::Module;
 use crate::section::SectionKind;
 
@@ -38,7 +38,7 @@ pub fn map_defs(module: &Module, btf: Option<&Btf<'_>>) -> Result<Vec<MapDef>> {
 /// Parse one libbpf map definition: `__uint(field, n)` is `int (*field)[n]`, and
 /// `__type(field, T)` is `T *field`.
 fn parse_def(btf: &Btf<'_>, name: &str, type_id: u32) -> Result<MapDef> {
-    let bad = |what: &str| invalid(format!("map {name}: {what}"));
+    let bad = |what: &str| VmError::from(LinkError::InvalidMap(format!("map {name}: {what}")));
 
     let Some(BtfTypeInfo::Struct { members, .. }) = resolve(btf, type_id) else {
         return Err(bad("definition is not a struct"));
@@ -81,7 +81,7 @@ fn parse_def(btf: &Btf<'_>, name: &str, type_id: u32) -> Result<MapDef> {
         value_size,
         max_entries,
     };
-    check_def(&def)?;
+    check_def(&def).map_err(LinkError::InvalidMap)?;
     Ok(def)
 }
 

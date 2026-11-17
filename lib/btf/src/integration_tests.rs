@@ -394,6 +394,32 @@ fn missing_type_poisons_or_reads_as_absent() {
     assert_eq!(imm_of(insns[0]), 0);
 }
 
+/// `TYPE_SIZE` checks the instruction against the local type's size and patches in the
+/// target's, here a struct that grew a field.
+#[test]
+fn type_size_follows_target() {
+    let mut local = BtfBuilder::new();
+    let int_ty = local.int("int", 4, true);
+    let event = local.add_struct("event", 4);
+    local.member(event, "pid", 0, int_ty);
+    let r = relo(&mut local, event, "0", CoreReloKind::TypeSize);
+    let local_bytes = local.encode();
+    let local_btf = Btf::parse(&local_bytes).unwrap();
+
+    let mut target = BtfBuilder::new();
+    let t_int = target.int("int", 4, true);
+    let t_event = target.add_struct("event", 8);
+    target.member(t_event, "flags", 0, t_int);
+    target.member(t_event, "pid", 4, t_int);
+    let target_bytes = target.encode();
+    let target_btf = Btf::parse(&target_bytes).unwrap();
+
+    let mut insns = [insn(ALU64_MOV_K, 0, 0, 0, 4)];
+    let unresolved = apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r]).unwrap();
+    assert!(unresolved.is_empty());
+    assert_eq!(imm_of(insns[0]), 8);
+}
+
 /// `FieldByteSize` on an array member is the whole array's size (element size times
 /// length), matching libbpf's `btf__resolve_size`, not just the element's size.
 #[test]

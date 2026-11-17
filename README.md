@@ -8,7 +8,6 @@ plugins that call each other and share maps. Needs nightly (pinned in
 ```bash
 cargo build --release
 cargo run --bin loader                         # loads and calls bpf/example.o
-cargo run --bin demo                           # CO-RE relocation walkthrough
 cargo run --bin emu                            # runs bpf.o, prepared into an image at build time
 cargo run -p rvm --example modding             # game mods as plugins: CO-RE, exports, borrows, shared maps, hot reload
 cargo run -p rvm --example msgpack_logs        # streams MessagePack logs through a parser plugin into maps
@@ -37,7 +36,7 @@ Objects built with `-mcpu=v4` need LLVM 18 or newer.
 - `lib/constelf`: a `const fn` ELF reader for the linker.
 - `lib/ebpf-asm`: an assembler and disassembler for writing bytecode in Rust,
   used by tests, benches and examples.
-- `bin/loader`, `bin/demo`, `bin/emu`: the programs above.
+- `bin/loader`, `bin/emu`: the programs above.
 
 ## Features and profiles
 

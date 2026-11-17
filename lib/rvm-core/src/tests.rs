@@ -18,7 +18,7 @@ impl TestMem {
 
     fn with_data(offset: usize, bytes: &[u8]) -> Self {
         let mut mem = Self::new();
-        mem.data[offset..offset + bytes.len()].copy_from_slice(bytes);
+        mem.data[offset..][..bytes.len()].copy_from_slice(bytes);
         mem
     }
 }
@@ -162,7 +162,7 @@ fn load_store_sizes() {
         ctx.regs[2] = want;
         let i = instr(OpCode::streg_from_parts(size, MemMode::Mem), 1, 2, 0, 0);
         assert!(matches!(exec(&mut ctx, i), Flow::Next));
-        assert_eq!(&ctx.data.data[100..100 + bytes.len()], bytes, "{size:?} store");
+        assert_eq!(&ctx.data.data[100..][..bytes.len()], bytes, "{size:?} store");
     }
 
     // ST stores an immediate value instead of a register.

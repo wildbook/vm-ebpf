@@ -108,11 +108,9 @@ pub fn link<'m>(helpers: &HelperRegistry, types: &BtfBuilder, modules: &[&'m Mod
     let target = Btf::parse(&target_bytes)?;
 
     let (mut image, layouts) = lay_out(modules)?;
-    if [&image.code, &image.rodata, &image.data]
-        .iter()
-        .any(|b| b.len() > MAX_REGION_LEN)
-    {
-        return Err(VmError::InvalidArgument(format!("program exceeds {MAX_REGION_LEN} bytes")));
+    let regions = [("code", &image.code), ("rodata", &image.rodata), ("data", &image.data)];
+    if let Some((region, _)) = regions.iter().find(|(_, b)| b.len() > MAX_REGION_LEN) {
+        return Err(VmError::ProgramTooLarge(region));
     }
     let global_symbols = build_symbol_table(modules, &layouts)?;
     check_extern_signatures(helpers, &btfs)?;
@@ -153,14 +151,14 @@ fn trim_zeros(bytes: &mut Vec<u8>) -> usize {
 fn lay_out(modules: &[&Module]) -> Result<(Image, Vec<ModuleLayout>)> {
     // Checks the size before growing `buf`, so a section header can't ask for more
     // than a region holds.
-    fn place(buf: &mut Vec<u8>, section: &Section, align: usize) -> Result<u64> {
+    fn place(buf: &mut Vec<u8>, region: &'static str, section: &Section, align: usize) -> Result<u64> {
         let align = section.align.max(align as u64);
         let end = (buf.len() as u64)
             .checked_next_multiple_of(align)
             .and_then(|at| Some((at, at.checked_add(section.size)?)))
             .filter(|&(_, end)| end <= MAX_REGION_LEN as u64);
         let Some((at, end)) = end else {
-            return Err(VmError::InvalidArgument(format!("program exceeds {MAX_REGION_LEN} bytes")));
+            return Err(VmError::ProgramTooLarge(region));
         };
         buf.resize(at as usize, 0);
         buf.extend_from_slice(&section.data);
@@ -175,12 +173,12 @@ fn lay_out(modules: &[&Module]) -> Result<(Image, Vec<ModuleLayout>)> {
             let mut layout = ModuleLayout::default();
             for (idx, section) in module.sections.iter().enumerate() {
                 let addr = match section.kind {
-                    SectionKind::Code => Addr::Code(place(&mut image.code, section, 8)?),
+                    SectionKind::Code => Addr::Code(place(&mut image.code, "code", section, 8)?),
                     SectionKind::RoData => {
-                        Addr::Data(region_base(RODATA_REGION) + place(&mut image.rodata, section, 1)?)
+                        Addr::Data(region_base(RODATA_REGION) + place(&mut image.rodata, "rodata", section, 1)?)
                     }
                     SectionKind::Data | SectionKind::Bss => {
-                        Addr::Data(region_base(DATA_REGION) + place(&mut image.data, section, 1)?)
+                        Addr::Data(region_base(DATA_REGION) + place(&mut image.data, "data", section, 1)?)
                     }
                     _ => continue,
                 };

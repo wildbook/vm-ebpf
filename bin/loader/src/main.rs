@@ -85,7 +85,9 @@ fn print_module_info(module: &Module) {
     }
 
     println!("\n=== Exports ===");
-    for (name, export) in &module.exports {
+    let mut exports: Vec<_> = module.exports.iter().collect();
+    exports.sort_unstable_by_key(|(name, _)| *name);
+    for (name, export) in exports {
         let section_idx = export.section_idx;
         let offset = export.offset;
         let suffix = if export.is_function { " (func)" } else { "" };

@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
 
 use crate::error::{HelperError, Result, VmError};
 use crate::helper::HelperContext;
-use crate::layout::BORROW_FIRST_REGION;
+use crate::layout::{BORROW_FIRST_REGION, BORROW_REGIONS};
 use crate::memory::{region_base, Perms};
 use crate::program::{Borrow, Func, FuncSlot, Program};
 
@@ -184,7 +184,7 @@ fn try_lock<'a>(program: &'a Mutex<Program>, name: &str) -> Result<MutexGuard<'a
         // caller memory, which may be gone by now
         Err(TryLockError::Poisoned(e)) => {
             let mut guard = e.into_inner();
-            for region in BORROW_FIRST_REGION..BORROW_FIRST_REGION + 5 {
+            for region in BORROW_FIRST_REGION..BORROW_FIRST_REGION + BORROW_REGIONS {
                 guard.memory_mut().unmap(region);
             }
             program.clear_poison();

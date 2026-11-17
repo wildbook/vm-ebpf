@@ -88,7 +88,7 @@ pub use host_type::__host_field_type;
 pub use host_type::HostType;
 pub use image::{Image, Import};
 pub use layout::{
-    BORROW_FIRST_REGION, CODE_REGION, DATA_REGION, FIRST_FREE_REGION, MAPS_REGION, RODATA_REGION,
+    BORROW_FIRST_REGION, BORROW_REGIONS, CODE_REGION, DATA_REGION, FIRST_FREE_REGION, MAPS_REGION, RODATA_REGION,
     SHARED_MAPS_FIRST_REGION, STACK_REGION,
 };
 pub use maps::{

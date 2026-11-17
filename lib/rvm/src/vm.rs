@@ -214,7 +214,7 @@ impl Vm {
     /// a malformed image, one written by another rvm version, or an extern this VM
     /// lacks.
     pub fn load_image(&self, bytes: &[u8]) -> Result<Program> {
-        self.load(Image::from_bytes(bytes)?)
+        self.load(Image::from_bytes(bytes)?, VmError::InvalidImage)
     }
 
     /// Load an image as a plugin that other programs can call into.
@@ -222,9 +222,9 @@ impl Vm {
         Ok(Plugin::new(name, self.load_image(bytes)?))
     }
 
-    fn load(&self, image: Image) -> Result<Program> {
+    fn load(&self, image: Image, bad_map: fn(String) -> VmError) -> Result<Program> {
         let shared_regions = self.shared_regions.lock().unwrap_or_else(|e| e.into_inner());
-        image::load(image, &self.helpers, &self.shared_maps, &shared_regions, &self.config)
+        image::load(image, &self.helpers, &self.shared_maps, &shared_regions, &self.config, bad_map)
     }
 
     /// Publish `func` from `plugin` as an extern of the same name.
@@ -292,7 +292,7 @@ impl Vm {
     /// let program = vm.link(&[&utils, &main])?;
     /// ```
     pub fn link(&self, modules: &[&Module]) -> Result<Program> {
-        self.load(self.prepare_modules(modules)?)
+        self.load(self.prepare_modules(modules)?, invalid_map)
     }
 
     /// Link a single module into a program.
@@ -309,7 +309,7 @@ impl Vm {
     /// let result = program.call("main", &[])?;
     /// ```
     pub fn load_elf(&self, elf_bytes: &[u8]) -> Result<Program> {
-        self.load(self.prepare(elf_bytes)?)
+        self.load(self.prepare(elf_bytes)?, invalid_map)
     }
 
     /// Load an ELF file as a plugin that other programs can call into.
@@ -317,6 +317,11 @@ impl Vm {
         let module = self.parse_module(name, elf_bytes)?;
         Ok(Plugin::new(name, self.link_one(&module)?))
     }
+}
+
+#[cfg(feature = "link")]
+fn invalid_map(msg: String) -> VmError {
+    crate::error::LinkError::InvalidMap(msg).into()
 }
 
 impl std::fmt::Debug for Vm {

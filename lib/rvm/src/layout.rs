@@ -24,9 +24,11 @@ pub const DATA_REGION: usize = 3;
 pub const MAPS_REGION: usize = 4;
 /// First region index the linker leaves free for the host.
 pub const FIRST_FREE_REGION: usize = MAPS_REGION + 1;
-/// First of the five regions in each program reserved for borrowed buffers, one per
-/// argument register.
-pub const BORROW_FIRST_REGION: usize = SHARED_MAPS_FIRST_REGION - 5;
+/// First of the [`BORROW_REGIONS`] regions in each program reserved for borrowed
+/// buffers.
+pub const BORROW_FIRST_REGION: usize = SHARED_MAPS_FIRST_REGION - BORROW_REGIONS;
+/// Number of borrow regions, one per argument register.
+pub const BORROW_REGIONS: usize = 5;
 /// First guest region used for shared maps; each shared map has its own region at
 /// the same address in every program.
 pub const SHARED_MAPS_FIRST_REGION: usize = MAX_REGIONS / 2;

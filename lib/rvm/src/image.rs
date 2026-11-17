@@ -205,13 +205,14 @@ impl Image {
 }
 
 /// Check `image`, bind its extern calls to `helpers`, and allocate its memory and
-/// maps.
+/// maps. Map definitions that can't be laid out fail with `bad_map`.
 pub fn load(
     image: Image,
     helpers: &Arc<SharedHelpers>,
     shared_maps: &SharedMaps,
     shared_regions: &[SharedRegion],
     config: &VmConfig,
+    bad_map: fn(String) -> VmError,
 ) -> Result<Program> {
     let Image {
         mut code,
@@ -224,12 +225,19 @@ pub fn load(
         externs,
     } = image;
 
-    if code.len() % 8 != 0 || code.len() > MAX_REGION_LEN {
+    if code.len() % 8 != 0 {
         return Err(invalid(format!("code is {} bytes", code.len())));
     }
-    for (init, len) in [(&rodata, rodata_len), (&data, data_len)] {
-        if init.len() > len || len > MAX_REGION_LEN {
-            return Err(invalid(format!("{} initial bytes in a {len} byte region", init.len())));
+    for (region, init, len) in [
+        ("code", &code, code.len()),
+        ("rodata", &rodata, rodata_len),
+        ("data", &data, data_len),
+    ] {
+        if len > MAX_REGION_LEN {
+            return Err(VmError::ProgramTooLarge(region));
+        }
+        if init.len() > len {
+            return Err(invalid(format!("{} initial bytes in a {len} byte {region} region", init.len())));
         }
     }
 
@@ -261,7 +269,7 @@ pub fn load(
         })
         .collect::<Result<HashMap<_, _>>>()?;
 
-    let (maps, maps_len) = Maps::new(maps, shared_maps)?;
+    let (maps, maps_len) = Maps::new(maps, shared_maps, bad_map)?;
 
     let mut memory = VmMemory::new();
     let stack_len = config.frame_size * (MAX_CALL_DEPTH + 1);

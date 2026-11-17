@@ -37,6 +37,10 @@ pub enum VmError {
     /// Invalid argument.
     InvalidArgument(String),
 
+    /// The program's code, rodata or data (named) exceeds
+    /// [`MAX_REGION_LEN`](crate::MAX_REGION_LEN) bytes.
+    ProgramTooLarge(&'static str),
+
     /// The plugin is already running a call.
     PluginBusy(String),
 
@@ -58,6 +62,9 @@ impl fmt::Display for VmError {
             Self::Memory(e) => write!(f, "memory error: {e}"),
             Self::FunctionNotFound(name) => write!(f, "function not found: {name}"),
             Self::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
+            Self::ProgramTooLarge(region) => {
+                write!(f, "program {region} exceeds {} bytes", crate::memory::MAX_REGION_LEN)
+            }
             Self::PluginBusy(name) => write!(f, "plugin {name} is already running a call"),
             Self::PluginUnloaded(name) => write!(f, "plugin {name} was unloaded"),
         }
@@ -120,6 +127,8 @@ pub enum LinkError {
     DuplicateSymbol(String),
     /// Invalid reference.
     InvalidReference(String),
+    /// A map definition no program can use, or maps that don't fit in guest memory.
+    InvalidMap(String),
     /// A malformed or unsupported CO-RE relocation.
     #[cfg(feature = "link")]
     CoreRelo(btf::CoreReloError),
@@ -139,6 +148,7 @@ impl fmt::Display for LinkError {
             Self::MapMismatch(name) => write!(f, "shared map {name} is declared with a different layout"),
             Self::DuplicateSymbol(name) => write!(f, "duplicate symbol: {name}"),
             Self::InvalidReference(msg) => write!(f, "invalid reference: {msg}"),
+            Self::InvalidMap(msg) => write!(f, "invalid map: {msg}"),
             #[cfg(feature = "link")]
             Self::CoreRelo(e) => write!(f, "CO-RE relocation: {e}"),
         }
