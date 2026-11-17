@@ -172,6 +172,50 @@ pub trait Memory {
         Ok(old)
     }
 
+    /// Load the `u8` at `addr` with acquire ordering, for `load_acquire`.
+    ///
+    /// The acquire loads and release stores default to the plain loads and stores, which are enough for memory only
+    /// this executor can reach. Like [`Memory::atomic_u32`], the defaults don't check alignment; an override for
+    /// memory shared with other threads should fail misaligned addresses as its atomics do.
+    fn load_acquire_u8(&self, addr: u64) -> Result<u8, Self::Err> {
+        self.load_u8(addr)
+    }
+
+    /// See [`Memory::load_acquire_u8`].
+    fn load_acquire_u16(&self, addr: u64) -> Result<u16, Self::Err> {
+        self.load_u16(addr)
+    }
+
+    /// See [`Memory::load_acquire_u8`].
+    fn load_acquire_u32(&self, addr: u64) -> Result<u32, Self::Err> {
+        self.load_u32(addr)
+    }
+
+    /// See [`Memory::load_acquire_u8`].
+    fn load_acquire_u64(&self, addr: u64) -> Result<u64, Self::Err> {
+        self.load_u64(addr)
+    }
+
+    /// Store `value` at `addr` with release ordering, for `store_release`. See [`Memory::load_acquire_u8`].
+    fn store_release_u8(&mut self, addr: u64, value: u8) -> Result<(), Self::Err> {
+        self.store_u8(addr, value)
+    }
+
+    /// See [`Memory::store_release_u8`].
+    fn store_release_u16(&mut self, addr: u64, value: u16) -> Result<(), Self::Err> {
+        self.store_u16(addr, value)
+    }
+
+    /// See [`Memory::store_release_u8`].
+    fn store_release_u32(&mut self, addr: u64, value: u32) -> Result<(), Self::Err> {
+        self.store_u32(addr, value)
+    }
+
+    /// See [`Memory::store_release_u8`].
+    fn store_release_u64(&mut self, addr: u64, value: u64) -> Result<(), Self::Err> {
+        self.store_u64(addr, value)
+    }
+
     /// The host memory that loads and stores near `addr` may access directly. [`run`] takes the window around r10 and
     /// runs 4 and 8 byte loads and stores through r10 that fall inside it without calling the methods above, until
     /// [`Memory::epoch`] changes. The default is [`Window::NONE`].
@@ -254,6 +298,30 @@ impl<M: Memory + ?Sized> Memory for &mut M {
     }
     fn atomic_u64(&mut self, addr: u64, op: AtomicOp<u64>) -> Result<u64, Self::Err> {
         (**self).atomic_u64(addr, op)
+    }
+    fn load_acquire_u8(&self, addr: u64) -> Result<u8, Self::Err> {
+        (**self).load_acquire_u8(addr)
+    }
+    fn load_acquire_u16(&self, addr: u64) -> Result<u16, Self::Err> {
+        (**self).load_acquire_u16(addr)
+    }
+    fn load_acquire_u32(&self, addr: u64) -> Result<u32, Self::Err> {
+        (**self).load_acquire_u32(addr)
+    }
+    fn load_acquire_u64(&self, addr: u64) -> Result<u64, Self::Err> {
+        (**self).load_acquire_u64(addr)
+    }
+    fn store_release_u8(&mut self, addr: u64, value: u8) -> Result<(), Self::Err> {
+        (**self).store_release_u8(addr, value)
+    }
+    fn store_release_u16(&mut self, addr: u64, value: u16) -> Result<(), Self::Err> {
+        (**self).store_release_u16(addr, value)
+    }
+    fn store_release_u32(&mut self, addr: u64, value: u32) -> Result<(), Self::Err> {
+        (**self).store_release_u32(addr, value)
+    }
+    fn store_release_u64(&mut self, addr: u64, value: u64) -> Result<(), Self::Err> {
+        (**self).store_release_u64(addr, value)
     }
     fn window(&self, addr: u64) -> Window {
         (**self).window(addr)
@@ -567,6 +635,24 @@ mod mem {
         }
     }
 
+    fn load_acquire<M: Memory>(mem: &M, size: MemSize, addr: u64) -> Result<u64, M::Err> {
+        match size {
+            MemSize::Byte => mem.load_acquire_u8(addr).map(u64::from),
+            MemSize::Half => mem.load_acquire_u16(addr).map(u64::from),
+            MemSize::Word => mem.load_acquire_u32(addr).map(u64::from),
+            MemSize::DWord => mem.load_acquire_u64(addr),
+        }
+    }
+
+    fn store_release<M: Memory>(mem: &mut M, size: MemSize, addr: u64, value: u64) -> Result<(), M::Err> {
+        match size {
+            MemSize::Byte => mem.store_release_u8(addr, value as u8),
+            MemSize::Half => mem.store_release_u16(addr, value as u16),
+            MemSize::Word => mem.store_release_u32(addr, value as u32),
+            MemSize::DWord => mem.store_release_u64(addr, value),
+        }
+    }
+
     #[inline(always)]
     pub fn save<M: Memory, const X: bool>(ctx: &mut Context<M>, instr: Instruction) -> Flow<M> {
         let val = match X {
@@ -598,7 +684,8 @@ mod mem {
         Flow::Next
     }
 
-    /// `STX | ATOMIC`: `imm` selects the operation; W and DW sizes only.
+    /// `STX | ATOMIC`: `imm` selects the operation. The read-modify-write operations take W and DW sizes only;
+    /// [`ordered`] runs the rest.
     fn atomic<M: Memory>(ctx: &mut Context<M>, instr: Instruction, size: MemSize, addr: u64, src: u64) -> Flow<M> {
         const FETCH: i32 = 0x01;
         const ADD: i32 = 0x00;
@@ -625,7 +712,7 @@ mod mem {
                     OR => AtomicOp::Or(v),
                     AND => AtomicOp::And(v),
                     XOR => AtomicOp::Xor(v),
-                    _ => return Flow::FailCpu,
+                    _ => return ordered(ctx, instr, size, addr, src),
                 };
                 match ctx.data.$method(addr, op) {
                     Ok(old) => old as u64,
@@ -637,7 +724,7 @@ mod mem {
         let old = match size {
             MemSize::Word => run!(u32, atomic_u32),
             MemSize::DWord => run!(u64, atomic_u64),
-            MemSize::Byte | MemSize::Half => return Flow::FailCpu,
+            MemSize::Byte | MemSize::Half => return ordered(ctx, instr, size, addr, src),
         };
 
         match imm {
@@ -646,6 +733,29 @@ mod mem {
             _ => {}
         }
         Flow::Next
+    }
+
+    /// `STX | ATOMIC` with an `imm` that names no read-modify-write operation: load-acquire and store-release, which
+    /// take every size. Load-acquire reads through `src_reg` into `dst_reg`, the reverse of the other operations.
+    // outlined to keep the read-modify-write path in `atomic` short
+    #[inline(never)]
+    fn ordered<M: Memory>(ctx: &mut Context<M>, instr: Instruction, size: MemSize, addr: u64, src: u64) -> Flow<M> {
+        const LOAD_ACQ: i32 = 0x100;
+        const STORE_REL: i32 = 0x110;
+
+        let result = match instr.imm() {
+            LOAD_ACQ => {
+                let base = ctx.regs[usize::from(instr.src_reg())];
+                let addr = base.wrapping_add_signed(i64::from(instr.offset()));
+                load_acquire(&ctx.data, size, addr).map(|val| ctx.regs[usize::from(instr.dst_reg())] = val)
+            }
+            STORE_REL => store_release(&mut ctx.data, size, addr, src),
+            _ => return Flow::FailCpu,
+        };
+        match result {
+            Ok(()) => Flow::Next,
+            Err(err) => Flow::FailMem(err),
+        }
     }
 
     #[inline(always)]

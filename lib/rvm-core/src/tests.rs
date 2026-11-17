@@ -187,6 +187,16 @@ fn load_store_sizes() {
 }
 
 #[test]
+fn load_acquire_zero_extends() {
+    let mut ctx = Context::new(TestMem::with_data(100, &[0x80, 0x7F]));
+    ctx.regs[0] = u64::MAX;
+    ctx.regs[1] = 100;
+    let i = instr(OpCode::streg_from_parts(MemSize::Byte, MemMode::Atomic), 0, 1, 0, 0x100);
+    assert!(matches!(exec(&mut ctx, i), Flow::Next));
+    assert_eq!(ctx.regs[0], 0x80);
+}
+
+#[test]
 fn ld_imm64() {
     let mut ctx = Context::new(TestMem::new());
 

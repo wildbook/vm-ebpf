@@ -22,7 +22,7 @@ impl Code {
     /// Prepare `insns` for [`run`](crate::run): fuse the sequences that have a superinstruction.
     ///
     /// r10 is read-only, so an instruction that would write it fails with [`Flow::FailCpu`]: an ALU, ALU64 or LDX
-    /// instruction or LD_IMM64 with `dst_reg` 10, and an atomic that fetches into `src_reg` 10.
+    /// instruction, LD_IMM64 or a load-acquire with `dst_reg` 10, and an atomic that fetches into `src_reg` 10.
     pub fn new(insns: impl Into<Box<[Instruction]>>) -> Self {
         let mut insns = insns.into();
         fuse(&mut insns);
@@ -77,19 +77,18 @@ fn fuse(code: &mut [Instruction]) {
 fn writes_r10(insn: Instruction) -> bool {
     const FETCH: i32 = 0x01;
     const CMPXCHG: i32 = 0xf0 | FETCH;
+    const LOAD_ACQ: i32 = 0x100;
 
     let opc = insn.opcode();
     match opc.class() {
         Class::Alu32 | Class::Alu64 | Class::LdReg => insn.dst_reg() == 10,
         Class::LdImm => opc.0 == LD_IMM64 && insn.dst_reg() == 10,
-        // CMPXCHG fetches into r0
-        Class::StReg => {
-            matches!(opc.mem_mode(), MemMode::Atomic)
-                && insn.src_reg() == 10
-                && insn.imm() & FETCH != 0
-                && insn.imm() != CMPXCHG
-        }
-        Class::StImm | Class::Jmp32 | Class::Jmp64 => false,
+        Class::StReg if matches!(opc.mem_mode(), MemMode::Atomic) => match insn.imm() {
+            LOAD_ACQ => insn.dst_reg() == 10,
+            // CMPXCHG fetches into r0
+            imm => insn.src_reg() == 10 && imm & FETCH != 0 && imm != CMPXCHG,
+        },
+        Class::StReg | Class::StImm | Class::Jmp32 | Class::Jmp64 => false,
     }
 }
 
