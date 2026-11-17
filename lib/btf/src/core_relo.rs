@@ -103,14 +103,16 @@ pub struct CoreRelo {
 impl CoreRelo {
     pub const SIZE: usize = 16;
 
-    /// Parse from bytes.
-    pub fn parse(data: &[u8]) -> Option<Self> {
+    /// Parse from bytes. Fails on a relocation kind this crate doesn't know, since skipping it would leave the
+    /// instruction with its compile-time value.
+    pub fn parse(data: &[u8]) -> Result<Self, BtfError> {
         if data.len() < Self::SIZE {
-            return None;
+            return Err(BtfError::TooShort);
         }
-        let kind = CoreReloKind::from_u32(word(data, 3))?;
+        let raw_kind = word(data, 3);
+        let kind = CoreReloKind::from_u32(raw_kind).ok_or(BtfError::UnknownReloKind(raw_kind))?;
 
-        Some(Self {
+        Ok(Self {
             insn_off: word(data, 0),
             type_id: word(data, 1),
             access_str_off: word(data, 2),
@@ -180,13 +182,11 @@ impl<'a> BtfExt<'a> {
         strings: &BtfStrings<'a>,
     ) -> Result<Vec<SectionCoreRelos<'a>>, BtfError> {
         let start = hdr_len + core_relo_off as usize;
-        let end = start + core_relo_len as usize;
-
-        if end > data.len() || start >= data.len() {
+        if core_relo_len as usize > data.len().saturating_sub(start) || start >= data.len() {
             return Err(BtfError::SectionOverflow);
         }
 
-        let relo_data = &data[start..end];
+        let relo_data = &data[start..][..core_relo_len as usize];
         if relo_data.len() < 4 {
             return Ok(Vec::new());
         }
@@ -213,8 +213,8 @@ impl<'a> BtfExt<'a> {
                 .ok_or(BtfError::SectionOverflow)?;
             let relos = relo_data[offset..][..records]
                 .chunks_exact(rec_size)
-                .filter_map(CoreRelo::parse)
-                .collect();
+                .map(CoreRelo::parse)
+                .collect::<Result<_, _>>()?;
             offset += records;
 
             sections.push(SectionCoreRelos { section_name, relos });
@@ -261,6 +261,9 @@ pub enum CoreReloError {
     /// Nothing in the target BTF matched the local type (and field, for field relocations); stored in [`Unresolved`]
     /// rather than failing the whole load.
     NoMatchingTarget { type_name: String, access_str: String },
+    /// The target field has a different size and isn't an unsigned integer or pointer on both sides, so the memory
+    /// access can't be resized safely; stored in [`Unresolved`] rather than failing the whole load.
+    IncompatibleFieldSize { type_name: String, access_str: String },
 }
 
 impl core::fmt::Display for CoreReloError {
@@ -287,6 +290,9 @@ impl core::fmt::Display for CoreReloError {
             Self::UnsupportedRelo(kind) => write!(f, "unsupported relocation kind: {kind:?}"),
             Self::NoMatchingTarget { type_name, access_str } => {
                 write!(f, "no target type matches '{type_name}' (accessing '{access_str}')")
+            }
+            Self::IncompatibleFieldSize { type_name, access_str } => {
+                write!(f, "field '{access_str}' of '{type_name}' changed to a size that can't be read safely")
             }
         }
     }
@@ -323,12 +329,15 @@ pub fn apply_core_relocations(
         if patch_instruction(instructions, relo, &res)? {
             let access_str = local.strings().get(relo.access_str_off).unwrap_or("");
             let type_name = local.type_by_id(relo.type_id).and_then(BtfTypeInfo::name).unwrap_or("");
+            let (type_name, access_str) = (type_name.to_string(), access_str.to_string());
+            let error = if res.poison {
+                CoreReloError::NoMatchingTarget { type_name, access_str }
+            } else {
+                CoreReloError::IncompatibleFieldSize { type_name, access_str }
+            };
             unresolved.push(Unresolved {
                 insn_off: relo.insn_off,
-                error: CoreReloError::NoMatchingTarget {
-                    type_name: type_name.to_string(),
-                    access_str: access_str.to_string(),
-                },
+                error,
             });
         }
     }
@@ -340,9 +349,12 @@ pub fn apply_core_relocations(
 struct ResolvedRelo {
     orig_val: u64,
     new_val: u64,
-    /// The field, type, or enum value this relocation refers to doesn't exist in `target` (or an existing field has an
-    /// incompatibly sized access), so the instruction is poisoned instead of patched.
+    /// The field, type, or enum value this relocation refers to doesn't exist in `target`, so the instruction is
+    /// poisoned instead of patched.
     poison: bool,
+    /// The field's size changed in a way a memory access can't be adjusted for (libbpf's `fail_memsz_adjust`). Only a
+    /// load or store is poisoned for this; an instruction that only computes the offset is patched as usual.
+    fail_memsz_adjust: bool,
     /// Whether `orig_val` must match what's already encoded in the instruction.
     validate: bool,
     /// For `FieldByteOffset`, the memory access size (and its BTF type) implied by `local`.
@@ -378,6 +390,7 @@ fn resolve_relocation(local: &Btf<'_>, target: &Btf<'_>, relo: &CoreRelo) -> Res
             orig_val: v,
             new_val: v,
             poison: false,
+            fail_memsz_adjust: false,
             validate: false,
             orig_sz: None,
             new_sz: None,
@@ -415,14 +428,15 @@ fn resolve_relocation(local: &Btf<'_>, target: &Btf<'_>, relo: &CoreRelo) -> Res
         }
     }
 
-    let (new_val, mut poison, new_mem) = match matched {
+    let (new_val, poison, new_mem) = match matched {
         Some(half) => (half.val, false, half.mem),
         None => (0, poisons_on_missing(relo.kind), None),
     };
 
     // A field that moved between an unsigned integer (or pointer) of a different size can be read with an adjusted
-    // memory access size without changing its value; anything else poisons rather than risk reading the wrong bytes or
-    // sign-extending wrongly.
+    // memory access size without changing its value; any other size change fails a load or store rather than risk
+    // reading the wrong bytes or sign-extending wrongly.
+    let mut fail_memsz_adjust = false;
     if let (Some((orig_sz, orig_tid)), Some((new_sz, new_tid))) = (orig.mem, new_mem) {
         if orig_sz != new_sz {
             let orig_t = local
@@ -433,7 +447,7 @@ fn resolve_relocation(local: &Btf<'_>, target: &Btf<'_>, relo: &CoreRelo) -> Res
                 .ok_or(CoreReloError::InvalidTypeId(new_tid))?;
             let safe_adjust = (matches!(orig_t, BtfTypeInfo::Ptr { .. }) && matches!(new_t, BtfTypeInfo::Ptr { .. }))
                 || (is_unsigned_int(orig_t) && is_unsigned_int(new_t));
-            poison |= !safe_adjust;
+            fail_memsz_adjust = !safe_adjust;
         }
     }
 
@@ -441,6 +455,7 @@ fn resolve_relocation(local: &Btf<'_>, target: &Btf<'_>, relo: &CoreRelo) -> Res
         orig_val: orig.val,
         new_val,
         poison,
+        fail_memsz_adjust,
         validate: orig.validate,
         orig_sz: orig.mem.map(|(sz, _)| sz),
         new_sz: new_mem.map(|(sz, _)| sz),
@@ -467,6 +482,9 @@ fn patch_instruction(instructions: &mut [u64], relo: &CoreRelo, res: &ResolvedRe
     const OFF_MASK: u64 = 0x0000_0000_FFFF_0000;
     const SRC_REG_MASK: u64 = 0x0000_0000_0000_F000;
 
+    if relo.insn_off % 8 != 0 {
+        return Err(CoreReloError::InstructionOutOfBounds(relo.insn_off));
+    }
     let idx = (relo.insn_off / 8) as usize;
     let insn = *instructions
         .get(idx)
@@ -511,6 +529,10 @@ fn patch_instruction(instructions: &mut [u64], relo: &CoreRelo, res: &ResolvedRe
                     insn_off: relo.insn_off,
                     value: res.new_val,
                 });
+            }
+            if res.fail_memsz_adjust {
+                poison_insn(instructions, idx, 1);
+                return Ok(true);
             }
             instructions[idx] = (insn & !OFF_MASK) | (res.new_val << 16);
 
@@ -1190,7 +1212,12 @@ fn fields_are_compat(
     target: &Btf<'_>,
     mut targ_id: u32,
 ) -> Result<bool, CoreReloError> {
+    let mut depth = 32i32;
     loop {
+        depth -= 1;
+        if depth < 0 {
+            return Err(CoreReloError::SpecTooDeep);
+        }
         let (_, lt) = local
             .resolve_type(local_id)
             .ok_or(CoreReloError::InvalidTypeId(local_id))?;
@@ -1234,9 +1261,9 @@ fn fields_are_compat(
     }
 }
 
-/// Whether a local and target type are compatible for `TYPE_ID_TARGET`/`TYPE_EXISTS`/
-/// `TYPE_SIZE` (`bpf_core_types_are_compat`): same shallow checks as [`fields_are_compat`] but entered via a kind check
-/// on the *un*resolved root types, and recursing through function pointers too.
+/// Whether a local and target type are compatible for `TYPE_ID_TARGET`/`TYPE_EXISTS`/`TYPE_SIZE`
+/// (`bpf_core_types_are_compat`): same shallow checks as [`fields_are_compat`] but entered via a kind check on the
+/// *un*resolved root types, and recursing through function pointers too.
 fn types_are_compat(local: &Btf<'_>, local_id: u32, target: &Btf<'_>, targ_id: u32) -> Result<bool, CoreReloError> {
     let lt0 = local
         .type_by_id(local_id)
@@ -1342,8 +1369,8 @@ fn types_are_compat_at(
 }
 
 /// Whether a local and target type structurally match for `TYPE_MATCHES` (`__bpf_core_types_match`): unlike
-/// [`types_are_compat`], member and enumerator names (modulo flavor suffix) and values are checked recursively, though
-/// only shallowly once behind a pointer (to avoid chasing self-referential structs forever).
+/// [`types_are_compat`], member names (modulo flavor suffix) are checked recursively and enums must agree in size and
+/// enumerator names, though only shallowly once behind a pointer (to avoid chasing self-referential structs forever).
 fn types_match(local: &Btf<'_>, local_id: u32, target: &Btf<'_>, targ_id: u32) -> Result<bool, CoreReloError> {
     types_match_at(local, local_id, target, targ_id, false, 32)
 }

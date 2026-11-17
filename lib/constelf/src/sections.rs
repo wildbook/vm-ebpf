@@ -55,8 +55,8 @@ impl<'a> ElfSections<'a> {
     #[rustfmt::skip]
     pub const fn new(file: ElfFile<'a>, ehdr: &'a Elf64Ehdr) -> ElfResult<Self> {
         ensure!(ElfError::Sections, ehdr.e_shoff as usize <= file.image().len());
-        ensure!(ElfError::Sections, ehdr.e_shoff as usize + ehdr.e_shentssize as usize * ehdr.e_shnum as usize <= file.image().len());
-        ensure!(ElfError::Sections, ehdr.e_shentssize as usize == mem::size_of::<Elf64Shdr>());
+        ensure!(ElfError::Sections, ehdr.e_shoff as usize + ehdr.e_shentsize as usize * ehdr.e_shnum as usize <= file.image().len());
+        ensure!(ElfError::Sections, ehdr.e_shentsize as usize == mem::size_of::<Elf64Shdr>());
 
         Ok(Self { file, ehdr })
     }

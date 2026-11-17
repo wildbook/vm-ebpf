@@ -22,14 +22,16 @@ build line, for example:
 clang -target bpf -O2 -g -c bpf/example.c -o bpf/example.o
 ```
 
-Objects built with `-mcpu=v4` need LLVM 18 or newer.
+The root `bpf.o` is the same source built to `-o bpf.o`. Objects built with
+`-mcpu=v4` need LLVM 18 or newer.
 
 ## Crates
 
-- `lib/rvm-core`: the instruction set and interpreter (`run`, `step`) over a
-  `Memory` and a `Host` trait. `run` returns a `Flow` saying why execution
-  stopped: exit, an indirect call or jump, a declined host call, a fault, or out
-  of fuel. `Code` fuses common instruction sequences into superinstructions.
+- `lib/rvm-core`: the instruction set and interpreter (`run`) over a `Memory`
+  and a `Host` trait. `run` returns a `Flow` saying why execution stopped: exit,
+  an indirect call or jump, a declined host call, an invalid or unimplemented
+  instruction, a memory fault, a `pc` outside the code, a call stack overflow, or
+  out of fuel. `Code` fuses common instruction sequences into superinstructions.
 - `lib/rvm`: the runtime: ELF loading, linking, guest memory, helpers, maps and
   plugins.
 - `lib/btf`: BTF parsing, `BtfBuilder` and CO-RE relocations.
@@ -52,8 +54,8 @@ rvm's features:
 
 The `release` profile optimizes for size but builds rvm at `opt-level = 3`,
 because the interpreter inlines into rvm. The `embedded` profile
-(`cargo build --profile embedded`) also strips symbols, panic locations and
-`Debug` output, for the smallest host binary.
+(`cargo build --profile embedded`) also strips symbols and panic locations and
+shortens `Debug` output to type names, for the smallest host binary.
 
 ## Using the runtime
 
@@ -97,10 +99,13 @@ adds `trace_printk` (6), passing each line to `sink`.
 each and `Vm::link` with the set. The linker places code and data sections,
 resolves relocations between modules, and applies CO-RE relocations; loading
 binds each call to a numeric helper or named extern. Linking fails if a named
-extern has no matching helper or module export, if a helper ID isn't registered,
-or if an extern's argument count in the module's BTF differs from the host
-function's arity. An unresolved call is always a link or load error, never a
-runtime one.
+extern has no matching helper or module export, or if a helper ID isn't
+registered. It also fails if an extern's argument count in the module's BTF
+differs from the arity of the host function registered under that name; exports
+from plugins and variadic prototypes aren't checked. Calls with more than five
+arguments fail with `VmError::InvalidArgument`. The only call resolved at run
+time is `callx` to a helper ID, which fails with `UnknownHelper` if no helper
+has that ID.
 
 ## CO-RE
 
@@ -132,8 +137,10 @@ call runs in the exporting plugin with its own memory and maps, so plain
 pointers mean nothing on the other side. `Plugin::replace` swaps in a new build,
 which importers use from their next call. A `Func` from `Plugin::func` fails
 after a replace; `Plugin::named_func` looks the function up again in the new
-build. Calling into a plugin that is already running fails with
-`VmError::PluginBusy`.
+build. A plugin runs one call at a time: calling into it, or replacing it, while
+a call runs fails with `VmError::PluginBusy` instead of blocking. When the call
+comes through another plugin's import, the importer's caller gets
+`HelperError::Plugin`, which names the export and wraps the inner `VmError`.
 
 An export can borrow a buffer from its caller for one call by tagging the
 pointer parameter with the index of its length parameter:
@@ -167,8 +174,8 @@ region slots, each with its own byte range and permissions:
 | `CODE_REGION` (64) | code addresses, never mapped | - |
 
 The host maps its own regions with `VmMemory::map` (zeroed) or
-`VmMemory::map_bytes` (host-owned buffer). The unsafe `VmMemory::map_host` maps
-existing host memory, which must outlive the mapping.
+`VmMemory::map_bytes` (initialized from a slice). The unsafe `VmMemory::map_host`
+maps existing host memory, which must outlive the mapping.
 
 `Vm::share_region(region, len, perms)` maps one buffer at the same region in
 every program linked afterwards, so plugins can pass plain pointers into it.
@@ -183,8 +190,9 @@ and stores.
 Array and hash maps are declared libbpf style in `.maps` (`__uint(type, ...)`,
 `__type(key, ...)`, `__type(value, ...)`, `max_entries`). Helpers 1 to 3
 (`map_lookup_elem`, `map_update_elem`, `map_delete_elem`) are built in unless the
-host registers its own under those IDs. Values live in `MAPS_REGION`, so a
-looked up pointer is an ordinary guest address.
+host registers its own under those IDs. Values live in `MAPS_REGION`, or in
+their own region for a shared map, so a looked up pointer is an ordinary guest
+address.
 
 The host reaches a map through `Program::map(name)`, as bytes (`get`, `update`,
 `delete`) or as `Pod` types (`get_as`, `update_as`). `MapRef::entries` iterates
@@ -205,6 +213,8 @@ The interpreter covers the ISA up to `-mcpu=v4`, with these details:
 - Atomics (add, or, and, xor with and without fetch, xchg, cmpxchg; 32 and 64
   bit) through `Memory::atomic_u32`/`atomic_u64`. `VmMemory` uses host atomics
   and faults on misaligned addresses.
+- Load-acquire and store-release (Linux 6.15; all sizes) through
+  `Memory::load_acquire_*`/`store_release_*`, with the same rules in `VmMemory`.
 - Function pointers. A code address is `region_base(CODE_REGION)` plus a byte
   offset into the program's code, so loads and stores through it fault. The
   linker writes one wherever clang takes a function's address. `callx` faults
@@ -231,8 +241,7 @@ The integration tests run the vendored
 (`lib/rvm/tests/conformance/`).
 
 Miri checks the unsafe memory code. The integration tests list fixture
-directories, which Miri supports only on Unix targets, so they run as Linux
-(about 8 minutes):
+directories, which Miri supports only on Unix targets, so they run as Linux:
 
 ```bash
 cargo miri test -p rvm-core

@@ -19,6 +19,8 @@ pub enum BtfError {
     InvalidType(u32),
     /// Unknown type kind.
     UnknownKind(u8),
+    /// Unknown CO-RE relocation kind in `.BTF.ext`.
+    UnknownReloKind(u32),
 }
 
 impl core::fmt::Display for BtfError {
@@ -30,6 +32,7 @@ impl core::fmt::Display for BtfError {
             Self::SectionOverflow => write!(f, "BTF section extends beyond data"),
             Self::InvalidType(id) => write!(f, "invalid BTF type at id {id}"),
             Self::UnknownKind(k) => write!(f, "unknown BTF kind: {k}"),
+            Self::UnknownReloKind(k) => write!(f, "unknown CO-RE relocation kind: {k}"),
         }
     }
 }
@@ -77,16 +80,13 @@ impl<'a> Btf<'a> {
         let str_len = word(data, 5) as usize;
 
         let type_start = hdr_len + type_off;
-        let type_end = type_start + type_len;
         let str_start = hdr_len + str_off;
-        let str_end = str_start + str_len;
-
-        if type_end > data.len() || str_end > data.len() {
+        if type_len > data.len().saturating_sub(type_start) || str_len > data.len().saturating_sub(str_start) {
             return Err(BtfError::SectionOverflow);
         }
 
-        let type_data = &data[type_start..type_end];
-        let str_data = &data[str_start..str_end];
+        let type_data = &data[type_start..][..type_len];
+        let str_data = &data[str_start..][..str_len];
         let strings = BtfStrings::new(str_data);
 
         let types = Self::parse_types(type_data, &strings)?;
@@ -113,18 +113,16 @@ impl<'a> Btf<'a> {
             let vlen = (info & 0xFFFF) as u16;
             let kind_flag = (info >> 31) != 0;
             let extra_size = kind.extra_size(vlen);
-
-            let extra_start = 12;
-            let extra_end = extra_start + extra_size;
-            if extra_end > remaining.len() {
+            if 12 + extra_size > remaining.len() {
                 return Err(BtfError::InvalidType(type_id));
             }
-            let extra = &remaining[extra_start..extra_end];
+            let extra = &remaining[12..][..extra_size];
 
             let name = strings.get_or_empty(name_off);
 
             let type_info = match kind {
-                BtfKind::Void => BtfTypeInfo::Void,
+                // type 0 is the implicit void; libbpf rejects `BTF_KIND_UNKN` inside the type section too
+                BtfKind::Void => return Err(BtfError::InvalidType(type_id)),
 
                 BtfKind::Int => {
                     let int_info = word(extra, 0);
@@ -265,7 +263,7 @@ impl<'a> Btf<'a> {
             };
 
             types.push(type_info);
-            offset += extra_end;
+            offset += 12 + extra_size;
             type_id += 1;
         }
 

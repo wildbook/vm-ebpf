@@ -1,4 +1,5 @@
-//! Links `bpf.o` into an rvm image, so the binary loads it without the linker.
+//! Links `bpf.o` into an rvm image, so the binary loads it without the linker. `bpf.o` is built from `bpf/example.c`
+//! with `clang -target bpf -O2 -g -c bpf/example.c -o bpf.o`.
 
 use std::path::Path;
 

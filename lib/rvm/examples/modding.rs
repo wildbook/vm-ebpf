@@ -131,7 +131,7 @@ fn run(vm: &Vm, world: &World, rules: &Plugin, combat: &Plugin) -> rvm::Result<(
     for tick in 0..TICKS {
         world.set_tick(tick);
         if tick == RELOAD_AT {
-            rules.replace(vm.load_elf(RULES_V2)?);
+            rules.replace(vm.load_elf(RULES_V2)?)?;
             println!("tick {tick:>2}  host: reloaded rules");
         }
 

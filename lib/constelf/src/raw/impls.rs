@@ -14,11 +14,11 @@ impl raw::Elf64Sym {
 }
 
 impl raw::Elf64Rel {
-    pub const fn sym(self) -> u32 {
+    pub const fn sym(&self) -> u32 {
         (self.r_info >> 32) as u32
     }
 
-    pub const fn typ(self) -> u32 {
+    pub const fn typ(&self) -> u32 {
         self.r_info as u32
     }
 }
@@ -40,7 +40,7 @@ impl raw::ElfIdent {
         ensure_matches!(ElfError::Header(ErrHeader::Ident), self.ei_data, raw::ELFDATA2LSB);
         ensure_matches!(ElfError::Header(ErrHeader::Ident), self.ei_version, raw::E_CURRENT);
         ensure_matches!(ElfError::Header(ErrHeader::Ident), self.ei_osabi, raw::ELFOSABI_NONE);
-        ensure_matches!(ElfError::Header(ErrHeader::Ident), self.ei_abiverssion, 0);
+        ensure_matches!(ElfError::Header(ErrHeader::Ident), self.ei_abiversion, 0);
 
         Ok(())
     }

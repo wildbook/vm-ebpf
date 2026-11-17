@@ -3,8 +3,11 @@
 //! test controls, and can hand-derive, the exact offsets/values the relocation must produce.
 
 use crate::builder::BtfBuilder;
-use crate::core_relo::{apply_core_relocations, CoreRelo, CoreReloError, CoreReloKind, Unresolved, CORE_POISON_HELPER};
-use crate::parse::Btf;
+use crate::core_relo::{
+    apply_core_relocations, BtfExt, CoreRelo, CoreReloError, CoreReloKind, Unresolved, CORE_POISON_HELPER,
+};
+use crate::parse::{Btf, BtfError};
+use crate::strings::BtfStrings;
 
 /// Encode a single `CoreRelo` whose access string is appended to a scratch `BtfBuilder`'s string table (CO-RE access
 /// strings live in the *local* BTF's strings).
@@ -163,7 +166,8 @@ fn bitfield_signed_and_shifts() {
 }
 
 /// A field whose unsigned integer type widened gets its `LDX` memory access size adjusted; the same change on a signed
-/// field poisons rather than risk sign-extending wrongly.
+/// field poisons a load rather than risk sign-extending wrongly, but still patches an ALU offset computation (as in
+/// `bpf_core_read`), which has no access size to get wrong.
 #[test]
 fn size_change_adjusts_or_poisons_memory_access() {
     let mut local = BtfBuilder::new();
@@ -195,9 +199,20 @@ fn size_change_adjusts_or_poisons_memory_access() {
     assert_eq!(insns[0] as u8 & 0x18, 0x18, "mem size should widen from W to DW");
 
     let mut insns = [insn(LDX_W, 0, 1, 0, 0)];
-    let unresolved = apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r_unsafe]).unwrap();
-    assert_eq!(unresolved.len(), 1);
+    let r_unsafe_slice = std::slice::from_ref(&r_unsafe);
+    let unresolved = apply_core_relocations(&mut insns, &local_btf, &target_btf, r_unsafe_slice).unwrap();
+    let error = CoreReloError::IncompatibleFieldSize {
+        type_name: "unsafe".to_string(),
+        access_str: "0:0".to_string(),
+    };
+    assert_eq!(unresolved, vec![Unresolved { insn_off: 0, error }]);
     assert_eq!(insns[0], 0x85 | u64::from(CORE_POISON_HELPER) << 32);
+
+    const ALU64_ADD_K: u8 = 0x07;
+    let mut insns = [insn(ALU64_ADD_K, 1, 0, 0, 0)];
+    let unresolved = apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r_unsafe]).unwrap();
+    assert!(unresolved.is_empty());
+    assert_eq!(insns[0], insn(ALU64_ADD_K, 1, 0, 0, 0));
 }
 
 /// A target type with a `___flavor` suffix is still found by its essential name.
@@ -462,4 +477,22 @@ fn two_dimensional_array_offset() {
     apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r]).unwrap();
     // 4 (before) + 1 * 16 (one full inner array) + 2 * 4 (one int)
     assert_eq!(off_of(insns[0]), 28);
+}
+
+/// Malformed input that libbpf rejects must fail to parse: a kind 0 record in the type section (only the implicit type
+/// 0 is void) and a CO-RE relocation kind past the last one known, which would otherwise be skipped and leave its
+/// instruction with the compile-time offset.
+#[test]
+fn parsers_reject_unknown_kinds() {
+    let words = |w: &[u32]| w.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+
+    // magic/version/flags, hdr_len, type_off, type_len, str_off, str_len; one all-zero type record; strings "\0"
+    let mut btf = words(&[0x0001_eb9f, 24, 0, 12, 12, 1, 0, 0, 0]);
+    btf.push(0);
+    assert_eq!(Btf::parse(&btf).unwrap_err(), BtfError::InvalidType(1));
+
+    // header with CO-RE fields (core_relo_off 0, len 28), then rec_size and one section with a kind 99 record
+    let ext = words(&[0x0001_eb9f, 32, 0, 0, 0, 0, 0, 28, 16, 0, 1, 0, 1, 0, 99]);
+    let err = BtfExt::parse(&ext, &BtfStrings::new(b"\0")).unwrap_err();
+    assert_eq!(err, BtfError::UnknownReloKind(99));
 }

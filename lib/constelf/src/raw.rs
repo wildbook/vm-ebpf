@@ -128,7 +128,7 @@ pub struct ElfIdent {
     pub ei_data: u8,
     pub ei_version: u8,
     pub ei_osabi: u8,
-    pub ei_abiverssion: u8,
+    pub ei_abiversion: u8,
     pub ei_pad: [u8; 7],
 }
 
@@ -146,7 +146,7 @@ pub struct Elf64Ehdr {
     pub e_ehsize: Elf64Half,
     pub e_phentsize: Elf64Half,
     pub e_phnum: Elf64Half,
-    pub e_shentssize: Elf64Half,
+    pub e_shentsize: Elf64Half,
     pub e_shnum: Elf64Half,
     pub e_shstrndx: Elf64Half,
 }

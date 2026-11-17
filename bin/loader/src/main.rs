@@ -1,33 +1,19 @@
-//! Loads `bpf/example.o` (falling back to `bpf.o`), prints what `Vm::parse_module` and `Vm::link_one` produce, and
-//! calls its exported functions.
+//! Loads `bpf/example.o`, prints what `Vm::parse_module` and `Vm::link_one` produce, and calls its exported functions.
+//! Exits with an error when a call fails or returns the wrong value.
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use rvm::{Module, Perms, Program, Vm};
 
 fn main() -> Result<()> {
-    println!("=== eBPF Loader Example ===\n");
-
     let elf_path = "bpf/example.o";
-    println!("Attempting to load: {elf_path}");
-
-    let elf_bytes = match std::fs::read(elf_path) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            println!("Failed to read {elf_path}: {e}");
-            println!("\nTo compile the eBPF program, run:");
-            println!("  clang -target bpf -O2 -g -c bpf/example.c -o bpf/example.o");
-
-            println!("\nTrying fallback: bpf.o");
-            std::fs::read("bpf.o").context("No eBPF object file found. Please compile one first.")?
-        }
-    };
-
+    let elf_bytes =
+        std::fs::read(elf_path).with_context(|| format!("reading {elf_path}; bpf/example.c has its build line"))?;
     let len = elf_bytes.len();
-    println!("Loaded {len} bytes\n");
+    println!("Loaded {elf_path}: {len} bytes");
 
     let vm = Vm::new();
 
-    println!("=== Parsing ELF ===");
+    println!("\n=== Parsing ELF ===");
     let module = vm.parse_module("example", &elf_bytes)?;
     print_module_info(&module);
 
@@ -37,26 +23,17 @@ fn main() -> Result<()> {
     println!("  Stack top: 0x{:x}", program.stack_top());
     print_function_table(&program);
 
-    println!("\n=== Test 1: Running 'simple_add(100, 200)' ===");
-    run_and_report(&mut program, "simple_add", &[100, 200], |result| {
-        println!("simple_add(100, 200) = {result}");
-        if result == 300 {
-            println!("Correct! 100 + 200 = 300");
-        }
-    });
+    println!("\n=== simple_add(100, 200) ===");
+    let sum = run_and_report(&mut program, "simple_add", &[100, 200])?;
+    ensure!(sum == 300, "simple_add(100, 200) returned {sum}, expected 300");
 
-    println!("\n=== Test 2: Running 'return_magic()' ===");
-    run_and_report(&mut program, "return_magic", &[], |result| {
-        println!("return_magic() = 0x{result:016X}");
-        if result == 0xDEADBEEFCAFEBABE {
-            println!("Correct! Got the magic value.");
-        }
-    });
+    println!("\n=== return_magic() ===");
+    let magic = run_and_report(&mut program, "return_magic", &[])?;
+    ensure!(magic == 0xDEADBEEFCAFEBABE, "return_magic() returned 0x{magic:016X}, expected 0xDEADBEEFCAFEBABE");
 
     // `struct input_ctx` and `struct output_result` live in a host-mapped scratch region.
-    println!("\n=== Test 3: Running 'bpf_main' (op=mul, 10 * 20) ===");
-    let scratch = program.memory_mut().map(rvm::FIRST_FREE_REGION, 4096, Perms::RW);
-    let ctx = scratch;
+    println!("\n=== bpf_main (op=mul, 10 * 20) ===");
+    let ctx = program.memory_mut().map(rvm::FIRST_FREE_REGION, 4096, Perms::RW);
     let out = ctx + 64;
     let mem = program.memory_mut();
     mem.write(ctx, 10u64)?; // value_a
@@ -64,9 +41,8 @@ fn main() -> Result<()> {
     mem.write(ctx + 16, 2u32)?; // operation = mul
     let status = program.call("bpf_main", &[ctx, out])?;
     let product: u64 = program.memory().read(out)?;
-
-    println!("\n=== All tests complete ===");
     println!("bpf_main returned {status}, out->result = {product}");
+    ensure!(status == 0 && product == 200, "bpf_main returned {status}, result {product}; expected 0, 200");
 
     Ok(())
 }
@@ -126,25 +102,20 @@ fn print_function_table(program: &Program) {
     }
 }
 
-/// Call `name` with `args`, print the entry point and arguments, then report the result.
-fn run_and_report(program: &mut Program, name: &str, args: &[u64], on_ok: impl FnOnce(u64)) {
+/// Call `name` with `args`, printing the entry point, arguments and result.
+fn run_and_report(program: &mut Program, name: &str, args: &[u64]) -> Result<u64> {
     if let Some(info) = program.function(name) {
         let pc = info.pc;
         let byte_offset = pc * 8;
         println!("Entry PC: {pc} (byte offset: 0x{byte_offset:x})");
     }
     println!("Stack pointer (r10): 0x{:x}", program.stack_top());
-    for (i, &arg) in args.iter().take(5).enumerate() {
+    for (i, &arg) in args.iter().enumerate() {
         let reg = i + 1;
         println!("Argument r{reg}: 0x{arg:x} ({arg})");
     }
-    println!();
 
-    match program.call(name, args) {
-        Ok(result) => {
-            println!("Return value (r0): {result} (0x{result:x})");
-            on_ok(result);
-        }
-        Err(e) => println!("Error: {e}"),
-    }
+    let result = program.call(name, args).with_context(|| format!("calling {name}"))?;
+    println!("Return value (r0): {result} (0x{result:x})");
+    Ok(result)
 }

@@ -42,7 +42,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         pending.extend_from_slice(chunk);
         parser.memory_mut().write_bytes(input, &pending)?;
         let consumed = parser.call_func(parse, &[input, pending.len() as u64])?;
-        pending.drain(..consumed as usize);
+        let consumed = usize::try_from(consumed)
+            .ok()
+            .filter(|&n| n <= pending.len())
+            .ok_or_else(|| format!("the plugin claims to have parsed {consumed} of {} bytes", pending.len()))?;
+        pending.drain(..consumed);
     }
     if !pending.is_empty() {
         return Err(format!("the stream ends inside a record, {} bytes in", pending.len()).into());
@@ -320,6 +324,10 @@ fn encode_int(n: i64, out: &mut Vec<u8>) {
         -0x8000..=-0x81 => {
             out.push(0xd1);
             out.extend((n as i16).to_be_bytes());
+        }
+        -0x8000_0000..=-0x8001 => {
+            out.push(0xd2);
+            out.extend((n as i32).to_be_bytes());
         }
         _ => {
             out.push(0xd3);
