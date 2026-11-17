@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use hashbrown::HashMap;
-use rvm_core::Instruction;
+use rvm_core::Code;
 
 use crate::error::{Result, VmError};
 use crate::executor::Executor;
@@ -71,7 +71,7 @@ pub struct Program {
     /// Tells this program's [`Func`] handles from other programs'.
     id: u64,
     /// Instructions; not addressable by the guest.
-    code: Box<[Instruction]>,
+    code: Code,
     /// Guest memory regions (stack, data, maps). See [`crate::layout`] for the layout.
     memory: VmMemory,
     maps: Maps,
@@ -93,7 +93,7 @@ pub struct Program {
 impl Program {
     /// Create a new program. Loading an image is the usual caller.
     pub fn new(
-        code: Box<[Instruction]>,
+        code: Code,
         memory: VmMemory,
         maps: Maps,
         functions: HashMap<String, FunctionInfo>,
@@ -119,8 +119,8 @@ impl Program {
         }
     }
 
-    /// The program's instructions.
-    pub fn code(&self) -> &[Instruction] {
+    /// The program's code, prepared for execution.
+    pub fn code(&self) -> &Code {
         &self.code
     }
 

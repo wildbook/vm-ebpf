@@ -5,14 +5,17 @@ use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use ebpf_asm::{Assembler, R0, R1, R10, R2, R6};
-use rvm::{Executor, HelperRegistry, Instruction, Perms, VmMemory};
+use rvm::{Code, Executor, HelperRegistry, Instruction, Perms, VmMemory};
 
 const N: i32 = 10_000;
 const STACK: usize = 4096;
 
-fn load(asm: &mut Assembler) -> (Box<[Instruction]>, VmMemory, u64) {
-    let bytes = asm.assemble().unwrap();
-    let code = rvm::instructions_from_bytes(&bytes);
+fn load(asm: &mut Assembler) -> (Code, VmMemory, u64) {
+    load_bytes(&asm.assemble().unwrap())
+}
+
+fn load_bytes(bytes: &[u8]) -> (Code, VmMemory, u64) {
+    let code = rvm::instructions_from_bytes(bytes);
     let mut mem = VmMemory::new();
     let stack_top = mem.map(rvm::STACK_REGION, STACK, Perms::RW) + STACK as u64;
     (code, mem, stack_top)
@@ -59,18 +62,19 @@ fn helper_loop() -> Assembler {
 }
 
 /// Rewrite `call <id>` into a slot call (`src_reg = 2`), as the linker does.
-/// Patches the decoded instruction slice, since code is not in guest memory.
-fn as_slot_calls(asm: &mut Assembler, helpers: &HelperRegistry) -> (Box<[Instruction]>, VmMemory, u64) {
+fn as_slot_calls(asm: &mut Assembler, helpers: &HelperRegistry) -> (Code, VmMemory, u64) {
     use rvm_core::opcode::OpCode;
 
-    let (mut code, mem, stack_top) = load(asm);
-    for insn in code.iter_mut() {
+    let mut bytes = asm.assemble().unwrap();
+    for word in bytes.as_chunks_mut::<8>().0 {
+        let insn = Instruction(u64::from_le_bytes(*word));
         if insn.opcode().0 == 0x85 && insn.src_reg() == 0 {
             let slot = helpers.slot_of_id(insn.imm() as u32).unwrap();
-            *insn = Instruction::from_parts(OpCode(0x85), insn.dst_reg(), 2, insn.offset(), slot as i32);
+            let call = Instruction::from_parts(OpCode(0x85), insn.dst_reg(), 2, insn.offset(), slot as i32);
+            *word = call.0.to_le_bytes();
         }
     }
-    (code, mem, stack_top)
+    load_bytes(&bytes)
 }
 
 fn bench(c: &mut Criterion) {

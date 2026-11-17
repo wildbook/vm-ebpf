@@ -6,7 +6,7 @@
 use std::fmt::Debug;
 use std::mem::ManuallyDrop;
 
-use rvm_core::{run, CallStack, Context, Flow, Host, Instruction, Memory};
+use rvm_core::{run, CallStack, Code, Context, Flow, Host, Memory};
 
 use crate::error::{ExecError, HelperError, Result};
 use crate::helper::{HelperArgs, HelperContext, HelperRegistry};
@@ -33,7 +33,7 @@ pub const CORE_POISON_HELPER: u32 = 0xbad2310;
 /// it through memory. Generic over any [`Memory`]; memory stays borrowed, so it
 /// survives errors.
 pub struct Executor<'a, M: Memory = VmMemory> {
-    code: &'a [Instruction],
+    code: &'a Code,
     memory: &'a mut M,
     helpers: &'a HelperRegistry<M>,
     /// Initial r10.
@@ -49,7 +49,7 @@ pub struct Executor<'a, M: Memory = VmMemory> {
 
 impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
     /// Create a new executor.
-    pub fn new(code: &'a [Instruction], memory: &'a mut M, helpers: &'a HelperRegistry<M>, stack_top: u64) -> Self {
+    pub fn new(code: &'a Code, memory: &'a mut M, helpers: &'a HelperRegistry<M>, stack_top: u64) -> Self {
         Self {
             code,
             memory,
@@ -196,7 +196,7 @@ impl<M: Memory<Err: Debug> + 'static> Host<&mut M> for Helpers<'_, M> {
 fn call_indirect<M: Memory<Err: Debug> + 'static>(
     target: u64,
     pc: u64,
-    code: &[Instruction],
+    code: &Code,
     ctx: &mut Context<&mut M>,
     calls: &mut CallStack<Helpers<'_, M>>,
 ) -> Result<u64> {
@@ -219,13 +219,13 @@ fn call_indirect<M: Memory<Err: Debug> + 'static>(
 /// `gotox` at `pc`: the instruction index of code address `target`.
 #[cold]
 #[inline(never)]
-fn jump_indirect(target: u64, pc: u64, code: &[Instruction]) -> Result<u64> {
+fn jump_indirect(target: u64, pc: u64, code: &Code) -> Result<u64> {
     code_index(target, code).ok_or_else(|| ExecError::BadCodeAddress { pc, target }.into())
 }
 
 /// Instruction index of the guest code address `addr`, if it is an instruction
 /// boundary inside `code`.
-fn code_index(addr: u64, code: &[Instruction]) -> Option<u64> {
+fn code_index(addr: u64, code: &Code) -> Option<u64> {
     let offset = addr.checked_sub(region_base(CODE_REGION))?;
     (offset % 8 == 0 && offset / 8 < code.len() as u64).then_some(offset / 8)
 }

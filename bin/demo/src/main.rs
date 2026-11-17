@@ -264,7 +264,7 @@ fn demo_core_relocation() -> Result<(), String> {
     }
 
     println!("\nRunning patched program against the host's actual memory layout...");
-    let code: Vec<rvm::Instruction> = insns.iter().map(|&i| rvm::Instruction(i)).collect();
+    let code = rvm::Code::new(insns.iter().map(|&i| rvm::Instruction(i)).collect::<Vec<_>>());
 
     let stack_size = 512;
     let mut mem = VmMemory::new();

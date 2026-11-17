@@ -37,7 +37,8 @@ cargo run --bin emu      # runs bpf.o, linked into an image at build time
   `Memory` trait implementation, runs helper and kfunc calls through a `Host`
   trait implementation, and returns a `Flow` describing why execution stopped
   (exit, an indirect call or jump, a host call the host declined, a fault, or
-  out of fuel).
+  out of fuel). `run` takes a `Code`, which fuses common instruction sequences
+  into superinstructions when it is created.
 - `lib/rvm`: the embeddable runtime built on `rvm-core`. Parses ELF objects,
   links them into executable programs, manages guest memory, and dispatches
   helper calls.

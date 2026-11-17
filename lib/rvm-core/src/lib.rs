@@ -9,8 +9,11 @@ use std::ops::ControlFlow;
 use opcode::{Class, MemMode, MemSize, OpCode};
 
 mod debug;
+mod fuse;
 
 pub mod opcode;
+
+pub use fuse::Code;
 
 #[cfg(test)]
 mod tests;
@@ -21,14 +24,16 @@ mod tests;
 #[derive(Copy, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Instruction(pub u64);
 
-/// Decode little-endian bytecode into instructions (a trailing partial word is ignored).
-pub fn instructions_from_bytes(bytes: &[u8]) -> Box<[Instruction]> {
-    bytes
+/// Decode little-endian bytecode (a trailing partial word is ignored) and prepare
+/// it for [`run`].
+pub fn instructions_from_bytes(bytes: &[u8]) -> Code {
+    let insns: Box<[Instruction]> = bytes
         .as_chunks::<8>()
         .0
         .iter()
         .map(|w| Instruction(u64::from_le_bytes(*w)))
-        .collect()
+        .collect();
+    Code::new(insns)
 }
 
 impl Instruction {
@@ -807,9 +812,10 @@ type Handler<M, H> = extern "rust-preserve-none" fn(
     &mut CallStack<H>,
 ) -> Flow<M>;
 
-/// The handler of every opcode byte, each running [`step`] with its opcode as a
-/// constant, so the class, operation, source, mode and size matches fold away.
-/// With `FUEL`, the handlers meter fuel; without it, they never read it.
+/// The handler of every opcode byte. Each runs [`step`] with its opcode as a
+/// constant, so the class, operation, source, mode and size matches fold away; the
+/// superinstruction bytes get theirs from [`fuse::install`]. With `FUEL`, the
+/// handlers meter fuel; without it, they never read it.
 struct Handlers<M, H, const FUEL: bool>(PhantomData<(M, H)>);
 
 impl<M: Memory, H: Host<M>, const FUEL: bool> Handlers<M, H, FUEL> {
@@ -820,7 +826,7 @@ impl<M: Memory, H: Host<M>, const FUEL: bool> Handlers<M, H, FUEL> {
             };
         }
 
-        table!(
+        let mut table = table!(
             0x00 0x01 0x02 0x03 0x04 0x05 0x06 0x07 0x08 0x09 0x0a 0x0b 0x0c 0x0d 0x0e 0x0f
             0x10 0x11 0x12 0x13 0x14 0x15 0x16 0x17 0x18 0x19 0x1a 0x1b 0x1c 0x1d 0x1e 0x1f
             0x20 0x21 0x22 0x23 0x24 0x25 0x26 0x27 0x28 0x29 0x2a 0x2b 0x2c 0x2d 0x2e 0x2f
@@ -837,7 +843,9 @@ impl<M: Memory, H: Host<M>, const FUEL: bool> Handlers<M, H, FUEL> {
             0xd0 0xd1 0xd2 0xd3 0xd4 0xd5 0xd6 0xd7 0xd8 0xd9 0xda 0xdb 0xdc 0xdd 0xde 0xdf
             0xe0 0xe1 0xe2 0xe3 0xe4 0xe5 0xe6 0xe7 0xe8 0xe9 0xea 0xeb 0xec 0xed 0xee 0xef
             0xf0 0xf1 0xf2 0xf3 0xf4 0xf5 0xf6 0xf7 0xf8 0xf9 0xfa 0xfb 0xfc 0xfd 0xfe 0xff
-        )
+        );
+        fuse::install::<M, H, FUEL>(&mut table);
+        table
     };
 }
 
@@ -993,7 +1001,7 @@ const METERED: bool = cfg!(feature = "fuel");
 #[inline]
 pub fn run<M: Memory, H: Host<M>>(
     ctx: &mut Context<M>,
-    code: &[Instruction],
+    code: &Code,
     pc: &mut u64,
     #[cfg(feature = "fuel")] fuel: &mut u64,
     calls: &mut CallStack<H>,
@@ -1001,6 +1009,7 @@ pub fn run<M: Memory, H: Host<M>>(
     #[cfg(not(feature = "fuel"))]
     let fuel = &mut 0;
 
+    let code = code.slots();
     let (first, insn) = match fetch::<M, H, METERED>(code, *pc, *fuel) {
         Ok(next) => next,
         Err(flow) => return flow,

@@ -102,7 +102,7 @@ pub use memory::{
 pub use module::Module;
 pub use plugin::{Plugin, WeakPlugin};
 pub use program::{Borrow, Func, FunctionInfo, Program};
-pub use rvm_core::{instructions_from_bytes, AtomicOp, Instruction, MAX_CALL_DEPTH};
+pub use rvm_core::{instructions_from_bytes, AtomicOp, Code, Instruction, MAX_CALL_DEPTH};
 #[cfg(feature = "link")]
 pub use section::{Section, SectionKind};
 pub use std_helpers::{BPF_FUNC_GET_PRANDOM_U32, BPF_FUNC_KTIME_GET_NS, BPF_FUNC_TRACE_PRINTK};
