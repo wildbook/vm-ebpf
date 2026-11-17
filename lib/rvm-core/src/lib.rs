@@ -394,14 +394,18 @@ mod alu {
             },
             AluOpc::Xor => d ^ s,
             // MOV (offset=0) or MOVSX (offset=8/16/32, register source only; 32 is ALU64-only).
-            // Plain MOV is tested first so the common copy is a branch, not a jump table.
+            // Without the cold path, LLVM merges the `offset == 0` test into the movsx
+            // switch and lowers all of it to a jump table on `offset`.
             AluOpc::Mov if offset == 0 => s,
-            AluOpc::Mov => match (offset, alu_src, BITS) {
-                (8, Source::Reg, _) => s as i8 as i64 as u64,
-                (16, Source::Reg, _) => s as i16 as i64 as u64,
-                (32, Source::Reg, BITS_64) => s as i32 as i64 as u64,
-                _ => return Flow::FailCpu,
-            },
+            AluOpc::Mov => {
+                core::hint::cold_path();
+                match (offset, alu_src, BITS) {
+                    (8, Source::Reg, _) => s as i8 as i64 as u64,
+                    (16, Source::Reg, _) => s as i16 as i64 as u64,
+                    (32, Source::Reg, BITS_64) => s as i32 as i64 as u64,
+                    _ => return Flow::FailCpu,
+                }
+            }
             AluOpc::Arsh => match BITS {
                 BITS_64 => ((d as i64) >> (s & 63)) as u64,
                 BITS_32 => ((d as i32) >> (s & 31)) as u64,
