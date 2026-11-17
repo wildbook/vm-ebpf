@@ -43,7 +43,6 @@ impl Debug for OpCode {
                     true => dstr.field("end", &self.alu_end()),
                     false => dstr.field("src", &self.alu_src()),
                 };
-
             },
         };
 

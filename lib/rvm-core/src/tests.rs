@@ -1,13 +1,11 @@
-//! Comprehensive test harness for eBPF instruction execution.
-//!
-//! Tests each supported instruction with various inputs to verify correct behavior.
+//! Single-instruction semantics of [`step`], with the edge cases the eBPF spec
+//! (RFC 9669) defines.
 
 use std::ops::ControlFlow;
 
 use crate::opcode::{AluEnd, AluOpc, JmpOpc, MemMode, MemSize, OpCode, Source};
-use crate::{step, step_ld64, Context, Flow, Instruction, Memory, OpCode as OC};
+use crate::{step, step_ld64, Context, Flow, Instruction, Memory};
 
-/// Simple memory implementation for testing
 #[derive(Debug)]
 struct TestMem {
     data: [u8; 4096],
@@ -42,30 +40,23 @@ impl Memory for TestMem {
     }
 }
 
-/// Helper to create an instruction from parts
 fn instr(opc: OpCode, dst: u8, src: u8, off: i16, imm: i32) -> Instruction {
     Instruction::from_parts(opc, dst, src, off, imm)
 }
 
-/// Execute a single instruction and return the result
 fn exec(ctx: &mut Context<TestMem>, instruction: Instruction) -> Flow<TestMem> {
     match step(ctx, instruction) {
         ControlFlow::Break(flow) => flow,
-        ControlFlow::Continue(_) => panic!("Unexpected LD_IMM64 first half"),
+        ControlFlow::Continue(_) => panic!("unexpected LD_IMM64 first half"),
     }
 }
 
-/// Execute a LD_IMM64 instruction pair
 fn exec_ld64(ctx: &mut Context<TestMem>, first: Instruction, second: Instruction) -> Flow<TestMem> {
     match step(ctx, first) {
         ControlFlow::Continue(_) => step_ld64(ctx, first, second),
         ControlFlow::Break(flow) => flow,
     }
 }
-
-// ============================================================================
-// ALU Tests (64-bit and 32-bit arithmetic edge cases)
-// ============================================================================
 
 #[test]
 fn alu_edges() {
@@ -110,10 +101,6 @@ fn alu_edges() {
     assert_eq!(ctx.regs[0], 0x9ABC_DEF0);
 }
 
-// ============================================================================
-// JMP Tests (64-bit and 32-bit conditions)
-// ============================================================================
-
 #[test]
 fn jmp_conditions() {
     // (dst register value, opcode, off, imm, whether the jump is taken)
@@ -155,10 +142,6 @@ fn jmp_conditions() {
     let i = instr(OpCode::jmp64_from_parts(JmpOpc::Call, Source::Imm), 0, 1, 0, 5);
     assert!(matches!(exec(&mut ctx, i), Flow::Call(5)));
 }
-
-// ============================================================================
-// Memory Load/Store Tests
-// ============================================================================
 
 #[test]
 fn load_store_sizes() {
@@ -204,25 +187,16 @@ fn load_store_sizes() {
     assert_eq!(ctx.data.data[120], 0xEF);
 }
 
-// ============================================================================
-// LD_IMM64 Tests
-// ============================================================================
-
 #[test]
-fn test_ld_imm64() {
+fn ld_imm64() {
     let mut ctx = Context::new(TestMem::new());
 
-    // LD_IMM64: opcode = 0x18 (LD | IMM | DW)
-    let first = Instruction::from_parts(OC(0x18), 0, 0, 0, 0xDEADBEEFu32 as i32);
-    let second = Instruction::from_parts(OC(0x00), 0, 0, 0, 0x12345678u32 as i32);
+    let first = instr(OpCode(0x18), 0, 0, 0, 0xDEADBEEFu32 as i32);
+    let second = instr(OpCode(0x00), 0, 0, 0, 0x12345678u32 as i32);
 
     assert!(matches!(exec_ld64(&mut ctx, first, second), Flow::Next));
     assert_eq!(ctx.regs[0], 0x12345678_DEADBEEF);
 }
-
-// ============================================================================
-// Edge Cases and Error Handling
-// ============================================================================
 
 #[test]
 fn mem_fault() {
@@ -244,12 +218,8 @@ fn mem_fault() {
     }
 }
 
-// ============================================================================
-// Spec Edge Cases (RFC 9669)
-// ============================================================================
-
 #[test]
-fn test_alu32_imm_is_unsigned_32bit() {
+fn alu32_imm_is_unsigned_32bit() {
     let mut ctx = Context::new(TestMem::new());
     ctx.regs[1] = 0xFFFF_FFFF;
     exec(&mut ctx, instr(AluOpc::div_32(Source::Imm), 1, 0, 0, -1));
@@ -261,7 +231,7 @@ fn test_alu32_imm_is_unsigned_32bit() {
 }
 
 #[test]
-fn test_jmp32_unsigned_compare_negative_imm() {
+fn jmp32_unsigned_compare_negative_imm() {
     let mut ctx = Context::new(TestMem::new());
     ctx.regs[1] = 0xFFFF_FFFF;
     let jeq = instr(OpCode::jmp32_from_parts(JmpOpc::Jeq, Source::Imm), 1, 0, 3, -1);
@@ -271,7 +241,7 @@ fn test_jmp32_unsigned_compare_negative_imm() {
 }
 
 #[test]
-fn test_movsx() {
+fn movsx() {
     let mut ctx = Context::new(TestMem::new());
     ctx.regs[2] = 0x1234_5678_8000_8080;
     for (off, want) in [
@@ -291,7 +261,7 @@ fn test_movsx() {
 }
 
 #[test]
-fn test_bswap_and_endianness() {
+fn bswap_and_endianness() {
     let v = 0x1122_3344_5566_7788;
     for (input, opc, imm, want) in [
         (v, AluOpc::end_64(AluEnd::ToLE), 16, 0x8877),

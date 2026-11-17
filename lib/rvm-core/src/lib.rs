@@ -80,11 +80,12 @@ impl Instruction {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Flow<C: Memory> {
-    Next, // Continue
+    Next,
 
-    Jump(i64), // Jump
-    Call(i64), // Call
-    Exit,      // Return
+    Jump(i64),
+    /// A program-local call, with the offset of the callee.
+    Call(i64),
+    Exit,
 
     /// Call a helper by its numeric ID (`src_reg = 0`).
     CallHelper(u32),
@@ -92,11 +93,12 @@ pub enum Flow<C: Memory> {
     /// runtime defines what the ID indexes (rvm: the program's extern table).
     CallKfunc(u32),
 
-    FailCpu, // Invalid instruction, etc.
+    /// An invalid or reserved instruction.
+    FailCpu,
     FailMem(C::Err),
 
-    Missing, // Not yet implemented.
-
+    /// A valid instruction that rvm doesn't implement.
+    Missing,
     /// [`run`] used up its instruction budget before the next instruction. Only
     /// with the `fuel` feature.
     OutOfFuel,
@@ -113,8 +115,7 @@ pub enum Flow<C: Memory> {
 }
 
 pub trait Memory {
-    /// The Memory implementation's error type.
-    /// If possible, avoid types larger than 8 bytes.
+    /// [`Flow::FailMem`] carries this, so keep it small, ideally 8 bytes or less.
     type Err;
 
     fn load_u8(&self, addr: u64) -> Result<u8, Self::Err>;
@@ -333,10 +334,7 @@ mod alu {
             AluOpc::Mul => d.wrapping_mul(s),
             // DIV (offset=0) or SDIV (offset=1)
             AluOpc::Div => match (offset, BITS) {
-                (0, _) => {
-                    // Unsigned division: dst = (src != 0) ? (dst / src) : 0
-                    d.checked_div(s).unwrap_or(0)
-                }
+                (0, _) => d.checked_div(s).unwrap_or(0),
                 (1, BITS_64) => {
                     // SDIV 64-bit: handle div by zero and LLONG_MIN / -1
                     let ds = d as i64;
@@ -376,12 +374,9 @@ mod alu {
             AluOpc::Neg => d.wrapping_neg(),
             // MOD (offset=0) or SMOD (offset=1)
             AluOpc::Mod => match (offset, BITS) {
-                (0, BITS_64) => {
-                    // Unsigned modulo: dst = (src != 0) ? (dst % src) : dst
-                    d.checked_rem(s).unwrap_or(d)
-                }
+                (0, BITS_64) => d.checked_rem(s).unwrap_or(d),
                 (0, BITS_32) => {
-                    // Unsigned modulo 32-bit: if src==0, upper 32 bits zeroed but lower preserved
+                    // the upper 32 bits are zeroed below
                     if s == 0 {
                         d
                     } else {
@@ -393,7 +388,7 @@ mod alu {
                     let ds = d as i64;
                     let ss = s as i64;
                     if ss == 0 {
-                        d // unchanged
+                        d
                     } else if ss == -1 && ds == i64::MIN {
                         0u64
                     } else {
@@ -405,7 +400,7 @@ mod alu {
                     let ds = d as i32;
                     let ss = s as i32;
                     if ss == 0 {
-                        d // unchanged (but will be zero-extended later)
+                        d // zero-extended below
                     } else if ss == -1 && ds == i32::MIN {
                         0u64
                     } else {
@@ -689,7 +684,7 @@ mod mem {
     }
 
     #[inline(always)]
-    pub fn ld64<M: Memory>(_ctx: &mut Context<M>, instr: Instruction) -> ControlFlow<Flow<M>, Instruction> {
+    pub fn ld64<M: Memory>(instr: Instruction) -> ControlFlow<Flow<M>, Instruction> {
         let opc = instr.opcode();
         let size = opc.mem_size();
         let mode = opc.mem_mode();
@@ -702,7 +697,7 @@ mod mem {
 }
 
 #[inline(always)]
-pub fn step<M: Memory>(ctx: &mut Context<M>, instr: Instruction) -> ControlFlow<Flow<M>, Instruction> {
+pub(crate) fn step<M: Memory>(ctx: &mut Context<M>, instr: Instruction) -> ControlFlow<Flow<M>, Instruction> {
     use alu::{BITS_32, BITS_64};
     use mem::{WITH_IMM, WITH_REG};
 
@@ -713,7 +708,7 @@ pub fn step<M: Memory>(ctx: &mut Context<M>, instr: Instruction) -> ControlFlow<
         Class::Jmp32 => ControlFlow::Break(alu::jump::<_, BITS_32>(ctx, instr)),
         Class::Jmp64 => ControlFlow::Break(alu::jump::<_, BITS_64>(ctx, instr)),
 
-        Class::LdImm => mem::ld64::<_>(ctx, instr),
+        Class::LdImm => mem::ld64::<_>(instr),
         Class::LdReg => ControlFlow::Break(mem::load::<_>(ctx, instr)),
 
         Class::StImm => ControlFlow::Break(mem::save::<_, WITH_IMM>(ctx, instr)),
@@ -880,8 +875,6 @@ impl<M: Memory, H: Host<M>, const FUEL: bool> Handlers<M, H, FUEL> {
 /// The [`Handler`] of opcode `OP`. Each handler fetches the next instruction itself
 /// and ends in its own indirect jump, so the branch predictor tracks the successors
 /// of every opcode separately.
-// PGO promotes a profiled tail call to a compare against its usual target; inlining
-// that target as well would copy whole handler chains of the profiled programs.
 #[inline(never)]
 extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, const OP: u8>(
     ctx: &mut Context<M>,
@@ -991,7 +984,7 @@ fn handler_of<M: Memory, H: Host<M>, const FUEL: bool>(insn: Instruction) -> Han
 }
 
 #[inline(always)]
-pub fn step_ld64<M: Memory>(ctx: &mut Context<M>, instr: Instruction, second: Instruction) -> Flow<M> {
+pub(crate) fn step_ld64<M: Memory>(ctx: &mut Context<M>, instr: Instruction, second: Instruction) -> Flow<M> {
     debug_assert!(matches!(
         (instr.opcode().class(), instr.opcode().mem_mode(), instr.opcode().mem_size()),
         (Class::LdImm, MemMode::Imm, MemSize::DWord)
