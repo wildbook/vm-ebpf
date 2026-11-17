@@ -6,13 +6,15 @@
 //!   `damage`, and passes each tick's kills to `record_kills` in one buffer that
 //!   the rules plugin borrows for the call.
 //!
-//! The entities live in a region that the host shares with every plugin. The host
-//! describes its `Entity` layout with `Vm::types`, and CO-RE patches the plugins'
-//! field offsets and array stride to match it: `bpf/game_sdk.h` declares the struct
-//! with other field order and size. `scores` and the rules plugin's `waves` are maps
-//! that the VM shares, so they belong to the VM and keep their contents when the
-//! host replaces the rules with `game_rules_v2.o` halfway through. The host links
-//! the combat plugin ahead of time into an image and loads it from bytes, and calls
+//! Both log through the host function `print`, which reads the line from the
+//! calling plugin's memory. The entities live in a region that the host shares
+//! with every plugin and reads and writes field by field. The host describes its
+//! `Entity` layout with `Vm::types`, and CO-RE patches the plugins' field offsets
+//! and array stride to match it: `bpf/game_sdk.h` declares the struct with other
+//! field order and size. `scores` and the rules plugin's `waves` are maps that the
+//! VM shares, so they belong to the VM and keep their contents when the host
+//! replaces the rules with `game_rules_v2.o` halfway through. The host links the
+//! combat plugin ahead of time into an image and loads it from bytes, and calls
 //! both plugins every tick through function handles it looks up once.
 //!
 //! Rebuild the plugins with:
@@ -24,9 +26,9 @@
 
 use std::error::Error;
 use std::mem::{offset_of, size_of};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use rvm::{BtfBuilder, Perms, Plugin, SharedRegion, Vm};
+use rvm::{BtfBuilder, MemoryError, Perms, Plugin, Scalar, SharedRegion, Vm};
 
 const RULES: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/game_rules.o"));
 const RULES_V2: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/game_rules_v2.o"));
@@ -134,7 +136,11 @@ fn register_host_fns(vm: &Vm, world: &Arc<World>) {
     vm.register_fn("damage", move |(id, amount): (u64, u64)| w.damage(id as u32, amount as i32));
 
     let w = world.clone();
-    vm.enable_print(move |line| println!("tick {:>2}  {line}", w.tick()));
+    vm.register_fn_with_memory("print", move |mem, (msg, len): (u64, u64)| {
+        let line = mem.read_vec(msg, len as usize)?;
+        println!("tick {:>2}  {}", w.tick(), String::from_utf8_lossy(&line));
+        Ok::<_, MemoryError>(())
+    });
 }
 
 /// Runs the game, swapping in the second version of the rules at `RELOAD_AT`.
@@ -210,12 +216,12 @@ struct Stats {
 /// Entities in a region shared with every plugin, as an array the host appends to
 /// and compacts.
 struct World {
-    region: SharedRegion,
+    base: u64,
     state: Mutex<WorldState>,
 }
 
-#[derive(Default)]
 struct WorldState {
+    region: SharedRegion,
     len: usize,
     next_id: u32,
     tick: u32,
@@ -223,90 +229,129 @@ struct WorldState {
 
 impl World {
     fn new(vm: &Vm) -> rvm::Result<Self> {
-        // SAFETY: plugins only run on this thread, so they never access the region
-        // while `with` holds a slice of it.
+        // SAFETY: plugins only run on this thread.
         let region = unsafe { vm.share_region(rvm::FIRST_FREE_REGION, CAPACITY * size_of::<Entity>(), Perms::RW)? };
         Ok(Self {
-            region,
-            state: Mutex::default(),
+            base: region.base(),
+            state: Mutex::new(WorldState {
+                region,
+                len: 0,
+                next_id: 0,
+                tick: 0,
+            }),
         })
     }
 
-    /// Runs `f` on the state and all `CAPACITY` slots.
-    fn with<R>(&self, f: impl FnOnce(&mut WorldState, &mut [Entity]) -> R) -> R {
-        let mut state = self.state.lock().unwrap();
-        let ptr = self.region.buffer().as_ptr().cast::<Entity>();
-        // SAFETY: the buffer holds `CAPACITY` entities, is aligned to 64 bytes, and
-        // any bytes form a valid `Entity`. The lock keeps host accesses apart, and
-        // see `new` for the guests.
-        let slots = unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), CAPACITY) };
-        f(&mut state, slots)
+    fn state(&self) -> MutexGuard<'_, WorldState> {
+        self.state.lock().unwrap()
     }
 
     /// Guest address of the first entity.
     fn base(&self) -> u64 {
-        self.region.base()
+        self.base
     }
 
     fn len(&self) -> usize {
-        self.with(|state, _| state.len)
+        self.state().len
     }
 
     fn entities(&self) -> Vec<Entity> {
-        self.with(|state, slots| slots[..state.len].to_vec())
+        let state = self.state();
+        (0..state.len).map(|slot| state.entity(slot)).collect()
     }
 
     fn tick(&self) -> u32 {
-        self.with(|state, _| state.tick)
+        self.state().tick
     }
 
     fn set_tick(&self, tick: u32) {
-        self.with(|state, _| state.tick = tick);
+        self.state().tick = tick;
     }
 
     /// Adds an entity and returns its id, or 0 if the world is full.
     fn spawn(&self, kind: u32, x: i32, y: i32, stats: Stats) -> u32 {
-        self.with(|state, slots| {
-            let Some(slot) = slots.get_mut(state.len) else {
-                return 0;
-            };
-            state.len += 1;
-            state.next_id += 1;
-            *slot = Entity {
-                id: state.next_id,
-                hp: stats.hp,
-                armor: stats.armor,
-                kind,
-                x,
-                y,
-                attack: stats.attack,
-                spawned_at: state.tick,
-            };
-            slot.id
-        })
+        let mut state = self.state();
+        if state.len == CAPACITY {
+            return 0;
+        }
+
+        state.next_id += 1;
+        let entity = Entity {
+            id: state.next_id,
+            hp: stats.hp,
+            armor: stats.armor,
+            kind,
+            x,
+            y,
+            attack: stats.attack,
+            spawned_at: state.tick,
+        };
+        let slot = state.len;
+        state.set_entity(slot, entity);
+        state.len += 1;
+        entity.id
     }
 
     /// Takes `amount` hit points from entity `id` and returns how many it has left.
     fn damage(&self, id: u32, amount: i32) -> u32 {
-        self.with(|state, slots| {
-            let Some(e) = slots[..state.len].iter_mut().find(|e| e.id == id) else {
-                return 0;
-            };
-            e.hp = (e.hp - amount).max(0);
-            e.hp as u32
-        })
+        const ID: usize = offset_of!(Entity, id);
+        const HP: usize = offset_of!(Entity, hp);
+        let mut state = self.state();
+        let Some(slot) = (0..state.len).find(|&slot| state.get::<u32>(slot, ID) == id) else {
+            return 0;
+        };
+        let hp = (state.get::<i32>(slot, HP) - amount).max(0);
+        state.set(slot, HP, hp);
+        hp as u32
     }
 
     fn remove_dead(&self) {
-        self.with(|state, slots| {
-            let mut kept = 0;
-            for i in 0..state.len {
-                if slots[i].hp > 0 {
-                    slots[kept] = slots[i];
-                    kept += 1;
-                }
+        let mut state = self.state();
+        let mut kept = 0;
+        for slot in 0..state.len {
+            let entity = state.entity(slot);
+            if entity.hp > 0 {
+                state.set_entity(kept, entity);
+                kept += 1;
             }
-            state.len = kept;
-        });
+        }
+        state.len = kept;
+    }
+}
+
+impl WorldState {
+    /// Field at byte offset `field` of the entity in `slot`.
+    fn get<T: Scalar>(&self, slot: usize, field: usize) -> T {
+        let offset = slot * size_of::<Entity>() + field;
+        self.region.read(offset).expect("slot inside the region")
+    }
+
+    fn set<T: Scalar>(&mut self, slot: usize, field: usize, value: T) {
+        let offset = slot * size_of::<Entity>() + field;
+        self.region.write(offset, value).expect("slot inside the region");
+    }
+
+    fn entity(&self, slot: usize) -> Entity {
+        Entity {
+            id: self.get(slot, offset_of!(Entity, id)),
+            hp: self.get(slot, offset_of!(Entity, hp)),
+            armor: self.get(slot, offset_of!(Entity, armor)),
+            kind: self.get(slot, offset_of!(Entity, kind)),
+            x: self.get(slot, offset_of!(Entity, x)),
+            y: self.get(slot, offset_of!(Entity, y)),
+            attack: self.get(slot, offset_of!(Entity, attack)),
+            spawned_at: self.get(slot, offset_of!(Entity, spawned_at)),
+        }
+    }
+
+    fn set_entity(&mut self, slot: usize, entity: Entity) {
+        self.set(slot, offset_of!(Entity, id), entity.id);
+        self.set(slot, offset_of!(Entity, hp), entity.hp);
+        self.set(slot, offset_of!(Entity, armor), entity.armor);
+        self.set(slot, offset_of!(Entity, kind), entity.kind);
+        self.set(slot, offset_of!(Entity, x), entity.x);
+        self.set(slot, offset_of!(Entity, y), entity.y);
+        self.set(slot, offset_of!(Entity, attack), entity.attack);
+        self.set(slot, offset_of!(Entity, spawned_at), entity.spawned_at);
     }
 }

@@ -215,7 +215,7 @@ impl fmt::Display for HelperError {
 
 impl std::error::Error for HelperError {}
 
-/// Out of bounds guest memory access.
+/// Guest memory access outside the mapped regions or their permissions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryError {
     pub addr: u64,
@@ -224,7 +224,7 @@ pub struct MemoryError {
 
 impl fmt::Display for MemoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "out of bounds: addr=0x{:x}, size={}", self.addr, self.size)
+        write!(f, "no access to {} bytes at {:#x}", self.size, self.addr)
     }
 }
 

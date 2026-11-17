@@ -57,6 +57,20 @@ static noinline s32 attack_of(struct entity *e) {
     return attack;
 }
 
+/* Logs "<kind> <id> killed <kind> <id>". */
+static noinline void log_kill(struct entity *killer, struct entity *victim) {
+    struct line l = {0};
+    put_str(&l, "combat: ");
+    put_str(&l, kind_name(killer->kind));
+    put_str(&l, " ");
+    put_u64(&l, killer->id);
+    put_str(&l, " killed ");
+    put_str(&l, kind_name(victim->kind));
+    put_str(&l, " ");
+    put_u64(&l, victim->id);
+    print(l.text, l.len);
+}
+
 /* Called by the host every tick with its entity array; returns the number of kills by heroes. */
 u64 on_tick(struct entity *ents, u64 n) {
     struct kill kills[MAX_KILLS];
@@ -80,12 +94,8 @@ u64 on_tick(struct entity *ents, u64 n) {
         s32 hit = attack_of(self) - armor_of(foe);
         if (damage(foe->id, hit > 1 ? hit : 1) != 0)
             continue;
-        if (self->kind != HERO) {
-            log("combat: %s %u killed hero %u\n", kind_name(self->kind), self->id, foe->id);
-            continue;
-        }
-        log("combat: hero %u killed %s %u\n", self->id, kind_name(foe->kind), foe->id);
-        if (nkills < MAX_KILLS)
+        log_kill(self, foe);
+        if (self->kind == HERO && nkills < MAX_KILLS)
             kills[nkills++] = (struct kill){.hero = self->id, .victim_kind = foe->kind};
     }
 

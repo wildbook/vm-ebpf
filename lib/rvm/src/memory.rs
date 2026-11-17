@@ -164,10 +164,11 @@ impl VmMemory {
     /// # Safety
     ///
     /// While a reference from [`bytes`](Self::bytes) or [`bytes_mut`](Self::bytes_mut)
-    /// into the buffer is alive, no other memory that maps it may access it. Code on
-    /// different threads may only touch bytes another thread writes concurrently with
-    /// atomics; guest stores, map helper writes and host writes all count as plain
-    /// stores.
+    /// into the buffer is alive, neither another memory that maps it nor a
+    /// [`SharedRegion`] over it may access it. Code on different threads may only
+    /// touch bytes another thread writes concurrently with atomics; guest stores, map
+    /// helper writes and host writes all count as plain stores, and host reads,
+    /// including [`GuestMemory`] and [`SharedRegion`] copies, as plain loads.
     pub unsafe fn map_shared(&mut self, idx: usize, buffer: Arc<SharedBuffer>, perms: Perms) -> u64 {
         // SAFETY: `self.shared[idx]` keeps the buffer alive until the region is replaced.
         let base = unsafe { self.map_host(idx, buffer.as_ptr(), buffer.len(), perms) };
@@ -296,6 +297,70 @@ impl Drop for VmMemory {
     }
 }
 
+/// The calling program's memory as a host function registered with
+/// [`crate::Vm::register_fn_with_memory`] sees it.
+///
+/// Every access needs the guest's permissions on the region, so a pointer passed to
+/// a host function reaches no more than the guest's own loads and stores would.
+/// Accesses copy, so no reference into guest memory outlives the call that made it.
+pub struct GuestMemory<'a> {
+    memory: &'a mut VmMemory,
+}
+
+impl<'a> GuestMemory<'a> {
+    pub fn new(memory: &'a mut VmMemory) -> Self {
+        Self { memory }
+    }
+
+    /// Copy `buf.len()` bytes from guest address `addr` into `buf`.
+    pub fn read_bytes(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemoryError> {
+        let src = self.memory.host_ptr(addr, buf.len(), Perms::R)?;
+        // SAFETY: `host_ptr` checked that the range lies inside a live region. `buf`
+        // can't overlap it: this view borrows the memory mutably, and the `map_host`
+        // and `map_shared` contracts forbid references into those regions while
+        // guest code runs.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), buf.as_mut_ptr(), buf.len()) };
+        Ok(())
+    }
+
+    /// Copy `len` bytes from guest address `addr` into a new vector. The range is
+    /// checked before anything is allocated, so a guest-supplied length is safe.
+    pub fn read_vec(&self, addr: u64, len: usize) -> Result<Vec<u8>, MemoryError> {
+        let src = self.memory.host_ptr(addr, len, Perms::R)?;
+        let mut bytes = Vec::with_capacity(len);
+        // SAFETY: as `read_bytes`; the copy initializes all `len` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), bytes.as_mut_ptr(), len);
+            bytes.set_len(len);
+        }
+        Ok(bytes)
+    }
+
+    /// Copy `data` to guest address `addr`.
+    pub fn write_bytes(&mut self, addr: u64, data: &[u8]) -> Result<(), MemoryError> {
+        let dst = self.memory.host_ptr(addr, data.len(), Perms::W)?;
+        // SAFETY: as `read_bytes`.
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), dst.as_ptr(), data.len()) };
+        Ok(())
+    }
+
+    /// Read a little-endian scalar at guest address `addr`.
+    pub fn read<T: Scalar>(&self, addr: u64) -> Result<T, MemoryError> {
+        let mut bytes = [0; 8];
+        let bytes = &mut bytes[..T::SIZE];
+        self.read_bytes(addr, bytes)?;
+        Ok(T::read_le(bytes))
+    }
+
+    /// Write a little-endian scalar at guest address `addr`.
+    pub fn write<T: Scalar>(&mut self, addr: u64, value: T) -> Result<(), MemoryError> {
+        let mut bytes = [0; 8];
+        let bytes = &mut bytes[..T::SIZE];
+        value.write_le(bytes);
+        self.write_bytes(addr, bytes)
+    }
+}
+
 /// Zeroed, cache-line aligned host memory that several programs map at once.
 #[derive(Debug)]
 pub struct SharedBuffer {
@@ -347,8 +412,58 @@ impl Drop for SharedBuffer {
     }
 }
 
+/// Apply `op` to the atomic `cell` and return the old value.
+macro_rules! fetch_op {
+    ($cell:expr, $op:expr) => {
+        match $op {
+            AtomicOp::Add(v) => $cell.fetch_add(v, SeqCst),
+            AtomicOp::Or(v) => $cell.fetch_or(v, SeqCst),
+            AtomicOp::And(v) => $cell.fetch_and(v, SeqCst),
+            AtomicOp::Xor(v) => $cell.fetch_xor(v, SeqCst),
+            AtomicOp::Xchg(v) => $cell.swap(v, SeqCst),
+            AtomicOp::CmpXchg { expected, new } => $cell
+                .compare_exchange(expected, new, SeqCst, SeqCst)
+                .unwrap_or_else(|old| old),
+        }
+    };
+}
+
+/// Host atomic on a shared region, coherent with guest atomics on other threads.
+/// Misaligned offsets fail, as they do for guests.
+macro_rules! region_atomic {
+    ($name:ident, $ty:ty, $atomic:ident) => {
+        /// Apply `op` atomically to the value at `offset` and return the old value.
+        pub fn $name(&mut self, offset: usize, op: AtomicOp<$ty>) -> Result<$ty, MemoryError> {
+            let ptr = self.ptr(offset, size_of::<$ty>())?;
+            if !ptr.cast::<$ty>().is_aligned() {
+                return Err(MemoryError {
+                    addr: self.base() + offset as u64,
+                    size: size_of::<$ty>(),
+                });
+            }
+            // SAFETY: in bounds and aligned; other threads reach this memory through
+            // guest atomics or under the `map_shared` contract.
+            let cell = unsafe { $atomic::from_ptr(ptr.as_ptr().cast()) };
+            Ok(fetch_op!(cell, op))
+        }
+    };
+}
+
 /// A buffer mapped at one region index into every program a VM links.
-#[derive(Debug, Clone)]
+///
+/// The host reads and writes the buffer through this handle, at offsets from the
+/// region's start and regardless of the guest permissions. Accessors copy and never
+/// hand out references, so a host function may use them while guest code that maps
+/// the buffer is running on the same thread. Writes and atomics take `&mut self`,
+/// so host accesses through this handle never race each other.
+///
+/// Guest code on other threads may access the buffer at the same time, under the
+/// [`VmMemory::map_shared`] contract the host accepted when it shared the region:
+/// copies count as plain loads and stores there, so bytes that guests on other
+/// threads write concurrently may only be touched with
+/// [`atomic_u32`](Self::atomic_u32) and [`atomic_u64`](Self::atomic_u64), which
+/// are real atomics. `AtomicOp::Or(0)` reads such a value.
+#[derive(Debug)]
 pub struct SharedRegion {
     region: usize,
     perms: Perms,
@@ -356,7 +471,11 @@ pub struct SharedRegion {
 }
 
 impl SharedRegion {
-    pub fn new(region: usize, perms: Perms, buffer: Arc<SharedBuffer>) -> Self {
+    /// # Safety
+    ///
+    /// While this handle is in use on one thread, no other `SharedRegion` over
+    /// `buffer` may be used on another.
+    pub unsafe fn new(region: usize, perms: Perms, buffer: Arc<SharedBuffer>) -> Self {
         Self { region, perms, buffer }
     }
 
@@ -378,6 +497,55 @@ impl SharedRegion {
     /// The host memory behind the region.
     pub fn buffer(&self) -> &Arc<SharedBuffer> {
         &self.buffer
+    }
+
+    /// Copy `buf.len()` bytes at `offset` into `buf`.
+    pub fn read_bytes(&self, offset: usize, buf: &mut [u8]) -> Result<(), MemoryError> {
+        let src = self.ptr(offset, buf.len())?;
+        // SAFETY: `ptr` checked the range. `buf` can't overlap it: references into
+        // the buffer only come from `VmMemory::bytes` and `bytes_mut`, and the
+        // `map_shared` contract keeps this handle off the buffer while one is alive.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), buf.as_mut_ptr(), buf.len()) };
+        Ok(())
+    }
+
+    /// Copy `data` to `offset`.
+    pub fn write_bytes(&mut self, offset: usize, data: &[u8]) -> Result<(), MemoryError> {
+        let dst = self.ptr(offset, data.len())?;
+        // SAFETY: as `read_bytes`.
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), dst.as_ptr(), data.len()) };
+        Ok(())
+    }
+
+    /// Read a little-endian scalar at `offset`.
+    pub fn read<T: Scalar>(&self, offset: usize) -> Result<T, MemoryError> {
+        let mut bytes = [0; 8];
+        let bytes = &mut bytes[..T::SIZE];
+        self.read_bytes(offset, bytes)?;
+        Ok(T::read_le(bytes))
+    }
+
+    /// Write a little-endian scalar at `offset`.
+    pub fn write<T: Scalar>(&mut self, offset: usize, value: T) -> Result<(), MemoryError> {
+        let mut bytes = [0; 8];
+        let bytes = &mut bytes[..T::SIZE];
+        value.write_le(bytes);
+        self.write_bytes(offset, bytes)
+    }
+
+    region_atomic!(atomic_u32, u32, AtomicU32);
+    region_atomic!(atomic_u64, u64, AtomicU64);
+
+    /// Host pointer to `len` bytes at `offset`.
+    fn ptr(&self, offset: usize, len: usize) -> Result<NonNull<u8>, MemoryError> {
+        match offset.checked_add(len) {
+            // SAFETY: in bounds of the buffer.
+            Some(end) if end <= self.buffer.len() => Ok(unsafe { self.buffer.as_ptr().add(offset) }),
+            _ => Err(MemoryError {
+                addr: self.base().wrapping_add(offset as u64),
+                size: len,
+            }),
+        }
     }
 }
 
@@ -418,16 +586,7 @@ macro_rules! guest_atomic {
             // SAFETY: in bounds and aligned; other threads only reach this memory through
             // atomics or under the `map_host` contract.
             let cell = unsafe { $atomic::from_ptr(ptr.as_ptr().cast()) };
-            Ok(match op {
-                AtomicOp::Add(v) => cell.fetch_add(v, SeqCst),
-                AtomicOp::Or(v) => cell.fetch_or(v, SeqCst),
-                AtomicOp::And(v) => cell.fetch_and(v, SeqCst),
-                AtomicOp::Xor(v) => cell.fetch_xor(v, SeqCst),
-                AtomicOp::Xchg(v) => cell.swap(v, SeqCst),
-                AtomicOp::CmpXchg { expected, new } => cell
-                    .compare_exchange(expected, new, SeqCst, SeqCst)
-                    .unwrap_or_else(|old| old),
-            })
+            Ok(fetch_op!(cell, op))
         }
     };
 }
@@ -444,7 +603,7 @@ impl Memory for VmMemory {
     guest_atomic!(atomic_u64, u64, AtomicU64);
 }
 
-/// Fixed-size little-endian scalar for host-side [`VmMemory::read`]/[`VmMemory::write`].
+/// Fixed-size little-endian scalar of at most 8 bytes, for host-side reads and writes.
 pub trait Scalar: Copy {
     /// Size in bytes.
     const SIZE: usize;
@@ -532,6 +691,48 @@ mod tests {
         assert_eq!(mem.load_u8(base), Err(base));
         drop(mem);
         assert_eq!(buf, [0, 0, 0, 0, 0xDD, 0xCC, 0xBB, 0xAA]);
+    }
+
+    // host functions reach guest memory only as far as the guest itself could
+    #[test]
+    fn guest_memory_needs_guest_perms() {
+        let mut mem = VmMemory::new();
+        let rw = mem.map(1, 16, Perms::RW);
+        let ro = mem.map_bytes(2, b"hi", 8, Perms::R);
+        let wo = mem.map(3, 8, Perms::W);
+        let mut guest = GuestMemory::new(&mut mem);
+        let fault = |addr, size| MemoryError { addr, size };
+
+        guest.write(rw + 8, 0x1122_3344_5566_7788u64).unwrap();
+        assert_eq!(guest.read::<u16>(rw + 8), Ok(0x7788));
+        assert_eq!(guest.read_vec(ro, 2).unwrap(), b"hi");
+
+        assert_eq!(guest.read::<u8>(0).unwrap_err(), fault(0, 1));
+        assert_eq!(guest.read::<u64>(rw + 9).unwrap_err(), fault(rw + 9, 8)); // straddles the end
+        assert_eq!(guest.write(ro, 1u8).unwrap_err(), fault(ro, 1));
+        assert_eq!(guest.read_bytes(wo, &mut [0; 4]).unwrap_err(), fault(wo, 4));
+        // fails before allocating
+        assert_eq!(guest.read_vec(rw, usize::MAX).unwrap_err(), fault(rw, usize::MAX));
+    }
+
+    #[test]
+    fn shared_region_bounds_and_alignment() {
+        // SAFETY: the only handle over the buffer.
+        let mut region = unsafe { SharedRegion::new(5, Perms::R, Arc::new(SharedBuffer::new(16))) };
+        let base = region.base();
+        let fault = |offset: u64, size| MemoryError {
+            addr: base.wrapping_add(offset),
+            size,
+        };
+
+        // guest perms don't apply to the host
+        region.write(12, 7u32).unwrap();
+        assert_eq!(region.atomic_u32(12, AtomicOp::Add(1)), Ok(7));
+        assert_eq!(region.read::<u32>(12), Ok(8));
+
+        assert_eq!(region.read::<u64>(12).unwrap_err(), fault(12, 8));
+        assert_eq!(region.write_bytes(usize::MAX, &[0; 2]).unwrap_err(), fault(u64::MAX, 2));
+        assert_eq!(region.atomic_u64(4, AtomicOp::Or(0)).unwrap_err(), fault(4, 8));
     }
 
     type Table = [(NonNull<u8>, usize, Perms); MAX_REGIONS];

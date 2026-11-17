@@ -17,7 +17,7 @@ use crate::layout::{BORROW_FIRST_REGION, FIRST_FREE_REGION};
 #[cfg(feature = "link")]
 use crate::linker;
 use crate::maps::SharedMaps;
-use crate::memory::{Perms, SharedBuffer, SharedRegion, MAX_REGION_LEN};
+use crate::memory::{GuestMemory, Perms, SharedBuffer, SharedRegion, MAX_REGION_LEN};
 #[cfg(feature = "link")]
 use crate::module::Module;
 use crate::plugin::Plugin;
@@ -135,6 +135,29 @@ impl Vm {
         self.helpers.update(|h| h.register_fn(name, func));
     }
 
+    /// Register an extern function that reads or writes the calling program's
+    /// memory, such as `void log(const char *msg, u64 len);` in C. `func` gets the
+    /// program's memory, where every access needs the guest's permissions and
+    /// fails on a bad pointer, followed by the typed arguments.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// vm.register_fn_with_memory("log", |mem, (msg, len): (u64, u64)| {
+    ///     let msg = mem.read_vec(msg, len as usize)?;
+    ///     println!("{}", String::from_utf8_lossy(&msg));
+    ///     Ok::<_, rvm::MemoryError>(())
+    /// });
+    /// ```
+    pub fn register_fn_with_memory<F, A, R>(&self, name: impl Into<String>, func: F)
+    where
+        F: Fn(&mut GuestMemory, A) -> R + Send + Sync + 'static,
+        A: FromArgs + 'static,
+        R: IntoReturn + 'static,
+    {
+        self.helpers.update(|h| h.register_fn_with_memory(name, func));
+    }
+
     /// Enable `ktime_get_ns` (helper 5).
     pub fn enable_time(&self) {
         self.helpers.update(std_helpers::register_time);
@@ -182,9 +205,12 @@ impl Vm {
         if !usable || regions.iter().any(|r| r.region() == region) || len == 0 || len > MAX_REGION_LEN {
             return Err(VmError::InvalidArgument(format!("cannot share region {region} with {len} bytes")));
         }
-        let shared = SharedRegion::new(region, perms, Arc::new(SharedBuffer::new(len)));
-        regions.push(shared.clone());
-        Ok(shared)
+        let buffer = Arc::new(SharedBuffer::new(len));
+        // SAFETY: the VM only maps its own handle and never reads or writes through it.
+        let (own, host) =
+            unsafe { (SharedRegion::new(region, perms, buffer.clone()), SharedRegion::new(region, perms, buffer)) };
+        regions.push(own);
+        Ok(host)
     }
 
     // =========================================================================

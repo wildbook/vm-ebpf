@@ -16,13 +16,6 @@ typedef unsigned long long u64;
 
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
 static long (*bpf_map_update_elem)(void *map, const void *key, const void *value, u64 flags) = (void *)2;
-static long (*bpf_trace_printk)(const char *fmt, u32 fmt_size, ...) = (void *)6;
-
-#define log(fmt, ...)                                                   \
-    ({                                                                  \
-        static const char ____fmt[] = fmt;                              \
-        bpf_trace_printk(____fmt, sizeof(____fmt), ##__VA_ARGS__);      \
-    })
 
 enum kind { HERO, GOBLIN, ORC, TROLL };
 
@@ -63,6 +56,29 @@ static inline const char *kind_name(u32 kind) {
 /* Host functions. */
 extern u64 spawn(u64 kind, u64 x, u64 y); /* new entity's id, 0 if the world is full */
 extern u64 damage(u64 id, u64 amount);   /* hit points left */
+extern void print(const char *msg, u64 len); /* one line to the game log */
+
+/* A log line for `print`, which takes bytes rather than a format string. */
+struct line {
+    u64 len;
+    char text[64];
+};
+
+static inline void put_str(struct line *l, const char *s) {
+    for (; *s && l->len < sizeof(l->text); s++)
+        l->text[l->len++] = *s;
+}
+
+static inline void put_u64(struct line *l, u64 v) {
+    char digits[20];
+    u64 n = 0;
+    do {
+        digits[n++] = '0' + v % 10;
+        v /= 10;
+    } while (v);
+    while (n && l->len < sizeof(l->text))
+        l->text[l->len++] = digits[--n];
+}
 
 /* A kill, passed from combat to rules in bulk. */
 struct kill {

@@ -107,9 +107,7 @@ fn shared_region_is_visible_to_every_plugin() {
     let slot = rw.base() + 8;
     x.call("put", &[slot, 42]).unwrap();
     assert_eq!(y.call("get", &[slot]).unwrap(), 42);
-    // SAFETY: no plugin is running.
-    let host = unsafe { rw.buffer().as_ptr().add(8).cast::<u64>().read_unaligned() };
-    assert_eq!(host, 42);
+    assert_eq!(rw.read::<u64>(8).unwrap(), 42);
 
     assert!(matches!(x.call("put", &[ro.base(), 1]).unwrap_err(), VmError::Exec(rvm::ExecError::MemoryFault(_))));
 }
@@ -129,7 +127,7 @@ fn borrowed_buffers() {
 
     // a length past the caller's memory fails before the callee runs
     let err = caller.call("overrun", &[]).unwrap_err().to_string();
-    assert!(err.contains("callee::sum") && err.contains("out of bounds"), "{err}");
+    assert!(err.contains("callee::sum") && err.contains("no access"), "{err}");
 
     // a read-only borrow faults on write, and the slot is unmapped afterwards
     let err = caller.call("write_ro", &[]).unwrap_err().to_string();

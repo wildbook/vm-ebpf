@@ -235,8 +235,8 @@ mod tests {
     use ebpf_asm::{Assembler, R0, R1, R10, R2, R6, R7};
 
     use super::*;
-    use crate::error::VmError;
-    use crate::memory::Perms;
+    use crate::error::{MemoryError, VmError};
+    use crate::memory::{GuestMemory, Perms};
 
     fn run(asm: &mut Assembler, args: &[u64]) -> Result<u64> {
         run_with(asm, args, |_| {})
@@ -335,5 +335,50 @@ mod tests {
         asm.call(2);
         asm.exit();
         assert!(matches!(run(&mut asm), Err(VmError::Helper(HelperError::UnknownHelper(2)))));
+    }
+
+    // a host function with memory access runs inside the handler chain too, and a
+    // pointer the guest couldn't use itself fails the access, not the program
+    #[test]
+    fn test_memory_fn() {
+        let mut helpers = HelperRegistry::new();
+        helpers.register_fn_with_memory("bump", |mem: &mut GuestMemory, addr: u64| {
+            let old = mem.read::<u64>(addr)?;
+            mem.write(addr, old + 1)?;
+            Ok::<_, MemoryError>(old)
+        });
+        let run = |addr: Option<u64>| {
+            let mut asm = Assembler::new();
+            asm.stdw(R10, -8, 41);
+            match addr {
+                Some(addr) => asm.lddw(R1, addr as i64),
+                None => asm.mov64(R1, R10).add64_imm(R1, -8),
+            };
+            asm.call(0);
+            asm.ldxdw(R6, R10, -8);
+            asm.lsh64_imm(R6, 32);
+            asm.mov32(R0, R0);
+            asm.or64(R0, R6);
+            asm.exit();
+
+            let mut bytes = asm.assemble().unwrap();
+            let (insns, _) = bytes.as_chunks_mut::<8>();
+            let call = insns.iter_mut().find(|insn| insn[0] == 0x85).unwrap();
+            crate::image::set_slot_call(call, helpers.slot_of_name("bump").unwrap());
+            let code = crate::instructions_from_bytes(&bytes);
+
+            let mut memory = VmMemory::new();
+            let stack_top = memory.map(1, 512, Perms::RW) + 512;
+            memory.map_bytes(2, &[7; 8], 8, Perms::R);
+            Executor::new(&code, &mut memory, &helpers, stack_top)
+                .call(0, &[])
+                .unwrap()
+        };
+
+        // r0 in the low half, the stack slot in the high half
+        assert_eq!(run(None), 42 << 32 | 41);
+        assert_eq!(run(Some(0)), 41 << 32 | 0xffff_ffff);
+        // the read-only region can be read but not written
+        assert_eq!(run(Some(region_base(2))), 41 << 32 | 0xffff_ffff);
     }
 }

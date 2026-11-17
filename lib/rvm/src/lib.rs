@@ -96,7 +96,8 @@ pub use maps::{
     BPF_FUNC_MAP_UPDATE_ELEM, BPF_NOEXIST,
 };
 pub use memory::{
-    region_base, Memory, Perms, Scalar, SharedBuffer, SharedRegion, VmMemory, MAX_REGIONS, MAX_REGION_LEN, REGION_SHIFT,
+    region_base, GuestMemory, Memory, Perms, Scalar, SharedBuffer, SharedRegion, VmMemory, MAX_REGIONS, MAX_REGION_LEN,
+    REGION_SHIFT,
 };
 #[cfg(feature = "link")]
 pub use module::Module;

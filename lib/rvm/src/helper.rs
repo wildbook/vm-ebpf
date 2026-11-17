@@ -9,7 +9,7 @@ use hashbrown::HashMap;
 
 use crate::error::HelperError;
 use crate::maps::Maps;
-use crate::memory::VmMemory;
+use crate::memory::{GuestMemory, VmMemory};
 
 /// Arguments passed to a helper function.
 ///
@@ -190,6 +190,21 @@ impl<M: 'static> Slot<M> {
     }
 }
 
+impl Slot<VmMemory> {
+    fn with_memory<F, A, R>(func: F) -> Self
+    where
+        F: Fn(&mut GuestMemory, A) -> R + Send + Sync + 'static,
+        A: FromArgs,
+        R: IntoReturn,
+    {
+        let call = move |ctx: &mut HelperContext| {
+            let args = A::from_args(&ctx.args);
+            Ok(func(&mut GuestMemory::new(ctx.memory), args).into_return())
+        };
+        Self::new(call, Some(A::ARITY))
+    }
+}
+
 /// Extern table: host functions callable from eBPF, stored in dense slots.
 ///
 /// Functions are registered either by numeric helper ID (standard BPF helpers,
@@ -227,6 +242,17 @@ impl HelperRegistry {
     /// Create a new empty registry for [`VmMemory`]; use `default()` for other memories.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Register an extern function by name that reads or writes the calling
+    /// program's memory through [`GuestMemory`], with typed arguments.
+    pub fn register_fn_with_memory<F, A, R>(&mut self, name: impl Into<String>, func: F)
+    where
+        F: Fn(&mut GuestMemory, A) -> R + Send + Sync + 'static,
+        A: FromArgs + 'static,
+        R: IntoReturn + 'static,
+    {
+        self.put_name(name.into(), Slot::with_memory(func));
     }
 }
 

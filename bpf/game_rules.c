@@ -31,6 +31,20 @@ static noinline u64 spawn_line(u64 kind, u64 count, u64 wave) {
     return spawned;
 }
 
+static noinline void log_wave(u64 wave, u64 spawned) {
+    struct line l = {0};
+#ifdef RULES_V2
+    put_str(&l, "rules v2: wave ");
+#else
+    put_str(&l, "rules: wave ");
+#endif
+    put_u64(&l, wave);
+    put_str(&l, ", ");
+    put_u64(&l, spawned);
+    put_str(&l, " monsters");
+    print(l.text, l.len);
+}
+
 /* Called by the host every tick; returns the number of monsters spawned. */
 u64 on_tick(u64 tick) {
     u32 key = 0;
@@ -44,10 +58,8 @@ u64 on_tick(u64 tick) {
     spawned += spawn_line(ORC, 1, wave + 2);
     if (wave % 3 == 0)
         spawned += spawn_line(TROLL, 1, wave + 4);
-    log("rules v2: wave %llu, %llu monsters\n", wave, spawned);
-#else
-    log("rules: wave %llu, %llu monsters\n", wave, spawned);
 #endif
+    log_wave(wave, spawned);
     state->spawned += spawned;
     return spawned;
 }

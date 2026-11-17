@@ -71,9 +71,21 @@ vm.register_helper(100, |x: u64| x * 2);
 // Named extern, imported by the guest as `extern u64 host_add(u64, u64);`.
 vm.register_fn("host_add", |(a, b): (u64, u64)| a + b);
 
+// Named extern that reads the guest's memory: `extern void log(const char *, u64);`.
+vm.register_fn_with_memory("log", |mem, (msg, len): (u64, u64)| {
+    println!("{}", String::from_utf8_lossy(&mem.read_vec(msg, len as usize)?));
+    Ok::<_, rvm::MemoryError>(())
+});
+
 let mut program = vm.load_elf(&elf_bytes)?;
 let result = program.call("run", &[42])?;
 ```
+
+A function registered with `register_fn_with_memory` gets the calling program's
+memory as a `GuestMemory`. Its reads and writes copy, need the same region
+permissions as the guest's own loads and stores, and return a `MemoryError` for
+a pointer the guest couldn't use. A host function that returns `Result` gives
+the guest -1 on `Err`.
 
 `load_elf` parses and links a single module. For multi-module programs, call
 `Vm::parse_module` for each object and `Vm::link` with the set of modules.
@@ -222,9 +234,13 @@ time may only touch shared values with atomics.
 
 `Vm::share_region(region, len, perms)` allocates a buffer and maps it at region
 `region` (between `FIRST_FREE_REGION` and `BORROW_FIRST_REGION`) into every
-program linked afterwards, so plugins can pass plain pointers into it. The host
-reaches the same bytes through `SharedRegion::buffer`. It has the same `unsafe`
-contract as `share_map`.
+program linked afterwards, so plugins can pass plain pointers into it. It has the
+same `unsafe` contract as `share_map`. The host reads and writes the bytes
+through the returned `SharedRegion`: `read_bytes`/`write_bytes` and the typed
+`read`/`write` copy, and `atomic_u32`/`atomic_u64` are real atomics. Writes take
+`&mut self`, so host accesses never race each other; against guests on other
+threads, copies count as plain loads and stores, and only the atomics may touch
+values those guests write concurrently.
 
 Atomics (`BPF_ATOMIC` add, or, and, xor with and without fetch, xchg and
 cmpxchg, 32 and 64 bit) go through `Memory::atomic_u32` and
