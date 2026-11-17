@@ -34,7 +34,6 @@ impl raw::Elf64Rela {
 }
 
 impl raw::ElfIdent {
-    // TODO: Remove.
     pub const fn validate(&self) -> ElfResult {
         ensure_matches!(ElfError::Header(ErrHeader::Ident), &self.ei_magic, b"\x7fELF");
         ensure_matches!(ElfError::Header(ErrHeader::Ident), self.ei_class, raw::ELFCLASS64);

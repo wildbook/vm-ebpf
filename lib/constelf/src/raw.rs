@@ -1,7 +1,6 @@
 #![allow(non_camel_case_types)]
 
-//! This module consists of definitions, nothing more.
-//! Any implementations go in the [`impls`] child module.
+//! ELF definitions. Implementations live in the `impls` child module.
 
 mod impls;
 

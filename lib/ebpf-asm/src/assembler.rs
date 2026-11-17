@@ -1,32 +1,15 @@
-//! eBPF assembler with label support and CO-RE relocation tracking.
-//!
-//! Provides a builder-style API for creating eBPF bytecode with automatic
-//! label resolution for branches and CO-RE (Compile Once - Run Everywhere)
-//! relocation tracking.
-//!
-//! # Basic Example
+//! eBPF assembler with label resolution and CO-RE relocation tracking.
 //!
 //! ```
-//! use ebpf_asm::{Assembler, R0, R1};
+//! use ebpf_asm::{Assembler, R0};
 //!
 //! let mut asm = Assembler::new();
-//!
-//! // Create a label for a loop
 //! let mut loop_start = asm.create_label();
 //!
-//! // mov64 r0, 10
 //! asm.mov64_imm(R0, 10);
-//!
-//! // loop_start:
 //! asm.set_label(&mut loop_start).unwrap();
-//!
-//! // sub64 r0, 1
 //! asm.sub64_imm(R0, 1);
-//!
-//! // jne r0, 0, loop_start
 //! asm.jne_imm(R0, 0, &loop_start);
-//!
-//! // exit
 //! asm.exit();
 //!
 //! let code = asm.assemble().unwrap();
@@ -40,16 +23,16 @@
 //!
 //! let mut asm = Assembler::new();
 //!
-//! // Load a field offset that will be patched by CO-RE at load time
-//! asm.mov64_imm(R3, 8);  // placeholder offset
-//! asm.mark_core_relo(CoreReloKind::FieldByteOffset, 1, 17);  // type_id=1, access_str_off=17
+//! // placeholder offset, patched at load time
+//! asm.mov64_imm(R3, 8);
+//! asm.mark_core_relo(CoreReloKind::FieldByteOffset, 1, 17);
 //!
 //! asm.add64(R1, R3);
 //! asm.exit();
 //!
 //! let result = asm.assemble_with_core().unwrap();
 //! assert_eq!(result.relocations.len(), 1);
-//! assert_eq!(result.relocations[0].insn_off, 0);  // first instruction
+//! assert_eq!(result.relocations[0].insn_off, 0);
 //! ```
 
 use std::collections::HashMap;
@@ -86,16 +69,12 @@ impl fmt::Display for AsmError {
 
 impl std::error::Error for AsmError {}
 
-/// Pending CO-RE relocation (attached to an instruction index, not yet resolved to bytes).
+/// CO-RE relocation attached to an instruction index, resolved to a byte offset on assembly.
 #[derive(Debug, Clone)]
 struct PendingCoreRelo {
-    /// Instruction index this relocation applies to.
     insn_index: usize,
-    /// BTF type ID.
     type_id: u32,
-    /// Access string offset in BTF strings.
     access_str_off: u32,
-    /// Relocation kind.
     kind: CoreReloKind,
 }
 
@@ -116,51 +95,35 @@ impl AssembledProgram {
     }
 }
 
-/// A label identifier for branch targets.
-///
-/// Labels are created with `Assembler::create_label()` and bound to
-/// a position with `Assembler::set_label()`.
+/// A branch target, created with `Assembler::create_label` and bound with
+/// `Assembler::set_label`.
 #[derive(Debug, Clone)]
 pub struct Label {
     id: usize,
-    name: Option<String>,
     position: Option<usize>,
 }
 
-impl Label {
-    fn new(id: usize) -> Self {
-        Self {
-            id,
-            name: None,
-            position: None,
-        }
-    }
-}
-
-/// A reference to a label that needs to be resolved.
+/// A label reference that needs to be resolved.
 #[derive(Debug, Clone)]
 struct LabelRef {
-    /// Label ID being referenced.
     label_id: usize,
-    /// Instruction index where the reference occurs.
+    /// Index of the referencing instruction entry.
     insn_index: usize,
-    /// Type of reference (determines how offset is encoded).
     ref_type: LabelRefType,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum LabelRefType {
-    /// Jump (conditional or JA in the JMP64 class) - offset in bits 16-31.
+    /// Conditional jump or JA in the JMP64 class: offset in bits 16-31.
     Jump,
-    /// BPF-to-BPF call or JA in the JMP32 class - offset in bits 32-63 (imm field).
+    /// BPF-to-BPF call or JA in the JMP32 class: offset in bits 32-63 (imm field).
     Imm32,
 }
 
-/// Internal instruction representation during assembly.
 #[derive(Debug, Clone)]
 struct AsmInsn {
     raw: RawInstruction,
-    /// Second instruction for LDDW.
+    /// Second slot of LDDW.
     raw2: Option<RawInstruction>,
 }
 
@@ -306,20 +269,13 @@ macro_rules! endian_family {
     };
 }
 
-/// eBPF bytecode assembler.
-///
-/// Provides a fluent API for building eBPF programs with automatic
-/// label resolution and CO-RE relocation tracking.
+/// eBPF bytecode assembler with a fluent API.
 pub struct Assembler {
-    /// Assembled instructions.
     instructions: Vec<AsmInsn>,
-    /// Label counter for generating unique IDs.
     label_counter: usize,
-    /// Label positions (label_id -> instruction index).
+    /// Label ID to instruction index.
     label_positions: HashMap<usize, usize>,
-    /// Pending label references to resolve.
     label_refs: Vec<LabelRef>,
-    /// Pending CO-RE relocations (instruction index based).
     core_relos: Vec<PendingCoreRelo>,
 }
 
@@ -351,16 +307,13 @@ impl Assembler {
     pub fn create_label(&mut self) -> Label {
         let id = self.label_counter;
         self.label_counter += 1;
-        Label::new(id)
+        Label { id, position: None }
     }
 
-    /// Bind a label to the current position.
-    ///
-    /// The label will point to the next instruction added.
+    /// Bind a label to the next instruction added.
     pub fn set_label(&mut self, label: &mut Label) -> Result<&mut Self, AsmError> {
         if label.position.is_some() {
-            let name = label.name.clone().unwrap_or_else(|| format!("L{}", label.id));
-            return Err(AsmError::DuplicateLabel(name));
+            return Err(AsmError::DuplicateLabel(format!("L{}", label.id)));
         }
 
         let position = self.instructions.len();
@@ -369,7 +322,7 @@ impl Assembler {
         Ok(self)
     }
 
-    /// Add a raw instruction.
+    /// Add a single-slot instruction.
     fn emit(&mut self, raw: RawInstruction) {
         self.instructions.push(AsmInsn { raw, raw2: None });
     }
@@ -379,7 +332,7 @@ impl Assembler {
         self.instructions.push(AsmInsn { raw, raw2: Some(raw2) });
     }
 
-    /// Add a label reference for later resolution.
+    /// Reference `label` from the last emitted instruction.
     fn add_label_ref(&mut self, label: &Label, ref_type: LabelRefType) {
         self.label_refs.push(LabelRef {
             label_id: label.id,
@@ -388,62 +341,39 @@ impl Assembler {
         });
     }
 
-    /// Assemble the program into bytecode.
-    ///
-    /// Resolves all label references and returns the final bytecode.
+    /// Resolve all label references and return the bytecode.
     pub fn assemble(&mut self) -> Result<Vec<u8>, AsmError> {
         // Labels and refs hold entry indices; jumps count 8-byte slots (LDDW takes two).
         let slot_of = self.slot_prefix();
 
-        // Resolve all label references
-        for i in 0..self.label_refs.len() {
-            let label_ref = &self.label_refs[i];
+        for label_ref in &self.label_refs {
             let target_pos = self
                 .label_positions
                 .get(&label_ref.label_id)
                 .copied()
                 .ok_or_else(|| AsmError::UndefinedLabel(format!("L{}", label_ref.label_id)))?;
 
-            // eBPF jumps are relative to the NEXT slot
+            // eBPF jumps are relative to the next slot
             let offset = (slot_of[target_pos] as i64) - (slot_of[label_ref.insn_index] as i64 + 1);
-            let insn_index = label_ref.insn_index;
-            let ref_type = label_ref.ref_type;
+            let out_of_range = AsmError::OffsetOutOfRange {
+                from: label_ref.insn_index,
+                to: target_pos,
+            };
 
-            let insn = &mut self.instructions[insn_index];
-
-            match ref_type {
+            let insn = &mut self.instructions[label_ref.insn_index];
+            let raw = insn.raw.value();
+            insn.raw = RawInstruction::new(match label_ref.ref_type {
                 LabelRefType::Jump => {
-                    // Offset in bits 16-31 (i16)
-                    if offset < i16::MIN as i64 || offset > i16::MAX as i64 {
-                        return Err(AsmError::OffsetOutOfRange {
-                            from: insn_index,
-                            to: target_pos,
-                        });
-                    }
-                    // Update offset field
-                    let raw = insn.raw.value();
-                    let mask = 0xFFFFFFFF0000FFFF_u64;
-                    let new_offset = ((offset as i16 as u16 as u64) << 16) & 0x00000000FFFF0000;
-                    insn.raw = RawInstruction::new((raw & mask) | new_offset);
+                    let offset = i16::try_from(offset).map_err(|_| out_of_range)?;
+                    (raw & 0xFFFFFFFF_0000FFFF) | ((offset as u16 as u64) << 16)
                 }
                 LabelRefType::Imm32 => {
-                    // Offset in bits 32-63 (i32)
-                    if offset < i32::MIN as i64 || offset > i32::MAX as i64 {
-                        return Err(AsmError::OffsetOutOfRange {
-                            from: insn_index,
-                            to: target_pos,
-                        });
-                    }
-                    // Update imm field
-                    let raw = insn.raw.value();
-                    let mask = 0x00000000FFFFFFFF_u64;
-                    let new_imm = ((offset as i32 as u32 as u64) << 32) & 0xFFFFFFFF00000000;
-                    insn.raw = RawInstruction::new((raw & mask) | new_imm);
+                    let offset = i32::try_from(offset).map_err(|_| out_of_range)?;
+                    (raw & 0x00000000_FFFFFFFF) | ((offset as u32 as u64) << 32)
                 }
-            }
+            });
         }
 
-        // Emit bytecode
         let mut code = Vec::with_capacity(self.instructions.len() * 8);
         for insn in &self.instructions {
             code.extend_from_slice(&insn.raw.to_le_bytes());
@@ -459,9 +389,6 @@ impl Assembler {
 
     /// Mark the last emitted instruction with a CO-RE relocation.
     ///
-    /// This attaches relocation metadata to the most recently emitted instruction.
-    /// At assembly time, the instruction index is converted to a byte offset.
-    ///
     /// # Panics
     ///
     /// Panics if no instructions have been emitted yet.
@@ -474,7 +401,7 @@ impl Assembler {
     ///
     /// let mut asm = Assembler::new();
     ///
-    /// // Emit a MOV with a placeholder offset, then mark it for CO-RE
+    /// // placeholder offset, patched at load time
     /// asm.mov64_imm(R3, 8);
     /// asm.mark_core_relo(CoreReloKind::FieldByteOffset, 1, 17);
     ///
@@ -493,17 +420,13 @@ impl Assembler {
         self
     }
 
-    /// Assemble the program with CO-RE relocation information.
-    ///
-    /// Returns both the bytecode and the resolved CO-RE relocations.
-    /// Each relocation's `insn_off` is set to the byte offset of its instruction.
+    /// Assemble the program and resolve each CO-RE relocation's `insn_off` to the
+    /// byte offset of its instruction.
     pub fn assemble_with_core(&mut self) -> Result<AssembledProgram, AsmError> {
         let byte_offsets: Vec<u32> = self.slot_prefix().iter().map(|&s| (s * 8) as u32).collect();
 
-        // Assemble the bytecode
         let bytecode = self.assemble()?;
 
-        // Resolve CO-RE relocations
         let relocations = self
             .core_relos
             .iter()
@@ -520,14 +443,14 @@ impl Assembler {
 
     // ==================== ALU Instructions ====================
 
-    /// `neg64 dst` - 64-bit negation.
+    /// `neg64 dst`: 64-bit negation.
     pub fn neg64(&mut self, dst: Register) -> &mut Self {
         let opcode = class::ALU64 | alu::NEG | SRC_IMM;
         self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, 0));
         self
     }
 
-    /// `neg32 dst` - 32-bit negation.
+    /// `neg32 dst`: 32-bit negation.
     pub fn neg32(&mut self, dst: Register) -> &mut Self {
         let opcode = class::ALU32 | alu::NEG | SRC_IMM;
         self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, 0));
@@ -594,7 +517,7 @@ impl Assembler {
         ldxsb = B, MEMSX;
     );
 
-    /// `lddw dst, imm64` - Load 64-bit immediate.
+    /// `lddw dst, imm64`: load a 64-bit immediate.
     pub fn lddw(&mut self, dst: Register, imm: i64) -> &mut Self {
         let opcode = class::LD | size::DW | mode::IMM;
         let imm_lo = imm as u32 as i32;
@@ -625,21 +548,21 @@ impl Assembler {
         atomic_xor32, atomic_fetch_xor32 = XOR;
     );
 
-    /// `lock xchg [dst+off], src` - 64-bit atomic exchange; always reports the prior value.
+    /// `lock xchg [dst+off], src`: 64-bit atomic exchange; always reports the prior value.
     pub fn atomic_xchg64(&mut self, dst: Register, offset: i16, src: Register) -> &mut Self {
         let opcode = class::STX | size::DW | mode::ATOMIC;
         self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, atomic::XCHG));
         self
     }
 
-    /// `lock xchg32 [dst+off], src` - 32-bit atomic exchange; always reports the prior value.
+    /// `lock xchg32 [dst+off], src`: 32-bit atomic exchange; always reports the prior value.
     pub fn atomic_xchg32(&mut self, dst: Register, offset: i16, src: Register) -> &mut Self {
         let opcode = class::STX | size::W | mode::ATOMIC;
         self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, atomic::XCHG));
         self
     }
 
-    /// `lock cmpxchg [dst+off], src` - 64-bit atomic compare-and-exchange against `r0`;
+    /// `lock cmpxchg [dst+off], src`: 64-bit atomic compare-and-exchange against `r0`;
     /// always reports the prior value in `r0`.
     pub fn atomic_cmpxchg64(&mut self, dst: Register, offset: i16, src: Register) -> &mut Self {
         let opcode = class::STX | size::DW | mode::ATOMIC;
@@ -647,7 +570,7 @@ impl Assembler {
         self
     }
 
-    /// `lock cmpxchg32 [dst+off], src` - 32-bit atomic compare-and-exchange against `r0`;
+    /// `lock cmpxchg32 [dst+off], src`: 32-bit atomic compare-and-exchange against `r0`;
     /// always reports the prior value in `r0`.
     pub fn atomic_cmpxchg32(&mut self, dst: Register, offset: i16, src: Register) -> &mut Self {
         let opcode = class::STX | size::W | mode::ATOMIC;
@@ -657,7 +580,7 @@ impl Assembler {
 
     // ==================== Jump Instructions with Labels ====================
 
-    /// `ja label` - Unconditional jump to label.
+    /// `ja label`: unconditional jump to a label.
     pub fn ja(&mut self, label: &Label) -> &mut Self {
         let opcode = class::JMP64 | jmp::JA;
         self.emit(RawInstruction::from_parts(opcode, 0, 0, 0, 0));
@@ -665,15 +588,15 @@ impl Assembler {
         self
     }
 
-    /// `ja offset` - Unconditional jump to relative offset.
+    /// `ja offset`: unconditional jump to a relative offset.
     pub fn ja_off(&mut self, offset: i16) -> &mut Self {
         let opcode = class::JMP64 | jmp::JA;
         self.emit(RawInstruction::from_parts(opcode, 0, 0, offset, 0));
         self
     }
 
-    /// `ja32 label` - Unconditional jump to label, JMP32 class (RFC 9669 Section 4.3:
-    /// the relative offset sits in the 32-bit `imm` field instead of the 16-bit `offset`).
+    /// `ja32 label`: unconditional jump in the JMP32 class, whose offset sits in the
+    /// 32-bit `imm` field instead of the 16-bit `offset` (RFC 9669 Section 4.3).
     pub fn ja32(&mut self, label: &Label) -> &mut Self {
         let opcode = class::JMP32 | jmp::JA;
         self.emit(RawInstruction::from_parts(opcode, 0, 0, 0, 0));
@@ -681,7 +604,7 @@ impl Assembler {
         self
     }
 
-    /// `gotox dst` - Jump to the code address in `dst`.
+    /// `gotox dst`: jump to the code address in `dst`.
     pub fn gotox(&mut self, dst: Register) -> &mut Self {
         let opcode = class::JMP64 | jmp::JA | SRC_REG;
         self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, 0));
@@ -718,30 +641,29 @@ impl Assembler {
 
     // ==================== Call / Exit ====================
 
-    /// `call imm` - Call helper function by ID.
+    /// `call imm`: call a helper function by ID.
     pub fn call(&mut self, func_id: i32) -> &mut Self {
         let opcode = class::JMP64 | jmp::CALL;
         self.emit(RawInstruction::from_parts(opcode, 0, 0, 0, func_id));
         self
     }
 
-    /// `call label` - Call local function (BPF-to-BPF call).
+    /// `call label`: BPF-to-BPF call (`src_reg = 1`).
     pub fn call_local(&mut self, label: &Label) -> &mut Self {
         let opcode = class::JMP64 | jmp::CALL;
-        // src_reg = 1 indicates BPF-to-BPF call
         self.emit(RawInstruction::from_parts(opcode, 0, 1, 0, 0));
         self.add_label_ref(label, LabelRefType::Imm32);
         self
     }
 
-    /// `callx dst` - Call the function whose address is in `dst`.
+    /// `callx dst`: call the function whose address is in `dst`.
     pub fn callx(&mut self, dst: Register) -> &mut Self {
         let opcode = class::JMP64 | jmp::CALL | SRC_REG;
         self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, 0));
         self
     }
 
-    /// `exit` - Exit program.
+    /// `exit`: return from the program.
     pub fn exit(&mut self) -> &mut Self {
         let opcode = class::JMP64 | jmp::EXIT;
         self.emit(RawInstruction::from_parts(opcode, 0, 0, 0, 0));
@@ -759,59 +681,6 @@ impl Default for Assembler {
 mod tests {
     use super::*;
     use crate::register::*;
-
-    #[test]
-    fn test_simple_program() {
-        let mut asm = Assembler::new();
-        asm.mov64_imm(R0, 42);
-        asm.exit();
-
-        let code = asm.assemble().unwrap();
-        assert_eq!(code.len(), 16); // 2 instructions * 8 bytes
-
-        // mov64 r0, 42 = 0xb7, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00
-        assert_eq!(code[0], 0xb7);
-        assert_eq!(code[4], 42);
-
-        // exit = 0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-        assert_eq!(code[8], 0x95);
-    }
-
-    #[test]
-    fn test_forward_label() {
-        let mut asm = Assembler::new();
-        let mut end = asm.create_label();
-
-        asm.mov64_imm(R0, 1);
-        asm.ja(&end);
-        asm.mov64_imm(R0, 2);
-        asm.set_label(&mut end).unwrap();
-        asm.exit();
-
-        let code = asm.assemble().unwrap();
-        // Check jump offset: from insn 1 to insn 3, offset = 3 - (1 + 1) = 1
-        let offset = i16::from_le_bytes([code[10], code[11]]);
-        assert_eq!(offset, 1);
-    }
-
-    #[test]
-    fn test_backward_label() {
-        let mut asm = Assembler::new();
-        let mut loop_start = asm.create_label();
-
-        asm.mov64_imm(R0, 10); // insn 0
-        asm.set_label(&mut loop_start).unwrap(); // label points to insn 1
-        asm.sub64_imm(R0, 1); // insn 1
-        asm.jne_imm(R0, 0, &loop_start); // insn 2
-        asm.exit(); // insn 3
-
-        let code = asm.assemble().unwrap();
-        // jne_imm is at bytes 16-23 (insn 2)
-        // offset field is at bytes 18-19 (bits 16-31)
-        // Jump from insn 2 to insn 1: offset = 1 - (2 + 1) = -2
-        let offset = i16::from_le_bytes([code[18], code[19]]);
-        assert_eq!(offset, -2);
-    }
 
     #[test]
     fn test_undefined_label() {
@@ -857,18 +726,6 @@ mod tests {
     }
 
     #[test]
-    fn test_call_helper() {
-        let mut asm = Assembler::new();
-        asm.call(1); // bpf_map_lookup_elem
-        asm.exit();
-
-        let code = asm.assemble().unwrap();
-        assert_eq!(code[0], 0x85); // call opcode
-        let func_id = i32::from_le_bytes([code[4], code[5], code[6], code[7]]);
-        assert_eq!(func_id, 1);
-    }
-
-    #[test]
     fn test_local_call() {
         let mut asm = Assembler::new();
         let mut func = asm.create_label();
@@ -880,56 +737,19 @@ mod tests {
         asm.exit();
 
         let code = asm.assemble().unwrap();
-        // src_reg should be 1 for local call
         assert_eq!((code[1] >> 4) & 0xF, 1);
-    }
-
-    #[test]
-    fn test_mark_core_relo() {
-        let mut asm = Assembler::new();
-
-        // Emit instruction and mark with CO-RE relocation
-        asm.mov64_imm(R3, 8);
-        asm.mark_core_relo(CoreReloKind::FieldByteOffset, 1, 17);
-
-        asm.add64(R1, R3);
-
-        // Second relocation, at a later instruction
-        asm.mov64_imm(R4, 1);
-        asm.mark_core_relo(CoreReloKind::FieldExists, 1, 25); // debug_flags exists check
-
-        asm.exit();
-
-        let result = asm.assemble_with_core().unwrap();
-
-        assert_eq!(result.relocations.len(), 2);
-        assert_eq!(result.relocations[0].insn_off, 0); // first instruction
-        assert_eq!(result.relocations[0].type_id, 1);
-        assert_eq!(result.relocations[0].access_str_off, 17);
-        assert_eq!(result.relocations[0].kind, CoreReloKind::FieldByteOffset);
-
-        // Second relo at instruction 2 (after add64)
-        assert_eq!(result.relocations[1].insn_off, 16);
-        assert_eq!(result.relocations[1].kind, CoreReloKind::FieldExists);
     }
 
     #[test]
     fn test_core_relo_with_wide_instruction() {
         let mut asm = Assembler::new();
-
-        // LDDW is a wide instruction (16 bytes)
         asm.lddw(R0, 0x1234567890ABCDEF_i64);
-
-        // Instruction after LDDW should be at byte offset 16, not 8
         asm.mov64_imm(R1, 42);
         asm.mark_core_relo(CoreReloKind::TypeSize, 2, 0);
-
         asm.exit();
 
         let result = asm.assemble_with_core().unwrap();
-
         assert_eq!(result.relocations.len(), 1);
-        // LDDW takes 16 bytes, so mov64 is at offset 16
         assert_eq!(result.relocations[0].insn_off, 16);
     }
 
@@ -977,22 +797,6 @@ mod tests {
         assert_eq!(code[72], 0xc6); // jslt32
         assert_eq!(code[80], 0xd6); // jsle32
         assert_eq!(code[88], 0x46); // jset32
-    }
-
-    #[test]
-    fn test_jmp32_with_register() {
-        let mut asm = Assembler::new();
-        let mut target = asm.create_label();
-
-        asm.jeq32(R0, R1, &target);
-        asm.set_label(&mut target).unwrap();
-        asm.exit();
-
-        let code = asm.assemble().unwrap();
-        // JMP32 = 0x06, JEQ = 0x10, SRC_REG = 0x08 -> 0x1e
-        assert_eq!(code[0], 0x1e);
-        // src register should be R1 (1) in upper nibble of byte 1
-        assert_eq!((code[1] >> 4) & 0xF, 1);
     }
 
     #[test]

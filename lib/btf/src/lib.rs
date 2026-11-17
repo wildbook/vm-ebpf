@@ -5,17 +5,16 @@
 //! - A builder for host applications to describe their types as BTF
 //! - CO-RE (Compile Once - Run Everywhere) relocation support
 //!
-//! # Non-Kernel Use Case
+//! # Host types as the target
 //!
-//! Unlike kernel eBPF, this library is designed for embedding eBPF in user applications.
 //! The host application's types stand in for the kernel's: eBPF programs compiled with
-//! BTF have their field accesses relocated to match the host's actual layouts, exactly as
+//! BTF have their field accesses relocated to match the host's actual layouts, as
 //! kernel CO-RE relocates a program's accesses against the running kernel's BTF.
 //!
 //! # Example
 //!
 //! ```ignore
-//! use btf::{Btf, BtfBuilder, BtfExt};
+//! use btf::{apply_core_relocations, Btf, BtfBuilder, BtfExt};
 //!
 //! // Host application describes its struct layout as BTF
 //! let mut host = BtfBuilder::new();
@@ -33,7 +32,6 @@
 //! let btf_ext = BtfExt::parse(btf_ext_bytes, local.strings())?;
 //! let relocations = btf_ext.relos_for_section(".text").unwrap_or(&[]);
 //!
-//! // Apply CO-RE relocations
 //! apply_core_relocations(&mut instructions, &local, &target, relocations)?;
 //! ```
 

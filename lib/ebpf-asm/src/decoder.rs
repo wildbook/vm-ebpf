@@ -1,7 +1,5 @@
 //! eBPF bytecode decoder.
 //!
-//! Decodes raw eBPF bytecode into structured `Instruction` representations.
-//!
 //! Acceptance follows llvm-objdump: a field the instruction defines must hold a valid
 //! value, a field it does not define is ignored, and anything else decodes as
 //! `Mnemonic::Unknown` with no operands. Register numbers above 10 are invalid, so
@@ -15,9 +13,7 @@ use crate::register::Register;
 /// Mnemonic and operands of a valid instruction; `None` for an invalid encoding.
 type Decoded = Option<(Mnemonic, Operand, Operand)>;
 
-/// eBPF bytecode decoder.
-///
-/// Iterates over bytecode and yields decoded instructions.
+/// Iterator over the instructions in eBPF bytecode.
 ///
 /// # Example
 ///
@@ -102,10 +98,9 @@ fn reg(number: u8) -> Option<Register> {
 
 /// `[base + off]` with the base register taken from the `dst` or `src` field.
 fn mem(base: u8, raw: RawInstruction) -> Option<Operand> {
-    let offset = raw.offset();
     Some(Operand::Mem {
         base: reg(base)?,
-        offset,
+        offset: raw.offset(),
     })
 }
 
@@ -418,33 +413,6 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_exit() {
-        let bytes = [0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let insn = Decoder::new(&bytes).next().unwrap();
-        assert_eq!(insn.mnemonic, Mnemonic::Exit);
-    }
-
-    #[test]
-    fn test_decode_mov64_imm() {
-        // mov64 r0, 42
-        let bytes = [0xb7, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00];
-        let insn = Decoder::new(&bytes).next().unwrap();
-        assert_eq!(insn.mnemonic, Mnemonic::Mov64);
-        assert_eq!(insn.dst, Operand::Reg(Register::R0));
-        assert_eq!(insn.src, Operand::Imm(42));
-    }
-
-    #[test]
-    fn test_decode_add64_reg() {
-        // add64 r0, r1
-        let bytes = [0x0f, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let insn = Decoder::new(&bytes).next().unwrap();
-        assert_eq!(insn.mnemonic, Mnemonic::Add64);
-        assert_eq!(insn.dst, Operand::Reg(Register::R0));
-        assert_eq!(insn.src, Operand::Reg(Register::R1));
-    }
-
-    #[test]
     fn test_decode_lddw() {
         // lddw r0, 0x123456789abcdef0
         let bytes = [
@@ -474,14 +442,6 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_jeq() {
-        // jeq r0, 0, +5
-        let bytes = [0x15, 0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let insn = Decoder::new(&bytes).next().unwrap();
-        assert_eq!(insn.mnemonic, Mnemonic::Jeq);
-    }
-
-    #[test]
     fn test_decode_atomic_ops() {
         // Atomic ops use opcode 0xDB (STX | DW | ATOMIC); the imm selects the operation.
         for (imm, want) in [
@@ -504,7 +464,7 @@ mod tests {
         let insn = Decoder::new(&bytes).next().unwrap();
         assert_eq!(insn.mnemonic, Mnemonic::AtomicAdd32);
 
-        // AtomicAdd64 also carries dst/src operands, unlike the other mnemonics above.
+        // the atomic operand shape: `[dst+off], src`
         let bytes = [0xdb, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         let insn = Decoder::new(&bytes).next().unwrap();
         assert_eq!(

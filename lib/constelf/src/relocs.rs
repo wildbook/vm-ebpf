@@ -26,13 +26,12 @@ impl<'a> ElfRelocSections<'a> {
 
             self.index += 1;
 
-            // Handle both REL and RELA section types
             if src.sh_type != sht::REL && src.sh_type != sht::RELA {
                 continue;
             }
 
             let Some(dst) = self.sects.header_by_index(src.sh_info as usize) else {
-                // Invalid sh_info reference - skip this relocation section
+                // dangling sh_info: skip this relocation section
                 continue;
             };
 

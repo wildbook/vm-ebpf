@@ -25,8 +25,7 @@ impl ElfFile<'_> {
         Ok(())
     }
 
-    /// SAFETY: This function is responsible for validating the data that is later treated as valid.
-    /// If the structure is invalid and this function does not filter it out, later code may cause undefined behavior.
+    /// `header` dereferences the image unchecked, so every `ElfFile` must pass through here.
     pub const fn validated(self) -> ElfResult<Self> {
         tryres!(self.validate());
         Ok(self)

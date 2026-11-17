@@ -1,17 +1,6 @@
-//! eBPF Loader Example
-//!
-//! This program demonstrates loading and executing a C-compiled eBPF program using
-//! the `rvm` embeddable eBPF runtime:
-//! - `vm.parse_module`: parses the ELF file into sections, symbols, exports and
-//!   relocations (`rvm::Module`).
-//! - `vm.link_one`: lays out memory, applies relocations and produces an
-//!   executable `rvm::Program`.
-//! - `program.call`: executes an exported function by name.
-//!
-//! Usage:
-//!   cargo run --bin loader
-//!
-//! The program expects `bpf/example.o` to exist (compile with `make -C bpf example.o`)
+//! Loads `bpf/example.o` (built with `make -C bpf example.o`, falling back to
+//! `bpf.o`), prints what `Vm::parse_module` and `Vm::link_one` produce, and calls
+//! its exported functions.
 
 use anyhow::{Context, Result};
 use rvm::{Module, Perms, Program, Vm};
@@ -51,7 +40,6 @@ fn main() -> Result<()> {
     println!("  Stack top: 0x{:x}", program.stack_top());
     print_function_table(&program);
 
-    // 1. Run the 'simple_add' function which just adds two numbers
     println!("\n=== Test 1: Running 'simple_add(100, 200)' ===");
     run_and_report(&mut program, "simple_add", &[100, 200], |result| {
         println!("simple_add(100, 200) = {result}");
@@ -60,7 +48,6 @@ fn main() -> Result<()> {
         }
     });
 
-    // 2. Run the 'return_magic' function which returns the magic value
     println!("\n=== Test 2: Running 'return_magic()' ===");
     run_and_report(&mut program, "return_magic", &[], |result| {
         println!("return_magic() = 0x{result:016X}");
@@ -69,8 +56,7 @@ fn main() -> Result<()> {
         }
     });
 
-    // 3. Run the main 'bpf_main' entry point: 10 * 20 via `struct input_ctx` / `struct output_result`.
-    //    Both structs live in a host-mapped scratch region, separate from the stack.
+    // `struct input_ctx` and `struct output_result` live in a host-mapped scratch region.
     println!("\n=== Test 3: Running 'bpf_main' (op=mul, 10 * 20) ===");
     let scratch = program.memory_mut().map(rvm::FIRST_FREE_REGION, 4096, Perms::RW);
     let ctx = scratch;

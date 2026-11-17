@@ -24,14 +24,13 @@ impl<'a> BtfStrings<'a> {
             return None;
         }
 
-        // Find the null terminator
         let slice = &self.data[offset..];
         let end = slice.iter().position(|&b| b == 0)?;
 
         core::str::from_utf8(&slice[..end]).ok()
     }
 
-    /// Get a string by offset, returning empty string for offset 0 or errors.
+    /// Get a string by offset, or `""` if it is missing or invalid.
     pub fn get_or_empty(&self, offset: u32) -> &'a str {
         self.get(offset).unwrap_or("")
     }

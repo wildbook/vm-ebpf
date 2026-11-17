@@ -47,7 +47,7 @@ impl fmt::Display for Instruction {
 /// Layout:
 /// - Bits 0-7: opcode
 /// - Bits 8-11: dst register
-/// - Bits 12-15: src register  
+/// - Bits 12-15: src register
 /// - Bits 16-31: offset (signed)
 /// - Bits 32-63: immediate (signed)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -55,7 +55,7 @@ impl fmt::Display for Instruction {
 pub struct RawInstruction(pub u64);
 
 impl RawInstruction {
-    /// Create from a u64 value (little-endian).
+    /// Wrap a raw instruction word.
     #[inline]
     pub const fn new(value: u64) -> Self {
         Self(value)
@@ -202,7 +202,7 @@ pub mod atomic {
     pub const XOR: i32 = 0xa0;
     pub const XCHG: i32 = 0xe1;
     pub const CMPXCHG: i32 = 0xf1;
-    /// Flag indicating fetch variant (returns old value).
+    /// Fetch variant flag: the prior value is written back to `src`.
     pub const FETCH: i32 = 0x01;
 }
 

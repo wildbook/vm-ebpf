@@ -1,72 +1,25 @@
-//! Demo: Embeddable eBPF VM with BTF/CO-RE and Structured Logging
+//! CO-RE demo built directly on the `btf` and `ebpf-asm` crates.
 //!
-//! This demo shows the correct CO-RE (Compile Once - Run Everywhere) workflow:
-//!
-//! 1. eBPF program is compiled with BTF describing types it *expects*
-//! 2. Host application describes its *actual* struct layouts as BTF, with `BtfBuilder`
-//! 3. At load time, CO-RE relocations patch eBPF instructions to use host's offsets
-//! 4. The patched program runs correctly against host's memory layout
-//!
-//! # The Problem CO-RE Solves
+//! Each program carries local BTF describing the `struct event` layout it was
+//! written against. The host describes its actual layout with `BtfBuilder`, and
+//! `apply_core_relocations` patches the instructions to match before they run.
 //!
 //! ```text
-//! eBPF program compiled expecting:     Host application actually has:
+//! program expects:                     host has:
 //!   struct event {                       struct event {
 //!     u64 timestamp;  // offset 0          u64 timestamp;  // offset 0
-//!     u32 pid;        // offset 8          u32 flags;      // offset 8  (new!)
-//!   }                                      u32 pid;        // offset 12 (moved!)
+//!     u32 pid;        // offset 8          u32 flags;      // offset 8
+//!   }                                      u32 pid;        // offset 12
 //!                                        }
-//!
-//! Without CO-RE: Program reads offset 8, gets flags instead of pid - BUG!
-//! With CO-RE:    Program's "read pid" patched to offset 12 - CORRECT!
-//! ```
-//!
-//! # Architecture
-//!
-//! ```text
-//! ┌─────────────────────────────────────────────────────────────────────┐
-//! │                         LOAD TIME                                   │
-//! │  ┌──────────────────┐          ┌──────────────────┐                │
-//! │  │ eBPF Program     │          │ Host BTF          │                │
-//! │  │ + BTF (expected) │──────────│ (actual layout)   │                │
-//! │  └────────┬─────────┘          └─────────┬────────┘                │
-//! │           │                              │                          │
-//! │           └──────────┬───────────────────┘                          │
-//! │                      ▼                                              │
-//! │           ┌──────────────────────┐                                  │
-//! │           │ apply_core_relocations│                                  │
-//! │           │ (patches instructions)│                                  │
-//! │           └──────────┬───────────┘                                  │
-//! │                      ▼                                              │
-//! │           ┌──────────────────────┐                                  │
-//! │           │ Patched eBPF Program │                                  │
-//! │           └──────────────────────┘                                  │
-//! └─────────────────────────────────────────────────────────────────────┘
-//!
-//! ┌─────────────────────────────────────────────────────────────────────┐
-//! │                         RUN TIME                                    │
-//! │  ┌──────────────────┐     ┌─────────────────────────────────────┐  │
-//! │  │ Patched Program  │────▶│ Correctly accesses host's structs   │  │
-//! │  │ (offset=12)      │     │ even though compiled with offset=8  │  │
-//! │  └──────────────────┘     └─────────────────────────────────────┘  │
-//! └─────────────────────────────────────────────────────────────────────┘
 //! ```
 
 use btf::{apply_core_relocations, Btf, BtfBuilder, CoreRelo, CoreReloKind};
 use ebpf_asm::{Assembler, R0, R1, R2, R6};
 use rvm::{Executor, HelperRegistry, VmMemory};
 
-// ============================================================================
-// Host Helper Function IDs
-// ============================================================================
-
 mod helper_id {
     pub const PRINT_U64: u32 = 1;
 }
-
-// ============================================================================
-// Helper Registration
-// ============================================================================
 
 /// Build the registry of host helper functions exposed to eBPF programs.
 fn build_helpers() -> HelperRegistry {
@@ -95,7 +48,7 @@ fn host_event(fields: &[(&str, u32, u32)], size: u32) -> Vec<u8> {
 /// member per field, named so libbpf-style access strings resolve against it.
 ///
 /// `fields` is `(name, byte size)`, laid out contiguously from offset 0. Returns the
-/// encoded BTF, each field's libbpf access string offset ("0:<index>"), and the
+/// encoded BTF, each field's libbpf access string offset (`"0:<index>"`), and the
 /// access string offset for type-kind relocations (the literal `"0"`).
 fn local_event_btf(struct_name: &str, fields: &[(&str, u32)]) -> (Vec<u8>, Vec<u32>, u32) {
     let mut b = BtfBuilder::new();
@@ -118,16 +71,12 @@ fn local_event_btf(struct_name: &str, fields: &[(&str, u32)]) -> (Vec<u8>, Vec<u
     (b.encode(), access_offs, type_root_access)
 }
 
-// ============================================================================
-// eBPF Program + BTF (using ebpf-asm and btf)
-// ============================================================================
-
 /// An eBPF program together with its local BTF and CO-RE relocations.
 struct EbpfProgram {
     assembler: Assembler,
-    /// Raw instructions as u64 values (populated by `finalize`).
+    /// Populated by `finalize`.
     instructions: Vec<u64>,
-    /// BTF data describing types the program expects.
+    /// Local BTF describing the types the program expects.
     btf_data: Vec<u8>,
     relocations: Vec<CoreRelo>,
 }
@@ -142,7 +91,7 @@ impl EbpfProgram {
         }
     }
 
-    /// Finalize assembly and store instructions and relocations.
+    /// Assemble and store the instructions and relocations.
     fn finalize(&mut self) -> Result<(), ebpf_asm::AsmError> {
         let result = self.assembler.assemble_with_core()?;
         self.instructions = result.instructions();
@@ -162,51 +111,29 @@ fn relocate(insns: &mut [u64], local: &Btf, target: &Btf, relos: &[CoreRelo]) ->
     }
 }
 
-// ============================================================================
-// Demo: CO-RE Field Offset Relocation
-// ============================================================================
-
-/// Build a program that reads `event.pid` using CO-RE.
-///
-/// The program expects this struct layout (from BTF):
-/// ```c
-/// struct event {
-///     u64 timestamp;  // offset 0, size 8
-///     u32 pid;        // offset 8, size 4  <-- BPF expects pid here!
-/// };
-/// ```
-///
-/// The instruction that reads `pid` will be patched by CO-RE to use
-/// whatever offset the host's BTF says.
+/// Build a program that reads `event.pid` at offset 8 and returns it, with CO-RE
+/// patching the load to the host's offset.
 fn build_core_demo_program() -> EbpfProgram {
     let mut prog = EbpfProgram::new();
 
-    // Program expects struct event { timestamp(8), pid(4) }, i.e. pid at offset 8.
     let (btf_data, access_offs, _) = local_event_btf("event", &[("timestamp", 8), ("pid", 4)]);
     prog.btf_data = btf_data;
     let pid_access = access_offs[1];
 
-    // === Program ===
-    // r1 = pointer to event struct (passed as input)
-    // This simulates: u32 pid = event->pid;
-
-    // Instruction 0: r2 = *(u32*)(r1 + OFFSET)
-    // The offset here (8) is what BPF *expects*, but CO-RE will patch it
-    prog.assembler.ldxw(R2, R1, 8); // <-- This offset gets patched!
+    // r2 = event->pid
+    prog.assembler.ldxw(R2, R1, 8);
     prog.assembler
         .mark_core_relo(CoreReloKind::FieldByteOffset, 1, pid_access);
 
     // Save pid in a callee-saved register because the helper call clobbers r1-r5.
     prog.assembler.mov64(R6, R2);
 
-    // Call print_u64(pid)
+    // print_u64(pid)
     prog.assembler.mov64(R1, R6);
     prog.assembler.call(helper_id::PRINT_U64 as i32);
 
-    // r0 = pid (read back from the callee-saved register)
     prog.assembler.mov64(R0, R6);
 
-    // exit
     prog.assembler.exit();
 
     prog.finalize().unwrap();
@@ -289,32 +216,28 @@ fn demo_core_relocation() -> Result<(), String> {
     Ok(())
 }
 
-/// Demo: Field existence check
+/// Patch a `FIELD_EXISTS` check against hosts with and without `debug_flags`.
 fn demo_field_exists() -> Result<(), String> {
     println!("=== Demo: CO-RE Field Existence Check ===\n");
 
     let mut prog = EbpfProgram::new();
 
-    // Program checks for optional "debug_flags" field.
     let (btf_data, access_offs, _) = local_event_btf("event", &[("timestamp", 8), ("pid", 4), ("debug_flags", 4)]);
     prog.btf_data = btf_data;
     let debug_flags_access = access_offs[2];
 
     let mut missing = prog.assembler.create_label();
 
-    // Instruction 0: r1 = FIELD_EXISTS (1 or 0)
-    prog.assembler.mov64_imm(R1, 1); // placeholder: assume exists
+    // r1 = field exists ? 1 : 0
+    prog.assembler.mov64_imm(R1, 1);
     prog.assembler
         .mark_core_relo(CoreReloKind::FieldExists, 1, debug_flags_access);
 
-    // if r1 == 0 goto missing
     prog.assembler.jeq_imm(R1, 0, &missing);
 
-    // field exists path
     prog.assembler.mov64_imm(R0, 1);
     prog.assembler.exit();
 
-    // field missing path
     prog.assembler.set_label(&mut missing).unwrap();
     prog.assembler.mov64_imm(R0, 0);
     prog.assembler.exit();
@@ -323,7 +246,6 @@ fn demo_field_exists() -> Result<(), String> {
 
     let btf = Btf::parse(&prog.btf_data).expect("BTF parse failed");
 
-    // Test 1: Host HAS the field
     println!("--- Scenario: Host HAS debug_flags ---");
     {
         let host_bytes = host_event(&[("timestamp", 0, 8), ("pid", 8, 4), ("debug_flags", 12, 4)], 16);
@@ -340,10 +262,8 @@ fn demo_field_exists() -> Result<(), String> {
         }
     }
 
-    // Test 2: Host does NOT have the field
     println!("--- Scenario: Host does NOT have debug_flags ---");
     {
-        // No debug_flags!
         let host_bytes = host_event(&[("timestamp", 0, 8), ("pid", 8, 4)], 12);
         let target = Btf::parse(&host_bytes).unwrap();
 
@@ -361,7 +281,7 @@ fn demo_field_exists() -> Result<(), String> {
     Ok(())
 }
 
-/// Demo: Type size query
+/// Patch a `TYPE_SIZE` query against a host whose `struct event` is larger.
 fn demo_type_size() -> Result<(), String> {
     println!("=== Demo: CO-RE Type Size Query ===\n");
 
@@ -369,8 +289,7 @@ fn demo_type_size() -> Result<(), String> {
     let (btf_data, _, type_access) = local_event_btf("event", &[("timestamp", 8), ("pid", 4)]);
     prog.btf_data = btf_data;
 
-    // Instruction 0: r0 = sizeof(event) -- will be patched
-    prog.assembler.mov64_imm(R0, 12); // BPF expects 12
+    prog.assembler.mov64_imm(R0, 12);
     prog.assembler.mark_core_relo(CoreReloKind::TypeSize, 1, type_access);
 
     prog.assembler.exit();
@@ -378,7 +297,6 @@ fn demo_type_size() -> Result<(), String> {
 
     let btf = Btf::parse(&prog.btf_data).expect("BTF parse failed");
 
-    // Host has larger struct
     let host_bytes = host_event(&[("timestamp", 0, 8), ("flags", 8, 4), ("pid", 12, 4), ("extra", 16, 8)], 24);
     let target = Btf::parse(&host_bytes).unwrap();
 
@@ -394,10 +312,6 @@ fn demo_type_size() -> Result<(), String> {
     }
     Ok(())
 }
-
-// ============================================================================
-// Main
-// ============================================================================
 
 fn main() -> Result<(), String> {
     println!("########################################################");

@@ -57,11 +57,10 @@ impl Register {
 
 impl fmt::Display for Register {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "r{}", self.number()) // number() not a simple variable
+        write!(f, "r{}", self.number())
     }
 }
 
-// Convenient register constants
 #[allow(missing_docs)]
 pub const R0: Register = Register::R0;
 #[allow(missing_docs)]

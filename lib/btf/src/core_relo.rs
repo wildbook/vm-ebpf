@@ -1,12 +1,12 @@
 //! CO-RE (Compile Once - Run Everywhere) relocation support.
 //!
 //! This module parses `.BTF.ext` sections and applies CO-RE relocations to eBPF
-//! instructions, exactly as libbpf does against kernel BTF: the host's types are a
+//! instructions the way libbpf does against kernel BTF: the host's types are a
 //! "target" BTF, the eBPF program's own debug info is the "local" BTF, and a
 //! relocation's access string names a path through the local type that gets re-resolved
 //! against whichever matching type the target actually has.
 
-use crate::parse::{word, Btf, MAX_RESOLVE_DEPTH};
+use crate::parse::{word, Btf, BtfError, MAX_RESOLVE_DEPTH};
 use crate::raw::{BtfKind, BTF_INT_SIGNED};
 use crate::strings::BtfStrings;
 use crate::types::{BtfTypeInfo, Member};
@@ -146,9 +146,7 @@ impl<'a> BtfExt<'a> {
     /// Parse BTF.ext from raw bytes.
     ///
     /// Requires the BTF strings table for resolving section names.
-    pub fn parse(data: &'a [u8], strings: &BtfStrings<'a>) -> Result<Self, crate::parse::BtfError> {
-        use crate::parse::BtfError;
-
+    pub fn parse(data: &'a [u8], strings: &BtfStrings<'a>) -> Result<Self, BtfError> {
         if data.len() < BTF_EXT_HDR_MIN_SIZE {
             return Err(BtfError::TooShort);
         }
@@ -158,7 +156,7 @@ impl<'a> BtfExt<'a> {
         }
         let hdr_len = word(data, 1) as usize;
 
-        // CO-RE relocations are optional (added later).
+        // older headers end before the CO-RE relocation fields
         let (core_relo_off, core_relo_len) =
             if hdr_len >= BTF_EXT_HDR_SIZE_WITH_CORE && data.len() >= BTF_EXT_HDR_SIZE_WITH_CORE {
                 (word(data, 6), word(data, 7))
@@ -181,9 +179,7 @@ impl<'a> BtfExt<'a> {
         core_relo_off: u32,
         core_relo_len: u32,
         strings: &BtfStrings<'a>,
-    ) -> Result<Vec<SectionCoreRelos<'a>>, crate::parse::BtfError> {
-        use crate::parse::BtfError;
-
+    ) -> Result<Vec<SectionCoreRelos<'a>>, BtfError> {
         let start = hdr_len + core_relo_off as usize;
         let end = start + core_relo_len as usize;
 

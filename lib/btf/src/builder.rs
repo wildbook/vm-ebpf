@@ -3,7 +3,7 @@
 //! The host describes its own types the same way a compiler describes a program's:
 //! as standard BTF. [`BtfBuilder`] assembles that BTF incrementally and [`encode`]
 //! produces bytes [`Btf::parse`] can read back, so CO-RE relocations resolve against
-//! the host's types exactly as they would against a second translation unit.
+//! the host's types as they would against a second translation unit.
 //!
 //! [`encode`]: BtfBuilder::encode
 

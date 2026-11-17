@@ -17,11 +17,6 @@ macro_rules! tryopt {
 }
 
 macro_rules! ensure {
-    (None, $expression:expr) => {
-        if !$expression {
-            return None;
-        }
-    };
     ($err:expr, $expression:expr) => {
         if !$expression {
             return Err($err);

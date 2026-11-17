@@ -60,13 +60,6 @@ impl<'a> ElfSections<'a> {
 
         Ok(Self { file, ehdr })
     }
-}
-
-impl<'a> ElfSections<'a> {
-    #[allow(clippy::len_without_is_empty)] // `is_empty` had no callers; removed as dead API
-    pub const fn len(self) -> usize {
-        self.ehdr.e_shnum as usize
-    }
 
     pub const fn headers(self) -> &'a [Elf64Shdr] {
         let beg = self.ehdr.e_shoff as usize;
@@ -103,7 +96,6 @@ impl<'a> ElfSections<'a> {
             if header.sh_type == raw::sht::SYMTAB {
                 let bytes = tryres!(self.bytes(header));
                 ensure!(ElfError::InvalidData, bytes.len() % mem::size_of::<Elf64Sym>() == 0);
-                // assert!(bytes.as_ptr().is_aligned_to(align_of::<Elf64Sym>()));
 
                 let ptr = bytes.as_ptr().cast::<Elf64Sym>();
                 let len = bytes.len() / mem::size_of::<Elf64Sym>();
@@ -154,7 +146,6 @@ impl<'a> ElfSections<'a> {
             i += 1;
 
             if header.sh_type == raw::sht::STRTAB {
-                // Check if this is .strtab (not .shstrtab)
                 if let Ok(name) = self.name(header) {
                     if util::slice_eq(name.to_bytes(), b".strtab") {
                         return self.bytes(header);

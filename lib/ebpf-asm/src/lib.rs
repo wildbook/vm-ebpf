@@ -72,7 +72,6 @@ mod mnemonic;
 mod operand;
 mod register;
 
-// Re-export main types
 pub use assembler::{AsmError, AssembledProgram, Assembler, Label};
 pub use decoder::{decode_all, Decoder};
 pub use formatter::DefaultFormatter;
@@ -85,9 +84,8 @@ pub use register::{Register, FP, R0, R1, R10, R2, R3, R4, R5, R6, R7, R8, R9};
 mod tests {
     use super::*;
 
-    /// Runs every assembler instruction through `assemble` -> `decode_all` and checks
-    /// that the mnemonic round-trips; a real invariant linking the two halves of the
-    /// crate, unlike the old per-family tests that each pinned one call sequence.
+    /// Runs every assembler instruction through `assemble` and `decode_all` and checks
+    /// that every emitted opcode decodes.
     #[test]
     fn round_trip_every_instruction() {
         let mut asm = Assembler::new();
