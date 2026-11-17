@@ -10,10 +10,10 @@ fn images_run_like_elf() {
     type Case = (&'static [&'static str], &'static [(&'static str, &'static [u64])]);
     const SLOT: u64 = region_base(FIRST_FREE_REGION) + 8;
     let cases: &[Case] = &[
-        (&["atomics.o"], &[("run", &[5])]),
-        (&["data_ptrs.o"], &[("deref", &[])]),
+        (&["tests/atomics.o"], &[("run", &[5])]),
+        (&["tests/data_ptrs.o"], &[("deref", &[])]),
         (
-            &["func_ptr.o"],
+            &["tests/func_ptr.o"],
             &[
                 ("call_ro", &[2, 10, 3]),
                 ("call_rw", &[1, 10, 3]),
@@ -23,10 +23,10 @@ fn images_run_like_elf() {
                 ("addr_of_add", &[]),
             ],
         ),
-        (&["core_guard.o"], &[("read_flags", &[0]), ("read_flags_unguarded", &[0])]),
-        (&["core_bitfield.o"], &[("read_b", &[0])]),
+        (&["tests/core_guard.o"], &[("read_flags", &[0]), ("read_flags_unguarded", &[0])]),
+        (&["tests/core_bitfield.o"], &[("read_b", &[0])]),
         (
-            &["maps.o"],
+            &["tests/maps.o"],
             &[
                 ("count", &[1]),
                 ("count", &[1]),
@@ -35,14 +35,14 @@ fn images_run_like_elf() {
                 ("recall", &[7]),
             ],
         ),
-        (&["example.o"], &[("simple_add", &[2, 3]), ("return_magic", &[])]),
-        (&["std_helpers.o"], &[("draws_differ", &[])]),
-        (&["shared_counter.o"], &[("bump", &[]), ("bump", &[])]),
-        (&["shared_region.o"], &[("put", &[SLOT, 42]), ("get", &[SLOT])]),
-        (&["plugin_a.o"], &[("a_scale", &[5])]),
-        (&["plugin_b.o"], &[("b_run", &[5])]),
-        (&["borrow_caller.o"], &[("run", &[])]),
-        (&["link_main.o", "link_lib.o"], &[("run", &[7]), ("lib_scale", &[5])]),
+        (&["examples/example.o"], &[("simple_add", &[2, 3]), ("return_magic", &[])]),
+        (&["tests/std_helpers.o"], &[("draws_differ", &[])]),
+        (&["tests/shared_counter.o"], &[("bump", &[]), ("bump", &[])]),
+        (&["tests/shared_region.o"], &[("put", &[SLOT, 42]), ("get", &[SLOT])]),
+        (&["tests/plugin_a.o"], &[("a_scale", &[5])]),
+        (&["tests/plugin_b.o"], &[("b_run", &[5])]),
+        (&["tests/borrow_caller.o"], &[("run", &[])]),
+        (&["tests/link_main.o", "tests/link_lib.o"], &[("run", &[7]), ("lib_scale", &[5])]),
     ];
 
     let vm = Vm::new();
@@ -54,9 +54,9 @@ fn images_run_like_elf() {
     vm.enable_print(|_| {});
     // SAFETY: the programs run on this thread only.
     unsafe { vm.share_region(FIRST_FREE_REGION, 64, rvm::Perms::RW) }.unwrap();
-    let a = vm.load_plugin("a", &object("plugin_a.o")).unwrap();
+    let a = vm.load_plugin("a", &object("tests/plugin_a.o")).unwrap();
     vm.export(&a, "a_scale").unwrap();
-    let callee = vm.load_plugin("callee", &object("borrow_callee.o")).unwrap();
+    let callee = vm.load_plugin("callee", &object("tests/borrow_callee.o")).unwrap();
     for func in ["sum", "fill", "poke"] {
         vm.export(&callee, func).unwrap();
     }
@@ -85,13 +85,13 @@ fn plugins_from_images() {
     vm.register_fn("host_reenter", |x: u64| x);
     let image = |name: &str| vm.prepare(&object(name)).unwrap().to_bytes();
 
-    let a = vm.load_plugin_image("a", &image("plugin_a.o")).unwrap();
+    let a = vm.load_plugin_image("a", &image("tests/plugin_a.o")).unwrap();
     vm.export(&a, "a_scale").unwrap();
-    let b_image = image("plugin_b.o");
+    let b_image = image("tests/plugin_b.o");
     let b = vm.load_plugin_image("b", &b_image).unwrap();
     assert_eq!(b.call("b_run", &[5]).unwrap(), 11);
 
-    a.replace(vm.load_image(&image("plugin_a3.o")).unwrap()).unwrap();
+    a.replace(vm.load_image(&image("tests/plugin_a3.o")).unwrap()).unwrap();
     assert_eq!(b.call("b_run", &[5]).unwrap(), 16);
 
     // a VM without the export can't bind b's import
@@ -106,7 +106,7 @@ fn plugins_from_images() {
 #[test]
 fn malformed_images_fail_to_load() {
     let vm = Vm::new();
-    let good = vm.prepare(&object("maps.o")).unwrap();
+    let good = vm.prepare(&object("tests/maps.o")).unwrap();
     let bytes = good.to_bytes();
     let load = |image: &Image| vm.load_image(&image.to_bytes());
     let is_invalid = |r: rvm::Result<rvm::Program>| matches!(r, Err(VmError::InvalidImage(_)));

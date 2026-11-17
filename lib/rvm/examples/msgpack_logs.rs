@@ -1,16 +1,15 @@
 //! Streams MessagePack log events through a parser plugin in fixed-size chunks.
 //!
-//! `bpf/msgpack_logs.c` decodes records with a `switch` over the MessagePack tag bytes, which clang compiles to a jump
-//! table (`gotox`), hands known keys to handlers through a table of function pointers (`callx`), and adds each event to
-//! per-service stats in a hash map and two array maps. The decoder is split into BPF-to-BPF calls.
+//! `bpf/examples/msgpack_logs.c` decodes records with a `switch` over the MessagePack tag bytes, which clang compiles
+//! to a jump table (`gotox`), hands known keys to handlers through a table of function pointers (`callx`), and adds
+//! each event to per-service stats in a hash map and two array maps. The decoder is split into BPF-to-BPF calls.
 //!
 //! The host maps a read-only input region into the program, copies each chunk in and calls `parse` through a function
 //! handle. `parse` returns how many bytes of complete records it consumed. The host keeps the rest and passes it again
 //! in front of the next chunk, so a record split across chunks is parsed once. At the end, the host reads the stats
 //! from the maps and checks them against its own tally of the events it generated.
 //!
-//! Rebuild the plugin with:
-//!   clang -target bpf -mcpu=v4 -O2 -g -c bpf/msgpack_logs.c -o bpf/msgpack_logs.o
+//! Rebuild the plugin with `bpf/build.sh`.
 //!
 //! Run with: cargo run -p rvm --example msgpack_logs
 
@@ -18,7 +17,7 @@ use std::error::Error;
 
 use rvm::{Perms, Pod, Program, Vm};
 
-const PARSER: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/msgpack_logs.o"));
+const PARSER: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/examples/msgpack_logs.o"));
 
 const RECORDS: usize = 400;
 const CHUNK: usize = 96;

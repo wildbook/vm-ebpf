@@ -5,11 +5,11 @@ use rvm::{region_base, ExecError, Perms, Vm, VmError, CODE_REGION, DATA_REGION, 
 
 use crate::common::object;
 
-/// Every atomic form clang emits (bpf/atomics.c), with the expected values worked out by hand from the RFC 9669
+/// Every atomic form clang emits (bpf/tests/atomics.c), with the expected values worked out by hand from the RFC 9669
 /// semantics.
 #[test]
 fn test_clang_atomics() {
-    let mut program = Vm::new().load_elf(&object("atomics.o")).unwrap();
+    let mut program = Vm::new().load_elf(&object("tests/atomics.o")).unwrap();
 
     assert_eq!(program.call("run", &[5]).unwrap(), 1058);
 
@@ -18,19 +18,20 @@ fn test_clang_atomics() {
     assert_eq!(program.memory().read::<u32>(bss + 8).unwrap(), 0xFFFF_FFFF);
 }
 
-/// Pointers in `.data` and `.rodata` (bpf/data_ptrs.c) are relocated at link time, including an addend into the middle
-/// of an array.
+/// Pointers in `.data` and `.rodata` (bpf/tests/data_ptrs.c) are relocated at link time, including an addend into the
+/// middle of an array.
 #[test]
 fn data_pointers_are_relocated() {
-    let mut program = Vm::new().load_elf(&object("data_ptrs.o")).unwrap();
+    let mut program = Vm::new().load_elf(&object("tests/data_ptrs.o")).unwrap();
     assert_eq!(program.call("deref", &[]).unwrap(), 42 + 10 + 30);
 }
 
-/// Function pointers (bpf/func_ptr.c): callback tables in `.rodata` and `.data`, a callback passed as an argument, a
-/// switch lowered to a `gotox` jump table, and `callx` faulting on anything but an instruction in the program.
+/// Function pointers (bpf/tests/func_ptr.c): callback tables in `.rodata` and `.data`, a callback passed as an
+/// argument, a switch lowered to a `gotox` jump table, and `callx` faulting on anything but an instruction in the
+/// program.
 #[test]
 fn function_pointers_and_jump_tables() {
-    let mut program = Vm::new().load_elf(&object("func_ptr.o")).unwrap();
+    let mut program = Vm::new().load_elf(&object("tests/func_ptr.o")).unwrap();
 
     assert_eq!(program.call("call_ro", &[1, 10, 3]).unwrap(), 7);
     assert_eq!(program.call("call_ro", &[2, 10, 3]).unwrap(), 30);
@@ -73,8 +74,9 @@ fn function_pointers_and_jump_tables() {
     }
 }
 
-/// CO-RE against a host whose `struct event` moved `pid` and lacks `flags` (bpf/core_guard.c): field accesses follow
-/// the host layout, an existence check takes the fallback, and an unguarded access to the missing field fails when run.
+/// CO-RE against a host whose `struct event` moved `pid` and lacks `flags` (bpf/tests/core_guard.c): field accesses
+/// follow the host layout, an existence check takes the fallback, and an unguarded access to the missing field fails
+/// when run.
 #[test]
 fn core_relocations_follow_host_layout() {
     let vm = Vm::new();
@@ -83,7 +85,7 @@ fn core_relocations_follow_host_layout() {
     let event_ty = vm.types().add_struct("event", 16);
     vm.types().member(event_ty, "timestamp", 0, u64_t);
     vm.types().member(event_ty, "pid", 12, u32_t);
-    let mut program = vm.load_elf(&object("core_guard.o")).unwrap();
+    let mut program = vm.load_elf(&object("tests/core_guard.o")).unwrap();
 
     let event = program.memory_mut().map(FIRST_FREE_REGION, 16, Perms::R);
     program.memory_mut().write::<u32>(event + 12, 77).unwrap();
@@ -94,14 +96,14 @@ fn core_relocations_follow_host_layout() {
     assert!(matches!(err, VmError::Exec(ExecError::UnresolvedCoreRelo { .. })), "{err}");
 }
 
-/// A host can ship its actual layout as BTF compiled from a C header (bpf/host_event.c), instead of describing it field
-/// by field: `append_btf` reads the struct straight out of the compiled object.
+/// A host can ship its actual layout as BTF compiled from a C header (bpf/tests/host_event.c), instead of describing it
+/// field by field: `append_btf` reads the struct straight out of the compiled object.
 #[test]
 fn core_relocations_follow_appended_host_btf() {
-    let host_module = rvm::Module::from_elf("host_event", &object("host_event.o")).unwrap();
+    let host_module = rvm::Module::from_elf("host_event", &object("tests/host_event.o")).unwrap();
     let vm = Vm::new();
     vm.types().append_btf(host_module.btf_data.as_ref().unwrap()).unwrap();
-    let mut program = vm.load_elf(&object("core_guard.o")).unwrap();
+    let mut program = vm.load_elf(&object("tests/core_guard.o")).unwrap();
 
     // Host layout: flags(0), pid(4), timestamp(8); every field present, reordered.
     let event = program.memory_mut().map(FIRST_FREE_REGION, 16, Perms::R);
@@ -113,10 +115,9 @@ fn core_relocations_follow_appended_host_btf() {
     assert_eq!(program.call("read_flags_unguarded", &[event]).unwrap(), 0xABCD);
 }
 
-/// A CO-RE bitfield read (bpf/core_bitfield.c) written out in `bpf_core_read.h`'s `BPF_CORE_READ_BITFIELD` style,
-/// exercising `FieldLShiftU64`/`FieldRShiftU64`/
-/// `FieldSigned` together: the host's bitfield sits at a different bit position than the one the program was compiled
-/// against, and is signed.
+/// A CO-RE bitfield read (bpf/tests/core_bitfield.c) written out in `bpf_core_read.h`'s `BPF_CORE_READ_BITFIELD` style,
+/// exercising `FieldLShiftU64`/`FieldRShiftU64`/`FieldSigned` together: the host's bitfield sits at a different bit
+/// position than the one the program was compiled against, and is signed.
 #[test]
 fn core_relocations_read_signed_bitfield() {
     let vm = Vm::new();
@@ -125,7 +126,7 @@ fn core_relocations_read_signed_bitfield() {
     let bits = vm.types().add_struct("bits", 4);
     vm.types().bitfield_member(bits, "reserved", 0, 20, u32_t);
     vm.types().bitfield_member(bits, "b", 20, 12, i32_t);
-    let mut program = vm.load_elf(&object("core_bitfield.o")).unwrap();
+    let mut program = vm.load_elf(&object("tests/core_bitfield.o")).unwrap();
 
     // b = -5 (12-bit two's complement) at bit 20, with arbitrary bits below it.
     let word: u32 = (0xABCDE) | (0xFFBu32 << 20);
@@ -135,14 +136,14 @@ fn core_relocations_read_signed_bitfield() {
     assert_eq!(program.call("read_b", &[ptr]).unwrap(), -5i64 as u64);
 }
 
-/// Array and hash maps from bpf/maps.c, used from the guest and the host.
+/// Array and hash maps from bpf/tests/maps.c, used from the guest and the host.
 #[test]
 fn test_maps() {
     const EEXIST: u64 = (-17i64) as u64;
     const E2BIG: u64 = (-7i64) as u64;
     const ENOENT: u64 = (-2i64) as u64;
 
-    let mut program = Vm::new().load_elf(&object("maps.o")).unwrap();
+    let mut program = Vm::new().load_elf(&object("tests/maps.o")).unwrap();
 
     // Array: the guest increments a value in place through the looked-up pointer.
     assert_eq!(program.call("count", &[1]).unwrap(), 1);
@@ -175,7 +176,7 @@ fn test_maps() {
 fn test_std_helpers() {
     use std::sync::{Arc, Mutex};
 
-    let elf = object("std_helpers.o");
+    let elf = object("tests/std_helpers.o");
 
     let err = Vm::new().load_elf(&elf).unwrap_err().to_string();
     assert!(err.contains("ktime_get_ns"), "{err}");

@@ -12,7 +12,7 @@ use rvm::{
 use crate::common::object;
 
 fn example() -> Program {
-    Vm::new().load_elf(&object("example.o")).unwrap()
+    Vm::new().load_elf(&object("examples/example.o")).unwrap()
 }
 
 /// Run `*(u64 *)r1 = r2; r0 = *(u64 *)r1` against the program's memory.
@@ -31,7 +31,7 @@ fn is_mem_fault(r: rvm::Result<u64>) -> bool {
 #[test]
 fn rodata_is_read_only_data_is_writable() {
     let vm = Vm::new();
-    let module = vm.parse_module("example", &object("example.o")).unwrap();
+    let module = vm.parse_module("example", &object("examples/example.o")).unwrap();
     let magic = region_base(RODATA_REGION) + module.symbol("MAGIC_VALUE").unwrap().value;
 
     let mut program = vm.link_one(&module).unwrap();
@@ -106,7 +106,7 @@ fn helpers_cannot_read_write_only_memory() {
     readable.write_bytes(0, b"secret!\0").unwrap();
     let (write_only, readable) = (write_only.base(), readable.base());
 
-    let mut program = vm.load_elf(&object("guest_ptrs.o")).unwrap();
+    let mut program = vm.load_elf(&object("tests/guest_ptrs.o")).unwrap();
     let key = u64::from_le_bytes(*b"secret!\0");
     program.map("seen").unwrap().update_as(key, 7u64, 0).unwrap();
 

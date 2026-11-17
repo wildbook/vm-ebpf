@@ -1,23 +1,20 @@
 //! A game that runs its mods as rvm plugins.
 //!
-//! - `bpf/game_rules.c` spawns monster waves through the host function `spawn` and exports `record_kills`, which keeps
-//!   each hero's score in a map.
-//! - `bpf/game_combat.c` moves monsters, attacks through the host function `damage`, and passes each tick's kills to
-//!   `record_kills` in one buffer that the rules plugin borrows for the call.
+//! - `bpf/examples/game_rules.c` spawns monster waves through the host function `spawn` and exports `record_kills`,
+//!   which keeps each hero's score in a map.
+//! - `bpf/examples/game_combat.c` moves monsters, attacks through the host function `damage`, and passes each tick's
+//!   kills to `record_kills` in one buffer that the rules plugin borrows for the call.
 //!
 //! Both log through the host function `print`, which reads the line from the calling plugin's memory. The entities live
 //! in a region that the host shares with every plugin and reads and writes field by field. The host describes its
 //! `Entity` layout with `host_struct!`, and CO-RE patches the plugins' field offsets and array stride to match it:
-//! `bpf/game_sdk.h` declares the struct with other field order and size. `scores` and the rules plugin's `waves` are
-//! maps that the VM shares, so they belong to the VM and keep their contents when the host replaces the rules with
-//! `game_rules_v2.o` halfway through. The host links the combat plugin ahead of time into an image and loads it from
-//! bytes, and calls both plugins every tick through function handles it looks up once; the rules handle follows the
-//! reload.
+//! `bpf/examples/game_sdk.h` declares the struct with other field order and size. `scores` and the rules plugin's
+//! `waves` are maps that the VM shares, so they belong to the VM and keep their contents when the host replaces the
+//! rules with `game_rules_v2.o` halfway through. The host links the combat plugin ahead of time into an image and loads
+//! it from bytes, and calls both plugins every tick through function handles it looks up once; the rules handle follows
+//! the reload.
 //!
-//! Rebuild the plugins with:
-//!   clang -target bpf -mcpu=v4 -O2 -g -c bpf/game_rules.c -o bpf/game_rules.o
-//!   clang -target bpf -mcpu=v4 -O2 -g -DRULES_V2 -c bpf/game_rules.c -o bpf/game_rules_v2.o
-//!   clang -target bpf -mcpu=v4 -O2 -g -c bpf/game_combat.c -o bpf/game_combat.o
+//! Rebuild the plugins with `bpf/build.sh`.
 //!
 //! Run with: cargo run -p rvm --example modding
 
@@ -27,9 +24,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use rvm::{MapError, MemoryError, Perms, Plugin, Scalar, SharedRegion, Vm};
 
-const RULES: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/game_rules.o"));
-const RULES_V2: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/game_rules_v2.o"));
-const COMBAT: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/game_combat.o"));
+const RULES: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/examples/game_rules.o"));
+const RULES_V2: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/examples/game_rules_v2.o"));
+const COMBAT: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/examples/game_combat.o"));
 
 const TICKS: u32 = 32;
 const RELOAD_AT: u32 = 12;
@@ -167,7 +164,7 @@ fn print_summary(world: &World, rules: &Plugin) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// The host's entity. Its field order and size differ from `struct entity` in `bpf/game_sdk.h`.
+/// The host's entity. Its field order and size differ from `struct entity` in `bpf/examples/game_sdk.h`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Entity {

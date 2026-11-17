@@ -7,23 +7,17 @@ plugins that call each other and share maps. Needs nightly (pinned in
 
 ```bash
 cargo build --release
-cargo run --bin loader                         # loads and calls bpf/example.o
-cargo run --bin emu                            # runs bpf.o, prepared into an image at build time
+cargo run --bin loader                         # loads and calls bpf/examples/example.o
+cargo run --bin emu                            # runs the same object, prepared into an image at build time
 cargo run -p rvm --example modding             # game mods as plugins: CO-RE, exports, borrows, shared maps, hot reload
 cargo run -p rvm --example msgpack_logs        # streams MessagePack logs through a parser plugin into maps
 cargo run -p rvm --example core_reloc          # one object against two struct layouts
 cargo run -p rvm --example hello               # hand-assembled bytecode on a bare Executor
 ```
 
-The eBPF objects under `bpf/` are checked in. Each source file's header has its
-build line, for example:
-
-```bash
-clang -target bpf -O2 -g -c bpf/example.c -o bpf/example.o
-```
-
-The root `bpf.o` is the same source built to `-o bpf.o`. Objects built with
-`-mcpu=v4` need LLVM 18 or newer.
+The eBPF objects under `bpf/` (`examples/`, `bench/`, `tests/`) are checked in.
+`bpf/build.sh` rebuilds them with the clang line in each source file's header,
+which needs LLVM 18 or newer for `-mcpu=v4`.
 
 ## Crates
 
@@ -233,7 +227,7 @@ Not implemented: kfunc BTF ID resolution, and the legacy packet access modes
 cargo test
 cargo test -p rvm --no-default-features --features link
 cargo bench -p rvm --bench exec        # interpreter loops from ebpf-asm, map helpers
-cargo bench -p rvm --bench workloads   # program and plugin calls, bpf/workloads.c
+cargo bench -p rvm --bench workloads   # program and plugin calls, bpf/bench/workloads.c
 ```
 
 The integration tests run the vendored

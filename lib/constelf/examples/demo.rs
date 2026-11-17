@@ -2,8 +2,7 @@ use constelf::file::ElfFile;
 use constelf::ElfResult;
 
 fn main() -> ElfResult {
-    // built with `clang -target bpf -O2 -g -c bpf/example.c -o bpf.o`
-    let elf = include_bytes!("../../../bpf.o");
+    let elf = include_bytes!("../../../bpf/examples/example.o");
     let elf = ElfFile::new(elf)?;
     println!("{elf:#?}");
 

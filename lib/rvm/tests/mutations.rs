@@ -76,7 +76,7 @@ fn mutated_elf_files_load_or_fail() {
 /// candidates to match.
 fn host_vm() -> Vm {
     let vm = Vm::new();
-    let host = Module::from_elf("host_event", &fixture("host_event.o")).unwrap();
+    let host = Module::from_elf("host_event", &fixture("tests/host_event.o")).unwrap();
     vm.types().append_btf(host.btf_data.as_ref().unwrap()).unwrap();
     let u32_t = vm.types().int("unsigned int", 4, false);
     let i32_t = vm.types().int("int", 4, true);
@@ -92,9 +92,9 @@ fn host_vm() -> Vm {
     vm.enable_print(|_| {});
     // SAFETY: no program runs.
     unsafe { vm.share_region(FIRST_FREE_REGION, 64, Perms::RW) }.unwrap();
-    let a = vm.load_plugin("a", &fixture("plugin_a.o")).unwrap();
+    let a = vm.load_plugin("a", &fixture("tests/plugin_a.o")).unwrap();
     vm.export(&a, "a_scale").unwrap();
-    let callee = vm.load_plugin("callee", &fixture("borrow_callee.o")).unwrap();
+    let callee = vm.load_plugin("callee", &fixture("tests/borrow_callee.o")).unwrap();
     for func in ["sum", "fill", "poke"] {
         vm.export(&callee, func).unwrap();
     }
@@ -105,14 +105,23 @@ fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(format!("{}/../../bpf/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
 }
 
-/// Every `.o` under `bpf/`, by name.
+/// Every `.o` in the directories under `bpf/`, by path relative to it.
 fn fixtures() -> Vec<(String, Vec<u8>)> {
-    let dir = format!("{}/../../bpf", env!("CARGO_MANIFEST_DIR"));
-    let mut names: Vec<String> = std::fs::read_dir(dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-        .filter(|name| name.ends_with(".o"))
-        .collect();
+    let root = format!("{}/../../bpf", env!("CARGO_MANIFEST_DIR"));
+    let mut names = Vec::new();
+    for dir in std::fs::read_dir(root).unwrap() {
+        let dir = dir.unwrap();
+        if !dir.file_type().unwrap().is_dir() {
+            continue;
+        }
+        let sub = dir.file_name().into_string().unwrap();
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            if name.ends_with(".o") {
+                names.push(format!("{sub}/{name}"));
+            }
+        }
+    }
     names.sort();
     names.into_iter().map(|name| (name.clone(), fixture(&name))).collect()
 }

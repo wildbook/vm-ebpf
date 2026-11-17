@@ -101,7 +101,7 @@ fn bench(c: &mut Criterion) {
     group.finish();
 
     // Map helpers from a compiled object; each call runs N operations in a guest loop.
-    let elf = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/map_bench.o")).unwrap();
+    let elf = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/bench/map_bench.o")).unwrap();
     let mut program = rvm::Vm::new().load_elf(&elf).unwrap();
     program.call("hash_update", &[N as u64]).unwrap(); // fill all keys before timing lookups
 

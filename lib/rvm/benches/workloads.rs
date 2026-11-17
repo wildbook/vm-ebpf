@@ -1,5 +1,5 @@
 //! Costs a plugin host sees: entering a program, calling between plugins, and clang-compiled workloads
-//! (bpf/workloads.c). Compare against a saved baseline:
+//! (bpf/bench/workloads.c). Compare against a saved baseline:
 //!
 //!   cargo bench -p rvm --bench workloads -- --save-baseline before
 //!   cargo bench -p rvm --bench workloads -- --baseline before
@@ -17,8 +17,8 @@ fn object(name: &str) -> Vec<u8> {
 /// Calling into a program and plugin, with no guest work.
 fn entry(c: &mut Criterion) {
     let vm = Vm::new();
-    let mut program = vm.load_elf(&object("workloads.o")).unwrap();
-    let plugin = vm.load_plugin("w", &object("workloads.o")).unwrap();
+    let mut program = vm.load_elf(&object("bench/workloads.o")).unwrap();
+    let plugin = vm.load_plugin("w", &object("bench/workloads.o")).unwrap();
 
     let mut group = c.benchmark_group("entry");
     group.bench_function("program_call", |b| b.iter(|| program.call("noop", black_box(&[])).unwrap()));
@@ -30,15 +30,15 @@ fn entry(c: &mut Criterion) {
 fn cross_plugin(c: &mut Criterion) {
     let vm = Vm::new();
     vm.register_fn("host_reenter", |x: u64| x);
-    let a = vm.load_plugin("a", &object("plugin_a.o")).unwrap();
+    let a = vm.load_plugin("a", &object("tests/plugin_a.o")).unwrap();
     vm.export(&a, "a_scale").unwrap();
-    let b = vm.load_plugin("b", &object("plugin_b.o")).unwrap();
+    let b = vm.load_plugin("b", &object("tests/plugin_b.o")).unwrap();
 
-    let callee = vm.load_plugin("callee", &object("borrow_callee.o")).unwrap();
+    let callee = vm.load_plugin("callee", &object("tests/borrow_callee.o")).unwrap();
     for func in ["sum", "fill", "poke"] {
         vm.export(&callee, func).unwrap();
     }
-    let caller = vm.load_plugin("caller", &object("borrow_caller.o")).unwrap();
+    let caller = vm.load_plugin("caller", &object("tests/borrow_caller.o")).unwrap();
 
     let mut group = c.benchmark_group("cross_plugin");
     group.bench_function("export_call", |bench| bench.iter(|| b.call("b_run", black_box(&[5])).unwrap()));
@@ -52,7 +52,7 @@ fn guest(c: &mut Criterion) {
     const N: u64 = 10_000;
 
     let vm = Vm::new();
-    let mut program = vm.load_elf(&object("workloads.o")).unwrap();
+    let mut program = vm.load_elf(&object("bench/workloads.o")).unwrap();
 
     // records of [kind][n][n bytes], n cycling 0..32
     let mut records = Vec::with_capacity(BUF);

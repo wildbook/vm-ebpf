@@ -1,10 +1,9 @@
-//! Links `bpf.o` into an rvm image, so the binary loads it without the linker. `bpf.o` is built from `bpf/example.c`
-//! with `clang -target bpf -O2 -g -c bpf/example.c -o bpf.o`.
+//! Links `bpf/examples/example.o` into an rvm image, so the binary loads it without the linker.
 
 use std::path::Path;
 
 fn main() {
-    let elf = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf.o");
+    let elf = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/examples/example.o");
     println!("cargo::rerun-if-changed={elf}");
 
     let bytes = std::fs::read(elf).unwrap_or_else(|e| panic!("reading {elf}: {e}"));

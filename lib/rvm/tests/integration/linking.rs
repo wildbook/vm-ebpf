@@ -13,8 +13,8 @@ fn full_vm() -> Vm {
 }
 
 fn link(vm: &Vm) -> rvm::Result<rvm::Program> {
-    let main = vm.parse_module("main", &object("link_main.o"))?;
-    let lib = vm.parse_module("lib", &object("link_lib.o"))?;
+    let main = vm.parse_module("main", &object("tests/link_main.o"))?;
+    let lib = vm.parse_module("lib", &object("tests/link_lib.o"))?;
     vm.link(&[&main, &lib])
 }
 
@@ -80,8 +80,8 @@ fn replacing_extern_rebinds_linked_calls() {
 #[test]
 fn global_named_like_a_map_is_data() {
     let vm = Vm::new();
-    let counter = vm.parse_module("counter", &object("shared_counter.o")).unwrap();
-    let global = vm.parse_module("global", &object("global_hits.o")).unwrap();
+    let counter = vm.parse_module("counter", &object("tests/shared_counter.o")).unwrap();
+    let global = vm.parse_module("global", &object("tests/global_hits.o")).unwrap();
     let mut program = vm.link(&[&counter, &global]).unwrap();
     assert_eq!(program.call("get", &[]).unwrap(), 5);
     assert_eq!(program.call("bump", &[]).unwrap(), 1);

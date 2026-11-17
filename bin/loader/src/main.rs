@@ -1,13 +1,13 @@
-//! Loads `bpf/example.o`, prints what `Vm::parse_module` and `Vm::link_one` produce, and calls its exported functions.
+//! Loads `bpf/examples/example.o`, prints what `Vm::parse_module` and `Vm::link_one` produce, and calls its exported
+//! functions.
 //! Exits with an error when a call fails or returns the wrong value.
 
 use anyhow::{ensure, Context, Result};
 use rvm::{Module, Perms, Program, Vm};
 
 fn main() -> Result<()> {
-    let elf_path = "bpf/example.o";
-    let elf_bytes =
-        std::fs::read(elf_path).with_context(|| format!("reading {elf_path}; bpf/example.c has its build line"))?;
+    let elf_path = "bpf/examples/example.o";
+    let elf_bytes = std::fs::read(elf_path).with_context(|| format!("reading {elf_path}; bpf/build.sh rebuilds it"))?;
     let len = elf_bytes.len();
     println!("Loaded {elf_path}: {len} bytes");
 
