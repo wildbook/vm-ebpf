@@ -1,6 +1,6 @@
-//! Loads `bpf/example.o` (built with `make -C bpf example.o`, falling back to
-//! `bpf.o`), prints what `Vm::parse_module` and `Vm::link_one` produce, and calls
-//! its exported functions.
+//! Loads `bpf/example.o` (falling back to `bpf.o`), prints what
+//! `Vm::parse_module` and `Vm::link_one` produce, and calls its exported
+//! functions.
 
 use anyhow::{Context, Result};
 use rvm::{Module, Perms, Program, Vm};
@@ -16,9 +16,7 @@ fn main() -> Result<()> {
         Err(e) => {
             println!("Failed to read {elf_path}: {e}");
             println!("\nTo compile the eBPF program, run:");
-            println!("  clang -target bpf -O2 -c bpf/example.c -o bpf/example.o");
-            println!("\nOr use the Makefile:");
-            println!("  make -C bpf example.o");
+            println!("  clang -target bpf -O2 -g -c bpf/example.c -o bpf/example.o");
 
             println!("\nTrying fallback: bpf.o");
             std::fs::read("bpf.o").context("No eBPF object file found. Please compile one first.")?
