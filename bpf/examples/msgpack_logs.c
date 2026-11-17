@@ -5,21 +5,7 @@
  * Other keys, and records that aren't maps, are skipped whatever they hold.
  * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/examples/msgpack_logs.c -o bpf/examples/msgpack_logs.o
  */
-typedef unsigned char u8;
-typedef signed char s8;
-typedef short s16;
-typedef int s32;
-typedef unsigned int u32;
-typedef long long s64;
-typedef unsigned long long u64;
-
-#define SEC(name) __attribute__((section(name), used))
-#define __uint(name, val) int (*name)[val]
-#define __type(name, val) typeof(val) *name
-#define noinline __attribute__((noinline))
-
-static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
-static long (*bpf_map_update_elem)(void *map, const void *key, const void *value, u64 flags) = (void *)2;
+#include "../rvm_bpf.h"
 
 #define NAME_LEN 16
 #define MAX_SERVICES 16

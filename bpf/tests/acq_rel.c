@@ -2,9 +2,7 @@
  * Message passing through a host-shared region with load-acquire and store-release.
  * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/acq_rel.c -o bpf/tests/acq_rel.o
  */
-typedef unsigned short u16;
-typedef unsigned int u32;
-typedef unsigned long long u64;
+#include "../rvm_bpf.h"
 
 #define WORDS 6
 

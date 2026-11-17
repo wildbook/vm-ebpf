@@ -2,7 +2,7 @@
  * Passes stack buffers to borrow_callee.c's exports.
  * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/borrow_caller.c -o bpf/tests/borrow_caller.o
  */
-typedef unsigned long long u64;
+#include "../rvm_bpf.h"
 
 extern u64 sum(const u64 *buf, u64 len);
 extern u64 fill(u64 *buf, u64 len, u64 value);

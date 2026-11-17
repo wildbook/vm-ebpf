@@ -2,7 +2,7 @@
  * Pointers stored in global data, which need data relocations at link time.
  * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/data_ptrs.c -o bpf/tests/data_ptrs.o
  */
-typedef unsigned long long u64;
+#include "../rvm_bpf.h"
 
 u64 target = 41;
 const u64 table[3] = {10, 20, 30};

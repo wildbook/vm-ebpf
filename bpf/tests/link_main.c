@@ -3,7 +3,7 @@
  * a host extern function by name, and calls host helper 100.
  * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/link_main.c -o bpf/tests/link_main.o
  */
-typedef unsigned long long u64;
+#include "../rvm_bpf.h"
 
 extern u64 lib_scale(u64 x);  /* defined in link_lib.o */
 extern u64 host_add(u64 a, u64 b); /* provided by the host by name */

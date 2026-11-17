@@ -2,19 +2,10 @@
  * Benchmark workloads for lib/rvm/benches.
  * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/bench/workloads.c -o bpf/bench/workloads.o
  */
-typedef unsigned char u8;
-typedef unsigned int u32;
-typedef unsigned long long u64;
-
-#define SEC(name) __attribute__((section(name), used))
-#define __uint(name, val) int (*name)[val]
-#define __type(name, val) typeof(val) *name
-
-static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
-static long (*bpf_map_update_elem)(void *map, const void *key, const void *value, u64 flags) = (void *)2;
+#include "../rvm_bpf.h"
 
 struct {
-    __uint(type, 1 /* hash */);
+    __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 256);
     __type(key, u32);
     __type(value, u64);
@@ -59,7 +50,7 @@ u64 aggregate(u64 n) {
     return 0;
 }
 
-static __attribute__((noinline)) u64 fib(u64 n) {
+static noinline u64 fib(u64 n) {
     return n < 2 ? n : fib(n - 1) + fib(n - 2);
 }
 

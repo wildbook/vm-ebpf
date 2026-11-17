@@ -3,8 +3,7 @@
  * `read_flags_unguarded` doesn't.
  * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/core_guard.c -o bpf/tests/core_guard.o
  */
-typedef unsigned int u32;
-typedef unsigned long long u64;
+#include "../rvm_bpf.h"
 
 struct event {
     u64 timestamp;

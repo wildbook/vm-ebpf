@@ -4,10 +4,7 @@
  * its length in bytes.
  * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/borrow_callee.c -o bpf/tests/borrow_callee.o
  */
-typedef unsigned long long u64;
-
-#define BORROW(len_arg) __attribute__((btf_decl_tag("borrow:" #len_arg)))
-#define BORROW_RO(len_arg) __attribute__((btf_decl_tag("borrow_ro:" #len_arg)))
+#include "../rvm_bpf.h"
 
 u64 sum(const u64 *buf BORROW_RO(1), u64 len) {
     u64 total = 0;

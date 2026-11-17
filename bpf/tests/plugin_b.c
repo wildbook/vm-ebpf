@@ -3,7 +3,7 @@
  * this plugin.
  * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/plugin_b.c -o bpf/tests/plugin_b.o
  */
-typedef unsigned long long u64;
+#include "../rvm_bpf.h"
 
 extern u64 a_scale(u64 x);
 extern u64 host_reenter(u64 x);

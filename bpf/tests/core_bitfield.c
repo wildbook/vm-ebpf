@@ -3,7 +3,7 @@
  * BPF_CORE_READ_BITFIELD macro (no libbpf headers available to this fixture).
  * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/core_bitfield.c -o bpf/tests/core_bitfield.o
  */
-typedef unsigned long long u64;
+#include "../rvm_bpf.h"
 
 struct bits {
     unsigned reserved : 20;

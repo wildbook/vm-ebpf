@@ -3,18 +3,19 @@
  * argument, and a dense switch that clang lowers to a jump table (gotox).
  * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/func_ptr.c -o bpf/tests/func_ptr.o
  */
-typedef unsigned long long u64;
+#include "../rvm_bpf.h"
+
 typedef u64 (*op_fn)(u64, u64);
 
-static __attribute__((noinline)) u64 add(u64 a, u64 b) { return a + b; }
-static __attribute__((noinline)) u64 sub(u64 a, u64 b) { return a - b; }
-static __attribute__((noinline)) u64 mul(u64 a, u64 b) { return a * b; }
+static noinline u64 add(u64 a, u64 b) { return a + b; }
+static noinline u64 sub(u64 a, u64 b) { return a - b; }
+static noinline u64 mul(u64 a, u64 b) { return a * b; }
 
 static op_fn const ro_ops[3] = {add, sub, mul}; /* .rodata */
 op_fn rw_ops[2] = {mul, add};                    /* .data */
 
 /* Global, so clang can't specialize it for each callback. */
-__attribute__((noinline)) u64 apply(op_fn f, u64 a, u64 b) { return f(a, b); }
+noinline u64 apply(op_fn f, u64 a, u64 b) { return f(a, b); }
 
 u64 call_ro(u64 i, u64 a, u64 b) { return ro_ops[i](a, b); }
 

@@ -3,19 +3,7 @@
  * and .data, BPF-to-BPF calls, and struct pointer arguments.
  * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/examples/example.c -o bpf/examples/example.o
  */
-
-#define NULL ((void *)0)
-
-typedef unsigned char      u8;
-typedef unsigned short     u16;
-typedef unsigned int       u32;
-typedef unsigned long long u64;
-typedef signed char        s8;
-typedef signed short       s16;
-typedef signed int         s32;
-typedef signed long long   s64;
-
-#define SEC(name) __attribute__((section(name), used))
+#include "../rvm_bpf.h"
 
 struct input_ctx {
     u64 value_a;

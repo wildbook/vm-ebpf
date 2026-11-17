@@ -2,20 +2,7 @@
  * Modding SDK for the game host in lib/rvm/examples/modding.rs: the types, host
  * functions and shared maps that plugins see.
  */
-typedef unsigned int u32;
-typedef int s32;
-typedef unsigned long long u64;
-
-#define SEC(name) __attribute__((section(name), used))
-#define __uint(name, val) int (*name)[val]
-#define __type(name, val) typeof(val) *name
-#define noinline __attribute__((noinline))
-
-/* The callee reads the caller's buffer in place for one call; `len_arg` holds its size. */
-#define BORROW_RO(len_arg) __attribute__((btf_decl_tag("borrow_ro:" #len_arg)))
-
-static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
-static long (*bpf_map_update_elem)(void *map, const void *key, const void *value, u64 flags) = (void *)2;
+#include "../rvm_bpf.h"
 
 enum kind { HERO, GOBLIN, ORC, TROLL };
 

@@ -3,21 +3,14 @@
  *   clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/shared_counter.c -o bpf/tests/shared_counter.o
  *   clang -target bpf -mcpu=v4 -O2 -g -DVALUE=u32 -c bpf/tests/shared_counter.c -o bpf/tests/shared_counter_u32.o
  */
-typedef unsigned int u32;
-typedef unsigned long long u64;
+#include "../rvm_bpf.h"
 
 #ifndef VALUE
 #define VALUE u64
 #endif
 
-#define SEC(name) __attribute__((section(name), used))
-#define __uint(name, val) int (*name)[val]
-#define __type(name, val) typeof(val) *name
-
-static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
-
 struct {
-    __uint(type, 2 /* BPF_MAP_TYPE_ARRAY */);
+    __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
     __type(key, u32);
     __type(value, VALUE);

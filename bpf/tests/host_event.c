@@ -3,8 +3,7 @@
  * indexes: this is the real layout, not a program reading someone else's).
  * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/host_event.c -o bpf/tests/host_event.o
  */
-typedef unsigned int u32;
-typedef unsigned long long u64;
+#include "../rvm_bpf.h"
 
 struct event {
     u32 flags;

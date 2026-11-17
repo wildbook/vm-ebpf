@@ -2,19 +2,7 @@
  * Helpers that read through pointers the caller passes in, which need the guest's read permission.
  * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/guest_ptrs.c -o bpf/tests/guest_ptrs.o
  */
-typedef unsigned int u32;
-typedef unsigned long long u64;
-
-#define SEC(name) __attribute__((section(name), used))
-#define __uint(name, val) int (*name)[val]
-#define __type(name, val) typeof(val) *name
-
-#define BPF_MAP_TYPE_HASH 1
-#define BPF_ANY 0
-
-static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
-static long (*bpf_map_update_elem)(void *map, const void *key, const void *value, u64 flags) = (void *)2;
-static long (*bpf_trace_printk)(const char *fmt, u32 fmt_size, ...) = (void *)6;
+#include "../rvm_bpf.h"
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);

@@ -2,8 +2,7 @@
  * BPF atomics as clang emits them.
  * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/atomics.c -o bpf/tests/atomics.o
  */
-typedef unsigned int u32;
-typedef unsigned long long u64;
+#include "../rvm_bpf.h"
 
 u64 counter64 = 0;
 u32 counter32 = 0;

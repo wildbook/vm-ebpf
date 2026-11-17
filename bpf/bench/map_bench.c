@@ -2,25 +2,17 @@
  * Map helper throughput, for lib/rvm/benches/exec.rs.
  * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/bench/map_bench.c -o bpf/bench/map_bench.o
  */
-typedef unsigned int u32;
-typedef unsigned long long u64;
-
-#define SEC(name) __attribute__((section(name), used))
-#define __uint(name, val) int (*name)[val]
-#define __type(name, val) typeof(val) *name
-
-static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
-static long (*bpf_map_update_elem)(void *map, const void *key, const void *value, u64 flags) = (void *)2;
+#include "../rvm_bpf.h"
 
 struct {
-    __uint(type, 1 /* hash */);
+    __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1024);
     __type(key, u64);
     __type(value, u64);
 } hash SEC(".maps");
 
 struct {
-    __uint(type, 2 /* array */);
+    __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1024);
     __type(key, u32);
     __type(value, u64);
