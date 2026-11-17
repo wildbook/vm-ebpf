@@ -38,3 +38,11 @@ required-features = ["link"]
 [[example]]
 name = "core_reloc"
 required-features = ["link"]
+
+[[example]]
+name = "modding"
+required-features = ["link"]
+
+[[example]]
+name = "msgpack_logs"
+required-features = ["link"]

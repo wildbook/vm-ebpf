@@ -28,6 +28,8 @@ numbers reflect clang's current ISA: sign-extending loads, `movsx`, `sdiv`/`smod
 cargo run --bin loader   # loads and calls bpf/example.o
 cargo run --bin demo     # CO-RE relocation walkthrough
 cargo run --bin emu      # runs bpf.o, linked into an image at build time
+cargo run -p rvm --example modding       # game mods as plugins: CO-RE, exports, borrows, shared maps, hot reload
+cargo run -p rvm --example msgpack_logs  # streams MessagePack logs through a parser plugin into maps
 ```
 
 ## Crates
