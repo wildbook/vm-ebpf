@@ -323,7 +323,7 @@ impl Super {
             let alu = OpCode(self.alu);
             insns[1] = match alu.alu_src() {
                 Source::Imm => Instruction::from_parts(alu, dst, 0, 0, operand),
-                Source::Reg => Instruction::from_parts(alu, dst, operand as u8 & 0xF, 0, 0),
+                Source::Reg => Instruction::from_parts(alu, dst, operand as u8, 0, 0),
             };
         }
         let start = 1 + (self.alu != 0) as usize;

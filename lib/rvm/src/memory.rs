@@ -83,7 +83,7 @@ pub struct VmMemory {
     owned: u64,
     // buffer behind each region mapped with `map_shared`, kept alive while mapped
     shared: [Option<Arc<SharedBuffer>>; MAX_REGIONS],
-    // changes with every mapping, to a value no memory had before; see `Window::new`
+    // changes with every mapping, to a value no memory had before; see `Memory`
     epoch: u64,
 }
 
@@ -616,7 +616,8 @@ macro_rules! guest_ordered {
     };
 }
 
-impl Memory for VmMemory {
+// SAFETY: `set` moves to a new epoch whenever a mapping changes, and the `Memory` methods leave the epoch alone
+unsafe impl Memory for VmMemory {
     type Err = u64;
 
     guest_access!(load_u8, store_u8, u8);

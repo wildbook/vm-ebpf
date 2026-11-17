@@ -36,16 +36,11 @@ impl Window {
     ///
     /// # Safety
     ///
-    /// Whenever a memory's [`Memory::epoch`] returns `epoch`, `ptr` must be valid for reads of `read_len` bytes and for
-    /// writes of `write_len` bytes, and a guest load (store) of `n` bytes at `base + i` with `i + n <= read_len`
-    /// (`write_len`) on that memory must do nothing but read (write) the `n` bytes at `ptr + i`, unaligned and
-    /// little-endian. So a memory must give each change of the host memory behind its windows an epoch that no memory
-    /// used before, and 0, the default, only to empty windows. `ptr` must not come from a reference to the memory,
-    /// which a call of a [`Memory`] method would invalidate.
-    ///
-    /// [`run`](crate::run) reads the epoch only when it starts and after a [`Host`](crate::Host) call, so no
-    /// [`Memory`] method may change what [`Memory::epoch`] returns. Change the epoch only outside `run` or inside a
-    /// host call.
+    /// Whenever the memory that reports the window is at epoch `epoch`, `ptr` must be valid for reads of `read_len`
+    /// bytes and for writes of `write_len` bytes, and a guest load (store) of `n` bytes at `base + i` with
+    /// `i + n <= read_len` (`write_len`) on that memory must do nothing but read (write) the `n` bytes at `ptr + i`,
+    /// unaligned and little-endian. `ptr` must not come from a reference to the memory, which a call of a [`Memory`]
+    /// method would invalidate. [`Memory`] states the rules for epochs.
     pub const unsafe fn new(base: u64, ptr: *mut u8, read_len: u64, write_len: u64, epoch: u64) -> Self {
         Self {
             base,

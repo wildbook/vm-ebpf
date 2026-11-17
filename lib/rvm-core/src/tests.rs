@@ -22,7 +22,8 @@ impl TestMem {
     }
 }
 
-impl Memory for TestMem {
+// SAFETY: the default `window` reports no windows
+unsafe impl Memory for TestMem {
     type Err = ();
 
     fn load_u8(&self, addr: u64) -> Result<u8, Self::Err> {

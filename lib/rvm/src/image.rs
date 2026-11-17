@@ -306,7 +306,7 @@ pub fn load(
 
 /// Turn a call instruction into a call to extern-table `slot`.
 pub fn set_slot_call(insn: &mut [u8; 8], slot: u32) {
-    insn[1] = (insn[1] & 0x0F) | ((BPF_PSEUDO_KFUNC_CALL as u8) << 4);
+    insn[1] = (insn[1] & 0x0F) | (BPF_PSEUDO_KFUNC_CALL << 4);
     insn[4..].copy_from_slice(&slot.to_le_bytes());
 }
 
