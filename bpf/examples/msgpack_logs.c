@@ -3,7 +3,6 @@
  * lib/rvm/examples/msgpack_logs.rs. An event is a map such as
  *   {"svc": "api", "lvl": "warn", "ms": 120, "bytes": 5120}
  * Other keys, and records that aren't maps, are skipped whatever they hold.
- * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/examples/msgpack_logs.c -o bpf/examples/msgpack_logs.o
  */
 #include "../rvm_bpf.h"
 

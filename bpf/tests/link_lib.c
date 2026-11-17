@@ -1,6 +1,5 @@
 /*
  * Library module for cross-module link tests (see link_main.c).
- * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/link_lib.c -o bpf/tests/link_lib.o
  */
 #include "../rvm_bpf.h"
 

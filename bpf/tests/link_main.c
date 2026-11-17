@@ -1,7 +1,6 @@
 /*
  * Main module for cross-module link tests. Imports a function from link_lib.c,
  * a host extern function by name, and calls host helper 100.
- * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/link_main.c -o bpf/tests/link_main.o
  */
 #include "../rvm_bpf.h"
 

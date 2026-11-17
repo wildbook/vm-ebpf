@@ -1,7 +1,6 @@
 /*
  * CO-RE against a host that may lack a field: `read_flags` checks for it first,
  * `read_flags_unguarded` doesn't.
- * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/core_guard.c -o bpf/tests/core_guard.o
  */
 #include "../rvm_bpf.h"
 

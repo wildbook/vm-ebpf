@@ -1,7 +1,6 @@
 /*
  * A host's actual `struct event` layout, shipped as plain BTF (no CO-RE access
  * indexes: this is the real layout, not a program reading someone else's).
- * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/host_event.c -o bpf/tests/host_event.o
  */
 #include "../rvm_bpf.h"
 

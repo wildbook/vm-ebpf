@@ -1,7 +1,6 @@
 /*
- * One array map, `hits`, for sharing between plugins. Build:
- *   clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/shared_counter.c -o bpf/tests/shared_counter.o
- *   clang -target bpf -mcpu=v4 -O2 -g -DVALUE=u32 -c bpf/tests/shared_counter.c -o bpf/tests/shared_counter_u32.o
+ * One array map, `hits`, for sharing between plugins; a second build with
+ * VALUE=u32 gives it 32-bit values.
  */
 #include "../rvm_bpf.h"
 

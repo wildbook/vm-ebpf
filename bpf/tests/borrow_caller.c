@@ -1,6 +1,5 @@
 /*
  * Passes stack buffers to borrow_callee.c's exports.
- * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/borrow_caller.c -o bpf/tests/borrow_caller.o
  */
 #include "../rvm_bpf.h"
 

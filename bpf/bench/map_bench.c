@@ -1,6 +1,5 @@
 /*
  * Map helper throughput, for lib/rvm/benches/exec.rs.
- * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/bench/map_bench.c -o bpf/bench/map_bench.o
  */
 #include "../rvm_bpf.h"
 

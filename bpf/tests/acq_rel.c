@@ -1,6 +1,5 @@
 /*
  * Message passing through a host-shared region with load-acquire and store-release.
- * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/acq_rel.c -o bpf/tests/acq_rel.o
  */
 #include "../rvm_bpf.h"
 

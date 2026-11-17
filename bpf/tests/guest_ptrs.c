@@ -1,6 +1,5 @@
 /*
  * Helpers that read through pointers the caller passes in, which need the guest's read permission.
- * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/guest_ptrs.c -o bpf/tests/guest_ptrs.o
  */
 #include "../rvm_bpf.h"
 

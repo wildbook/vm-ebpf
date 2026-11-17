@@ -1,6 +1,5 @@
 /*
  * BPF atomics as clang emits them.
- * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/atomics.c -o bpf/tests/atomics.o
  */
 #include "../rvm_bpf.h"
 

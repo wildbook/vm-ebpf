@@ -1,7 +1,6 @@
 /*
  * CO-RE bitfield read, written out in the style of libbpf's bpf_core_read.h
  * BPF_CORE_READ_BITFIELD macro (no libbpf headers available to this fixture).
- * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/core_bitfield.c -o bpf/tests/core_bitfield.o
  */
 #include "../rvm_bpf.h"
 

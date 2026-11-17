@@ -2,7 +2,6 @@
  * Exports that take buffers borrowed from the caller's memory for one call.
  * `borrow:N` / `borrow_ro:N` on a pointer parameter names the parameter holding
  * its length in bytes.
- * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/borrow_callee.c -o bpf/tests/borrow_callee.o
  */
 #include "../rvm_bpf.h"
 

@@ -2,7 +2,6 @@
  * Combat plugin for lib/rvm/examples/modding.rs: moves monsters toward the
  * heroes, resolves attacks through the host's `damage`, and hands the tick's
  * kills to the rules plugin in one borrowed buffer.
- * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/examples/game_combat.c -o bpf/examples/game_combat.o
  */
 #include "game_sdk.h"
 

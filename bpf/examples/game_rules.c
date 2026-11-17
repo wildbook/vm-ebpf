@@ -1,9 +1,7 @@
 /*
  * Game rules plugin for lib/rvm/examples/modding.rs: spawns monster waves and
  * keeps the score. The host swaps in version 2 mid-game, which adds orcs and a
- * troll. Build both:
- *   clang -target bpf -mcpu=v4 -O2 -g -c bpf/examples/game_rules.c -o bpf/examples/game_rules.o
- *   clang -target bpf -mcpu=v4 -O2 -g -DRULES_V2 -c bpf/examples/game_rules.c -o bpf/examples/game_rules_v2.o
+ * troll; the RULES_V2 build is version 2.
  */
 #include "game_sdk.h"
 

@@ -1,7 +1,6 @@
 /*
  * Calculator used by bin/loader and the integration tests: globals in .rodata
  * and .data, BPF-to-BPF calls, and struct pointer arguments.
- * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/examples/example.c -o bpf/examples/example.o
  */
 #include "../rvm_bpf.h"
 

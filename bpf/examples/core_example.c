@@ -1,7 +1,6 @@
 /*
  * Reads `struct event` fields through CO-RE relocations, which the linker
  * patches to the host's layout of the struct.
- * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/examples/core_example.c -o bpf/examples/core_example.o
  */
 
 #define NULL ((void *)0)

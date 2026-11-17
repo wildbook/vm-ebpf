@@ -1,7 +1,6 @@
 /*
  * Function pointers: callback tables in .rodata and .data, a callback passed as an
  * argument, and a dense switch that clang lowers to a jump table (gotox).
- * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/func_ptr.c -o bpf/tests/func_ptr.o
  */
 #include "../rvm_bpf.h"
 

@@ -1,6 +1,5 @@
 /*
  * Benchmark workloads for lib/rvm/benches.
- * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/bench/workloads.c -o bpf/bench/workloads.o
  */
 #include "../rvm_bpf.h"
 

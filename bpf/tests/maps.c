@@ -1,6 +1,5 @@
 /*
  * Array and hash maps declared libbpf style, used through the standard helpers.
- * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/maps.c -o bpf/tests/maps.o
  */
 #include "../rvm_bpf.h"
 

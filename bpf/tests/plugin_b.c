@@ -1,7 +1,6 @@
 /*
  * Plugin importing a_scale from plugin_a and a host function that calls back into
  * this plugin.
- * Build: clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/plugin_b.c -o bpf/tests/plugin_b.o
  */
 #include "../rvm_bpf.h"
 

@@ -1,7 +1,5 @@
 /*
- * Plugin exporting a_scale. Build twice to test hot reload:
- *   clang -target bpf -mcpu=v4 -O2 -g -c bpf/tests/plugin_a.c -o bpf/tests/plugin_a.o
- *   clang -target bpf -mcpu=v4 -O2 -g -DFACTOR=3 -c bpf/tests/plugin_a.c -o bpf/tests/plugin_a3.o
+ * Plugin exporting a_scale; a second build with FACTOR=3 tests hot reload.
  */
 #include "../rvm_bpf.h"
 
