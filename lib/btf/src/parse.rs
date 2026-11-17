@@ -79,14 +79,9 @@ impl<'a> Btf<'a> {
         let str_off = word(data, 4) as usize;
         let str_len = word(data, 5) as usize;
 
-        let type_start = hdr_len + type_off;
-        let str_start = hdr_len + str_off;
-        if type_len > data.len().saturating_sub(type_start) || str_len > data.len().saturating_sub(str_start) {
-            return Err(BtfError::SectionOverflow);
-        }
-
-        let type_data = &data[type_start..][..type_len];
-        let str_data = &data[str_start..][..str_len];
+        let section = |off: usize, len: usize| data.get(hdr_len + off..)?.get(..len);
+        let type_data = section(type_off, type_len).ok_or(BtfError::SectionOverflow)?;
+        let str_data = section(str_off, str_len).ok_or(BtfError::SectionOverflow)?;
         let strings = BtfStrings::new(str_data);
 
         let types = Self::parse_types(type_data, &strings)?;

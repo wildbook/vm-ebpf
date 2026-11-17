@@ -496,3 +496,17 @@ fn parsers_reject_unknown_kinds() {
     let err = BtfExt::parse(&ext, &BtfStrings::new(b"\0")).unwrap_err();
     assert_eq!(err, BtfError::UnknownReloKind(99));
 }
+
+/// An empty type or string section that starts past the end of the data overflows rather than slicing out of bounds.
+#[test]
+fn empty_section_past_data_overflows() {
+    let words = |w: &[u32]| w.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+
+    // magic/version/flags, hdr_len, type_off, type_len, str_off, str_len; strings "\0"
+    let mut type_past_end = words(&[0x0001_eb9f, 24, 100, 0, 0, 1]);
+    type_past_end.push(0);
+    assert_eq!(Btf::parse(&type_past_end).unwrap_err(), BtfError::SectionOverflow);
+
+    let str_past_end = words(&[0x0001_eb9f, 24, 0, 0, 100, 0]);
+    assert_eq!(Btf::parse(&str_past_end).unwrap_err(), BtfError::SectionOverflow);
+}
