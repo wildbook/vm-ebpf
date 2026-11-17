@@ -20,8 +20,7 @@ pub use stack::Window;
 #[cfg(test)]
 mod tests;
 
-// https://github.com/ietf-wg-bpf/ebpf-docs/blob/9fecd435d065094050cb6c14ddc11fffac313180/rst/instruction-set.rst
-// https://docs.kernel.org/6.4/bpf/instruction-set.html#bit-immediate-instructions
+// https://www.rfc-editor.org/rfc/rfc9669.html
 
 #[derive(Copy, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Instruction(pub u64);
@@ -120,35 +119,35 @@ pub trait Memory {
 
     fn load_u16(&self, addr: u64) -> Result<u16, Self::Err> {
         let lo = self.load_u8(addr)? as u16;
-        let hi = self.load_u8(addr + 1)? as u16;
+        let hi = self.load_u8(addr.wrapping_add(1))? as u16;
         Ok(lo | hi << 8)
     }
 
     fn load_u32(&self, addr: u64) -> Result<u32, Self::Err> {
         let lo = self.load_u16(addr)? as u32;
-        let hi = self.load_u16(addr + 2)? as u32;
+        let hi = self.load_u16(addr.wrapping_add(2))? as u32;
         Ok(lo | hi << 16)
     }
 
     fn load_u64(&self, addr: u64) -> Result<u64, Self::Err> {
         let lo = self.load_u32(addr)? as u64;
-        let hi = self.load_u32(addr + 4)? as u64;
+        let hi = self.load_u32(addr.wrapping_add(4))? as u64;
         Ok(lo | hi << 32)
     }
 
     fn store_u16(&mut self, addr: u64, value: u16) -> Result<(), Self::Err> {
         self.store_u8(addr, value as u8)?;
-        self.store_u8(addr + 1, (value >> 8) as u8)
+        self.store_u8(addr.wrapping_add(1), (value >> 8) as u8)
     }
 
     fn store_u32(&mut self, addr: u64, value: u32) -> Result<(), Self::Err> {
         self.store_u16(addr, value as u16)?;
-        self.store_u16(addr + 2, (value >> 16) as u16)
+        self.store_u16(addr.wrapping_add(2), (value >> 16) as u16)
     }
 
     fn store_u64(&mut self, addr: u64, value: u64) -> Result<(), Self::Err> {
         self.store_u32(addr, value as u32)?;
-        self.store_u32(addr + 4, (value >> 32) as u32)
+        self.store_u32(addr.wrapping_add(4), (value >> 32) as u32)
     }
 
     /// Apply `op` to the `u32` at `addr` and return the previous value.
@@ -353,31 +352,25 @@ pub const BPF_PSEUDO_CALL: usize = 1;
 /// `src_reg` of a `call` instruction targeting the host's extern table.
 pub const BPF_PSEUDO_KFUNC_CALL: usize = 2;
 
-mod alu {
-    use std::ops::{BitAnd, BitOr};
-
+mod ops {
     use crate::opcode::{AluEnd, AluOpc, JmpOpc, Source};
     use crate::{Context, Flow, Instruction, Memory, BPF_PSEUDO_CALL, BPF_PSEUDO_KFUNC_CALL};
 
     pub const BITS_32: bool = false;
     pub const BITS_64: bool = true;
 
-    fn zero_extend_32_to_64(value: u64) -> u64 {
-        value & 0xFFFFFFFF
-    }
-
     #[inline(always)]
-    pub fn math<M: Memory, const BITS: bool>(ctx: &mut Context<M>, instr: Instruction) -> Flow<M> {
-        let opc = instr.opcode();
+    pub fn math<M: Memory, const BITS: bool>(ctx: &mut Context<M>, insn: Instruction) -> Flow<M> {
+        let opc = insn.opcode();
         let alu_opc = opc.alu_opc();
         let alu_src = opc.alu_src();
         let alu_end = opc.alu_end();
 
-        let src_reg = instr.src_reg() as usize;
-        let dst_reg = instr.dst_reg() as usize;
+        let src_reg = insn.src_reg() as usize;
+        let dst_reg = insn.dst_reg() as usize;
 
-        let imm = instr.imm();
-        let offset = instr.offset();
+        let imm = insn.imm();
+        let offset = insn.offset();
 
         let d = match BITS {
             BITS_64 => ctx.regs[dst_reg],
@@ -400,7 +393,6 @@ mod alu {
             AluOpc::Div => match (offset, BITS) {
                 (0, _) => d.checked_div(s).unwrap_or(0),
                 (1, BITS_64) => {
-                    // SDIV 64-bit: handle div by zero and LLONG_MIN / -1
                     let ds = d as i64;
                     let ss = s as i64;
                     if ss == 0 {
@@ -412,7 +404,6 @@ mod alu {
                     }
                 }
                 (1, BITS_32) => {
-                    // SDIV 32-bit: handle div by zero and INT_MIN / -1
                     let ds = d as i32;
                     let ss = s as i32;
                     if ss == 0 {
@@ -425,8 +416,8 @@ mod alu {
                 }
                 _ => return Flow::FailCpu,
             },
-            AluOpc::Or => d.bitor(s),
-            AluOpc::And => d.bitand(s),
+            AluOpc::Or => d | s,
+            AluOpc::And => d & s,
             AluOpc::Lsh => match BITS {
                 BITS_64 => d << (s & 63),
                 BITS_32 => d << (s & 31),
@@ -448,7 +439,6 @@ mod alu {
                     }
                 }
                 (1, BITS_64) => {
-                    // SMOD 64-bit: handle mod by zero and LLONG_MIN % -1
                     let ds = d as i64;
                     let ss = s as i64;
                     if ss == 0 {
@@ -460,7 +450,6 @@ mod alu {
                     }
                 }
                 (1, BITS_32) => {
-                    // SMOD 32-bit: handle mod by zero and INT_MIN % -1
                     let ds = d as i32;
                     let ss = s as i32;
                     if ss == 0 {
@@ -514,25 +503,24 @@ mod alu {
             AluOpc::UndefE | AluOpc::UndefF => return Flow::FailCpu,
         };
 
-        // For ALU32 operations, zero-extend the 32-bit result to 64 bits
         ctx.regs[dst_reg] = match BITS {
             BITS_64 => result,
-            BITS_32 => zero_extend_32_to_64(result),
+            BITS_32 => result & 0xFFFFFFFF,
         };
 
         Flow::Next
     }
 
     #[inline(always)]
-    pub fn jump<M: Memory, const BITS: bool>(ctx: &mut Context<M>, instr: Instruction) -> Flow<M> {
-        let opc = instr.opcode();
+    pub fn jump<M: Memory, const BITS: bool>(ctx: &mut Context<M>, insn: Instruction) -> Flow<M> {
+        let opc = insn.opcode();
         let jmp_opc = opc.jmp_opc();
         let jmp_src = opc.alu_src();
 
-        let src_reg = instr.src_reg() as usize;
-        let dst_reg = instr.dst_reg() as usize;
+        let src_reg = insn.src_reg() as usize;
+        let dst_reg = insn.dst_reg() as usize;
 
-        let imm = instr.imm();
+        let imm = insn.imm();
 
         let d = match BITS {
             BITS_64 => ctx.regs[dst_reg],
@@ -547,12 +535,16 @@ mod alu {
         };
 
         let cond = match jmp_opc {
+            // RFC 9669 defines CALL and EXIT only in the JMP class, EXIT only with source K, and JMP32 JA only with K
+            JmpOpc::Call | JmpOpc::Exit if BITS == BITS_32 => return Flow::FailCpu,
+            JmpOpc::Exit if jmp_src == Source::Reg => return Flow::FailCpu,
+            JmpOpc::Ja if jmp_src == Source::Reg && BITS == BITS_32 => return Flow::FailCpu,
             // `gotox`: JMP64 class only, target in dst_reg
-            JmpOpc::Ja if BITS == BITS_64 && jmp_src == Source::Reg => return Flow::JumpIndirect(d),
+            JmpOpc::Ja if jmp_src == Source::Reg => return Flow::JumpIndirect(d),
             // JA in JMP64 class uses offset field, JA in JMP32 class uses imm field
             JmpOpc::Ja => {
                 return match BITS {
-                    BITS_64 => Flow::Jump(instr.offset() as i64),
+                    BITS_64 => Flow::Jump(insn.offset() as i64),
                     BITS_32 => Flow::Jump(imm as i64),
                 }
             }
@@ -582,18 +574,17 @@ mod alu {
 
             JmpOpc::Call if jmp_src == Source::Reg => return Flow::CallIndirect(d),
             JmpOpc::Call if src_reg == 0 => return Flow::CallHelper(imm as u32),
-            JmpOpc::Call if src_reg == BPF_PSEUDO_CALL => return Flow::Call(i64::from(imm)), // program-local function
+            JmpOpc::Call if src_reg == BPF_PSEUDO_CALL => return Flow::Call(i64::from(imm)),
             JmpOpc::Call if src_reg == BPF_PSEUDO_KFUNC_CALL => return Flow::CallKfunc(imm as u32),
             JmpOpc::Call => return Flow::Missing,
 
             JmpOpc::Exit => return Flow::Exit,
 
-            JmpOpc::UndefE => return Flow::FailCpu,
-            JmpOpc::UndefF => return Flow::FailCpu,
+            JmpOpc::UndefE | JmpOpc::UndefF => return Flow::FailCpu,
         };
 
         match cond {
-            true => Flow::Jump(instr.offset() as i64),
+            true => Flow::Jump(insn.offset() as i64),
             false => Flow::Next,
         }
     }
@@ -631,7 +622,7 @@ mod mem {
             MemSize::Byte => mem.load_u8(addr).map(|x| x as i8 as i64 as u64),
             MemSize::Half => mem.load_u16(addr).map(|x| x as i16 as i64 as u64),
             MemSize::Word => mem.load_u32(addr).map(|x| x as i32 as i64 as u64),
-            MemSize::DWord => mem.load_u64(addr),
+            MemSize::DWord => unreachable!("`load` fails LDX | MEMSX | DW"),
         }
     }
 
@@ -654,28 +645,31 @@ mod mem {
     }
 
     #[inline(always)]
-    pub fn save<M: Memory, const X: bool>(ctx: &mut Context<M>, instr: Instruction) -> Flow<M> {
+    pub fn save<M: Memory, const X: bool>(ctx: &mut Context<M>, insn: Instruction) -> Flow<M> {
         let val = match X {
-            true => ctx.regs[usize::from(instr.src_reg())],
-            false => i64::from(instr.imm()) as u64,
+            true => ctx.regs[usize::from(insn.src_reg())],
+            false => i64::from(insn.imm()) as u64,
         };
 
-        let dst = ctx.regs[usize::from(instr.dst_reg())];
-        let addr = dst.wrapping_add_signed(i64::from(instr.offset()));
+        let dst = ctx.regs[usize::from(insn.dst_reg())];
+        let addr = dst.wrapping_add_signed(i64::from(insn.offset()));
 
-        let opc = instr.opcode();
+        let opc = insn.opcode();
         let size = opc.mem_size();
         let mode = opc.mem_mode();
 
         let result = match mode {
             MemMode::Mem => mem_store(&mut ctx.data, size, addr, val),
-            MemMode::Atomic if X => return atomic(ctx, instr, size, addr, val),
+            MemMode::Atomic if X => return atomic(ctx, insn, size, addr, val),
 
-            MemMode::Imm => return Flow::Missing,
-            MemMode::Abs => return Flow::Missing,
-            MemMode::Ind => return Flow::Missing,
-
-            MemMode::MemSX | MemMode::Atomic | MemMode::UndefA | MemMode::UndefE => return Flow::FailCpu,
+            // ABS and IND exist only in the LD class
+            MemMode::Imm
+            | MemMode::Abs
+            | MemMode::Ind
+            | MemMode::MemSX
+            | MemMode::Atomic
+            | MemMode::UndefA
+            | MemMode::UndefE => return Flow::FailCpu,
         };
         if let Err(err) = result {
             return Flow::FailMem(err);
@@ -686,7 +680,7 @@ mod mem {
 
     /// `STX | ATOMIC`: `imm` selects the operation. The read-modify-write operations take W and DW sizes only;
     /// [`ordered`] runs the rest.
-    fn atomic<M: Memory>(ctx: &mut Context<M>, instr: Instruction, size: MemSize, addr: u64, src: u64) -> Flow<M> {
+    fn atomic<M: Memory>(ctx: &mut Context<M>, insn: Instruction, size: MemSize, addr: u64, src: u64) -> Flow<M> {
         const FETCH: i32 = 0x01;
         const ADD: i32 = 0x00;
         const OR: i32 = 0x40;
@@ -695,8 +689,8 @@ mod mem {
         const XCHG: i32 = 0xe0 | FETCH;
         const CMPXCHG: i32 = 0xf0 | FETCH;
 
-        let src_reg = usize::from(instr.src_reg());
-        let imm = instr.imm();
+        let src_reg = usize::from(insn.src_reg());
+        let imm = insn.imm();
 
         // `CmpXchg` compares against r0 and writes the old value there instead of `src`.
         macro_rules! run {
@@ -712,7 +706,7 @@ mod mem {
                     OR => AtomicOp::Or(v),
                     AND => AtomicOp::And(v),
                     XOR => AtomicOp::Xor(v),
-                    _ => return ordered(ctx, instr, size, addr, src),
+                    _ => return ordered(ctx, insn, size, addr, src),
                 };
                 match ctx.data.$method(addr, op) {
                     Ok(old) => old as u64,
@@ -724,7 +718,7 @@ mod mem {
         let old = match size {
             MemSize::Word => run!(u32, atomic_u32),
             MemSize::DWord => run!(u64, atomic_u64),
-            MemSize::Byte | MemSize::Half => return ordered(ctx, instr, size, addr, src),
+            MemSize::Byte | MemSize::Half => return ordered(ctx, insn, size, addr, src),
         };
 
         match imm {
@@ -739,15 +733,15 @@ mod mem {
     /// take every size. Load-acquire reads through `src_reg` into `dst_reg`, the reverse of the other operations.
     // outlined to keep the read-modify-write path in `atomic` short
     #[inline(never)]
-    fn ordered<M: Memory>(ctx: &mut Context<M>, instr: Instruction, size: MemSize, addr: u64, src: u64) -> Flow<M> {
+    fn ordered<M: Memory>(ctx: &mut Context<M>, insn: Instruction, size: MemSize, addr: u64, src: u64) -> Flow<M> {
         const LOAD_ACQ: i32 = 0x100;
         const STORE_REL: i32 = 0x110;
 
-        let result = match instr.imm() {
+        let result = match insn.imm() {
             LOAD_ACQ => {
-                let base = ctx.regs[usize::from(instr.src_reg())];
-                let addr = base.wrapping_add_signed(i64::from(instr.offset()));
-                load_acquire(&ctx.data, size, addr).map(|val| ctx.regs[usize::from(instr.dst_reg())] = val)
+                let base = ctx.regs[usize::from(insn.src_reg())];
+                let addr = base.wrapping_add_signed(i64::from(insn.offset()));
+                load_acquire(&ctx.data, size, addr).map(|val| ctx.regs[usize::from(insn.dst_reg())] = val)
             }
             STORE_REL => store_release(&mut ctx.data, size, addr, src),
             _ => return Flow::FailCpu,
@@ -759,27 +753,29 @@ mod mem {
     }
 
     #[inline(always)]
-    pub fn load<M: Memory>(ctx: &mut Context<M>, instr: Instruction) -> Flow<M> {
-        let dst = usize::from(instr.dst_reg());
+    pub fn load<M: Memory>(ctx: &mut Context<M>, insn: Instruction) -> Flow<M> {
+        let dst = usize::from(insn.dst_reg());
 
-        let src = ctx.regs[usize::from(instr.src_reg())];
-        let addr = src.wrapping_add_signed(i64::from(instr.offset()));
+        let src = ctx.regs[usize::from(insn.src_reg())];
+        let addr = src.wrapping_add_signed(i64::from(insn.offset()));
 
-        let opc = instr.opcode();
+        let opc = insn.opcode();
         let size = opc.mem_size();
         let mode = opc.mem_mode();
 
         match match mode {
             MemMode::Mem => mem_load(&ctx.data, size, addr),
-            MemMode::MemSX => mem_load_sx(&ctx.data, size, addr),
+            // RFC 9669 defines MEMSX for B, H and W only
+            MemMode::MemSX if !matches!(size, MemSize::DWord) => mem_load_sx(&ctx.data, size, addr),
 
-            MemMode::Imm => return Flow::Missing,
-            MemMode::Abs => return Flow::Missing,
-            MemMode::Ind => return Flow::Missing,
-            MemMode::Atomic => return Flow::Missing,
-
-            MemMode::UndefA => return Flow::FailCpu,
-            MemMode::UndefE => return Flow::FailCpu,
+            // ABS and IND exist only in the LD class
+            MemMode::Imm
+            | MemMode::Abs
+            | MemMode::Ind
+            | MemMode::MemSX
+            | MemMode::Atomic
+            | MemMode::UndefA
+            | MemMode::UndefE => return Flow::FailCpu,
         } {
             Ok(val) => ctx.regs[dst] = val,
             Err(err) => return Flow::FailMem(err),
@@ -788,36 +784,38 @@ mod mem {
         Flow::Next
     }
 
+    /// Continues with LD_IMM64 that loads its immediate. The pseudo loads (`src_reg` other than 0) are [`Flow::Missing`]
+    /// at their first slot.
     #[inline(always)]
-    pub fn ld64<M: Memory>(instr: Instruction) -> ControlFlow<Flow<M>, Instruction> {
-        let opc = instr.opcode();
+    pub fn ld64<M: Memory>(insn: Instruction) -> ControlFlow<Flow<M>, Instruction> {
+        let opc = insn.opcode();
         let size = opc.mem_size();
         let mode = opc.mem_mode();
 
         match (mode, size) {
-            (MemMode::Imm, MemSize::DWord) => ControlFlow::Continue(instr),
+            (MemMode::Imm, MemSize::DWord) if insn.src_reg() == 0 => ControlFlow::Continue(insn),
             _ => ControlFlow::Break(Flow::Missing),
         }
     }
 }
 
 #[inline(always)]
-pub(crate) fn step<M: Memory>(ctx: &mut Context<M>, instr: Instruction) -> ControlFlow<Flow<M>, Instruction> {
-    use alu::{BITS_32, BITS_64};
+pub(crate) fn step<M: Memory>(ctx: &mut Context<M>, insn: Instruction) -> ControlFlow<Flow<M>, Instruction> {
     use mem::{WITH_IMM, WITH_REG};
+    use ops::{BITS_32, BITS_64};
 
-    match instr.opcode().class() {
-        Class::Alu32 => ControlFlow::Break(alu::math::<_, BITS_32>(ctx, instr)),
-        Class::Alu64 => ControlFlow::Break(alu::math::<_, BITS_64>(ctx, instr)),
+    match insn.opcode().class() {
+        Class::Alu32 => ControlFlow::Break(ops::math::<_, BITS_32>(ctx, insn)),
+        Class::Alu64 => ControlFlow::Break(ops::math::<_, BITS_64>(ctx, insn)),
 
-        Class::Jmp32 => ControlFlow::Break(alu::jump::<_, BITS_32>(ctx, instr)),
-        Class::Jmp64 => ControlFlow::Break(alu::jump::<_, BITS_64>(ctx, instr)),
+        Class::Jmp32 => ControlFlow::Break(ops::jump::<_, BITS_32>(ctx, insn)),
+        Class::Jmp64 => ControlFlow::Break(ops::jump::<_, BITS_64>(ctx, insn)),
 
-        Class::LdImm => mem::ld64::<_>(instr),
-        Class::LdReg => ControlFlow::Break(mem::load::<_>(ctx, instr)),
+        Class::LdImm => mem::ld64(insn),
+        Class::LdReg => ControlFlow::Break(mem::load(ctx, insn)),
 
-        Class::StImm => ControlFlow::Break(mem::save::<_, WITH_IMM>(ctx, instr)),
-        Class::StReg => ControlFlow::Break(mem::save::<_, WITH_REG>(ctx, instr)),
+        Class::StImm => ControlFlow::Break(mem::save::<_, WITH_IMM>(ctx, insn)),
+        Class::StReg => ControlFlow::Break(mem::save::<_, WITH_REG>(ctx, insn)),
     }
 }
 
@@ -1006,17 +1004,18 @@ extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, 
             become host_call::<M, H, FUEL, true>(ctx, code, insn, pc, fuel, calls)
         }
         ControlFlow::Continue(first) => {
+            // without a unit for the second slot, LD_IMM64 doesn't run and gets its unit back
+            if FUEL && fuel == 0 {
+                return calls.stop.at(pc, 1, Flow::OutOfFuel);
+            }
             pc += 1;
             let Some(&second) = code.get(pc as usize) else {
                 return calls.stop.at(pc, fuel, Flow::BadPc);
             };
             if FUEL {
-                fuel = fuel.saturating_sub(1);
+                fuel -= 1;
             }
-            match step_ld64(ctx, first, second) {
-                Flow::Next => {}
-                flow => return calls.stop.at(pc, fuel, flow),
-            }
+            step_ld64(ctx, first, second);
         }
         ControlFlow::Break(flow) => return calls.stop.at(pc, fuel, flow),
     }
@@ -1082,25 +1081,16 @@ fn handler_of<M: Memory, H: Host<M>, const FUEL: bool>(insn: Instruction) -> Han
 }
 
 #[inline(always)]
-pub(crate) fn step_ld64<M: Memory>(ctx: &mut Context<M>, instr: Instruction, second: Instruction) -> Flow<M> {
+pub(crate) fn step_ld64<M: Memory>(ctx: &mut Context<M>, insn: Instruction, second: Instruction) {
     debug_assert!(matches!(
-        (instr.opcode().class(), instr.opcode().mem_mode(), instr.opcode().mem_size()),
-        (Class::LdImm, MemMode::Imm, MemSize::DWord)
+        (insn.opcode().class(), insn.opcode().mem_mode(), insn.opcode().mem_size(), insn.src_reg()),
+        (Class::LdImm, MemMode::Imm, MemSize::DWord, 0)
     ));
 
-    let dst = usize::from(instr.dst_reg());
-
     // the first slot carries the low 32 bits, the second the high 32 bits
-    let imm_lo = instr.imm() as u32 as u64;
+    let imm_lo = insn.imm() as u32 as u64;
     let imm_hi = second.imm() as u32 as u64;
-    let imm64 = imm_lo | (imm_hi << 32);
-
-    match instr.src_reg() {
-        0 => ctx.regs[dst] = imm64,
-        _ => return Flow::Missing,
-    }
-
-    Flow::Next
+    ctx.regs[usize::from(insn.dst_reg())] = imm_lo | (imm_hi << 32);
 }
 
 /// Whether [`run`] meters fuel, chosen by the `fuel` feature.
@@ -1113,8 +1103,8 @@ const METERED: bool = cfg!(feature = "fuel");
 /// progress and keeps them from one `run` to the next. Execution returns helper and kfunc calls that the host declined,
 /// indirect calls and jumps, [`Flow::Exit`] from the entry frame and faults with `*pc` at the instruction that produced
 /// them, and [`Flow::OutOfFuel`] or [`Flow::BadPc`] with `*pc` at the instruction that could not run. With the `fuel`
-/// feature, each executed instruction (both slots of LD_IMM64) consumes one unit of `fuel`; without it, `run` takes no
-/// `fuel` and never runs out.
+/// feature, each executed instruction consumes one unit of `fuel`, and LD_IMM64 one per slot: with one unit left, it
+/// stops with [`Flow::OutOfFuel`] and that unit. Without the feature, `run` takes no `fuel` and never runs out.
 #[inline]
 pub fn run<M: Memory, H: Host<M>>(
     ctx: &mut Context<M>,
