@@ -31,10 +31,10 @@
 //! let mut asm = Assembler::new();
 //!
 //! // Create a countdown loop
-//! let mut loop_start = asm.create_label();
+//! let loop_start = asm.create_label();
 //!
 //! asm.mov64_imm(R0, 10);       // r0 = 10
-//! asm.set_label(&mut loop_start).unwrap();
+//! asm.set_label(&loop_start).unwrap();
 //! asm.sub64_imm(R0, 1);         // r0--
 //! asm.jne_imm(R0, 0, &loop_start); // if r0 != 0 goto loop_start
 //! asm.exit();
@@ -89,8 +89,8 @@ mod tests {
     #[test]
     fn round_trip_every_instruction() {
         let mut asm = Assembler::new();
-        let mut l1 = asm.create_label();
-        let mut l2 = asm.create_label();
+        let l1 = asm.create_label();
+        let l2 = asm.create_label();
 
         asm.add64(R0, R1).add64_imm(R0, 1);
         asm.sub64(R0, R1).sub64_imm(R0, 1);
@@ -128,7 +128,7 @@ mod tests {
         asm.be16(R0).be32(R0).be64(R0);
 
         asm.ja(&l1);
-        asm.set_label(&mut l1).unwrap();
+        asm.set_label(&l1).unwrap();
         asm.ja_off(0);
         asm.jeq(R0, R1, &l2).jeq_imm(R0, 1, &l2);
         asm.jne(R0, R1, &l2).jne_imm(R0, 1, &l2);
@@ -171,14 +171,18 @@ mod tests {
         asm.stw(R1, 0, 1);
         asm.sth(R1, 0, 1);
         asm.stb(R1, 0, 1);
+        asm.load_acquire64(R0, R1, 0).load_acquire32(R0, R1, 0);
+        asm.load_acquire16(R0, R1, 0).load_acquire8(R0, R1, 0);
+        asm.store_release64(R1, 0, R0).store_release32(R1, 0, R0);
+        asm.store_release16(R1, 0, R0).store_release8(R1, 0, R0);
 
         asm.call(1);
         asm.callx(R1);
         asm.gotox(R1);
-        let mut func = asm.create_label();
+        let func = asm.create_label();
         asm.call_local(&func);
-        asm.set_label(&mut func).unwrap();
-        asm.set_label(&mut l2).unwrap();
+        asm.set_label(&func).unwrap();
+        asm.set_label(&l2).unwrap();
         asm.exit();
 
         let code = asm.assemble().unwrap();
@@ -193,7 +197,7 @@ mod tests {
     #[test]
     fn v4_forms_disassemble_distinctly() {
         let mut asm = Assembler::new();
-        let mut far = asm.create_label();
+        let far = asm.create_label();
         asm.movsx832(R0, R1)
             .movsx1632(R0, R1)
             .movsx864(R0, R1)
@@ -203,7 +207,7 @@ mod tests {
         asm.ja32(&far);
         asm.gotox(R1).callx(R2);
         asm.ldxdw(R0, R1, i16::MIN).jeq_imm(R0, i32::MIN, &far);
-        asm.set_label(&mut far).unwrap();
+        asm.set_label(&far).unwrap();
         asm.exit();
 
         let fmt = DefaultFormatter::new();

@@ -22,7 +22,7 @@ type Decoded = Option<(Mnemonic, Operand, Operand)>;
 /// let bytes = [0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]; // exit
 /// let decoder = Decoder::new(&bytes);
 /// for insn in decoder {
-///     println!("{}", insn);
+///     println!("{insn}");
 /// }
 /// ```
 pub struct Decoder<'a> {
@@ -291,38 +291,57 @@ fn decode_stx(raw: RawInstruction) -> Decoded {
         },
         _ => return None,
     };
-    Some((mnemonic, mem(raw.dst(), raw)?, Operand::Reg(reg(raw.src())?)))
+    let load = matches!(
+        mnemonic,
+        Mnemonic::LoadAcquire64 | Mnemonic::LoadAcquire32 | Mnemonic::LoadAcquire16 | Mnemonic::LoadAcquire8
+    );
+    match load {
+        true => Some((mnemonic, Operand::Reg(reg(raw.dst())?), mem(raw.src(), raw)?)),
+        false => Some((mnemonic, mem(raw.dst(), raw)?, Operand::Reg(reg(raw.src())?))),
+    }
 }
 
-/// Pick the atomic operation from `imm`: bits 4-7 hold the operation and bits 0-3 the fetch flag. As in llvm, the
-/// remaining bits are ignored, except that bits 4-8 equal to 0x10 or 0x11 select the unsupported load-acquire and
-/// store-release.
+/// Pick the atomic operation from `imm` as llvm does. For W and DW, bits 0-3 equal to 1 select a fetching operation
+/// from bits 4-7. Otherwise bits 4-8 equal to 0x10 select load-acquire and 0x11 store-release, of any size, and failing
+/// that bits 4-7 select a W or DW operation without fetch. The remaining bits are ignored.
 fn decode_atomic(mem_size: u8, imm: i32) -> Option<Mnemonic> {
+    use Mnemonic::*;
+
+    let wide = matches!(mem_size, size::DW | size::W);
     let pick = |m64, m32| match mem_size {
         size::DW => Some(m64),
         size::W => Some(m32),
         _ => None,
     };
+    let any_size = |m64, m32, m16, m8| match mem_size {
+        size::DW => m64,
+        size::W => m32,
+        size::H => m16,
+        _ => m8,
+    };
+
     let op = imm & 0xF0;
-    if imm & 0x0F == atomic::FETCH {
+    if imm & 0x0F == atomic::FETCH && wide {
         match op {
-            atomic::ADD => return pick(Mnemonic::AtomicFetchAdd64, Mnemonic::AtomicFetchAdd32),
-            atomic::OR => return pick(Mnemonic::AtomicFetchOr64, Mnemonic::AtomicFetchOr32),
-            atomic::AND => return pick(Mnemonic::AtomicFetchAnd64, Mnemonic::AtomicFetchAnd32),
-            atomic::XOR => return pick(Mnemonic::AtomicFetchXor64, Mnemonic::AtomicFetchXor32),
-            _ if op == atomic::XCHG & 0xF0 => return pick(Mnemonic::AtomicXchg64, Mnemonic::AtomicXchg32),
-            _ if op == atomic::CMPXCHG & 0xF0 => return pick(Mnemonic::AtomicCmpxchg64, Mnemonic::AtomicCmpxchg32),
+            atomic::ADD => return pick(AtomicFetchAdd64, AtomicFetchAdd32),
+            atomic::OR => return pick(AtomicFetchOr64, AtomicFetchOr32),
+            atomic::AND => return pick(AtomicFetchAnd64, AtomicFetchAnd32),
+            atomic::XOR => return pick(AtomicFetchXor64, AtomicFetchXor32),
+            _ if op == atomic::XCHG & 0xF0 => return pick(AtomicXchg64, AtomicXchg32),
+            _ if op == atomic::CMPXCHG & 0xF0 => return pick(AtomicCmpxchg64, AtomicCmpxchg32),
             _ => {}
         }
     }
-    if matches!((imm >> 4) & 0x1F, 0x10 | 0x11) {
-        return None;
+    match imm & 0x1F0 {
+        atomic::LOAD_ACQ => return Some(any_size(LoadAcquire64, LoadAcquire32, LoadAcquire16, LoadAcquire8)),
+        atomic::STORE_REL => return Some(any_size(StoreRelease64, StoreRelease32, StoreRelease16, StoreRelease8)),
+        _ => {}
     }
     match op {
-        atomic::ADD => pick(Mnemonic::AtomicAdd64, Mnemonic::AtomicAdd32),
-        atomic::OR => pick(Mnemonic::AtomicOr64, Mnemonic::AtomicOr32),
-        atomic::AND => pick(Mnemonic::AtomicAnd64, Mnemonic::AtomicAnd32),
-        atomic::XOR => pick(Mnemonic::AtomicXor64, Mnemonic::AtomicXor32),
+        atomic::ADD => pick(AtomicAdd64, AtomicAdd32),
+        atomic::OR => pick(AtomicOr64, AtomicOr32),
+        atomic::AND => pick(AtomicAnd64, AtomicAnd32),
+        atomic::XOR => pick(AtomicXor64, AtomicXor32),
         _ => None,
     }
 }
@@ -356,7 +375,7 @@ mod tests {
             ("bf2b000000000000", "r11 = r2", "unknown"),
             ("bfc1000000000000", "<unknown>", "unknown"),
             ("612c000000000000", "<unknown>", "unknown"),
-            // ST/STX modes other than MEM, sizes other than W/DW for atomics
+            // ST/STX modes other than MEM, sizes other than W/DW for read-modify-write atomics
             ("0221030004000000", "<unknown>", "unknown"),
             ("e221030004000000", "<unknown>", "unknown"),
             ("6221030004000000", "*(u32 *)(r1 + 0x3) = 0x4", "stw [r1+0x3], 0x4"),
@@ -367,6 +386,17 @@ mod tests {
             ("c321030004000000", "lock *(u32 *)(r1 + 0x3) += w2", "lock add32 [r1+0x3], r2"),
             ("db21000041000000", "r2 = atomic_fetch_or((u64 *)(r1 + 0x0), r2)", "lock for64 [r1+0x0], r2"),
             ("db210000e0000000", "<unknown>", "unknown"),
+            ("db21030010000000", "<unknown>", "unknown"),
+            // load-acquire (bits 4-8 0x10) reads through src into dst, store-release (0x11) stores src; any size
+            ("db10000000010000", "r0 = load_acquire((u64 *)(r1 + 0x0))", "load_acquire64 r0, [r1+0x0]"),
+            ("db21000010010000", "store_release((u64 *)(r1 + 0x0), r2)", "store_release64 [r1+0x0], r2"),
+            ("d310000000010000", "w0 = load_acquire((u8 *)(r1 + 0x0))", "load_acquire8 r0, [r1+0x0]"),
+            ("cb21f8ff10010000", "store_release((u16 *)(r1 - 0x8), w2)", "store_release16 [r1-0x8], r2"),
+            ("db21030010030080", "store_release((u64 *)(r1 + 0x3), r2)", "store_release64 [r1+0x3], r2"),
+            ("db1b000000010000", "r11 = load_acquire((u64 *)(r1 + 0x0))", "unknown"),
+            // a W or DW fetch wins over load-acquire; B and H have none
+            ("c321030001010000", "w2 = atomic_fetch_add((u32 *)(r1 + 0x3), w2)", "lock fadd32 [r1+0x3], r2"),
+            ("cb21030001010000", "w1 = load_acquire((u16 *)(r2 + 0x3))", "load_acquire16 r1, [r2+0x3]"),
             // JMP32 has no call, exit or gotox; exit takes no X bit and needs imm 0
             ("8621030004000000", "<unknown>", "unknown"),
             ("8e21000000000000", "<unknown>", "unknown"),

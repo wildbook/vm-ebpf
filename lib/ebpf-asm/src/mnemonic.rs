@@ -85,6 +85,10 @@ mnemonics! {
     AtomicFetchOr64 = "lock for64", AtomicFetchOr32 = "lock for32",
     AtomicFetchAnd64 = "lock fand64", AtomicFetchAnd32 = "lock fand32",
     AtomicFetchXor64 = "lock fxor64", AtomicFetchXor32 = "lock fxor32",
+    LoadAcquire64 = "load_acquire64", LoadAcquire32 = "load_acquire32",
+    LoadAcquire16 = "load_acquire16", LoadAcquire8 = "load_acquire8",
+    StoreRelease64 = "store_release64", StoreRelease32 = "store_release32",
+    StoreRelease16 = "store_release16", StoreRelease8 = "store_release8",
 
     Unknown = "unknown",
 }

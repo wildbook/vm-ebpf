@@ -2,19 +2,18 @@
 //!
 //! Run with: cargo run --example disassembly
 
-use ebpf_asm::{decode_all, Assembler, Decoder, DefaultFormatter, Mnemonic, Operand, R0, R1, R10};
+use ebpf_asm::{decode_all, AsmError, Assembler, Decoder, DefaultFormatter, Operand, R0, R1, R10};
 
-fn main() {
-    println!("=== eBPF Disassembly Example ===\n");
-
-    basic_disassembly();
-    with_raw_bytes();
-    inspect_instructions();
+fn main() -> Result<(), AsmError> {
+    basic_disassembly()?;
+    with_raw_bytes()?;
+    inspect_instructions()?;
     disassemble_raw();
+    Ok(())
 }
 
 /// Assemble a program, then disassemble it.
-fn basic_disassembly() {
+fn basic_disassembly() -> Result<(), AsmError> {
     println!("--- Example 1: Basic Disassembly ---\n");
 
     let mut asm = Assembler::new();
@@ -23,7 +22,7 @@ fn basic_disassembly() {
     asm.ldxdw(R0, R10, -8);
     asm.exit();
 
-    let bytecode = asm.assemble().unwrap();
+    let bytecode = asm.assemble()?;
 
     let formatter = DefaultFormatter::new();
 
@@ -34,19 +33,20 @@ fn basic_disassembly() {
         println!("{offset:04x}    {}", formatter.format_to_string(&insn));
     }
     println!();
+    Ok(())
 }
 
-/// Compare the default formatter with raw bytes enabled.
-fn with_raw_bytes() {
+/// Compare the default formatter with raw bytes enabled; `lddw` shows both of its 8-byte slots.
+fn with_raw_bytes() -> Result<(), AsmError> {
     println!("--- Example 2: Formatter with Raw Bytes ---\n");
 
     let mut asm = Assembler::new();
-    asm.mov64_imm(R0, 0x100);
+    asm.lddw(R0, 0x1122_3344_5566_7788);
     asm.stxdw(R10, -16, R0);
     asm.ldxw(R1, R0, 4);
     asm.exit();
 
-    let bytecode = asm.assemble().unwrap();
+    let bytecode = asm.assemble()?;
 
     let default_fmt = DefaultFormatter::new();
     let bytes_fmt = DefaultFormatter::new().with_bytes();
@@ -61,10 +61,11 @@ fn with_raw_bytes() {
         println!("  {}", bytes_fmt.format_to_string(&insn));
     }
     println!();
+    Ok(())
 }
 
 /// Inspect decoded instruction fields.
-fn inspect_instructions() {
+fn inspect_instructions() -> Result<(), AsmError> {
     println!("--- Example 3: Instruction Inspection ---\n");
 
     let mut asm = Assembler::new();
@@ -73,7 +74,7 @@ fn inspect_instructions() {
     asm.lddw(R0, 0xCAFEBABE);
     asm.exit();
 
-    let bytecode = asm.assemble().unwrap();
+    let bytecode = asm.assemble()?;
 
     let instructions = decode_all(&bytecode);
 
@@ -102,12 +103,9 @@ fn inspect_instructions() {
             Operand::None => println!("  Source: none"),
         }
 
-        if insn.mnemonic == Mnemonic::Exit {
-            println!("  (This is a program exit point)");
-        }
-
         println!();
     }
+    Ok(())
 }
 
 /// Disassemble hand-written bytecode.

@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use crate::formatter::DefaultFormatter;
 use crate::mnemonic::Mnemonic;
 use crate::operand::Operand;
 
@@ -28,17 +29,7 @@ pub struct Instruction {
 
 impl fmt::Display for Instruction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mnemonic = &self.mnemonic;
-        write!(f, "{mnemonic}")?;
-
-        match (&self.dst, &self.src) {
-            (Operand::None, Operand::None) => {}
-            (dst, Operand::None) => write!(f, " {dst}")?,
-            (Operand::None, src) => write!(f, " {src}")?,
-            (dst, src) => write!(f, " {dst}, {src}")?,
-        }
-
-        Ok(())
+        f.write_str(&DefaultFormatter::new().format_to_string(self))
     }
 }
 
@@ -204,6 +195,10 @@ pub mod atomic {
     pub const CMPXCHG: i32 = 0xf1;
     /// Fetch variant flag: the prior value is written back to `src`.
     pub const FETCH: i32 = 0x01;
+    /// Load-acquire, which reads through `src` into `dst`; any size.
+    pub const LOAD_ACQ: i32 = 0x100;
+    /// Store-release; any size.
+    pub const STORE_REL: i32 = 0x110;
 }
 
 /// Source is immediate value (K).

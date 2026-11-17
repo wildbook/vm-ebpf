@@ -4,10 +4,10 @@
 //! use ebpf_asm::{Assembler, R0};
 //!
 //! let mut asm = Assembler::new();
-//! let mut loop_start = asm.create_label();
+//! let loop_start = asm.create_label();
 //!
 //! asm.mov64_imm(R0, 10);
-//! asm.set_label(&mut loop_start).unwrap();
+//! asm.set_label(&loop_start).unwrap();
 //! asm.sub64_imm(R0, 1);
 //! asm.jne_imm(R0, 0, &loop_start);
 //! asm.exit();
@@ -35,6 +35,7 @@
 //! assert_eq!(result.relocations[0].insn_off, 0);
 //! ```
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -99,7 +100,6 @@ impl AssembledProgram {
 #[derive(Debug, Clone)]
 pub struct Label {
     id: usize,
-    position: Option<usize>,
 }
 
 /// A label reference that needs to be resolved.
@@ -231,16 +231,16 @@ macro_rules! st_family {
 /// Emits a non-fetch/fetch pair of atomic read-modify-write methods per op, for one memory size. `xchg` and `cmpxchg`
 /// always report the prior value, so they are defined separately instead of through this macro.
 macro_rules! atomic_family {
-    ($size:ident; $( $name:ident, $name_fetch:ident = $op:ident );+ $(;)?) => {
+    ($size:ident; $( $name:ident, $name_fetch:ident = $op:ident, $mnem:literal, $mnem_fetch:literal );+ $(;)?) => {
         $(
-            #[doc = concat!("`lock ", stringify!($op), " [dst+off], src`")]
+            #[doc = concat!("`lock ", $mnem, " [dst+off], src`")]
             pub fn $name(&mut self, dst: Register, offset: i16, src: Register) -> &mut Self {
                 let opcode = class::STX | size::$size | mode::ATOMIC;
                 self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, atomic::$op));
                 self
             }
 
-            #[doc = concat!("`lock fetch ", stringify!($op), " [dst+off], src`")]
+            #[doc = concat!("`lock ", $mnem_fetch, " [dst+off], src`")]
             pub fn $name_fetch(&mut self, dst: Register, offset: i16, src: Register) -> &mut Self {
                 let opcode = class::STX | size::$size | mode::ATOMIC;
                 let imm = atomic::$op | atomic::FETCH;
@@ -251,8 +251,29 @@ macro_rules! atomic_family {
     };
 }
 
+/// Emits a load-acquire and a store-release method per memory size, with the operand order of `ldx*` and `stx*`.
+macro_rules! acquire_release_family {
+    ($( $load:ident, $store:ident = $size:ident );+ $(;)?) => {
+        $(
+            #[doc = concat!("`", stringify!($load), " dst, [src+off]`")]
+            pub fn $load(&mut self, dst: Register, src: Register, offset: i16) -> &mut Self {
+                let opcode = class::STX | size::$size | mode::ATOMIC;
+                self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, atomic::LOAD_ACQ));
+                self
+            }
+
+            #[doc = concat!("`", stringify!($store), " [dst+off], src`")]
+            pub fn $store(&mut self, dst: Register, offset: i16, src: Register) -> &mut Self {
+                let opcode = class::STX | size::$size | mode::ATOMIC;
+                self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, atomic::STORE_REL));
+                self
+            }
+        )+
+    };
+}
+
 /// Emits one byte-swap method per bit width, for a fixed class and source type (`le*`/`be*` are ALU32 and truncate;
-/// `swap*` is ALU64 and always swaps the full width regardless of host endianness).
+/// `bswap*` is ALU64 and always swaps the full width regardless of host endianness).
 macro_rules! endian_family {
     ($class:ident, $src:ident; $( $name:ident = $bits:expr ),+) => {
         $(
@@ -304,19 +325,19 @@ impl Assembler {
     pub fn create_label(&mut self) -> Label {
         let id = self.label_counter;
         self.label_counter += 1;
-        Label { id, position: None }
+        Label { id }
     }
 
-    /// Bind a label to the next instruction added.
-    pub fn set_label(&mut self, label: &mut Label) -> Result<&mut Self, AsmError> {
-        if label.position.is_some() {
-            return Err(AsmError::DuplicateLabel(format!("L{}", label.id)));
-        }
-
+    /// Bind a label to the next instruction added. Fails if the label, or a clone of it, is already bound.
+    pub fn set_label(&mut self, label: &Label) -> Result<&mut Self, AsmError> {
         let position = self.instructions.len();
-        label.position = Some(position);
-        self.label_positions.insert(label.id, position);
-        Ok(self)
+        match self.label_positions.entry(label.id) {
+            Entry::Occupied(_) => Err(AsmError::DuplicateLabel(format!("L{}", label.id))),
+            Entry::Vacant(slot) => {
+                slot.insert(position);
+                Ok(self)
+            }
+        }
     }
 
     /// Add a single-slot instruction.
@@ -532,19 +553,19 @@ impl Assembler {
     // ==================== Atomic Instructions ====================
 
     atomic_family!(DW;
-        atomic_add64, atomic_fetch_add64 = ADD;
-        atomic_or64, atomic_fetch_or64 = OR;
-        atomic_and64, atomic_fetch_and64 = AND;
-        atomic_xor64, atomic_fetch_xor64 = XOR;
+        atomic_add64, atomic_fetch_add64 = ADD, "add64", "fadd64";
+        atomic_or64, atomic_fetch_or64 = OR, "or64", "for64";
+        atomic_and64, atomic_fetch_and64 = AND, "and64", "fand64";
+        atomic_xor64, atomic_fetch_xor64 = XOR, "xor64", "fxor64";
     );
     atomic_family!(W;
-        atomic_add32, atomic_fetch_add32 = ADD;
-        atomic_or32, atomic_fetch_or32 = OR;
-        atomic_and32, atomic_fetch_and32 = AND;
-        atomic_xor32, atomic_fetch_xor32 = XOR;
+        atomic_add32, atomic_fetch_add32 = ADD, "add32", "fadd32";
+        atomic_or32, atomic_fetch_or32 = OR, "or32", "for32";
+        atomic_and32, atomic_fetch_and32 = AND, "and32", "fand32";
+        atomic_xor32, atomic_fetch_xor32 = XOR, "xor32", "fxor32";
     );
 
-    /// `lock xchg [dst+off], src`: 64-bit atomic exchange; always reports the prior value.
+    /// `lock xchg64 [dst+off], src`: 64-bit atomic exchange; always reports the prior value.
     pub fn atomic_xchg64(&mut self, dst: Register, offset: i16, src: Register) -> &mut Self {
         let opcode = class::STX | size::DW | mode::ATOMIC;
         self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, atomic::XCHG));
@@ -558,7 +579,7 @@ impl Assembler {
         self
     }
 
-    /// `lock cmpxchg [dst+off], src`: 64-bit atomic compare-and-exchange against `r0`; always reports the prior value
+    /// `lock cmpxchg64 [dst+off], src`: 64-bit atomic compare-and-exchange against `r0`; always reports the prior value
     /// in `r0`.
     pub fn atomic_cmpxchg64(&mut self, dst: Register, offset: i16, src: Register) -> &mut Self {
         let opcode = class::STX | size::DW | mode::ATOMIC;
@@ -573,6 +594,13 @@ impl Assembler {
         self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, atomic::CMPXCHG));
         self
     }
+
+    acquire_release_family!(
+        load_acquire64, store_release64 = DW;
+        load_acquire32, store_release32 = W;
+        load_acquire16, store_release16 = H;
+        load_acquire8, store_release8 = B;
+    );
 
     // ==================== Jump Instructions with Labels ====================
 
@@ -693,10 +721,10 @@ mod tests {
     #[test]
     fn test_duplicate_label() {
         let mut asm = Assembler::new();
-        let mut label = asm.create_label();
+        let label = asm.create_label();
 
-        asm.set_label(&mut label).unwrap();
-        let result = asm.set_label(&mut label);
+        asm.set_label(&label).unwrap();
+        let result = asm.set_label(&label.clone());
         assert!(matches!(result, Err(AsmError::DuplicateLabel(_))));
     }
 
@@ -724,11 +752,11 @@ mod tests {
     #[test]
     fn test_local_call() {
         let mut asm = Assembler::new();
-        let mut func = asm.create_label();
+        let func = asm.create_label();
 
         asm.call_local(&func);
         asm.exit();
-        asm.set_label(&mut func).unwrap();
+        asm.set_label(&func).unwrap();
         asm.mov64_imm(R0, 0);
         asm.exit();
 
@@ -752,31 +780,31 @@ mod tests {
     #[test]
     fn test_jmp32_opcodes() {
         let mut asm = Assembler::new();
-        let mut labels: Vec<_> = (0..11).map(|_| asm.create_label()).collect();
+        let labels: Vec<_> = (0..11).map(|_| asm.create_label()).collect();
 
         asm.mov32_imm(R0, 100);
         asm.jeq32_imm(R0, 100, &labels[0]);
-        asm.set_label(&mut labels[0]).unwrap();
+        asm.set_label(&labels[0]).unwrap();
         asm.jne32_imm(R0, 50, &labels[1]);
-        asm.set_label(&mut labels[1]).unwrap();
+        asm.set_label(&labels[1]).unwrap();
         asm.jgt32_imm(R0, 10, &labels[2]);
-        asm.set_label(&mut labels[2]).unwrap();
+        asm.set_label(&labels[2]).unwrap();
         asm.jge32_imm(R0, 10, &labels[3]);
-        asm.set_label(&mut labels[3]).unwrap();
+        asm.set_label(&labels[3]).unwrap();
         asm.jlt32_imm(R0, 10, &labels[4]);
-        asm.set_label(&mut labels[4]).unwrap();
+        asm.set_label(&labels[4]).unwrap();
         asm.jle32_imm(R0, 10, &labels[5]);
-        asm.set_label(&mut labels[5]).unwrap();
+        asm.set_label(&labels[5]).unwrap();
         asm.jsgt32_imm(R0, -10, &labels[6]);
-        asm.set_label(&mut labels[6]).unwrap();
+        asm.set_label(&labels[6]).unwrap();
         asm.jsge32_imm(R0, -10, &labels[7]);
-        asm.set_label(&mut labels[7]).unwrap();
+        asm.set_label(&labels[7]).unwrap();
         asm.jslt32_imm(R0, -10, &labels[8]);
-        asm.set_label(&mut labels[8]).unwrap();
+        asm.set_label(&labels[8]).unwrap();
         asm.jsle32_imm(R0, -10, &labels[9]);
-        asm.set_label(&mut labels[9]).unwrap();
+        asm.set_label(&labels[9]).unwrap();
         asm.jset32_imm(R0, 0x80, &labels[10]);
-        asm.set_label(&mut labels[10]).unwrap();
+        asm.set_label(&labels[10]).unwrap();
         asm.exit();
 
         let code = asm.assemble().unwrap();
@@ -798,14 +826,14 @@ mod tests {
     #[test]
     fn test_jump_offsets_count_lddw_slots() {
         let mut asm = Assembler::new();
-        let mut fwd = asm.create_label();
-        let mut back = asm.create_label();
+        let fwd = asm.create_label();
+        let back = asm.create_label();
 
-        asm.set_label(&mut back).unwrap();
+        asm.set_label(&back).unwrap();
         asm.ja(&fwd); // slot 0
         asm.lddw(R0, 0x1_0000_0002); // slots 1-2
         asm.ja(&back); // slot 3
-        asm.set_label(&mut fwd).unwrap();
+        asm.set_label(&fwd).unwrap();
         asm.exit(); // slot 4
 
         let code = asm.assemble().unwrap();

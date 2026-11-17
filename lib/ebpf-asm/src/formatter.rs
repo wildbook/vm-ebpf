@@ -28,7 +28,7 @@ impl DefaultFormatter {
         Self { show_bytes: false }
     }
 
-    /// Enable raw bytes display before the instruction.
+    /// Enable raw bytes display before the instruction, both slots for `lddw` and other wide instructions.
     pub fn with_bytes(mut self) -> Self {
         self.show_bytes = true;
         self
@@ -39,8 +39,10 @@ impl DefaultFormatter {
         let mut out = String::new();
 
         if self.show_bytes {
-            for b in insn.raw.to_le_bytes() {
-                write!(out, "{b:02x} ").unwrap();
+            for slot in [Some(insn.raw), insn.raw2].into_iter().flatten() {
+                for b in slot.to_le_bytes() {
+                    write!(out, "{b:02x} ").unwrap();
+                }
             }
             out.push(' ');
         }
