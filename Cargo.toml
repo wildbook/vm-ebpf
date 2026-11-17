@@ -4,6 +4,21 @@ cargo-features = ["profile-rustflags"]
 resolver = "2"
 members = ["bin/*", "lib/*"]
 
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+btf       = { path = "lib/btf" }
+constelf  = { path = "lib/constelf" }
+ebpf-asm  = { path = "lib/ebpf-asm" }
+rvm-core  = { path = "lib/rvm-core", default-features = false }
+hashbrown = { version = "0.17.1", default-features = false, features = ["default-hasher"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
 [profile.release]
 codegen-units = 1
 opt-level = "s"
@@ -25,6 +40,3 @@ rustflags = [
     "-Zlocation-detail=none",
     "-Zfmt-debug=shallow",
 ]
-
-[profile.embedded.package.rvm]
-opt-level = 3

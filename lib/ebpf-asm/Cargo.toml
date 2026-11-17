@@ -1,9 +1,12 @@
 [package]
 name = "ebpf-asm"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
 description = "eBPF assembler and disassembler library"
-license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
 
 [dependencies]
-btf = { path = "../btf" }
+btf.workspace = true

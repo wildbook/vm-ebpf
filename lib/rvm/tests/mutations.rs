@@ -7,7 +7,6 @@
 //! `RVM_FUZZ_ITERS` sets the cases per fixture. A failure prints its fixture and seed; `RVM_FUZZ_SEED=<seed>` runs only
 //! that case for every fixture.
 
-#![cfg(feature = "link")]
 #![feature(alloc_error_hook)]
 
 use std::alloc::{GlobalAlloc, Layout, System};

@@ -230,17 +230,18 @@ cargo bench -p rvm --bench exec        # interpreter loops from ebpf-asm, map he
 cargo bench -p rvm --bench workloads   # program and plugin calls, bpf/bench/workloads.c
 ```
 
-The integration tests run the vendored
+The `conformance` test target runs the vendored
 [bpf_conformance](https://github.com/Alan-Jowett/bpf_conformance) suite
 (`lib/rvm/tests/conformance/`).
 
-Miri checks the unsafe memory code. The integration tests list fixture
-directories, which Miri supports only on Unix targets, so they run as Linux:
+Miri checks the unsafe memory code. The integration and conformance tests list
+fixture directories, which Miri supports only on Unix targets, so they run as
+Linux:
 
 ```bash
 cargo miri test -p rvm-core
 cargo miri test -p rvm --lib
-MIRIFLAGS=-Zmiri-disable-isolation cargo miri test -p rvm --test integration --target x86_64-unknown-linux-gnu
+MIRIFLAGS=-Zmiri-disable-isolation cargo miri test -p rvm --test integration --test conformance --target x86_64-unknown-linux-gnu
 ```
 
 To compare interpreter changes, benchmark plain release builds with

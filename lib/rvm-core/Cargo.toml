@@ -1,9 +1,11 @@
 [package]
 name = "rvm-core"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
 
-[dependencies]
+[lints]
+workspace = true
 
 [features]
 default = ["fuel"]
