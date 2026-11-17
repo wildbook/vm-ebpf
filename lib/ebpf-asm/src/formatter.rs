@@ -4,7 +4,7 @@
 
 use std::fmt::Write;
 
-use crate::instruction::Instruction;
+use crate::instruction::{Instruction, RawInstruction};
 use crate::mnemonic::Mnemonic;
 use crate::operand::Operand;
 
@@ -62,17 +62,17 @@ impl DefaultFormatter {
                 write!(out, " {}", insn.dst).unwrap();
             }
             Mnemonic::LdPseudo => {
-                let kind = (insn.raw >> 12) & 0xF;
+                let kind = RawInstruction(insn.raw).src();
                 write!(out, " {}, {kind:#x}, {}", insn.dst, insn.src).unwrap();
             }
             Mnemonic::AddrSpaceCast => {
-                let imm = (insn.raw >> 32) as u32;
+                let imm = RawInstruction(insn.raw).imm() as u32;
                 let (dst_as, src_as) = (imm >> 16, imm & 0xFFFF);
                 write!(out, " {}, {}, {dst_as:#x}, {src_as:#x}", insn.dst, insn.src).unwrap();
             }
             _ if insn.mnemonic.is_conditional_jump() => {
                 // Conditional jumps carry their offset in the raw instruction, not in the decoded src/dst operands.
-                let offset = ((insn.raw >> 16) & 0xFFFF) as i16;
+                let offset = RawInstruction(insn.raw).offset();
                 write!(out, " {}, {}, {}", insn.dst, insn.src, Operand::Off(offset.into())).unwrap();
             }
             _ if insn.mnemonic.is_endian() || matches!(insn.mnemonic, Mnemonic::Neg64 | Mnemonic::Neg32) => {

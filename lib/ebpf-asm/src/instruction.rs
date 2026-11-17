@@ -69,6 +69,30 @@ impl RawInstruction {
         (self.0 & 0xFF) as u8
     }
 
+    /// Get the instruction class (opcode bits 0-2), one of the [`class`] constants.
+    #[inline]
+    pub const fn class(self) -> u8 {
+        self.opcode() & 0x07
+    }
+
+    /// Get the memory access size (opcode bits 3-4) of a load or store, one of the [`size`] constants.
+    #[inline]
+    pub const fn size(self) -> u8 {
+        self.opcode() & 0x18
+    }
+
+    /// Get the addressing mode (opcode bits 5-7) of a load or store, one of the [`mode`] constants.
+    #[inline]
+    pub const fn mode(self) -> u8 {
+        self.opcode() & 0xE0
+    }
+
+    /// Get the operation (opcode bits 4-7) of an ALU or jump instruction, one of the [`alu`] or [`jmp`] constants.
+    #[inline]
+    pub const fn op(self) -> u8 {
+        self.opcode() & 0xF0
+    }
+
     /// Get the destination register (4 bits).
     #[inline]
     pub const fn dst(self) -> u8 {
@@ -211,12 +235,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_raw_instruction_parts() {
+    fn raw_instruction_parts() {
         let raw = RawInstruction::from_parts(0xBF, 1, 2, -16, 42);
         assert_eq!(raw.opcode(), 0xBF);
         assert_eq!(raw.dst(), 1);
         assert_eq!(raw.src(), 2);
         assert_eq!(raw.offset(), -16);
         assert_eq!(raw.imm(), 42);
+
+        // ldxw r1, [r2+0] is LDX | W | MEM; mov64 r1, r2 is ALU64 | MOV | X
+        let load = RawInstruction::from_parts(0x61, 1, 2, 0, 0);
+        assert_eq!((load.class(), load.size(), load.mode()), (class::LDX, size::W, mode::MEM));
+        assert_eq!((raw.class(), raw.op()), (class::ALU64, alu::MOV));
     }
 }

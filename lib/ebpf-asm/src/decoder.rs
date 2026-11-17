@@ -104,7 +104,7 @@ fn mem(base: u8, raw: RawInstruction) -> Option<Operand> {
 
 /// Decode a single-slot instruction.
 fn decode(raw: RawInstruction) -> Decoded {
-    match raw.opcode() & 0x07 {
+    match raw.class() {
         class::ALU64 => decode_alu(raw, true),
         class::ALU32 => decode_alu(raw, false),
         class::JMP64 => decode_jmp(raw, true),
@@ -137,14 +137,13 @@ fn decode_lddw(raw: RawInstruction, dst: Register, next: RawInstruction) -> (Mne
 
 /// Decode the legacy packet loads; LD_IMM64 is handled by the iterator.
 fn decode_ld(raw: RawInstruction) -> Decoded {
-    let opcode = raw.opcode();
-    let (abs, ind) = match opcode & 0x18 {
+    let (abs, ind) = match raw.size() {
         size::W => (Mnemonic::Ldabsw, Mnemonic::Ldindw),
         size::H => (Mnemonic::Ldabsh, Mnemonic::Ldindh),
         size::B => (Mnemonic::Ldabsb, Mnemonic::Ldindb),
         _ => return None,
     };
-    match opcode & 0xE0 {
+    match raw.mode() {
         mode::ABS => Some((abs, Operand::Imm(raw.imm()), Operand::None)),
         mode::IND => Some((ind, Operand::Reg(reg(raw.src())?), Operand::Imm(raw.imm()))),
         _ => None,
@@ -152,9 +151,8 @@ fn decode_ld(raw: RawInstruction) -> Decoded {
 }
 
 fn decode_alu(raw: RawInstruction, is_64: bool) -> Decoded {
-    let opcode = raw.opcode();
-    let op = opcode & 0xF0;
-    let is_reg = opcode & SRC_REG != 0;
+    let op = raw.op();
+    let is_reg = raw.opcode() & SRC_REG != 0;
     let dst = Operand::Reg(reg(raw.dst())?);
     let imm = raw.imm();
 
@@ -213,9 +211,8 @@ fn decode_alu(raw: RawInstruction, is_64: bool) -> Decoded {
 }
 
 fn decode_jmp(raw: RawInstruction, is_64: bool) -> Decoded {
-    let opcode = raw.opcode();
-    let op = opcode & 0xF0;
-    let is_reg = opcode & SRC_REG != 0;
+    let op = raw.op();
+    let is_reg = raw.opcode() & SRC_REG != 0;
     let off = Operand::Off(raw.offset().into());
 
     match (op, is_64, is_reg) {
@@ -241,7 +238,7 @@ fn decode_jmp(raw: RawInstruction, is_64: bool) -> Decoded {
 
 fn decode_cond_jmp(raw: RawInstruction, is_64: bool) -> Decoded {
     let pick = |m64, m32| if is_64 { m64 } else { m32 };
-    let mnemonic = match raw.opcode() & 0xF0 {
+    let mnemonic = match raw.op() {
         jmp::JEQ => pick(Mnemonic::Jeq, Mnemonic::Jeq32),
         jmp::JGT => pick(Mnemonic::Jgt, Mnemonic::Jgt32),
         jmp::JGE => pick(Mnemonic::Jge, Mnemonic::Jge32),
@@ -266,7 +263,7 @@ fn decode_cond_jmp(raw: RawInstruction, is_64: bool) -> Decoded {
 }
 
 fn decode_ldx(raw: RawInstruction) -> Decoded {
-    let mnemonic = match (raw.opcode() & 0xE0, raw.opcode() & 0x18) {
+    let mnemonic = match (raw.mode(), raw.size()) {
         (mode::MEM, size::DW) => Mnemonic::Ldxdw,
         (mode::MEM, size::W) => Mnemonic::Ldxw,
         (mode::MEM, size::H) => Mnemonic::Ldxh,
@@ -280,8 +277,8 @@ fn decode_ldx(raw: RawInstruction) -> Decoded {
 }
 
 fn decode_stx(raw: RawInstruction) -> Decoded {
-    let mem_size = raw.opcode() & 0x18;
-    let mnemonic = match raw.opcode() & 0xE0 {
+    let mem_size = raw.size();
+    let mnemonic = match raw.mode() {
         mode::ATOMIC => decode_atomic(mem_size, raw.imm())?,
         mode::MEM => match mem_size {
             size::DW => Mnemonic::Stxdw,
@@ -347,10 +344,10 @@ fn decode_atomic(mem_size: u8, imm: i32) -> Option<Mnemonic> {
 }
 
 fn decode_st(raw: RawInstruction) -> Decoded {
-    if raw.opcode() & 0xE0 != mode::MEM {
+    if raw.mode() != mode::MEM {
         return None;
     }
-    let mnemonic = match raw.opcode() & 0x18 {
+    let mnemonic = match raw.size() {
         size::DW => Mnemonic::Stdw,
         size::W => Mnemonic::Stw,
         size::H => Mnemonic::Sth,
@@ -440,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_lddw() {
+    fn decode_lddw_pair() {
         // lddw r0, 0x123456789abcdef0
         let bytes = [
             0x18, 0x00, 0x00, 0x00, 0xf0, 0xde, 0xbc, 0x9a, // first insn: imm = low 32 bits
@@ -453,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_ldxdw() {
+    fn decode_ldxdw() {
         // ldxdw r0, [r1+16]
         let bytes = [0x79, 0x10, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00];
         let insn = Decoder::new(&bytes).next().unwrap();
@@ -469,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_atomic_ops() {
+    fn decode_atomic_ops() {
         // Atomic ops use opcode 0xDB (STX | DW | ATOMIC); the imm selects the operation.
         for (imm, want) in [
             (0x00, Mnemonic::AtomicAdd64),

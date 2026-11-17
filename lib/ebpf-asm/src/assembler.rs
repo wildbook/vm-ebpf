@@ -707,7 +707,7 @@ mod tests {
     use crate::register::*;
 
     #[test]
-    fn test_undefined_label() {
+    fn undefined_label() {
         let mut asm = Assembler::new();
         let end = asm.create_label();
 
@@ -719,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn test_duplicate_label() {
+    fn duplicate_label() {
         let mut asm = Assembler::new();
         let label = asm.create_label();
 
@@ -729,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    fn test_memory_operations() {
+    fn memory_operations() {
         let mut asm = Assembler::new();
         asm.ldxdw(R0, R1, 16);
         asm.stxdw(R1, -8, R0);
@@ -750,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn test_local_call() {
+    fn local_call() {
         let mut asm = Assembler::new();
         let func = asm.create_label();
 
@@ -765,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    fn test_core_relo_with_wide_instruction() {
+    fn core_relo_with_wide_instruction() {
         let mut asm = Assembler::new();
         asm.lddw(R0, 0x1234567890ABCDEF_i64);
         asm.mov64_imm(R1, 42);
@@ -778,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn test_jmp32_opcodes() {
+    fn jmp32_opcodes() {
         let mut asm = Assembler::new();
         let labels: Vec<_> = (0..11).map(|_| asm.create_label()).collect();
 
@@ -824,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    fn test_jump_offsets_count_lddw_slots() {
+    fn jump_offsets_count_lddw_slots() {
         let mut asm = Assembler::new();
         let fwd = asm.create_label();
         let back = asm.create_label();
