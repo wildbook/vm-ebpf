@@ -175,12 +175,13 @@ cargo miri test -p rvm --lib
 MIRIFLAGS=-Zmiri-disable-isolation cargo miri test -p rvm --test integration --target x86_64-unknown-linux-gnu
 ```
 
-Without PGO, the interpreter loop's speed depends on where the compiler happens to
-place it: one loop alignment flag moves the guest benchmarks by 12-20%. Compare
-interpreter changes on PGO builds, where the layout follows the profile and the same
-flag moves them by under 4%. Collect a profile for each version being compared, since
-a profile only matches the code it was recorded on (needs `cargo install cargo-pgo`
-and `rustup component add llvm-tools-preview`):
+Compare interpreter changes on plain release builds, which is what an embedder gets,
+and build both versions from the same checkout path: cargo's package IDs include the
+source path, and builds from different directories lay code out differently. Enable
+`fixed-hash-seed` so guest hash maps probe the same way in both builds. PGO is a
+bonus on top that depends on which guest programs it was trained on; to try it
+(`cargo install cargo-pgo`, `rustup component add llvm-tools-preview`), collect a
+profile per version, since a profile only matches the code it was recorded on:
 
 ```bash
 cargo pgo bench -- -p rvm --bench workloads --bench exec -- --profile-time 2
