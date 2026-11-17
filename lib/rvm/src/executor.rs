@@ -4,8 +4,9 @@
 //! and dispatches helper function calls to the registered helpers.
 
 use std::fmt::Debug;
+use std::mem::ManuallyDrop;
 
-use rvm_core::{run, CallStack, Context, Flow, Instruction, Memory};
+use rvm_core::{run, CallStack, Context, Flow, Host, Instruction, Memory};
 
 use crate::error::{ExecError, HelperError, Result};
 use crate::helper::{HelperArgs, HelperContext, HelperRegistry};
@@ -85,7 +86,12 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
         }
         ctx.regs[10] = self.stack_top;
 
-        let mut calls = CallStack::new(self.frame_size);
+        let helpers = Helpers {
+            registry: self.helpers,
+            maps: self.maps.as_deref_mut(),
+            error: ManuallyDrop::new(None),
+        };
+        let mut calls = CallStack::new(self.frame_size, helpers);
         let mut pc = pc;
         #[cfg(feature = "fuel")]
         let limit = match self.instruction_limit {
@@ -103,20 +109,11 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
             pc = match flow {
                 Flow::Exit => return Ok(ctx.regs[0]),
                 Flow::StackOverflow => return Err(ExecError::StackOverflow.into()),
-                // Raw bytecode path: look the helper ID up. Linked programs only use slots,
-                // except for calls the linker planted for unresolved CO-RE relocations.
+                // a call the linker planted for an unresolved CO-RE relocation
                 Flow::CallHelper(CORE_POISON_HELPER) => {
                     return Err(ExecError::UnresolvedCoreRelo { pc }.into());
                 }
-                Flow::CallHelper(id) => {
-                    let slot = self.helpers.slot_of_id(id).ok_or(HelperError::UnknownHelper(id))?;
-                    ctx.regs[0] = call_slot(self.helpers, slot, &mut ctx, self.maps.as_deref_mut())?;
-                    pc + 1
-                }
-                Flow::CallKfunc(slot) => {
-                    ctx.regs[0] = call_slot(self.helpers, slot, &mut ctx, self.maps.as_deref_mut())?;
-                    pc + 1
-                }
+                Flow::CallHelper(_) | Flow::CallKfunc(_) => return Err(calls.host.take_error().into()),
                 #[cfg(feature = "fuel")]
                 Flow::OutOfFuel => return Err(ExecError::InstructionLimit(limit).into()),
                 Flow::BadPc => return Err(ExecError::InvalidPc(pc).into()),
@@ -125,16 +122,69 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
                     return Err(ExecError::MemoryFault(format!("access at {err:#x?} (pc {pc})")).into())
                 }
                 Flow::Missing => return Err(ExecError::Unimplemented.into()),
-                Flow::CallIndirect(target) => {
-                    let maps = self.maps.as_deref_mut();
-                    call_indirect(target, pc, self.code, self.helpers, &mut ctx, maps, &mut calls)?
-                }
+                Flow::CallIndirect(target) => call_indirect(target, pc, self.code, &mut ctx, &mut calls)?,
                 Flow::JumpIndirect(target) => jump_indirect(target, pc, self.code)?,
                 // `run` handles these internally
                 Flow::Next | Flow::Jump(_) | Flow::Call(_) => unreachable!(),
                 #[cfg(not(feature = "fuel"))]
                 Flow::OutOfFuel => unreachable!(),
             };
+        }
+    }
+}
+
+/// The extern table and maps that helper and kfunc calls reach from inside [`run`].
+struct Helpers<'a, M> {
+    registry: &'a HelperRegistry<M>,
+    maps: Option<&'a mut Maps>,
+    /// Why the call that stopped [`run`] failed. The executor takes it as soon as
+    /// `run` stops, so it never needs dropping and costs no check on the way out.
+    error: ManuallyDrop<Option<HelperError>>,
+}
+
+impl<M: Memory<Err: Debug> + 'static> Helpers<'_, M> {
+    /// Call the extern table entry at `slot` with the arguments in `ctx.regs[1..=5]`.
+    #[inline]
+    fn call_slot(&mut self, ctx: &mut Context<&mut M>, slot: u32) -> std::result::Result<u64, HelperError> {
+        let mut helper_ctx = HelperContext {
+            args: HelperArgs::from_regs(&ctx.regs),
+            memory: &mut *ctx.data,
+            maps: self.maps.as_deref_mut(),
+        };
+        self.registry.call_slot(slot, &mut helper_ctx)
+    }
+
+    /// The error of the helper or kfunc call that stopped [`run`].
+    #[cold]
+    fn take_error(&mut self) -> HelperError {
+        self.error.take().expect("failed host call left no error")
+    }
+}
+
+impl<M: Memory<Err: Debug> + 'static> Host<&mut M> for Helpers<'_, M> {
+    // Raw bytecode calls helpers by ID; linked programs call slots only, except for
+    // calls the linker planted for unresolved CO-RE relocations, which the executor
+    // reports.
+    #[inline]
+    fn helper(&mut self, ctx: &mut Context<&mut M>, id: u32) -> Option<u64> {
+        if id == CORE_POISON_HELPER {
+            return None;
+        }
+        let Some(slot) = self.registry.slot_of_id(id) else {
+            *self.error = Some(HelperError::UnknownHelper(id));
+            return None;
+        };
+        self.kfunc(ctx, slot)
+    }
+
+    #[inline]
+    fn kfunc(&mut self, ctx: &mut Context<&mut M>, slot: u32) -> Option<u64> {
+        match self.call_slot(ctx, slot) {
+            Ok(r0) => Some(r0),
+            Err(err) => {
+                *self.error = Some(err);
+                None
+            }
         }
     }
 }
@@ -147,10 +197,8 @@ fn call_indirect<M: Memory<Err: Debug> + 'static>(
     target: u64,
     pc: u64,
     code: &[Instruction],
-    helpers: &HelperRegistry<M>,
     ctx: &mut Context<&mut M>,
-    maps: Option<&mut Maps>,
-    calls: &mut CallStack,
+    calls: &mut CallStack<Helpers<'_, M>>,
 ) -> Result<u64> {
     if let Some(callee) = code_index(target, code) {
         if !calls.push(&mut ctx.regs, pc) {
@@ -162,8 +210,9 @@ fn call_indirect<M: Memory<Err: Debug> + 'static>(
     // A helper's address is its ID, as in libbpf's `(void *)BPF_FUNC_*` helper
     // declarations.
     let id = u32::try_from(target).map_err(|_| ExecError::BadCodeAddress { pc, target })?;
-    let slot = helpers.slot_of_id(id).ok_or(HelperError::UnknownHelper(id))?;
-    ctx.regs[0] = call_slot(helpers, slot, ctx, maps)?;
+    let helpers = &mut calls.host;
+    let slot = helpers.registry.slot_of_id(id).ok_or(HelperError::UnknownHelper(id))?;
+    ctx.regs[0] = helpers.call_slot(ctx, slot)?;
     Ok(pc + 1)
 }
 
@@ -181,24 +230,9 @@ fn code_index(addr: u64, code: &[Instruction]) -> Option<u64> {
     (offset % 8 == 0 && offset / 8 < code.len() as u64).then_some(offset / 8)
 }
 
-/// Call the extern table entry at `slot` with the arguments in `ctx.regs[1..=5]`.
-fn call_slot<M: Memory<Err: Debug> + 'static>(
-    helpers: &HelperRegistry<M>,
-    slot: u32,
-    ctx: &mut Context<&mut M>,
-    maps: Option<&mut Maps>,
-) -> Result<u64> {
-    let mut helper_ctx = HelperContext {
-        args: HelperArgs::from_regs(&ctx.regs),
-        memory: &mut *ctx.data,
-        maps,
-    };
-    Ok(helpers.call_slot(slot, &mut helper_ctx)?)
-}
-
 #[cfg(test)]
 mod tests {
-    use ebpf_asm::{Assembler, R0, R6, R7};
+    use ebpf_asm::{Assembler, R0, R1, R10, R2, R6, R7};
 
     use super::*;
     use crate::error::VmError;
@@ -264,5 +298,42 @@ mod tests {
         asm.exit();
 
         assert_eq!(run(&mut asm, &[]).unwrap(), 300);
+    }
+
+    // helper calls run inside the handler chain; this is the lib test that takes Miri
+    // through that path
+    #[test]
+    fn test_helper_calls() {
+        let run = |asm: &mut Assembler| {
+            let code = crate::instructions_from_bytes(&asm.assemble().unwrap());
+            let mut memory = VmMemory::new();
+            let stack_top = memory.map(1, 512, Perms::RW) + 512;
+            let mut helpers = HelperRegistry::new();
+            helpers.register_with_ctx(1, |ctx| {
+                ctx.memory.store_u64(ctx.args.r2, 7).unwrap();
+                ctx.args.r1 * 2
+            });
+            Executor::new(&code, &mut memory, &helpers, stack_top).call(0, &[])
+        };
+
+        // the helper's r0 and its store are visible to the next instructions
+        let mut asm = Assembler::new();
+        asm.mov64_imm(R1, 21);
+        asm.mov64(R2, R10);
+        asm.add64_imm(R2, -8);
+        asm.call(1);
+        asm.mov64(R6, R0);
+        asm.ldxdw(R0, R10, -8);
+        asm.add64(R0, R6);
+        asm.exit();
+        assert_eq!(run(&mut asm).unwrap(), 49);
+
+        let mut asm = Assembler::new();
+        asm.mov64(R2, R10);
+        asm.add64_imm(R2, -8);
+        asm.call(1);
+        asm.call(2);
+        asm.exit();
+        assert!(matches!(run(&mut asm), Err(VmError::Helper(HelperError::UnknownHelper(2)))));
     }
 }

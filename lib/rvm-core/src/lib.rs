@@ -690,19 +690,33 @@ pub fn step<M: Memory>(ctx: &mut Context<M>, instr: Instruction) -> ControlFlow<
     }
 }
 
+/// Host functions the `call` handler runs without leaving [`run`].
+///
+/// Each method gets the arguments in `ctx.regs[1..=5]` and returns the new r0. It
+/// returns `None` to stop [`run`] at the `call` with [`Flow::CallHelper`] or
+/// [`Flow::CallKfunc`], having recorded whatever its caller needs to handle that.
+pub trait Host<M: Memory> {
+    /// Call helper `id` (`src_reg = 0`).
+    fn helper(&mut self, ctx: &mut Context<M>, id: u32) -> Option<u64>;
+    /// Call external function `id` (`src_reg = BPF_PSEUDO_KFUNC_CALL`).
+    fn kfunc(&mut self, ctx: &mut Context<M>, id: u32) -> Option<u64>;
+}
+
 /// Maximum nesting of BPF-to-BPF calls below the entry frame.
 pub const MAX_CALL_DEPTH: usize = 8;
 
-/// The BPF-to-BPF calls in progress, which [`run`] pushes and pops, and the slot
-/// where it records where it stopped.
+/// The BPF-to-BPF calls in progress, which [`run`] pushes and pops, the slot where
+/// it records where it stopped, and the [`Host`] that runs its helper and kfunc
+/// calls.
 // `repr(C)` keeps the scalars ahead of the frames, so every handler reaches them
 // with a one-byte displacement.
 #[repr(C)]
-pub struct CallStack {
+pub struct CallStack<H> {
     depth: usize,
     /// Bytes r10 moves down per nested call.
     frame_size: u64,
     stop: Stop,
+    pub host: H,
 
     /// `frames[..depth]` are initialised.
     frames: [MaybeUninit<Frame>; MAX_CALL_DEPTH],
@@ -716,13 +730,15 @@ struct Frame {
     call_pc: u64,
 }
 
-impl CallStack {
+impl<H> CallStack<H> {
     /// An empty call stack giving each callee `frame_size` bytes below its caller's r10.
-    pub fn new(frame_size: u64) -> Self {
+    #[inline]
+    pub fn new(frame_size: u64, host: H) -> Self {
         Self {
             depth: 0,
             frame_size,
             stop: Stop { pc: 0, fuel: 0 },
+            host,
             frames: [const { MaybeUninit::uninit() }; MAX_CALL_DEPTH],
         }
     }
@@ -782,19 +798,25 @@ impl Stop {
 ///
 /// `preserve_none` passes all arguments in registers (the Windows x64 C convention
 /// has four) and saves no registers, so a tail call between handlers is a jump.
-type Handler<M> =
-    extern "rust-preserve-none" fn(&mut Context<M>, &[Instruction], Instruction, u64, u64, &mut CallStack) -> Flow<M>;
+type Handler<M, H> = extern "rust-preserve-none" fn(
+    &mut Context<M>,
+    &[Instruction],
+    Instruction,
+    u64,
+    u64,
+    &mut CallStack<H>,
+) -> Flow<M>;
 
 /// The handler of every opcode byte, each running [`step`] with its opcode as a
 /// constant, so the class, operation, source, mode and size matches fold away.
 /// With `FUEL`, the handlers meter fuel; without it, they never read it.
-struct Handlers<M, const FUEL: bool>(PhantomData<M>);
+struct Handlers<M, H, const FUEL: bool>(PhantomData<(M, H)>);
 
-impl<M: Memory, const FUEL: bool> Handlers<M, FUEL> {
-    const TABLE: [Handler<M>; 256] = {
+impl<M: Memory, H: Host<M>, const FUEL: bool> Handlers<M, H, FUEL> {
+    const TABLE: [Handler<M, H>; 256] = {
         macro_rules! table {
             ($($op:literal)*) => {
-                [$(handler::<M, FUEL, $op> as Handler<M>,)*]
+                [$(handler::<M, H, FUEL, $op> as Handler<M, H>,)*]
             };
         }
 
@@ -825,13 +847,13 @@ impl<M: Memory, const FUEL: bool> Handlers<M, FUEL> {
 // PGO promotes a profiled tail call to a compare against its usual target; inlining
 // that target as well would copy whole handler chains of the profiled programs.
 #[inline(never)]
-extern "rust-preserve-none" fn handler<M: Memory, const FUEL: bool, const OP: u8>(
+extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, const OP: u8>(
     ctx: &mut Context<M>,
     code: &[Instruction],
     insn: Instruction,
     mut pc: u64,
     mut fuel: u64,
-    calls: &mut CallStack,
+    calls: &mut CallStack<H>,
 ) -> Flow<M> {
     // Only jump-class opcodes jump, call or exit. Without the guards, a handler whose
     // `step` returns from an outlined call (atomics) would test for those flows too.
@@ -849,6 +871,12 @@ extern "rust-preserve-none" fn handler<M: Memory, const FUEL: bool, const OP: u8
             Some(call_pc) => pc = call_pc,
             None => return calls.stop.at(pc, fuel, Flow::Exit),
         },
+        ControlFlow::Break(Flow::CallHelper(_)) if jumps => {
+            become host_call::<M, H, FUEL, false>(ctx, code, insn, pc, fuel, calls)
+        }
+        ControlFlow::Break(Flow::CallKfunc(_)) if jumps => {
+            become host_call::<M, H, FUEL, true>(ctx, code, insn, pc, fuel, calls)
+        }
         ControlFlow::Continue(first) => {
             pc += 1;
             let Some(&second) = code.get(pc as usize) else {
@@ -867,7 +895,37 @@ extern "rust-preserve-none" fn handler<M: Memory, const FUEL: bool, const OP: u8
 
     // a negative jump target wraps to a huge pc and fails the fetch
     let pc = pc.wrapping_add(1);
-    match fetch::<M, FUEL>(code, pc, fuel) {
+    match fetch::<M, H, FUEL>(code, pc, fuel) {
+        Ok((next, insn)) => become next(ctx, code, insn, pc, fuel - u64::from(FUEL), calls),
+        Err(flow) => calls.stop.at(pc, fuel, flow),
+    }
+}
+
+/// The rest of the handler of a helper `call`, or with `KFUNC` a kfunc `call`: runs
+/// it on the host and continues with the next instruction.
+// Out of line, so that the handler, which also runs local calls, calls no function
+// and needs no stack frame.
+#[inline(never)]
+extern "rust-preserve-none" fn host_call<M: Memory, H: Host<M>, const FUEL: bool, const KFUNC: bool>(
+    ctx: &mut Context<M>,
+    code: &[Instruction],
+    insn: Instruction,
+    pc: u64,
+    fuel: u64,
+    calls: &mut CallStack<H>,
+) -> Flow<M> {
+    let id = insn.imm() as u32;
+    let (r0, flow) = match KFUNC {
+        true => (calls.host.kfunc(ctx, id), Flow::CallKfunc(id)),
+        false => (calls.host.helper(ctx, id), Flow::CallHelper(id)),
+    };
+    let Some(r0) = r0 else {
+        return calls.stop.at(pc, fuel, flow);
+    };
+    ctx.regs[0] = r0;
+
+    let pc = pc + 1;
+    match fetch::<M, H, FUEL>(code, pc, fuel) {
         Ok((next, insn)) => become next(ctx, code, insn, pc, fuel - u64::from(FUEL), calls),
         Err(flow) => calls.stop.at(pc, fuel, flow),
     }
@@ -875,24 +933,24 @@ extern "rust-preserve-none" fn handler<M: Memory, const FUEL: bool, const OP: u8
 
 /// The instruction at `pc` and its handler, or why it can't run.
 #[inline(always)]
-fn fetch<M: Memory, const FUEL: bool>(
+fn fetch<M: Memory, H: Host<M>, const FUEL: bool>(
     code: &[Instruction],
     pc: u64,
     fuel: u64,
-) -> Result<(Handler<M>, Instruction), Flow<M>> {
+) -> Result<(Handler<M, H>, Instruction), Flow<M>> {
     if FUEL && fuel == 0 {
         return Err(Flow::OutOfFuel);
     }
     let Some(&insn) = code.get(pc as usize) else {
         return Err(Flow::BadPc);
     };
-    Ok((handler_of::<M, FUEL>(insn), insn))
+    Ok((handler_of::<M, H, FUEL>(insn), insn))
 }
 
 /// The handler of `insn` from the set that meters fuel, or the one that never reads it.
 #[inline(always)]
-fn handler_of<M: Memory, const FUEL: bool>(insn: Instruction) -> Handler<M> {
-    Handlers::<M, FUEL>::TABLE[usize::from(insn.0 as u8)]
+fn handler_of<M: Memory, H: Host<M>, const FUEL: bool>(insn: Instruction) -> Handler<M, H> {
+    Handlers::<M, H, FUEL>::TABLE[usize::from(insn.0 as u8)]
 }
 
 #[inline(always)]
@@ -922,27 +980,28 @@ const METERED: bool = cfg!(feature = "fuel");
 
 /// Execute from `*pc` until an instruction the caller must handle.
 ///
-/// ALU, memory and jump instructions, local calls and their returns stay inside the
-/// handler chain, so each one costs a single dispatch. `calls` holds the frames of
-/// the local calls in progress and keeps them from one `run` to the next.
-/// Execution returns helper and indirect calls, indirect jumps, [`Flow::Exit`] from
-/// the entry frame and faults with `*pc` at the instruction that produced them, and
+/// ALU, memory and jump instructions, local calls and their returns, and helper and
+/// kfunc calls that `calls.host` runs stay inside the handler chain, so each one
+/// costs a single dispatch. `calls` holds the frames of the local calls in progress
+/// and keeps them from one `run` to the next. Execution returns helper and kfunc
+/// calls that the host declined, indirect calls and jumps, [`Flow::Exit`] from the
+/// entry frame and faults with `*pc` at the instruction that produced them, and
 /// [`Flow::OutOfFuel`] or [`Flow::BadPc`] with `*pc` at the instruction that could
 /// not run. With the `fuel` feature, each executed instruction (both slots of
 /// LD_IMM64) consumes one unit of `fuel`; without it, `run` takes no `fuel` and
 /// never runs out.
 #[inline]
-pub fn run<M: Memory>(
+pub fn run<M: Memory, H: Host<M>>(
     ctx: &mut Context<M>,
     code: &[Instruction],
     pc: &mut u64,
     #[cfg(feature = "fuel")] fuel: &mut u64,
-    calls: &mut CallStack,
+    calls: &mut CallStack<H>,
 ) -> Flow<M> {
     #[cfg(not(feature = "fuel"))]
     let fuel = &mut 0;
 
-    let (first, insn) = match fetch::<M, METERED>(code, *pc, *fuel) {
+    let (first, insn) = match fetch::<M, H, METERED>(code, *pc, *fuel) {
         Ok(next) => next,
         Err(flow) => return flow,
     };

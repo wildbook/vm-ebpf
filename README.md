@@ -34,8 +34,10 @@ cargo run --bin emu      # runs bpf.o, linked into an image at build time
 
 - `lib/rvm-core`: the instruction set and interpreter loop (`run`, `step`),
   independent of any host integration. Operates on a `Context<M>` over a
-  `Memory` trait implementation and returns a `Flow` describing why execution
-  stopped (exit, a call, a helper, a fault, or out of fuel).
+  `Memory` trait implementation, runs helper and kfunc calls through a `Host`
+  trait implementation, and returns a `Flow` describing why execution stopped
+  (exit, an indirect call or jump, a host call the host declined, a fault, or
+  out of fuel).
 - `lib/rvm`: the embeddable runtime built on `rvm-core`. Parses ELF objects,
   links them into executable programs, manages guest memory, and dispatches
   helper calls.
