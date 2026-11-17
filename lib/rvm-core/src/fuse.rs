@@ -374,7 +374,8 @@ extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool, co
     let len = const { Super::of(S).len() };
 
     // the sequence and the slot after it
-    let window = code.get(pc as usize..pc as usize + len + 1);
+    let at = pc as usize;
+    let window = code.get(at..=at + len);
     let Some(window) = window.filter(|_| !FUEL || fuel >= len as u64 - 1) else {
         // the fuel runs out inside the sequence, or the code ends with it
         let alone = const { Handlers::<M, H, FUEL>::TABLE[Super::of(S).first as usize] };
