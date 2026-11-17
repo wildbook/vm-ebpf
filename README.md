@@ -130,6 +130,9 @@ BTF and CO-RE (`Module`, `BtfBuilder`, `Vm::types`, `Vm::prepare`,
 on rvm with `default-features = false` and prepare them in a build script or a
 separate tool, as `bin/emu` does.
 
+rvm's `fuel` feature, also on by default, enforces `VmConfig::instruction_limit`;
+without it, the field doesn't exist and the interpreter doesn't count instructions.
+
 ## Guest memory
 
 A guest address is `(region << 32) | offset`. `rvm::VmMemory` holds

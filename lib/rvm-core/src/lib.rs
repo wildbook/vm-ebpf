@@ -90,7 +90,8 @@ pub enum Flow<C: Memory> {
 
     Missing, // Not yet implemented.
 
-    /// [`run`] used up its instruction budget before the next instruction.
+    /// [`run`] used up its instruction budget before the next instruction. Only
+    /// with the `fuel` feature.
     OutOfFuel,
     /// [`run`] reached a `pc` outside the code slice.
     BadPc,
@@ -776,8 +777,8 @@ impl Stop {
     }
 }
 
-/// Runs the instruction `insn` at `pc` and continues with the next one. `fuel` has
-/// already been charged for `insn`.
+/// Runs the instruction `insn` at `pc` and continues with the next one. A metering
+/// handler receives `fuel` already charged for `insn`; the others pass it on as is.
 ///
 /// `preserve_none` passes all arguments in registers (the Windows x64 C convention
 /// has four) and saves no registers, so a tail call between handlers is a jump.
@@ -786,13 +787,14 @@ type Handler<M> =
 
 /// The handler of every opcode byte, each running [`step`] with its opcode as a
 /// constant, so the class, operation, source, mode and size matches fold away.
-struct Handlers<M>(PhantomData<M>);
+/// With `FUEL`, the handlers meter fuel; without it, they never read it.
+struct Handlers<M, const FUEL: bool>(PhantomData<M>);
 
-impl<M: Memory> Handlers<M> {
+impl<M: Memory, const FUEL: bool> Handlers<M, FUEL> {
     const TABLE: [Handler<M>; 256] = {
         macro_rules! table {
             ($($op:literal)*) => {
-                [$(handler::<M, $op> as Handler<M>,)*]
+                [$(handler::<M, FUEL, $op> as Handler<M>,)*]
             };
         }
 
@@ -823,7 +825,7 @@ impl<M: Memory> Handlers<M> {
 // PGO promotes a profiled tail call to a compare against its usual target; inlining
 // that target as well would copy whole handler chains of the profiled programs.
 #[inline(never)]
-extern "rust-preserve-none" fn handler<M: Memory, const OP: u8>(
+extern "rust-preserve-none" fn handler<M: Memory, const FUEL: bool, const OP: u8>(
     ctx: &mut Context<M>,
     code: &[Instruction],
     insn: Instruction,
@@ -852,7 +854,9 @@ extern "rust-preserve-none" fn handler<M: Memory, const OP: u8>(
             let Some(&second) = code.get(pc as usize) else {
                 return calls.stop.at(pc, fuel, Flow::BadPc);
             };
-            fuel = fuel.saturating_sub(1);
+            if FUEL {
+                fuel = fuel.saturating_sub(1);
+            }
             match step_ld64(ctx, first, second) {
                 Flow::Next => {}
                 flow => return calls.stop.at(pc, fuel, flow),
@@ -863,22 +867,32 @@ extern "rust-preserve-none" fn handler<M: Memory, const OP: u8>(
 
     // a negative jump target wraps to a huge pc and fails the fetch
     let pc = pc.wrapping_add(1);
-    match fetch(code, pc, fuel) {
-        Ok((next, insn)) => become next(ctx, code, insn, pc, fuel - 1, calls),
+    match fetch::<M, FUEL>(code, pc, fuel) {
+        Ok((next, insn)) => become next(ctx, code, insn, pc, fuel - u64::from(FUEL), calls),
         Err(flow) => calls.stop.at(pc, fuel, flow),
     }
 }
 
 /// The instruction at `pc` and its handler, or why it can't run.
 #[inline(always)]
-fn fetch<M: Memory>(code: &[Instruction], pc: u64, fuel: u64) -> Result<(Handler<M>, Instruction), Flow<M>> {
-    if fuel == 0 {
+fn fetch<M: Memory, const FUEL: bool>(
+    code: &[Instruction],
+    pc: u64,
+    fuel: u64,
+) -> Result<(Handler<M>, Instruction), Flow<M>> {
+    if FUEL && fuel == 0 {
         return Err(Flow::OutOfFuel);
     }
     let Some(&insn) = code.get(pc as usize) else {
         return Err(Flow::BadPc);
     };
-    Ok((Handlers::<M>::TABLE[usize::from(insn.0 as u8)], insn))
+    Ok((handler_of::<M, FUEL>(insn), insn))
+}
+
+/// The handler of `insn` from the set that meters fuel, or the one that never reads it.
+#[inline(always)]
+fn handler_of<M: Memory, const FUEL: bool>(insn: Instruction) -> Handler<M> {
+    Handlers::<M, FUEL>::TABLE[usize::from(insn.0 as u8)]
 }
 
 #[inline(always)]
@@ -903,6 +917,9 @@ pub fn step_ld64<M: Memory>(ctx: &mut Context<M>, instr: Instruction, second: In
     Flow::Next
 }
 
+/// Whether [`run`] meters fuel, chosen by the `fuel` feature.
+const METERED: bool = cfg!(feature = "fuel");
+
 /// Execute from `*pc` until an instruction the caller must handle.
 ///
 /// ALU, memory and jump instructions, local calls and their returns stay inside the
@@ -911,21 +928,25 @@ pub fn step_ld64<M: Memory>(ctx: &mut Context<M>, instr: Instruction, second: In
 /// Execution returns helper and indirect calls, indirect jumps, [`Flow::Exit`] from
 /// the entry frame and faults with `*pc` at the instruction that produced them, and
 /// [`Flow::OutOfFuel`] or [`Flow::BadPc`] with `*pc` at the instruction that could
-/// not run. Each executed instruction (both slots of LD_IMM64) consumes one unit of
-/// `fuel`.
+/// not run. With the `fuel` feature, each executed instruction (both slots of
+/// LD_IMM64) consumes one unit of `fuel`; without it, `run` takes no `fuel` and
+/// never runs out.
 #[inline]
 pub fn run<M: Memory>(
     ctx: &mut Context<M>,
     code: &[Instruction],
     pc: &mut u64,
-    fuel: &mut u64,
+    #[cfg(feature = "fuel")] fuel: &mut u64,
     calls: &mut CallStack,
 ) -> Flow<M> {
-    let (first, insn) = match fetch(code, *pc, *fuel) {
+    #[cfg(not(feature = "fuel"))]
+    let fuel = &mut 0;
+
+    let (first, insn) = match fetch::<M, METERED>(code, *pc, *fuel) {
         Ok(next) => next,
         Err(flow) => return flow,
     };
-    let flow = first(ctx, code, insn, *pc, *fuel - 1, calls);
+    let flow = first(ctx, code, insn, *pc, *fuel - u64::from(METERED), calls);
     (*pc, *fuel) = (calls.stop.pc, calls.stop.fuel);
     flow
 }

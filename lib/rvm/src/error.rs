@@ -157,6 +157,7 @@ pub enum ExecError {
     /// Unimplemented instruction.
     Unimplemented,
     /// Instruction limit exceeded.
+    #[cfg(feature = "fuel")]
     InstructionLimit(u64),
     /// Stack overflow.
     StackOverflow,
@@ -175,6 +176,7 @@ impl fmt::Display for ExecError {
             Self::CpuFault => write!(f, "CPU fault: invalid instruction"),
             Self::MemoryFault(msg) => write!(f, "memory fault: {msg}"),
             Self::Unimplemented => write!(f, "unimplemented: instruction not implemented"),
+            #[cfg(feature = "fuel")]
             Self::InstructionLimit(count) => write!(f, "instruction limit exceeded: {count}"),
             Self::StackOverflow => write!(f, "stack overflow"),
             Self::InvalidPc(pc) => write!(f, "invalid program counter: {pc}"),

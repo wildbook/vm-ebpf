@@ -26,7 +26,7 @@ pub const CORE_POISON_HELPER: u32 = 0xbad2310;
 /// - Instruction fetching and execution via rvm-core
 /// - Helper function dispatch
 /// - BPF-to-BPF function calls, each with its own stack frame
-/// - Instruction limit enforcement
+/// - Instruction limit enforcement (the `fuel` feature)
 ///
 /// Code is a separate instruction slice, so the guest can neither read nor modify
 /// it through memory. Generic over any [`Memory`]; memory stays borrowed, so it
@@ -40,6 +40,7 @@ pub struct Executor<'a, M: Memory = VmMemory> {
     /// Bytes r10 moves down per nested call.
     frame_size: u64,
     /// Maximum instructions to execute (0 = unlimited).
+    #[cfg(feature = "fuel")]
     instruction_limit: u64,
     /// Maps passed to helpers through [`HelperContext::maps`].
     maps: Option<&'a mut Maps>,
@@ -54,12 +55,14 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
             helpers,
             stack_top,
             frame_size: DEFAULT_FRAME_SIZE,
+            #[cfg(feature = "fuel")]
             instruction_limit: 0,
             maps: None,
         }
     }
 
     /// Set the instruction limit (0 = unlimited).
+    #[cfg(feature = "fuel")]
     pub fn set_instruction_limit(&mut self, limit: u64) {
         self.instruction_limit = limit;
     }
@@ -84,14 +87,20 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
 
         let mut calls = CallStack::new(self.frame_size);
         let mut pc = pc;
+        #[cfg(feature = "fuel")]
         let limit = match self.instruction_limit {
             0 => u64::MAX,
             limit => limit,
         };
+        #[cfg(feature = "fuel")]
         let mut fuel = limit;
 
         loop {
-            pc = match run(&mut ctx, self.code, &mut pc, &mut fuel, &mut calls) {
+            #[cfg(feature = "fuel")]
+            let flow = run(&mut ctx, self.code, &mut pc, &mut fuel, &mut calls);
+            #[cfg(not(feature = "fuel"))]
+            let flow = run(&mut ctx, self.code, &mut pc, &mut calls);
+            pc = match flow {
                 Flow::Exit => return Ok(ctx.regs[0]),
                 Flow::StackOverflow => return Err(ExecError::StackOverflow.into()),
                 // Raw bytecode path: look the helper ID up. Linked programs only use slots,
@@ -108,6 +117,7 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
                     ctx.regs[0] = call_slot(self.helpers, slot, &mut ctx, self.maps.as_deref_mut())?;
                     pc + 1
                 }
+                #[cfg(feature = "fuel")]
                 Flow::OutOfFuel => return Err(ExecError::InstructionLimit(limit).into()),
                 Flow::BadPc => return Err(ExecError::InvalidPc(pc).into()),
                 Flow::FailCpu => return Err(ExecError::CpuFault.into()),
@@ -122,6 +132,8 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
                 Flow::JumpIndirect(target) => jump_indirect(target, pc, self.code)?,
                 // `run` handles these internally
                 Flow::Next | Flow::Jump(_) | Flow::Call(_) => unreachable!(),
+                #[cfg(not(feature = "fuel"))]
+                Flow::OutOfFuel => unreachable!(),
             };
         }
     }
@@ -192,30 +204,36 @@ mod tests {
     use crate::error::VmError;
     use crate::memory::Perms;
 
-    fn run(asm: &mut Assembler, args: &[u64], limit: u64) -> Result<u64> {
+    fn run(asm: &mut Assembler, args: &[u64]) -> Result<u64> {
+        run_with(asm, args, |_| {})
+    }
+
+    fn run_with(asm: &mut Assembler, args: &[u64], setup: impl FnOnce(&mut Executor)) -> Result<u64> {
         let code = crate::instructions_from_bytes(&asm.assemble().unwrap());
         let mut memory = VmMemory::new();
         let stack_top = memory.map(1, 512, Perms::RW) + 512;
         let helpers = HelperRegistry::new();
         let mut executor = Executor::new(&code, &mut memory, &helpers, stack_top);
-        executor.set_instruction_limit(limit);
+        setup(&mut executor);
         executor.call(0, args)
     }
 
+    #[cfg(feature = "fuel")]
     #[test]
     fn test_instruction_limit() {
         let mut asm = Assembler::new();
         let mut loop_label = asm.create_label();
         asm.set_label(&mut loop_label).unwrap();
         asm.ja(&loop_label);
-        assert!(matches!(run(&mut asm, &[], 10), Err(VmError::Exec(ExecError::InstructionLimit(_)))));
+        let result = run_with(&mut asm, &[], |executor| executor.set_instruction_limit(10));
+        assert!(matches!(result, Err(VmError::Exec(ExecError::InstructionLimit(_)))));
     }
 
     #[test]
     fn test_running_off_code_end_is_invalid_pc() {
         let mut asm = Assembler::new();
         asm.mov64_imm(R0, 1);
-        assert!(matches!(run(&mut asm, &[], 0), Err(VmError::Exec(ExecError::InvalidPc(1)))));
+        assert!(matches!(run(&mut asm, &[]), Err(VmError::Exec(ExecError::InvalidPc(1)))));
     }
 
     #[test]
@@ -225,7 +243,7 @@ mod tests {
         asm.set_label(&mut func_start).unwrap();
         asm.call_local(&func_start);
         asm.exit();
-        assert!(matches!(run(&mut asm, &[], 0), Err(VmError::Exec(ExecError::StackOverflow))));
+        assert!(matches!(run(&mut asm, &[]), Err(VmError::Exec(ExecError::StackOverflow))));
     }
 
     #[test]
@@ -245,6 +263,6 @@ mod tests {
         asm.mov64_imm(R7, 0);
         asm.exit();
 
-        assert_eq!(run(&mut asm, &[], 0).unwrap(), 300);
+        assert_eq!(run(&mut asm, &[]).unwrap(), 300);
     }
 }

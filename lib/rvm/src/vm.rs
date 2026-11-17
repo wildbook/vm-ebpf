@@ -28,6 +28,7 @@ use crate::{maps, std_helpers};
 #[derive(Debug, Clone)]
 pub struct VmConfig {
     /// Maximum number of instructions to execute (0 = no limit).
+    #[cfg(feature = "fuel")]
     pub instruction_limit: u64,
     /// Stack bytes reserved per call frame.
     pub frame_size: usize,
@@ -36,6 +37,7 @@ pub struct VmConfig {
 impl Default for VmConfig {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "fuel")]
             instruction_limit: 1_000_000,
             frame_size: DEFAULT_FRAME_SIZE as usize,
         }

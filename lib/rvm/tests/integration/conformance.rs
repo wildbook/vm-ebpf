@@ -67,6 +67,7 @@ fn run_one(text: &str) -> Result<(), String> {
     helpers.register(5, |_: ()| 0u64);
 
     let mut exec = Executor::new(&code, &mut memory, &helpers, stack_top);
+    #[cfg(feature = "fuel")]
     exec.set_instruction_limit(1_000_000);
     let outcome = exec.call(0, &[mem_ptr, case.mem.len() as u64]);
 

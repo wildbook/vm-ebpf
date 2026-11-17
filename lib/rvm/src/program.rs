@@ -84,6 +84,7 @@ pub struct Program {
     helpers: HelperRegistry,
     helpers_version: u64,
     /// Maximum instructions per call (0 = unlimited).
+    #[cfg(feature = "fuel")]
     instruction_limit: u64,
     /// Stack bytes per call frame.
     frame_size: u64,
@@ -112,6 +113,7 @@ impl Program {
             shared_helpers,
             helpers,
             helpers_version,
+            #[cfg(feature = "fuel")]
             instruction_limit: config.instruction_limit,
             frame_size: config.frame_size as u64,
         }
@@ -192,6 +194,7 @@ impl Program {
         }
 
         let mut executor = Executor::new(&self.code, &mut self.memory, &self.helpers, self.stack_top);
+        #[cfg(feature = "fuel")]
         executor.set_instruction_limit(self.instruction_limit);
         executor.set_frame_size(self.frame_size);
         executor.set_maps(&mut self.maps);

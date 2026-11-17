@@ -6,16 +6,18 @@ description = "Embeddable eBPF runtime with CO-RE support"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-rvm-core = { path = "../rvm-core" }
+rvm-core = { path = "../rvm-core", default-features = false }
 constelf = { path = "../constelf", optional = true }
 btf = { path = "../btf", optional = true }
 hashbrown = { version = "0.17.1", default-features = false, features = ["default-hasher"] }
 foldhash = { version = "0.2.0", default-features = false }
 
 [features]
-default = ["link"]
+default = ["link", "fuel"]
 # ELF parsing, CO-RE and the linker. Without it, rvm loads prepared images only.
 link = ["dep:constelf", "dep:btf"]
+# `VmConfig::instruction_limit`. Without it, the interpreter doesn't count instructions.
+fuel = ["rvm-core/fuel"]
 # Guest hash maps use a fixed hash seed (reproducible benchmarks and PGO profiles).
 fixed-hash-seed = []
 

@@ -9,3 +9,8 @@ edition = "2021"
 crate-type = ["lib"]
 
 [dependencies]
+
+[features]
+default = ["fuel"]
+# `run` meters fuel and stops with `Flow::OutOfFuel` when it runs out.
+fuel = []
