@@ -18,10 +18,9 @@
 use std::sync::Arc;
 
 use hashbrown::HashMap;
-use rvm_core::{instructions_from_bytes, BPF_PSEUDO_KFUNC_CALL};
+use rvm_core::{instructions_from_bytes, BPF_PSEUDO_KFUNC_CALL, MAX_CALL_DEPTH};
 
 use crate::error::{LinkError, Result, VmError};
-use crate::executor::MAX_CALL_DEPTH;
 use crate::helper::SharedHelpers;
 use crate::layout::{DATA_REGION, MAPS_REGION, RODATA_REGION, STACK_REGION};
 use crate::maps::{MapDef, MapKind, Maps, SharedMaps};

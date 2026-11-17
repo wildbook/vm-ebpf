@@ -3,6 +3,7 @@
 
 use std::fmt::Debug;
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 use std::ops::ControlFlow;
 
 use opcode::{Class, MemMode, MemSize, OpCode};
@@ -93,6 +94,9 @@ pub enum Flow<C: Memory> {
     OutOfFuel,
     /// [`run`] reached a `pc` outside the code slice.
     BadPc,
+    /// A local call found all [`MAX_CALL_DEPTH`] frames in use, or `r10` below the
+    /// frame size.
+    StackOverflow,
 
     /// `callx`: call through the address in `dst_reg`, which the runtime decodes.
     CallIndirect(u64),
@@ -685,6 +689,78 @@ pub fn step<M: Memory>(ctx: &mut Context<M>, instr: Instruction) -> ControlFlow<
     }
 }
 
+/// Maximum nesting of BPF-to-BPF calls below the entry frame.
+pub const MAX_CALL_DEPTH: usize = 8;
+
+/// The BPF-to-BPF calls in progress, which [`run`] pushes and pops, and the slot
+/// where it records where it stopped.
+// `repr(C)` keeps the scalars ahead of the frames, so every handler reaches them
+// with a one-byte displacement.
+#[repr(C)]
+pub struct CallStack {
+    depth: usize,
+    /// Bytes r10 moves down per nested call.
+    frame_size: u64,
+    stop: Stop,
+
+    /// `frames[..depth]` are initialised.
+    frames: [MaybeUninit<Frame>; MAX_CALL_DEPTH],
+}
+
+/// Caller state saved across a BPF-to-BPF call.
+struct Frame {
+    /// r6-r9 (callee-saved) and r10 (frame pointer).
+    regs: [u64; 5],
+    /// The pc of the `call`.
+    call_pc: u64,
+}
+
+impl CallStack {
+    /// An empty call stack giving each callee `frame_size` bytes below its caller's r10.
+    pub fn new(frame_size: u64) -> Self {
+        Self {
+            depth: 0,
+            frame_size,
+            stop: Stop { pc: 0, fuel: 0 },
+            frames: [const { MaybeUninit::uninit() }; MAX_CALL_DEPTH],
+        }
+    }
+
+    /// Save the caller's state for the call at `call_pc` and give the callee its stack
+    /// frame. Returns false, changing nothing, on a [`Flow::StackOverflow`].
+    #[inline(always)]
+    #[must_use]
+    pub fn push(&mut self, regs: &mut [u64; 16], call_pc: u64) -> bool {
+        let Some(frame) = self.frames.get_mut(self.depth) else {
+            return false;
+        };
+        let Some(callee_fp) = regs[10].checked_sub(self.frame_size) else {
+            return false;
+        };
+        frame.write(Frame {
+            regs: [regs[6], regs[7], regs[8], regs[9], regs[10]],
+            call_pc,
+        });
+        self.depth += 1;
+        regs[10] = callee_fp;
+        true
+    }
+
+    /// Restore the caller's state and return the pc of its `call`, or `None` in the
+    /// entry frame.
+    #[inline(always)]
+    fn pop(&mut self, regs: &mut [u64; 16]) -> Option<u64> {
+        // depth 0 wraps and fails the bounds check
+        let depth = self.depth.wrapping_sub(1);
+        let frame = self.frames.get(depth)?;
+        // SAFETY: `depth` is below `self.depth`, and `push` wrote every frame up to it
+        let frame = unsafe { frame.assume_init_ref() };
+        regs[6..=10].copy_from_slice(&frame.regs);
+        self.depth = depth;
+        Some(frame.call_pc)
+    }
+}
+
 /// Where [`run`] stopped, written once when execution leaves the handler chain.
 struct Stop {
     pc: u64,
@@ -706,7 +782,7 @@ impl Stop {
 /// `preserve_none` passes all arguments in registers (the Windows x64 C convention
 /// has four) and saves no registers, so a tail call between handlers is a jump.
 type Handler<M> =
-    extern "rust-preserve-none" fn(&mut Context<M>, &[Instruction], Instruction, u64, u64, &mut Stop) -> Flow<M>;
+    extern "rust-preserve-none" fn(&mut Context<M>, &[Instruction], Instruction, u64, u64, &mut CallStack) -> Flow<M>;
 
 /// The handler of every opcode byte, each running [`step`] with its opcode as a
 /// constant, so the class, operation, source, mode and size matches fold away.
@@ -753,30 +829,43 @@ extern "rust-preserve-none" fn handler<M: Memory, const OP: u8>(
     insn: Instruction,
     mut pc: u64,
     mut fuel: u64,
-    stop: &mut Stop,
+    calls: &mut CallStack,
 ) -> Flow<M> {
+    // Only jump-class opcodes jump, call or exit. Without the guards, a handler whose
+    // `step` returns from an outlined call (atomics) would test for those flows too.
+    let jumps = matches!(OpCode(OP).class(), Class::Jmp32 | Class::Jmp64);
     match step(ctx, Instruction(insn.0 & !0xFF | OP as u64)) {
         ControlFlow::Break(Flow::Next) => {}
-        ControlFlow::Break(Flow::Jump(offset)) => pc = pc.wrapping_add_signed(offset),
+        ControlFlow::Break(Flow::Jump(offset)) if jumps => pc = pc.wrapping_add_signed(offset),
+        ControlFlow::Break(Flow::Call(offset)) if jumps => {
+            if !calls.push(&mut ctx.regs, pc) {
+                return calls.stop.at(pc, fuel, Flow::StackOverflow);
+            }
+            pc = pc.wrapping_add_signed(offset);
+        }
+        ControlFlow::Break(Flow::Exit) if jumps => match calls.pop(&mut ctx.regs) {
+            Some(call_pc) => pc = call_pc,
+            None => return calls.stop.at(pc, fuel, Flow::Exit),
+        },
         ControlFlow::Continue(first) => {
             pc += 1;
             let Some(&second) = code.get(pc as usize) else {
-                return stop.at(pc, fuel, Flow::BadPc);
+                return calls.stop.at(pc, fuel, Flow::BadPc);
             };
             fuel = fuel.saturating_sub(1);
             match step_ld64(ctx, first, second) {
                 Flow::Next => {}
-                flow => return stop.at(pc, fuel, flow),
+                flow => return calls.stop.at(pc, fuel, flow),
             }
         }
-        ControlFlow::Break(flow) => return stop.at(pc, fuel, flow),
+        ControlFlow::Break(flow) => return calls.stop.at(pc, fuel, flow),
     }
 
     // a negative jump target wraps to a huge pc and fails the fetch
     let pc = pc.wrapping_add(1);
     match fetch(code, pc, fuel) {
-        Ok((next, insn)) => become next(ctx, code, insn, pc, fuel - 1, stop),
-        Err(flow) => stop.at(pc, fuel, flow),
+        Ok((next, insn)) => become next(ctx, code, insn, pc, fuel - 1, calls),
+        Err(flow) => calls.stop.at(pc, fuel, flow),
     }
 }
 
@@ -816,19 +905,27 @@ pub fn step_ld64<M: Memory>(ctx: &mut Context<M>, instr: Instruction, second: In
 
 /// Execute from `*pc` until an instruction the caller must handle.
 ///
-/// Plain ALU, memory and jump instructions stay inside the handler chain, so each one
-/// costs a single dispatch. Execution returns calls (local, helper and indirect),
-/// indirect jumps, [`Flow::Exit`] and faults with `*pc` at the instruction that
-/// produced them, and [`Flow::OutOfFuel`] or [`Flow::BadPc`] with `*pc` at the
-/// instruction that could not run. Each executed instruction (both slots of
-/// LD_IMM64) consumes one unit of `fuel`.
+/// ALU, memory and jump instructions, local calls and their returns stay inside the
+/// handler chain, so each one costs a single dispatch. `calls` holds the frames of
+/// the local calls in progress and keeps them from one `run` to the next.
+/// Execution returns helper and indirect calls, indirect jumps, [`Flow::Exit`] from
+/// the entry frame and faults with `*pc` at the instruction that produced them, and
+/// [`Flow::OutOfFuel`] or [`Flow::BadPc`] with `*pc` at the instruction that could
+/// not run. Each executed instruction (both slots of LD_IMM64) consumes one unit of
+/// `fuel`.
 #[inline]
-pub fn run<M: Memory>(ctx: &mut Context<M>, code: &[Instruction], pc: &mut u64, fuel: &mut u64) -> Flow<M> {
-    let mut stop = Stop { pc: *pc, fuel: *fuel };
-    let flow = match fetch(code, *pc, *fuel) {
-        Ok((first, insn)) => first(ctx, code, insn, *pc, *fuel - 1, &mut stop),
-        Err(flow) => flow,
+pub fn run<M: Memory>(
+    ctx: &mut Context<M>,
+    code: &[Instruction],
+    pc: &mut u64,
+    fuel: &mut u64,
+    calls: &mut CallStack,
+) -> Flow<M> {
+    let (first, insn) = match fetch(code, *pc, *fuel) {
+        Ok(next) => next,
+        Err(flow) => return flow,
     };
-    (*pc, *fuel) = (stop.pc, stop.fuel);
+    let flow = first(ctx, code, insn, *pc, *fuel - 1, calls);
+    (*pc, *fuel) = (calls.stop.pc, calls.stop.fuel);
     flow
 }

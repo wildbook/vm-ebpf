@@ -5,7 +5,7 @@
 
 use std::fmt::Debug;
 
-use rvm_core::{run, Context, Flow, Instruction, Memory};
+use rvm_core::{run, CallStack, Context, Flow, Instruction, Memory};
 
 use crate::error::{ExecError, HelperError, Result};
 use crate::helper::{HelperArgs, HelperContext, HelperRegistry};
@@ -13,23 +13,12 @@ use crate::layout::CODE_REGION;
 use crate::maps::Maps;
 use crate::memory::{region_base, VmMemory};
 
-/// Maximum nesting of BPF-to-BPF calls below the entry frame.
-pub const MAX_CALL_DEPTH: usize = 8;
-
 /// Default stack bytes reserved per call frame (eBPF's `MAX_BPF_STACK`).
 pub const DEFAULT_FRAME_SIZE: u64 = 512;
 
 /// Helper ID of the call the linker plants for a CO-RE relocation the host can't
 /// resolve (`btf::CORE_POISON_HELPER`).
 pub const CORE_POISON_HELPER: u32 = 0xbad2310;
-
-/// Caller state saved across a BPF-to-BPF call.
-#[derive(Clone, Copy, Default)]
-struct Frame {
-    /// r6-r9 (callee-saved) and r10 (frame pointer).
-    regs: [u64; 5],
-    return_pc: u64,
-}
 
 /// Executor for eBPF programs.
 ///
@@ -93,11 +82,7 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
         }
         ctx.regs[10] = self.stack_top;
 
-        let mut stack = CallStack {
-            frames: [Frame::default(); MAX_CALL_DEPTH],
-            depth: 0,
-            frame_size: self.frame_size,
-        };
+        let mut calls = CallStack::new(self.frame_size);
         let mut pc = pc;
         let limit = match self.instruction_limit {
             0 => u64::MAX,
@@ -106,18 +91,9 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
         let mut fuel = limit;
 
         loop {
-            pc = match run(&mut ctx, self.code, &mut pc, &mut fuel) {
-                Flow::Call(offset) => {
-                    stack.push(&mut ctx.regs, pc + 1)?;
-                    pc.wrapping_add_signed(offset + 1)
-                }
-                Flow::Exit if stack.depth == 0 => return Ok(ctx.regs[0]),
-                Flow::Exit => {
-                    stack.depth -= 1;
-                    let frame = &stack.frames[stack.depth];
-                    ctx.regs[6..=10].copy_from_slice(&frame.regs);
-                    frame.return_pc
-                }
+            pc = match run(&mut ctx, self.code, &mut pc, &mut fuel, &mut calls) {
+                Flow::Exit => return Ok(ctx.regs[0]),
+                Flow::StackOverflow => return Err(ExecError::StackOverflow.into()),
                 // Raw bytecode path: look the helper ID up. Linked programs only use slots,
                 // except for calls the linker planted for unresolved CO-RE relocations.
                 Flow::CallHelper(CORE_POISON_HELPER) => {
@@ -141,45 +117,18 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
                 Flow::Missing => return Err(ExecError::Unimplemented.into()),
                 Flow::CallIndirect(target) => {
                     let maps = self.maps.as_deref_mut();
-                    call_indirect(target, pc, self.code, self.helpers, &mut ctx, maps, &mut stack)?
+                    call_indirect(target, pc, self.code, self.helpers, &mut ctx, maps, &mut calls)?
                 }
                 Flow::JumpIndirect(target) => jump_indirect(target, pc, self.code)?,
                 // `run` handles these internally
-                Flow::Next | Flow::Jump(_) => unreachable!(),
+                Flow::Next | Flow::Jump(_) | Flow::Call(_) => unreachable!(),
             };
         }
     }
 }
 
-/// Caller frames of the BPF-to-BPF calls in progress.
-struct CallStack {
-    frames: [Frame; MAX_CALL_DEPTH],
-    depth: usize,
-    /// Bytes r10 moves down per nested call.
-    frame_size: u64,
-}
-
-impl CallStack {
-    /// Save the caller's state and give the callee its stack frame.
-    #[inline(always)]
-    fn push(&mut self, regs: &mut [u64; 16], return_pc: u64) -> Result<()> {
-        if self.depth == MAX_CALL_DEPTH {
-            return Err(ExecError::StackOverflow.into());
-        }
-        let callee_fp = regs[10].checked_sub(self.frame_size).ok_or(ExecError::StackOverflow)?;
-        self.frames[self.depth] = Frame {
-            regs: [regs[6], regs[7], regs[8], regs[9], regs[10]],
-            return_pc,
-        };
-        self.depth += 1;
-        regs[10] = callee_fp;
-        Ok(())
-    }
-}
-
 /// `callx` at `pc`: enter the function at code address `target`, or call the helper
-/// whose ID is `target`. Returns the next pc. Kept out of line so the call and exit
-/// paths in [`Executor::call`] compile as they would without it.
+/// whose ID is `target`. Returns the next pc.
 #[cold]
 #[inline(never)]
 fn call_indirect<M: Memory<Err: Debug> + 'static>(
@@ -189,10 +138,12 @@ fn call_indirect<M: Memory<Err: Debug> + 'static>(
     helpers: &HelperRegistry<M>,
     ctx: &mut Context<&mut M>,
     maps: Option<&mut Maps>,
-    stack: &mut CallStack,
+    calls: &mut CallStack,
 ) -> Result<u64> {
     if let Some(callee) = code_index(target, code) {
-        stack.push(&mut ctx.regs, pc + 1)?;
+        if !calls.push(&mut ctx.regs, pc) {
+            return Err(ExecError::StackOverflow.into());
+        }
         return Ok(callee);
     }
 
