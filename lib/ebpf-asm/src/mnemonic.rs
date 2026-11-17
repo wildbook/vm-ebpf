@@ -65,9 +65,14 @@ mnemonics! {
     Stxdw = "stxdw", Stxw = "stxw", Stxh = "stxh", Stxb = "stxb",
     Stdw = "stdw", Stw = "stw", Sth = "sth", Stb = "stb",
 
+    // Legacy packet loads: absolute offset in imm, or src_reg plus imm
+    Ldabsw = "ldabsw", Ldabsh = "ldabsh", Ldabsb = "ldabsb",
+    Ldindw = "ldindw", Ldindh = "ldindh", Ldindb = "ldindb",
+
     // Special instructions
-    Lddw = "lddw", Call = "call", CallLocal = "call", CallKfunc = "call kfunc", Callx = "callx", Gotox = "gotox",
-    Exit = "exit",
+    Lddw = "lddw", LdPseudo = "ld_pseudo",
+    Call = "call", CallLocal = "call", CallKfunc = "call kfunc", Callx = "callx", Gotox = "gotox",
+    Exit = "exit", MayGoto = "may_goto", AddrSpaceCast = "addr_space_cast",
 
     // Atomic operations
     AtomicAdd64 = "lock add64", AtomicAdd32 = "lock add32",
@@ -114,13 +119,14 @@ impl Mnemonic {
                 | Mnemonic::Jsge32
                 | Mnemonic::Jslt32
                 | Mnemonic::Jsle32
+                | Mnemonic::MayGoto
         )
     }
 
-    /// Check if this is a conditional jump.
+    /// Check if this is a jump that compares `dst` with a register or immediate.
     #[inline]
     pub const fn is_conditional_jump(self) -> bool {
-        self.is_jump() && !matches!(self, Mnemonic::Ja | Mnemonic::Ja32)
+        self.is_jump() && !matches!(self, Mnemonic::Ja | Mnemonic::Ja32 | Mnemonic::MayGoto)
     }
 
     /// Check if this is a byte swap operation.
@@ -143,7 +149,7 @@ impl Mnemonic {
     /// Check if this is a wide instruction (16 bytes, 2 slots).
     #[inline]
     pub const fn is_wide(self) -> bool {
-        matches!(self, Mnemonic::Lddw)
+        matches!(self, Mnemonic::Lddw | Mnemonic::LdPseudo)
     }
 }
 

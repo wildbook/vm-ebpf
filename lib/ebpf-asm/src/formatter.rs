@@ -55,8 +55,18 @@ impl DefaultFormatter {
             | Mnemonic::CallLocal
             | Mnemonic::CallKfunc
             | Mnemonic::Callx
-            | Mnemonic::Gotox => {
+            | Mnemonic::Gotox
+            | Mnemonic::MayGoto => {
                 write!(out, " {}", insn.dst).unwrap();
+            }
+            Mnemonic::LdPseudo => {
+                let kind = (insn.raw >> 12) & 0xF;
+                write!(out, " {}, {kind:#x}, {}", insn.dst, insn.src).unwrap();
+            }
+            Mnemonic::AddrSpaceCast => {
+                let imm = (insn.raw >> 32) as u32;
+                let (dst_as, src_as) = (imm >> 16, imm & 0xFFFF);
+                write!(out, " {}, {}, {dst_as:#x}, {src_as:#x}", insn.dst, insn.src).unwrap();
             }
             _ if insn.mnemonic.is_conditional_jump() => {
                 // Conditional jumps carry their offset in the raw instruction, not in

@@ -170,6 +170,7 @@ pub mod jmp {
     pub const JLE: u8 = 0xB0;
     pub const JSLT: u8 = 0xC0;
     pub const JSLE: u8 = 0xD0;
+    pub const JCOND: u8 = 0xE0;
 }
 
 /// Memory size codes (bits 3-4 of opcode).
@@ -183,7 +184,6 @@ pub mod size {
 
 /// Memory addressing mode codes (bits 5-7 of opcode).
 #[allow(missing_docs)]
-#[allow(dead_code)] // ABS/IND document the legacy packet-access modes; the decoder treats them as Unknown
 pub mod mode {
     pub const IMM: u8 = 0x00;
     pub const ABS: u8 = 0x20;

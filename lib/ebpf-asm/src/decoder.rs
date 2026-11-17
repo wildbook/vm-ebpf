@@ -1,11 +1,19 @@
 //! eBPF bytecode decoder.
 //!
 //! Decodes raw eBPF bytecode into structured `Instruction` representations.
+//!
+//! Acceptance follows llvm-objdump: a field the instruction defines must hold a valid
+//! value, a field it does not define is ignored, and anything else decodes as
+//! `Mnemonic::Unknown` with no operands. Register numbers above 10 are invalid, so
+//! llvm's internal `r11` decodes as `Unknown` too.
 
-use crate::instruction::{alu, atomic, class, jmp, mode, size, Instruction, RawInstruction, SRC_IMM, SRC_REG};
+use crate::instruction::{alu, atomic, class, jmp, mode, size, Instruction, RawInstruction, SRC_REG};
 use crate::mnemonic::Mnemonic;
 use crate::operand::Operand;
 use crate::register::Register;
+
+/// Mnemonic and operands of a valid instruction; `None` for an invalid encoding.
+type Decoded = Option<(Mnemonic, Operand, Operand)>;
 
 /// eBPF bytecode decoder.
 ///
@@ -38,59 +46,28 @@ impl<'a> Iterator for Decoder<'a> {
     type Item = Instruction;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.offset + 8 > self.bytes.len() {
-            return None;
-        }
-
         let start_offset = self.offset;
-
-        // Read first 8 bytes
-        let raw_bytes: [u8; 8] = self.bytes[self.offset..][..8].try_into().unwrap();
-        let raw = RawInstruction::from_le_bytes(raw_bytes);
+        let raw = self.slot(start_offset)?;
         self.offset += 8;
 
-        let opcode = raw.opcode();
-        let inst_class = opcode & 0x07;
-        let dst_reg = Register::from_u8(raw.dst()).unwrap_or(Register::R0);
-        let src_reg = Register::from_u8(raw.src()).unwrap_or(Register::R0);
-        let offset = raw.offset();
-        let imm = raw.imm();
-
-        let (mnemonic, dst, src, size, raw2) = match inst_class {
-            class::ALU64 => decode_alu(opcode, dst_reg, src_reg, offset, imm, true),
-            class::ALU32 => decode_alu(opcode, dst_reg, src_reg, offset, imm, false),
-            class::JMP64 => decode_jmp(opcode, dst_reg, src_reg, offset, imm, true),
-            class::JMP32 => decode_jmp(opcode, dst_reg, src_reg, offset, imm, false),
-            class::LDX => decode_ldx(opcode, dst_reg, src_reg, offset),
-            class::STX => decode_stx(opcode, dst_reg, src_reg, offset, imm),
-            class::ST => decode_st(opcode, dst_reg, offset, imm),
-            class::LD => {
-                // LD class includes LDDW (64-bit immediate load)
-                let mem_mode = opcode & 0xE0;
-                let mem_size = opcode & 0x18;
-
-                if mem_mode == mode::IMM && mem_size == size::DW {
-                    // LDDW - read second instruction
-                    if self.offset + 8 > self.bytes.len() {
-                        (Mnemonic::Unknown, Operand::None, Operand::None, 8, None)
-                    } else {
-                        let raw2_bytes: [u8; 8] = self.bytes[self.offset..][..8].try_into().unwrap();
-                        let raw2 = RawInstruction::from_le_bytes(raw2_bytes);
-                        self.offset += 8;
-
-                        let imm_lo = imm as u32 as u64;
-                        let imm_hi = raw2.imm() as u32 as u64;
-                        let imm64 = (imm_hi << 32) | imm_lo;
-
-                        (Mnemonic::Lddw, Operand::Reg(dst_reg), Operand::Imm64(imm64 as i64), 16, Some(raw2.value()))
-                    }
-                } else {
-                    // Other LD modes (ABS, IND) - legacy packet access
-                    (Mnemonic::Unknown, Operand::None, Operand::None, 8, None)
+        let mut size = 8;
+        let mut raw2 = None;
+        let decoded = if raw.opcode() == LDDW {
+            // the second slot only contributes its imm; an invalid first slot leaves it to
+            // decode on its own
+            match (decode_lddw_head(raw), self.slot(self.offset)) {
+                (Some(dst), Some(next)) => {
+                    self.offset += 8;
+                    size = 16;
+                    raw2 = Some(next.value());
+                    Some(decode_lddw(raw, dst, next))
                 }
+                _ => None,
             }
-            _ => (Mnemonic::Unknown, Operand::None, Operand::None, 8, None),
+        } else {
+            decode(raw)
         };
+        let (mnemonic, dst, src) = decoded.unwrap_or((Mnemonic::Unknown, Operand::None, Operand::None));
 
         Some(Instruction {
             mnemonic,
@@ -98,289 +75,347 @@ impl<'a> Iterator for Decoder<'a> {
             src,
             offset: start_offset as u64,
             size,
-            opcode,
+            opcode: raw.opcode(),
             raw: raw.value(),
             raw2,
         })
     }
 }
 
-/// Decode an ALU instruction.
-fn decode_alu(
-    opcode: u8,
-    dst: Register,
-    src_reg: Register,
-    offset: i16,
-    imm: i32,
-    is_64: bool,
-) -> (Mnemonic, Operand, Operand, u8, Option<u64>) {
-    let alu_op = opcode & 0xF0;
-    let src_type = opcode & 0x08;
-
-    if alu_op == alu::END {
-        // ALU64 is the unconditional swap; ALU32 converts to the endianness in the source bit
-        let mnemonic = match (is_64, src_type == SRC_IMM, imm) {
-            (true, true, 16) => Mnemonic::Bswap16,
-            (true, true, 32) => Mnemonic::Bswap32,
-            (true, true, 64) => Mnemonic::Bswap64,
-            (false, true, 16) => Mnemonic::Le16,
-            (false, true, 32) => Mnemonic::Le32,
-            (false, true, 64) => Mnemonic::Le64,
-            (false, false, 16) => Mnemonic::Be16,
-            (false, false, 32) => Mnemonic::Be32,
-            (false, false, 64) => Mnemonic::Be64,
-            _ => Mnemonic::Unknown,
-        };
-        return (mnemonic, Operand::Reg(dst), Operand::None, 8, None);
-    }
-
-    let mnemonic = match (alu_op, is_64, offset) {
-        (alu::ADD, true, _) => Mnemonic::Add64,
-        (alu::ADD, false, _) => Mnemonic::Add32,
-        (alu::SUB, true, _) => Mnemonic::Sub64,
-        (alu::SUB, false, _) => Mnemonic::Sub32,
-        (alu::MUL, true, _) => Mnemonic::Mul64,
-        (alu::MUL, false, _) => Mnemonic::Mul32,
-        (alu::DIV, true, 0) => Mnemonic::Div64,
-        (alu::DIV, false, 0) => Mnemonic::Div32,
-        (alu::DIV, true, 1) => Mnemonic::SDiv64,
-        (alu::DIV, false, 1) => Mnemonic::SDiv32,
-        (alu::OR, true, _) => Mnemonic::Or64,
-        (alu::OR, false, _) => Mnemonic::Or32,
-        (alu::AND, true, _) => Mnemonic::And64,
-        (alu::AND, false, _) => Mnemonic::And32,
-        (alu::LSH, true, _) => Mnemonic::Lsh64,
-        (alu::LSH, false, _) => Mnemonic::Lsh32,
-        (alu::RSH, true, _) => Mnemonic::Rsh64,
-        (alu::RSH, false, _) => Mnemonic::Rsh32,
-        (alu::NEG, true, _) => Mnemonic::Neg64,
-        (alu::NEG, false, _) => Mnemonic::Neg32,
-        (alu::MOD, true, 0) => Mnemonic::Mod64,
-        (alu::MOD, false, 0) => Mnemonic::Mod32,
-        (alu::MOD, true, 1) => Mnemonic::SMod64,
-        (alu::MOD, false, 1) => Mnemonic::SMod32,
-        (alu::XOR, true, _) => Mnemonic::Xor64,
-        (alu::XOR, false, _) => Mnemonic::Xor32,
-        (alu::MOV, true, 0) => Mnemonic::Mov64,
-        (alu::MOV, false, 0) => Mnemonic::Mov32,
-        // `off` is the source width of a sign-extending move
-        (alu::MOV, false, 8) => Mnemonic::Movsx832,
-        (alu::MOV, false, 16) => Mnemonic::Movsx1632,
-        (alu::MOV, true, 8) => Mnemonic::Movsx864,
-        (alu::MOV, true, 16) => Mnemonic::Movsx1664,
-        (alu::MOV, true, 32) => Mnemonic::Movsx3264,
-        (alu::ARSH, true, _) => Mnemonic::Arsh64,
-        (alu::ARSH, false, _) => Mnemonic::Arsh32,
-        _ => Mnemonic::Unknown,
-    };
-
-    let src = if src_type == SRC_REG {
-        Operand::Reg(src_reg)
-    } else {
-        Operand::Imm(imm)
-    };
-
-    // NEG only has dst
-    if alu_op == alu::NEG {
-        (mnemonic, Operand::Reg(dst), Operand::None, 8, None)
-    } else {
-        (mnemonic, Operand::Reg(dst), src, 8, None)
+impl Decoder<'_> {
+    fn slot(&self, at: usize) -> Option<RawInstruction> {
+        let bytes = self.bytes.get(at..)?.get(..8)?;
+        Some(RawInstruction::from_le_bytes(bytes.try_into().unwrap()))
     }
 }
 
-/// Decode a JMP instruction.
-fn decode_jmp(
-    opcode: u8,
-    dst: Register,
-    src_reg: Register,
-    offset: i16,
-    imm: i32,
-    is_64: bool,
-) -> (Mnemonic, Operand, Operand, u8, Option<u64>) {
-    let jmp_op = opcode & 0xF0;
-    let src_type = opcode & 0x08;
-
-    // Special instructions: CALL, EXIT, JA
-    match jmp_op {
-        jmp::EXIT => {
-            return (Mnemonic::Exit, Operand::None, Operand::None, 8, None);
-        }
-        jmp::CALL => {
-            return match (src_type == SRC_REG, src_reg.number()) {
-                // `callx`: the target is in dst_reg
-                (true, _) => (Mnemonic::Callx, Operand::Reg(dst), Operand::None, 8, None),
-                (false, 1) => (Mnemonic::CallLocal, Operand::Imm(imm), Operand::None, 8, None),
-                (false, 2) => (Mnemonic::CallKfunc, Operand::Imm(imm), Operand::None, 8, None),
-                _ => (Mnemonic::Call, Operand::Imm(imm), Operand::None, 8, None),
-            };
-        }
-        // `gotox`: the target is in dst_reg
-        jmp::JA if is_64 && src_type == SRC_REG => {
-            return (Mnemonic::Gotox, Operand::Reg(dst), Operand::None, 8, None);
-        }
-        jmp::JA => {
-            // JMP64 `ja` jumps by `off`, JMP32 `ja32` (`gotol`) by the 32-bit `imm`
-            let (mnemonic, target) = match is_64 {
-                true => (Mnemonic::Ja, i32::from(offset)),
-                false => (Mnemonic::Ja32, imm),
-            };
-            return (mnemonic, Operand::Off(target), Operand::None, 8, None);
-        }
-        _ => {}
-    }
-
-    let mnemonic = match (jmp_op, is_64) {
-        (jmp::JEQ, true) => Mnemonic::Jeq,
-        (jmp::JEQ, false) => Mnemonic::Jeq32,
-        (jmp::JGT, true) => Mnemonic::Jgt,
-        (jmp::JGT, false) => Mnemonic::Jgt32,
-        (jmp::JGE, true) => Mnemonic::Jge,
-        (jmp::JGE, false) => Mnemonic::Jge32,
-        (jmp::JLT, true) => Mnemonic::Jlt,
-        (jmp::JLT, false) => Mnemonic::Jlt32,
-        (jmp::JLE, true) => Mnemonic::Jle,
-        (jmp::JLE, false) => Mnemonic::Jle32,
-        (jmp::JSET, true) => Mnemonic::Jset,
-        (jmp::JSET, false) => Mnemonic::Jset32,
-        (jmp::JNE, true) => Mnemonic::Jne,
-        (jmp::JNE, false) => Mnemonic::Jne32,
-        (jmp::JSGT, true) => Mnemonic::Jsgt,
-        (jmp::JSGT, false) => Mnemonic::Jsgt32,
-        (jmp::JSGE, true) => Mnemonic::Jsge,
-        (jmp::JSGE, false) => Mnemonic::Jsge32,
-        (jmp::JSLT, true) => Mnemonic::Jslt,
-        (jmp::JSLT, false) => Mnemonic::Jslt32,
-        (jmp::JSLE, true) => Mnemonic::Jsle,
-        (jmp::JSLE, false) => Mnemonic::Jsle32,
-        _ => Mnemonic::Unknown,
-    };
-
-    let src = if src_type == SRC_REG {
-        Operand::Reg(src_reg)
-    } else {
-        Operand::Imm(imm)
-    };
-
-    // Conditional jumps: dst, src, offset
-    // We encode offset in a special way for the display
-    (mnemonic, Operand::Reg(dst), src, 8, None)
-}
-
-/// Decode a LDX (load from memory) instruction.
-fn decode_ldx(opcode: u8, dst: Register, src: Register, offset: i16) -> (Mnemonic, Operand, Operand, u8, Option<u64>) {
-    let mem_size = opcode & 0x18;
-    let mem_mode = opcode & 0xE0;
-
-    let mnemonic = match (mem_mode, mem_size) {
-        (mode::MEM, size::DW) => Mnemonic::Ldxdw,
-        (mode::MEM, size::W) => Mnemonic::Ldxw,
-        (mode::MEM, size::H) => Mnemonic::Ldxh,
-        (mode::MEM, size::B) => Mnemonic::Ldxb,
-        (mode::MEMSX, size::DW) => Mnemonic::Unknown, // no 64-bit sign-extending load in the ISA
-        (mode::MEMSX, size::W) => Mnemonic::Ldxsw,
-        (mode::MEMSX, size::H) => Mnemonic::Ldxsh,
-        (mode::MEMSX, size::B) => Mnemonic::Ldxsb,
-        _ => Mnemonic::Unknown,
-    };
-
-    (mnemonic, Operand::Reg(dst), Operand::Mem { base: src, offset }, 8, None)
-}
-
-/// Decode a STX (store to memory from register) instruction.
-fn decode_stx(
-    opcode: u8,
-    dst: Register,
-    src: Register,
-    offset: i16,
-    imm: i32,
-) -> (Mnemonic, Operand, Operand, u8, Option<u64>) {
-    let mem_size = opcode & 0x18;
-    let mem_mode = opcode & 0xE0;
-
-    // Check for atomic operations
-    if mem_mode == mode::ATOMIC {
-        return decode_atomic(mem_size, dst, src, offset, imm);
-    }
-
-    let mnemonic = match mem_size {
-        size::DW => Mnemonic::Stxdw,
-        size::W => Mnemonic::Stxw,
-        size::H => Mnemonic::Stxh,
-        size::B => Mnemonic::Stxb,
-        _ => Mnemonic::Unknown,
-    };
-
-    (mnemonic, Operand::Mem { base: dst, offset }, Operand::Reg(src), 8, None)
-}
-
-/// Decode an atomic operation.
-fn decode_atomic(
-    mem_size: u8,
-    dst: Register,
-    src: Register,
-    offset: i16,
-    imm: i32,
-) -> (Mnemonic, Operand, Operand, u8, Option<u64>) {
-    let is_64 = mem_size == size::DW;
-    let is_fetch = (imm & atomic::FETCH) != 0 && imm != atomic::XCHG && imm != atomic::CMPXCHG;
-
-    // Mask out the fetch bit for comparison (except for XCHG/CMPXCHG which include it)
-    let op = if imm == atomic::XCHG || imm == atomic::CMPXCHG {
-        imm
-    } else {
-        imm & !atomic::FETCH
-    };
-
-    let mnemonic = match (op, is_64, is_fetch) {
-        (atomic::ADD, true, false) => Mnemonic::AtomicAdd64,
-        (atomic::ADD, false, false) => Mnemonic::AtomicAdd32,
-        (atomic::ADD, true, true) => Mnemonic::AtomicFetchAdd64,
-        (atomic::ADD, false, true) => Mnemonic::AtomicFetchAdd32,
-        (atomic::OR, true, false) => Mnemonic::AtomicOr64,
-        (atomic::OR, false, false) => Mnemonic::AtomicOr32,
-        (atomic::OR, true, true) => Mnemonic::AtomicFetchOr64,
-        (atomic::OR, false, true) => Mnemonic::AtomicFetchOr32,
-        (atomic::AND, true, false) => Mnemonic::AtomicAnd64,
-        (atomic::AND, false, false) => Mnemonic::AtomicAnd32,
-        (atomic::AND, true, true) => Mnemonic::AtomicFetchAnd64,
-        (atomic::AND, false, true) => Mnemonic::AtomicFetchAnd32,
-        (atomic::XOR, true, false) => Mnemonic::AtomicXor64,
-        (atomic::XOR, false, false) => Mnemonic::AtomicXor32,
-        (atomic::XOR, true, true) => Mnemonic::AtomicFetchXor64,
-        (atomic::XOR, false, true) => Mnemonic::AtomicFetchXor32,
-        (atomic::XCHG, true, _) => Mnemonic::AtomicXchg64,
-        (atomic::XCHG, false, _) => Mnemonic::AtomicXchg32,
-        (atomic::CMPXCHG, true, _) => Mnemonic::AtomicCmpxchg64,
-        (atomic::CMPXCHG, false, _) => Mnemonic::AtomicCmpxchg32,
-        _ => Mnemonic::Unknown,
-    };
-
-    (mnemonic, Operand::Mem { base: dst, offset }, Operand::Reg(src), 8, None)
-}
-
-/// Decode a ST (store immediate to memory) instruction.
-fn decode_st(opcode: u8, dst: Register, offset: i16, imm: i32) -> (Mnemonic, Operand, Operand, u8, Option<u64>) {
-    let mem_size = opcode & 0x18;
-
-    let mnemonic = match mem_size {
-        size::DW => Mnemonic::Stdw,
-        size::W => Mnemonic::Stw,
-        size::H => Mnemonic::Sth,
-        size::B => Mnemonic::Stb,
-        _ => Mnemonic::Unknown,
-    };
-
-    (mnemonic, Operand::Mem { base: dst, offset }, Operand::Imm(imm), 8, None)
-}
+const LDDW: u8 = class::LD | mode::IMM | size::DW;
 
 /// Decode all instructions from bytes.
 pub fn decode_all(bytes: &[u8]) -> Vec<Instruction> {
     Decoder::new(bytes).collect()
 }
 
+fn reg(number: u8) -> Option<Register> {
+    Register::from_u8(number)
+}
+
+/// `[base + off]` with the base register taken from the `dst` or `src` field.
+fn mem(base: u8, raw: RawInstruction) -> Option<Operand> {
+    let offset = raw.offset();
+    Some(Operand::Mem {
+        base: reg(base)?,
+        offset,
+    })
+}
+
+/// Decode a single-slot instruction.
+fn decode(raw: RawInstruction) -> Decoded {
+    match raw.opcode() & 0x07 {
+        class::ALU64 => decode_alu(raw, true),
+        class::ALU32 => decode_alu(raw, false),
+        class::JMP64 => decode_jmp(raw, true),
+        class::JMP32 => decode_jmp(raw, false),
+        class::LDX => decode_ldx(raw),
+        class::STX => decode_stx(raw),
+        class::ST => decode_st(raw),
+        _ => decode_ld(raw),
+    }
+}
+
+/// Validate the first slot of a 64-bit immediate load and return its destination.
+fn decode_lddw_head(raw: RawInstruction) -> Option<Register> {
+    if raw.offset() != 0 {
+        return None;
+    }
+    reg(raw.dst())
+}
+
+/// Decode a 64-bit immediate load; a nonzero `src_reg` selects a pseudo kind (map fd,
+/// map value, BTF id, ...) whose meaning the loader resolves.
+fn decode_lddw(raw: RawInstruction, dst: Register, next: RawInstruction) -> (Mnemonic, Operand, Operand) {
+    let imm64 = (u64::from(next.imm() as u32) << 32) | u64::from(raw.imm() as u32);
+    let mnemonic = match raw.src() {
+        0 => Mnemonic::Lddw,
+        _ => Mnemonic::LdPseudo,
+    };
+    (mnemonic, Operand::Reg(dst), Operand::Imm64(imm64 as i64))
+}
+
+/// Decode the legacy packet loads; LD_IMM64 is handled by the iterator.
+fn decode_ld(raw: RawInstruction) -> Decoded {
+    let opcode = raw.opcode();
+    let (abs, ind) = match opcode & 0x18 {
+        size::W => (Mnemonic::Ldabsw, Mnemonic::Ldindw),
+        size::H => (Mnemonic::Ldabsh, Mnemonic::Ldindh),
+        size::B => (Mnemonic::Ldabsb, Mnemonic::Ldindb),
+        _ => return None,
+    };
+    match opcode & 0xE0 {
+        mode::ABS => Some((abs, Operand::Imm(raw.imm()), Operand::None)),
+        mode::IND => Some((ind, Operand::Reg(reg(raw.src())?), Operand::Imm(raw.imm()))),
+        _ => None,
+    }
+}
+
+fn decode_alu(raw: RawInstruction, is_64: bool) -> Decoded {
+    let opcode = raw.opcode();
+    let op = opcode & 0xF0;
+    let is_reg = opcode & SRC_REG != 0;
+    let dst = Operand::Reg(reg(raw.dst())?);
+    let imm = raw.imm();
+
+    if op == alu::NEG {
+        let mnemonic = if is_64 { Mnemonic::Neg64 } else { Mnemonic::Neg32 };
+        return (!is_reg).then_some((mnemonic, dst, Operand::None));
+    }
+    if op == alu::END {
+        // ALU64 is the unconditional swap; ALU32 converts to the endianness in the source bit
+        let mnemonic = match (is_64, is_reg, imm) {
+            (true, false, 16) => Mnemonic::Bswap16,
+            (true, false, 32) => Mnemonic::Bswap32,
+            (true, false, 64) => Mnemonic::Bswap64,
+            (false, false, 16) => Mnemonic::Le16,
+            (false, false, 32) => Mnemonic::Le32,
+            (false, false, 64) => Mnemonic::Le64,
+            (false, true, 16) => Mnemonic::Be16,
+            (false, true, 32) => Mnemonic::Be32,
+            (false, true, 64) => Mnemonic::Be64,
+            _ => return None,
+        };
+        return Some((mnemonic, dst, Operand::None));
+    }
+
+    let pick = |m64, m32| if is_64 { m64 } else { m32 };
+    let mnemonic = match (op, raw.offset()) {
+        (alu::ADD, 0) => pick(Mnemonic::Add64, Mnemonic::Add32),
+        (alu::SUB, 0) => pick(Mnemonic::Sub64, Mnemonic::Sub32),
+        (alu::MUL, 0) => pick(Mnemonic::Mul64, Mnemonic::Mul32),
+        (alu::DIV, 0) => pick(Mnemonic::Div64, Mnemonic::Div32),
+        (alu::DIV, 1) => pick(Mnemonic::SDiv64, Mnemonic::SDiv32),
+        (alu::OR, 0) => pick(Mnemonic::Or64, Mnemonic::Or32),
+        (alu::AND, 0) => pick(Mnemonic::And64, Mnemonic::And32),
+        (alu::LSH, 0) => pick(Mnemonic::Lsh64, Mnemonic::Lsh32),
+        (alu::RSH, 0) => pick(Mnemonic::Rsh64, Mnemonic::Rsh32),
+        (alu::MOD, 0) => pick(Mnemonic::Mod64, Mnemonic::Mod32),
+        (alu::MOD, 1) => pick(Mnemonic::SMod64, Mnemonic::SMod32),
+        (alu::XOR, 0) => pick(Mnemonic::Xor64, Mnemonic::Xor32),
+        (alu::MOV, 0) => pick(Mnemonic::Mov64, Mnemonic::Mov32),
+        (alu::ARSH, 0) => pick(Mnemonic::Arsh64, Mnemonic::Arsh32),
+        // register-only moves: `off` is the source width of a sign-extending move, or 1
+        // for an address space cast whose two address spaces are packed into `imm`
+        (alu::MOV, 8) if is_reg => pick(Mnemonic::Movsx864, Mnemonic::Movsx832),
+        (alu::MOV, 16) if is_reg => pick(Mnemonic::Movsx1664, Mnemonic::Movsx1632),
+        (alu::MOV, 32) if is_reg && is_64 => Mnemonic::Movsx3264,
+        (alu::MOV, 1) if is_reg && is_64 => Mnemonic::AddrSpaceCast,
+        _ => return None,
+    };
+
+    let src = if is_reg {
+        Operand::Reg(reg(raw.src())?)
+    } else {
+        Operand::Imm(imm)
+    };
+    Some((mnemonic, dst, src))
+}
+
+fn decode_jmp(raw: RawInstruction, is_64: bool) -> Decoded {
+    let opcode = raw.opcode();
+    let op = opcode & 0xF0;
+    let is_reg = opcode & SRC_REG != 0;
+    let off = Operand::Off(raw.offset().into());
+
+    match (op, is_64, is_reg) {
+        // JMP64 `ja` jumps by `off`, JMP32 `ja32` (`gotol`) by the 32-bit `imm`
+        (jmp::JA, true, false) => Some((Mnemonic::Ja, off, Operand::None)),
+        (jmp::JA, false, false) => Some((Mnemonic::Ja32, Operand::Off(raw.imm()), Operand::None)),
+        (jmp::JA, true, true) => Some((Mnemonic::Gotox, Operand::Reg(reg(raw.dst())?), Operand::None)),
+        (jmp::CALL, true, false) => {
+            let mnemonic = match raw.src() {
+                1 => Mnemonic::CallLocal,
+                2 => Mnemonic::CallKfunc,
+                _ => Mnemonic::Call,
+            };
+            Some((mnemonic, Operand::Imm(raw.imm()), Operand::None))
+        }
+        (jmp::CALL, true, true) => Some((Mnemonic::Callx, Operand::Reg(reg(raw.dst())?), Operand::None)),
+        (jmp::EXIT, true, false) if raw.imm() == 0 => Some((Mnemonic::Exit, Operand::None, Operand::None)),
+        (jmp::JCOND, true, false) => Some((Mnemonic::MayGoto, off, Operand::None)),
+        (jmp::JA | jmp::CALL | jmp::EXIT | jmp::JCOND, _, _) => None,
+        _ => decode_cond_jmp(raw, is_64),
+    }
+}
+
+fn decode_cond_jmp(raw: RawInstruction, is_64: bool) -> Decoded {
+    let pick = |m64, m32| if is_64 { m64 } else { m32 };
+    let mnemonic = match raw.opcode() & 0xF0 {
+        jmp::JEQ => pick(Mnemonic::Jeq, Mnemonic::Jeq32),
+        jmp::JGT => pick(Mnemonic::Jgt, Mnemonic::Jgt32),
+        jmp::JGE => pick(Mnemonic::Jge, Mnemonic::Jge32),
+        jmp::JLT => pick(Mnemonic::Jlt, Mnemonic::Jlt32),
+        jmp::JLE => pick(Mnemonic::Jle, Mnemonic::Jle32),
+        jmp::JSET => pick(Mnemonic::Jset, Mnemonic::Jset32),
+        jmp::JNE => pick(Mnemonic::Jne, Mnemonic::Jne32),
+        jmp::JSGT => pick(Mnemonic::Jsgt, Mnemonic::Jsgt32),
+        jmp::JSGE => pick(Mnemonic::Jsge, Mnemonic::Jsge32),
+        jmp::JSLT => pick(Mnemonic::Jslt, Mnemonic::Jslt32),
+        jmp::JSLE => pick(Mnemonic::Jsle, Mnemonic::Jsle32),
+        _ => return None,
+    };
+
+    // the formatter reads the branch offset from the raw instruction
+    let src = if raw.opcode() & SRC_REG != 0 {
+        Operand::Reg(reg(raw.src())?)
+    } else {
+        Operand::Imm(raw.imm())
+    };
+    Some((mnemonic, Operand::Reg(reg(raw.dst())?), src))
+}
+
+fn decode_ldx(raw: RawInstruction) -> Decoded {
+    let mnemonic = match (raw.opcode() & 0xE0, raw.opcode() & 0x18) {
+        (mode::MEM, size::DW) => Mnemonic::Ldxdw,
+        (mode::MEM, size::W) => Mnemonic::Ldxw,
+        (mode::MEM, size::H) => Mnemonic::Ldxh,
+        (mode::MEM, size::B) => Mnemonic::Ldxb,
+        (mode::MEMSX, size::W) => Mnemonic::Ldxsw,
+        (mode::MEMSX, size::H) => Mnemonic::Ldxsh,
+        (mode::MEMSX, size::B) => Mnemonic::Ldxsb,
+        _ => return None,
+    };
+    Some((mnemonic, Operand::Reg(reg(raw.dst())?), mem(raw.src(), raw)?))
+}
+
+fn decode_stx(raw: RawInstruction) -> Decoded {
+    let mem_size = raw.opcode() & 0x18;
+    let mnemonic = match raw.opcode() & 0xE0 {
+        mode::ATOMIC => decode_atomic(mem_size, raw.imm())?,
+        mode::MEM => match mem_size {
+            size::DW => Mnemonic::Stxdw,
+            size::W => Mnemonic::Stxw,
+            size::H => Mnemonic::Stxh,
+            _ => Mnemonic::Stxb,
+        },
+        _ => return None,
+    };
+    Some((mnemonic, mem(raw.dst(), raw)?, Operand::Reg(reg(raw.src())?)))
+}
+
+/// Pick the atomic operation from `imm`: bits 4-7 hold the operation and bits 0-3 the
+/// fetch flag. As in llvm, the remaining bits are ignored, except that bits 4-8 equal to
+/// 0x10 or 0x11 select the unsupported load-acquire and store-release.
+fn decode_atomic(mem_size: u8, imm: i32) -> Option<Mnemonic> {
+    let pick = |m64, m32| match mem_size {
+        size::DW => Some(m64),
+        size::W => Some(m32),
+        _ => None,
+    };
+    let op = imm & 0xF0;
+    if imm & 0x0F == atomic::FETCH {
+        match op {
+            atomic::ADD => return pick(Mnemonic::AtomicFetchAdd64, Mnemonic::AtomicFetchAdd32),
+            atomic::OR => return pick(Mnemonic::AtomicFetchOr64, Mnemonic::AtomicFetchOr32),
+            atomic::AND => return pick(Mnemonic::AtomicFetchAnd64, Mnemonic::AtomicFetchAnd32),
+            atomic::XOR => return pick(Mnemonic::AtomicFetchXor64, Mnemonic::AtomicFetchXor32),
+            _ if op == atomic::XCHG & 0xF0 => return pick(Mnemonic::AtomicXchg64, Mnemonic::AtomicXchg32),
+            _ if op == atomic::CMPXCHG & 0xF0 => return pick(Mnemonic::AtomicCmpxchg64, Mnemonic::AtomicCmpxchg32),
+            _ => {}
+        }
+    }
+    if matches!((imm >> 4) & 0x1F, 0x10 | 0x11) {
+        return None;
+    }
+    match op {
+        atomic::ADD => pick(Mnemonic::AtomicAdd64, Mnemonic::AtomicAdd32),
+        atomic::OR => pick(Mnemonic::AtomicOr64, Mnemonic::AtomicOr32),
+        atomic::AND => pick(Mnemonic::AtomicAnd64, Mnemonic::AtomicAnd32),
+        atomic::XOR => pick(Mnemonic::AtomicXor64, Mnemonic::AtomicXor32),
+        _ => None,
+    }
+}
+
+fn decode_st(raw: RawInstruction) -> Decoded {
+    if raw.opcode() & 0xE0 != mode::MEM {
+        return None;
+    }
+    let mnemonic = match raw.opcode() & 0x18 {
+        size::DW => Mnemonic::Stdw,
+        size::W => Mnemonic::Stw,
+        size::H => Mnemonic::Sth,
+        _ => Mnemonic::Stb,
+    };
+    Some((mnemonic, mem(raw.dst(), raw)?, Operand::Imm(raw.imm())))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DefaultFormatter;
+
+    /// Encodings where field validation matters, with llvm-objdump 22's text for the
+    /// same bytes. llvm ignores fields an instruction does not define and rejects
+    /// defined fields with invalid values; register 11, which llvm prints as `r11`,
+    /// is out of the ISA's range.
+    #[test]
+    fn field_validation_matches_llvm() {
+        #[rustfmt::skip]
+        let table = [
+            // bytes, llvm-objdump, ebpf-asm
+            ("bf2b000000000000", "r11 = r2", "unknown"),
+            ("bfc1000000000000", "<unknown>", "unknown"),
+            ("612c000000000000", "<unknown>", "unknown"),
+            // ST/STX modes other than MEM, sizes other than W/DW for atomics
+            ("0221030004000000", "<unknown>", "unknown"),
+            ("e221030004000000", "<unknown>", "unknown"),
+            ("6221030004000000", "*(u32 *)(r1 + 0x3) = 0x4", "stw [r1+0x3], 0x4"),
+            ("0321030004000000", "<unknown>", "unknown"),
+            ("cb21000000000000", "<unknown>", "unknown"),
+            ("d321000000000000", "<unknown>", "unknown"),
+            // atomic imm: bits 4-7 select the operation, bits 0-3 equal to 1 fetch
+            ("c321030004000000", "lock *(u32 *)(r1 + 0x3) += w2", "lock add32 [r1+0x3], r2"),
+            ("db21000041000000", "r2 = atomic_fetch_or((u64 *)(r1 + 0x0), r2)", "lock for64 [r1+0x0], r2"),
+            ("db210000e0000000", "<unknown>", "unknown"),
+            // JMP32 has no call, exit or gotox; exit takes no X bit and needs imm 0
+            ("8621030004000000", "<unknown>", "unknown"),
+            ("8e21000000000000", "<unknown>", "unknown"),
+            ("9621000000000000", "<unknown>", "unknown"),
+            ("0e21030004000000", "<unknown>", "unknown"),
+            ("9d21030004000000", "<unknown>", "unknown"),
+            ("9521000002000000", "<unknown>", "unknown"),
+            ("9521030000000000", "exit", "exit"),
+            // `off` selects movsx, sdiv/smod or addr_space_cast and is reserved elsewhere
+            ("b421080010000000", "<unknown>", "unknown"),
+            ("bc21200000000000", "<unknown>", "unknown"),
+            ("bf21080000000000", "r1 = (s8)r2", "movsx864 r1, r2"),
+            ("3f21010000000000", "r1 s/= r2", "sdiv64 r1, r2"),
+            ("0421030004000000", "<unknown>", "unknown"),
+            ("bf01010007000000", "r1 = addr_space_cast(r0, 0x0, 0x7)", "addr_space_cast r1, r0, 0x0, 0x7"),
+            // undefined fields are ignored: imm of a register ALU op, src of neg
+            ("0c21000002000000", "w1 += w2", "add32 r1, r2"),
+            ("8421030004000000", "w1 = -w1", "neg32 r1"),
+            ("8c21000000000000", "<unknown>", "unknown"),
+            ("df21000010000000", "<unknown>", "unknown"),
+            // LD_IMM64 pseudo kinds, reserved `off`
+            ("18110000030000000000000000000000", "ld_pseudo\tr1, 0x1, 0x3", "ld_pseudo r1, 0x1, 0x3"),
+            ("18010100030000000000000000000000", "<unknown>", "unknown"),
+            // legacy packet loads and may_goto
+            ("2000000004000000", "r0 = *(u32 *)skb[0x4]", "ldabsw 0x4"),
+            ("5021030004000000", "r0 = *(u8 *)skb[r2]", "ldindb r2, 0x4"),
+            ("3800000004000000", "<unknown>", "unknown"),
+            ("e521030004000000", "may_goto +0x3", "may_goto +3"),
+            ("ed21030000000000", "<unknown>", "unknown"),
+        ];
+
+        let fmt = DefaultFormatter::new();
+        for (hex, llvm, want) in table {
+            let bytes: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..][..2], 16).unwrap())
+                .collect();
+            let insn = Decoder::new(&bytes).next().unwrap();
+            assert_eq!(fmt.format_to_string(&insn), want, "{hex} (llvm: {llvm})");
+        }
+    }
 
     #[test]
     fn test_decode_exit() {
