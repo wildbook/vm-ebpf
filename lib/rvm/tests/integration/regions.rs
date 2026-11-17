@@ -101,7 +101,7 @@ fn bpf_main_globals_do_not_clobber_code() {
 }
 
 #[test]
-fn test_memory_survives_fault() {
+fn memory_survives_fault() {
     let mut program = example();
     assert!(program.call("bpf_main", &[0xFFFF_FFFF_0000, 0xFFFF_FFFF_0000]).is_err());
     assert_eq!(program.call("simple_add", &[2, 3]).unwrap(), 5);

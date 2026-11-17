@@ -86,9 +86,7 @@ pub fn parse(text: &str) -> Result<TestCase, String> {
     Ok(TestCase {
         code,
         mem: parse_mem_bytes(&mem_hex)?,
-        result: (!result_text.is_empty())
-            .then(|| parse_result(&result_text))
-            .transpose()?,
+        result: (!result_text.is_empty()).then(|| parse_u64(&result_text)).transpose()?,
         error: (!error.is_empty()).then_some(error),
     })
 }
@@ -98,11 +96,7 @@ pub fn parse(text: &str) -> Result<TestCase, String> {
 fn parse_raw_words(words: &str) -> Result<Vec<u8>, String> {
     let mut code = Vec::new();
     for word in words.split_whitespace() {
-        let value: u64 = match word.strip_prefix("0x") {
-            Some(hex) => u64::from_str_radix(hex, 16).map_err(|e| format!("bad raw word {word:?}: {e}"))?,
-            None => word.parse().map_err(|e| format!("bad raw word {word:?}: {e}"))?,
-        };
-        code.extend_from_slice(&value.to_le_bytes());
+        code.extend_from_slice(&parse_u64(word)?.to_le_bytes());
     }
     Ok(code)
 }
@@ -113,9 +107,11 @@ fn parse_mem_bytes(hex: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-fn parse_result(text: &str) -> Result<u64, String> {
+/// `0x...` hex or decimal.
+pub fn parse_u64(text: &str) -> Result<u64, String> {
     match text.strip_prefix("0x") {
-        Some(hex) => u64::from_str_radix(hex, 16).map_err(|e| format!("bad result {text:?}: {e}")),
-        None => text.parse().map_err(|e| format!("bad result {text:?}: {e}")),
+        Some(hex) => u64::from_str_radix(hex, 16),
+        None => text.parse(),
     }
+    .map_err(|e| format!("bad number {text:?}: {e}"))
 }

@@ -24,9 +24,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use rvm::{MemoryError, Perms, Plugin, Scalar, SharedRegion, Vm};
 
-const RULES: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/examples/game_rules.o"));
-const RULES_V2: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/examples/game_rules_v2.o"));
-const COMBAT: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/examples/game_combat.o"));
+const RULES: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/prebuilt/examples/game_rules.o"));
+const RULES_V2: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/prebuilt/examples/game_rules_v2.o"));
+const COMBAT: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/prebuilt/examples/game_combat.o"));
 
 const TICKS: u32 = 32;
 const RELOAD_AT: u32 = 12;

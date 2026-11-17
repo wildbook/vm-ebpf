@@ -11,7 +11,7 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use rvm::{Perms, Vm, FIRST_FREE_REGION};
 
 fn object(name: &str) -> Vec<u8> {
-    std::fs::read(format!("{}/../../bpf/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    std::fs::read(format!("{}/../../bpf/prebuilt/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
 }
 
 /// Calling into a program and plugin, with no guest work.

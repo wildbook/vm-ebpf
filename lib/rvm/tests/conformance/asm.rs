@@ -153,10 +153,7 @@ fn parse_number(token: &str) -> Result<i64, String> {
         Some(rest) => (true, rest),
         None => (false, token.strip_prefix('+').unwrap_or(token)),
     };
-    let value: u64 = match rest.strip_prefix("0x") {
-        Some(hex) => u64::from_str_radix(hex, 16).map_err(|e| format!("bad hex {token:?}: {e}"))?,
-        None => rest.parse().map_err(|e| format!("bad number {token:?}: {e}"))?,
-    };
+    let value = super::data::parse_u64(rest)?;
     Ok(if negative {
         value.wrapping_neg() as i64
     } else {

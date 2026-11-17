@@ -7,19 +7,20 @@ plugins that call each other and share maps. Needs nightly (pinned in
 
 ```bash
 cargo build --release
-cargo run --bin loader                         # loads and calls bpf/examples/example.o
+cargo run --bin loader                         # loads and calls bpf/prebuilt/examples/example.o
 cargo run --bin emu                            # runs the same object, prepared into an image at build time
 cargo run -p rvm --example modding             # game mods as plugins: CO-RE, exports, borrows, shared maps, hot reload
 cargo run -p rvm --example msgpack_logs        # streams MessagePack logs through a parser plugin into maps
 cargo run -p rvm --example core_reloc          # one object against two struct layouts
-cargo run -p rvm --example hello               # hand-assembled bytecode loaded as an Image, no ELF
+cargo run -p rvm --example hello               # hand-assembled bytecode with host helpers, loaded as an Image, no ELF
 ```
 
-The eBPF objects under `bpf/` (`examples/`, `bench/`, `tests/`) are checked in. The CMake project rebuilds them with
-clang, which needs LLVM 18 or newer for `-mcpu=v4`:
+The eBPF objects are built from the C sources under `bpf/` (`examples/`, `bench/`, `tests/`) and checked in under
+`bpf/prebuilt/`. Rebuilding them needs CMake 3.21 or newer and clang on `PATH` (LLVM 18 or newer for `-mcpu=v4`):
 
 ```bash
-cmake -S . -B build -G Ninja && cmake --build build
+cmake --preset bpf && cmake --build --preset bpf
+cmake --build --preset update-prebuilt         # copies the built objects into bpf/prebuilt/
 ```
 
 ## Crates

@@ -1,4 +1,4 @@
-//! Runs `bpf/examples/core_example.o` against two host layouts of `struct event`: the one it was compiled against, and
+//! Runs `bpf/prebuilt/examples/core_example.o` against two host layouts of `struct event`: the one it was compiled against, and
 //! one with the fields reordered. The linker patches each field access through its CO-RE relocation, so the same object
 //! reads the right bytes from both. Exits with an error when a read returns the wrong value.
 //!
@@ -8,7 +8,8 @@ use std::error::Error;
 
 use rvm::{Perms, Vm};
 
-const OBJECT: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/examples/core_example.o"));
+const OBJECT: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/prebuilt/examples/core_example.o"));
 
 /// A field of `struct event`: its name, byte size and the value the host writes into it.
 type Field = (&'static str, u32, u64);

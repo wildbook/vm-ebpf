@@ -17,7 +17,8 @@ use std::error::Error;
 
 use rvm::{Perms, Pod, Program, Vm};
 
-const PARSER: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/examples/msgpack_logs.o"));
+const PARSER: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/prebuilt/examples/msgpack_logs.o"));
 
 const RECORDS: usize = 400;
 const CHUNK: usize = 96;

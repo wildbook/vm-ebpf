@@ -32,10 +32,6 @@ ebpf-asm  = { workspace = true }
 name = "integration"
 required-features = ["link"]
 
-[[test]]
-name = "mutations"
-required-features = ["link"]
-
 [[bench]]
 name = "exec"
 harness = false

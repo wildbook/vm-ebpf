@@ -3,12 +3,12 @@
 
 use rvm::{region_base, ExecError, Perms, Vm, VmError, CODE_REGION, DATA_REGION, FIRST_FREE_REGION, REGION_SHIFT};
 
-use crate::common::object;
+use crate::common::{describe_bits, object};
 
 /// Every atomic form clang emits (bpf/tests/atomics.c), with the expected values worked out by hand from the RFC 9669
 /// semantics.
 #[test]
-fn test_clang_atomics() {
+fn clang_atomics() {
     let mut program = Vm::new().load_elf(&object("tests/atomics.o")).unwrap();
 
     assert_eq!(program.call("run", &[5]).unwrap(), 1058);
@@ -123,13 +123,7 @@ fn core_relocations_follow_appended_host_btf() {
 #[test]
 fn core_relocations_read_signed_bitfield() {
     let vm = Vm::new();
-    vm.with_types(|types| {
-        let u32_t = types.int("unsigned int", 4, false);
-        let i32_t = types.int("int", 4, true);
-        let bits = types.add_struct("bits", 4);
-        types.bitfield_member(bits, "reserved", 0, 20, u32_t);
-        types.bitfield_member(bits, "b", 20, 12, i32_t);
-    });
+    vm.with_types(describe_bits);
     let mut program = vm.load_elf(&object("tests/core_bitfield.o")).unwrap();
 
     // b = -5 (12-bit two's complement) at bit 20, with arbitrary bits below it.
@@ -142,7 +136,7 @@ fn core_relocations_read_signed_bitfield() {
 
 /// Array and hash maps from bpf/tests/maps.c, used from the guest and the host.
 #[test]
-fn test_maps() {
+fn maps() {
     const EEXIST: u64 = (-17i64) as u64;
     const E2BIG: u64 = (-7i64) as u64;
     const ENOENT: u64 = (-2i64) as u64;
@@ -177,7 +171,7 @@ fn test_maps() {
 
 /// The standard helpers only link once enabled, and trace_printk formats like the kernel.
 #[test]
-fn test_std_helpers() {
+fn std_helpers() {
     use std::sync::{Arc, Mutex};
 
     let elf = object("tests/std_helpers.o");

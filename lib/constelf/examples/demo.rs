@@ -2,7 +2,7 @@ use constelf::file::ElfFile;
 use constelf::ElfResult;
 
 fn main() -> ElfResult {
-    let elf = include_bytes!("../../../bpf/examples/example.o");
+    let elf = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/prebuilt/examples/example.o"));
     let elf = ElfFile::new(elf)?;
     println!("{elf:#?}");
 

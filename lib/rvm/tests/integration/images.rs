@@ -5,7 +5,7 @@ use rvm::{
     MAX_REGION_LEN,
 };
 
-use crate::common::object;
+use crate::common::{host_vm, object};
 
 /// Every program from an image calls exactly like the same program linked from ELF.
 #[test]
@@ -48,21 +48,7 @@ fn images_run_like_elf() {
         (&["tests/link_main.o", "tests/link_lib.o"], &[("run", &[7]), ("lib_scale", &[5])]),
     ];
 
-    let vm = Vm::new();
-    vm.register_helper(100, |x: u64| x * 2);
-    vm.register_fn("host_add", |(a, b): (u64, u64)| a + b);
-    vm.register_fn("host_reenter", |x: u64| x);
-    vm.enable_time();
-    vm.enable_random();
-    vm.enable_print(|_| {});
-    // SAFETY: the programs run on this thread only.
-    unsafe { vm.share_region(FIRST_FREE_REGION, 64, rvm::Perms::RW) }.unwrap();
-    let a = vm.load_plugin("a", &object("tests/plugin_a.o")).unwrap();
-    vm.export(&a, "a_scale").unwrap();
-    let callee = vm.load_plugin("callee", &object("tests/borrow_callee.o")).unwrap();
-    for func in ["sum", "fill", "poke"] {
-        vm.export(&callee, func).unwrap();
-    }
+    let vm = host_vm();
 
     for &(objects, calls) in cases {
         let elfs: Vec<_> = objects.iter().map(|name| object(name)).collect();
