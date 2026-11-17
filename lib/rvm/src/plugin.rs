@@ -19,7 +19,7 @@ use crate::error::{HelperError, Result, VmError};
 use crate::helper::HelperContext;
 use crate::layout::BORROW_FIRST_REGION;
 use crate::memory::{region_base, Perms};
-use crate::program::{Borrow, Program};
+use crate::program::{Borrow, Func, Program};
 
 /// A linked program that other programs can call into.
 #[derive(Clone)]
@@ -43,6 +43,17 @@ impl Plugin {
     /// Call `func` with arguments in r1-r5.
     pub fn call(&self, func: &str, args: &[u64]) -> Result<u64> {
         self.lock()?.call(func, args)
+    }
+
+    /// Look up `func` for [`Plugin::call_func`]. [`Plugin::replace`] invalidates the
+    /// handle.
+    pub fn func(&self, func: &str) -> Result<Func> {
+        self.lock()?.func(func)
+    }
+
+    /// Call a function looked up with [`Plugin::func`]; arguments go in r1-r5.
+    pub fn call_func(&self, func: Func, args: &[u64]) -> Result<u64> {
+        self.lock()?.call_func(func, args)
     }
 
     /// Exclusive access to the program, e.g. for its maps or memory.

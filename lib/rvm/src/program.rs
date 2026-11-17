@@ -3,6 +3,7 @@
 //! A `Program` is a loaded [`crate::Image`]: the executable code, data, maps and
 //! function table.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use hashbrown::HashMap;
@@ -36,10 +37,19 @@ pub struct Borrow {
     pub writable: bool,
 }
 
+/// A function of one [`Program`], looked up by name once so that repeated calls skip
+/// the lookup. See [`Program::func`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Func {
+    program: u64,
+    pc: u64,
+}
+
 /// A linked eBPF program ready for execution.
 ///
 /// Holds the code (outside guest memory), guest memory regions (stack, data),
-/// and function table. Use `call()` to execute a function by name.
+/// and function table. Use `call()` to execute a function by name, or look it up
+/// once with `func()` and call it with `call_func()`.
 ///
 /// # Example
 ///
@@ -51,9 +61,15 @@ pub struct Borrow {
 ///
 /// // Call with arguments (passed in r1-r5)
 /// let result = program.call("process", &[ctx_ptr, len])?;
+///
+/// // Skip the name lookup on repeated calls
+/// let process = program.func("process")?;
+/// let result = program.call_func(process, &[ctx_ptr, len])?;
 /// ```
 #[derive(Debug)]
 pub struct Program {
+    /// Tells this program's [`Func`] handles from other programs'.
+    id: u64,
     /// Instructions; not addressable by the guest.
     code: Box<[Instruction]>,
     /// Guest memory regions (stack, data, maps). See [`crate::layout`] for the layout.
@@ -87,6 +103,7 @@ impl Program {
         let stack_top = region_base(STACK_REGION) + memory.region_len(STACK_REGION) as u64;
         let (helpers, helpers_version) = helpers;
         Self {
+            id: NEXT_PROGRAM_ID.fetch_add(1, Ordering::Relaxed),
             code,
             memory,
             maps,
@@ -137,18 +154,41 @@ impl Program {
     }
 
     /// Call a function by name; arguments go in r1-r5.
+    #[inline]
     pub fn call(&mut self, name: &str, args: &[u64]) -> Result<u64> {
-        let pc = self
-            .functions
-            .get(name)
-            .ok_or_else(|| VmError::FunctionNotFound(name.to_string()))?
-            .pc;
+        let pc = self.func(name)?.pc;
         self.call_pc(pc, args)
     }
 
+    /// The function called `name`, for [`Program::call_func`].
+    #[inline]
+    pub fn func(&self, name: &str) -> Result<Func> {
+        let info = self
+            .functions
+            .get(name)
+            .ok_or_else(|| VmError::FunctionNotFound(name.to_string()))?;
+        Ok(Func {
+            program: self.id,
+            pc: info.pc,
+        })
+    }
+
+    /// Call a function looked up with [`Program::func`]; arguments go in r1-r5.
+    ///
+    /// A handle from another program fails with [`VmError::InvalidArgument`].
+    #[inline]
+    pub fn call_func(&mut self, func: Func, args: &[u64]) -> Result<u64> {
+        if func.program != self.id {
+            let msg = "function handle belongs to another program; look the function up again";
+            return Err(VmError::InvalidArgument(msg.to_string()));
+        }
+        self.call_pc(func.pc, args)
+    }
+
+    #[inline]
     fn call_pc(&mut self, pc: u64, args: &[u64]) -> Result<u64> {
         if self.shared_helpers.version() != self.helpers_version {
-            (self.helpers, self.helpers_version) = self.shared_helpers.snapshot();
+            self.refresh_helpers();
         }
 
         let mut executor = Executor::new(&self.code, &mut self.memory, &self.helpers, self.stack_top);
@@ -157,4 +197,12 @@ impl Program {
         executor.set_maps(&mut self.maps);
         executor.call(pc, args)
     }
+
+    #[cold]
+    #[inline(never)]
+    fn refresh_helpers(&mut self) {
+        (self.helpers, self.helpers_version) = self.shared_helpers.snapshot();
+    }
 }
+
+static NEXT_PROGRAM_ID: AtomicU64 = AtomicU64::new(0);

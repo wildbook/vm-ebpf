@@ -21,10 +21,14 @@ fn plugin_calls_export_and_survives_reload() {
     vm.export(&a, "a_scale").unwrap();
     let b = vm.load_plugin("b", &object("plugin_b.o")).unwrap();
     assert_eq!(b.call("b_run", &[5]).unwrap(), 11);
+    let scale = a.func("a_scale").unwrap();
+    assert_eq!(a.call_func(scale, &[5]).unwrap(), a.call("a_scale", &[5]).unwrap());
 
     // Replacing A's code is picked up by B's next call without relinking B.
     a.replace(vm.load_elf(&object("plugin_a3.o")).unwrap());
     assert_eq!(b.call("b_run", &[5]).unwrap(), 16);
+    // A handle into the replaced program fails instead of running the new one at its pc.
+    assert!(matches!(a.call_func(scale, &[5]), Err(VmError::InvalidArgument(_))));
 }
 
 #[test]

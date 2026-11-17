@@ -103,7 +103,7 @@ pub use memory::{
 #[cfg(feature = "link")]
 pub use module::Module;
 pub use plugin::{Plugin, WeakPlugin};
-pub use program::{Borrow, FunctionInfo, Program};
+pub use program::{Borrow, Func, FunctionInfo, Program};
 pub use rvm_core::{instructions_from_bytes, AtomicOp, Instruction};
 #[cfg(feature = "link")]
 pub use section::{Section, SectionKind};
