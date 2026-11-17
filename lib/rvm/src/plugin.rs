@@ -42,13 +42,13 @@ impl Plugin {
 
     /// Call `func` with arguments in r1-r5.
     pub fn call(&self, func: &str, args: &[u64]) -> Result<u64> {
-        self.lock()?.call(func, args)
+        self.lock()?.call(func, args).map_err(|e| in_plugin(e, &self.name))
     }
 
     /// Look up `func` for [`Plugin::call_func`]. [`Plugin::replace`] invalidates the handle; [`Plugin::named_func`]
     /// gives one that follows the replacement.
     pub fn func(&self, func: &str) -> Result<Func> {
-        self.lock()?.func(func)
+        self.lock()?.func(func).map_err(|e| in_plugin(e, &self.name))
     }
 
     /// Call a function looked up with [`Plugin::func`]; arguments go in r1-r5.
@@ -93,8 +93,7 @@ impl Plugin {
         &self,
         func: &str,
     ) -> Result<impl Fn(&mut HelperContext) -> std::result::Result<u64, HelperError> + Send + Sync + 'static> {
-        let target = ExportTarget::find(&*self.lock()?, func)
-            .ok_or_else(|| VmError::FunctionNotFound(format!("{}::{func}", self.name)))?;
+        let target = ExportTarget::find(&*self.lock()?, func).ok_or_else(|| not_found(&self.name, func))?;
         let target = Mutex::new(target);
         let program: Weak<Mutex<Program>> = Arc::downgrade(&self.program);
         let name = self.name.clone();
@@ -115,8 +114,7 @@ impl Plugin {
             let target = {
                 let mut target = lock(&target);
                 if !program.owns(target.entry) {
-                    *target = ExportTarget::find(&program, &func)
-                        .ok_or_else(|| failed(VmError::FunctionNotFound(func.to_string())))?;
+                    *target = ExportTarget::find(&program, &func).ok_or_else(|| failed(not_found(&name, &func)))?;
                 }
                 *target
             };
@@ -216,7 +214,26 @@ impl NamedFunc {
     /// Call the function in the plugin's current program; arguments go in r1-r5. Fails with
     /// [`VmError::FunctionNotFound`] if that program lacks it.
     pub fn call(&self, args: &[u64]) -> Result<u64> {
-        self.func.call(&mut *self.plugin.lock()?, &self.name, args)
+        let mut program = self.plugin.lock()?;
+        let result = self.func.call(&mut program, &self.name, args);
+        result.map_err(|e| in_plugin(e, &self.plugin.name))
+    }
+}
+
+fn not_found(plugin: &str, func: &str) -> VmError {
+    VmError::FunctionNotFound {
+        plugin: Some(plugin.to_string()),
+        func: func.to_string(),
+    }
+}
+
+/// `error`, naming `plugin` if it is a failed lookup in the plugin's program.
+#[cold]
+#[inline(never)]
+fn in_plugin(error: VmError, plugin: &str) -> VmError {
+    match error {
+        VmError::FunctionNotFound { plugin: None, func } => not_found(plugin, &func),
+        error => error,
     }
 }
 

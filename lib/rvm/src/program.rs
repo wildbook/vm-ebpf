@@ -166,9 +166,10 @@ impl Program {
     /// The function called `name`, for [`Program::call_func`].
     #[inline]
     pub fn func(&self, name: &str) -> Result<Func> {
-        let (func, _) = self
-            .func_with_info(name)
-            .ok_or_else(|| VmError::FunctionNotFound(name.to_string()))?;
+        let (func, _) = self.func_with_info(name).ok_or_else(|| VmError::FunctionNotFound {
+            plugin: None,
+            func: name.to_string(),
+        })?;
         Ok(func)
     }
 
@@ -191,12 +192,11 @@ impl Program {
 
     /// Call a function looked up with [`Program::func`]; arguments go in r1-r5.
     ///
-    /// A handle from another program fails with [`VmError::InvalidArgument`].
+    /// A handle from another program fails with [`VmError::ForeignFunc`].
     #[inline]
     pub fn call_func(&mut self, func: Func, args: &[u64]) -> Result<u64> {
         if !self.owns(func) {
-            let msg = "function handle belongs to another program; look the function up again";
-            return Err(VmError::InvalidArgument(msg.to_string()));
+            return Err(VmError::ForeignFunc);
         }
         self.call_pc(func.pc, args)
     }

@@ -1,11 +1,10 @@
 //! Runs eBPF bytecode on rvm-core and dispatches helper calls to a [`HelperRegistry`].
 
-use std::fmt::Debug;
 use std::mem::ManuallyDrop;
 
 use rvm_core::{run, CallStack, Code, Context, Flow, Host, Memory};
 
-use crate::error::{ExecError, HelperError, Result, VmError};
+use crate::error::{ExecError, HelperError, MemoryError, Result, VmError};
 use crate::helper::{HelperArgs, HelperContext, HelperRegistry};
 use crate::layout::CODE_REGION;
 use crate::maps::Maps;
@@ -36,7 +35,7 @@ pub struct Executor<'a, M: Memory = VmMemory> {
     maps: Option<&'a mut Maps>,
 }
 
-impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
+impl<'a, M: Memory<Err = u64> + 'static> Executor<'a, M> {
     /// Create a new executor.
     pub fn new(code: &'a Code, memory: &'a mut M, helpers: &'a HelperRegistry<M>, stack_top: u64) -> Self {
         Self {
@@ -68,11 +67,10 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
     }
 
     /// Call the function at `pc` (instruction index) with `args` in r1-r5; returns r0. More than 5 arguments fail with
-    /// [`VmError::InvalidArgument`].
+    /// [`VmError::TooManyArgs`].
     pub fn call(&mut self, pc: u64, args: &[u64]) -> Result<u64> {
         if args.len() > 5 {
-            let msg = format!("{} arguments, but eBPF functions take at most 5", args.len());
-            return Err(VmError::InvalidArgument(msg));
+            return Err(VmError::TooManyArgs(args.len()));
         }
         let mut ctx = Context::new(&mut *self.memory);
         ctx.regs[1..=args.len()].copy_from_slice(args);
@@ -100,7 +98,7 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
             let flow = run(&mut ctx, self.code, &mut pc, &mut calls);
             pc = match flow {
                 Flow::Exit => return Ok(ctx.regs[0]),
-                Flow::StackOverflow => return Err(ExecError::StackOverflow.into()),
+                Flow::StackOverflow => return Err(ExecError::StackOverflow { pc }.into()),
                 // a call the linker planted for an unresolved CO-RE relocation
                 Flow::CallHelper(CORE_POISON_HELPER) => {
                     return Err(ExecError::UnresolvedCoreRelo { pc }.into());
@@ -109,11 +107,9 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
                 #[cfg(feature = "fuel")]
                 Flow::OutOfFuel => return Err(ExecError::InstructionLimit(limit).into()),
                 Flow::BadPc => return Err(ExecError::InvalidPc(pc).into()),
-                Flow::FailCpu => return Err(ExecError::CpuFault.into()),
-                Flow::FailMem(err) => {
-                    return Err(ExecError::MemoryFault(format!("access at {err:#x?} (pc {pc})")).into())
-                }
-                Flow::Missing => return Err(ExecError::Unimplemented.into()),
+                Flow::FailCpu => return Err(ExecError::CpuFault { pc }.into()),
+                Flow::FailMem(addr) => return Err(memory_fault(pc, addr, self.code)),
+                Flow::Missing => return Err(ExecError::Unimplemented { pc }.into()),
                 Flow::CallIndirect(target) => call_indirect(target, pc, self.code, &mut ctx, &mut calls)?,
                 Flow::JumpIndirect(target) => jump_indirect(target, pc, self.code)?,
                 // `run` handles these internally
@@ -134,7 +130,7 @@ struct Helpers<'a, M> {
     error: ManuallyDrop<Option<HelperError>>,
 }
 
-impl<M: Memory<Err: Debug> + 'static> Helpers<'_, M> {
+impl<M: Memory<Err = u64> + 'static> Helpers<'_, M> {
     /// Call the extern table entry at `slot` with the arguments in `ctx.regs[1..=5]`.
     #[inline]
     fn call_slot(&mut self, ctx: &mut Context<&mut M>, slot: u32) -> std::result::Result<u64, HelperError> {
@@ -153,7 +149,7 @@ impl<M: Memory<Err: Debug> + 'static> Helpers<'_, M> {
     }
 }
 
-impl<M: Memory<Err: Debug> + 'static> Host<&mut M> for Helpers<'_, M> {
+impl<M: Memory<Err = u64> + 'static> Host<&mut M> for Helpers<'_, M> {
     // Raw bytecode calls helpers by ID; linked programs call slots only, except for calls the linker planted for
     // unresolved CO-RE relocations, which the executor reports.
     #[inline]
@@ -184,7 +180,7 @@ impl<M: Memory<Err: Debug> + 'static> Host<&mut M> for Helpers<'_, M> {
 /// next pc.
 #[cold]
 #[inline(never)]
-fn call_indirect<M: Memory<Err: Debug> + 'static>(
+fn call_indirect<M: Memory<Err = u64> + 'static>(
     target: u64,
     pc: u64,
     code: &Code,
@@ -193,7 +189,7 @@ fn call_indirect<M: Memory<Err: Debug> + 'static>(
 ) -> Result<u64> {
     if let Some(callee) = code_index(target, code) {
         if !calls.push(&mut ctx.regs, pc) {
-            return Err(ExecError::StackOverflow.into());
+            return Err(ExecError::StackOverflow { pc }.into());
         }
         return Ok(callee);
     }
@@ -204,6 +200,19 @@ fn call_indirect<M: Memory<Err: Debug> + 'static>(
     let slot = helpers.registry.slot_of_id(id).ok_or(HelperError::UnknownHelper(id))?;
     ctx.regs[0] = helpers.call_slot(ctx, slot)?;
     Ok(pc + 1)
+}
+
+/// The fault of the load or store at `pc` that failed at `addr`.
+#[cold]
+#[inline(never)]
+fn memory_fault(pc: u64, addr: u64, code: &Code) -> VmError {
+    // only loads and stores fail with `Flow::FailMem`
+    let size = code.access_size(pc).expect("memory fault outside a load or store");
+    ExecError::MemoryFault {
+        pc,
+        error: MemoryError { addr, size },
+    }
+    .into()
 }
 
 /// `gotox` at `pc`: the instruction index of code address `target`.
@@ -221,7 +230,7 @@ fn code_index(addr: u64, code: &Code) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use ebpf_asm::{Assembler, R0, R1, R10, R2, R6, R7};
+    use ebpf_asm::{Assembler, R0, R1, R10, R2, R3, R6, R7};
 
     use super::*;
     use crate::error::MemoryError;
@@ -264,7 +273,36 @@ mod tests {
     fn test_load_acquire_into_r10_faults() {
         let mut asm = Assembler::new();
         asm.mov64(R1, R10).load_acquire64(R10, R1, -8).exit();
-        assert!(matches!(run(&mut asm, &[]), Err(VmError::Exec(ExecError::CpuFault))));
+        assert!(matches!(run(&mut asm, &[]), Err(VmError::Exec(ExecError::CpuFault { pc: 1 }))));
+    }
+
+    /// The access size comes from the faulting instruction, which may sit inside a superinstruction or be an r10
+    /// access, whose first slots hold rewritten opcode bytes.
+    #[test]
+    fn memory_fault_reports_access_size() {
+        let fault = |asm: &mut Assembler| match run(asm, &[]) {
+            Err(VmError::Exec(ExecError::MemoryFault { pc, error })) => (pc, error.size),
+            other => panic!("{other:?}"),
+        };
+
+        let mut asm = Assembler::new();
+        asm.mov64_imm(R1, 0).ldxh(R0, R1, 0).exit();
+        assert_eq!(fault(&mut asm), (1, 2));
+
+        // mov, add, ldxw: one superinstruction
+        let mut asm = Assembler::new();
+        asm.mov64_imm(R2, 0)
+            .mov64_imm(R3, 0)
+            .mov64(R1, R2)
+            .add64(R1, R3)
+            .ldxw(R0, R1, 0)
+            .exit();
+        assert_eq!(fault(&mut asm), (4, 4));
+
+        // above the stack top
+        let mut asm = Assembler::new();
+        asm.stxdw(R10, 8, R1).exit();
+        assert_eq!(fault(&mut asm), (0, 8));
     }
 
     #[test]
@@ -274,7 +312,7 @@ mod tests {
         asm.set_label(&func_start).unwrap();
         asm.call_local(&func_start);
         asm.exit();
-        assert!(matches!(run(&mut asm, &[]), Err(VmError::Exec(ExecError::StackOverflow))));
+        assert!(matches!(run(&mut asm, &[]), Err(VmError::Exec(ExecError::StackOverflow { .. }))));
     }
 
     #[test]
@@ -333,8 +371,7 @@ mod tests {
         assert!(matches!(run(&mut asm), Err(VmError::Helper(HelperError::UnknownHelper(2)))));
     }
 
-    // a host function with memory access runs inside the handler chain too, and a pointer the guest couldn't use itself
-    // fails the access, not the program
+    // a host function with memory access runs inside the handler chain too, and an `Err` from it fails the guest call
     #[test]
     fn test_memory_fn() {
         let mut helpers = HelperRegistry::new();
@@ -366,15 +403,18 @@ mod tests {
             let mut memory = VmMemory::new();
             let stack_top = memory.map(1, 512, Perms::RW) + 512;
             memory.map_bytes(2, &[7; 8], 8, Perms::R);
-            Executor::new(&code, &mut memory, &helpers, stack_top)
-                .call(0, &[])
-                .unwrap()
+            Executor::new(&code, &mut memory, &helpers, stack_top).call(0, &[])
         };
 
         // r0 in the low half, the stack slot in the high half
-        assert_eq!(run(None), 42 << 32 | 41);
-        assert_eq!(run(Some(0)), 41 << 32 | 0xffff_ffff);
-        // the read-only region can be read but not written
-        assert_eq!(run(Some(region_base(2))), 41 << 32 | 0xffff_ffff);
+        assert_eq!(run(None).unwrap(), 42 << 32 | 41);
+        // an unmapped address, and a read-only region that can be read but not written
+        for addr in [0, region_base(2)] {
+            let err = run(Some(addr)).unwrap_err();
+            let VmError::Helper(HelperError::Host(e)) = &err else {
+                panic!("{err:?}")
+            };
+            assert_eq!(e.downcast_ref::<MemoryError>(), Some(&MemoryError { addr, size: 8 }));
+        }
     }
 }

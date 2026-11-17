@@ -64,6 +64,7 @@ pub struct MapDef {
 
 /// Why a map access failed. Guest helpers return these as negative errno.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MapError {
     /// Key not present (`ENOENT`).
     NotFound,

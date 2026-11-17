@@ -7,7 +7,8 @@ use rvm::{Module, Perms, Program, Vm};
 
 fn main() -> Result<()> {
     let elf_path = "bpf/examples/example.o";
-    let elf_bytes = std::fs::read(elf_path).with_context(|| format!("reading {elf_path}; bpf/CMakeLists.txt builds it"))?;
+    let elf_bytes =
+        std::fs::read(elf_path).with_context(|| format!("reading {elf_path}; bpf/CMakeLists.txt builds it"))?;
     let len = elf_bytes.len();
     println!("Loaded {elf_path}: {len} bytes");
 

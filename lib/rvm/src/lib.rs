@@ -75,7 +75,7 @@ mod sync;
 mod vm;
 
 #[cfg(feature = "link")]
-pub use btf::BtfBuilder;
+pub use btf::{BtfBuilder, BtfError, CoreReloError};
 pub use error::{ExecError, HelperError, LinkError, MemoryError, Result, VmError};
 pub use executor::{Executor, DEFAULT_FRAME_SIZE};
 pub use helper::{FromArgs, HelperArgs, HelperContext, HelperRegistry, IntoReturn, SharedHelpers};

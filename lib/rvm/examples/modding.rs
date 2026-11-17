@@ -14,7 +14,7 @@
 //! it from bytes, and calls both plugins every tick through function handles it looks up once; the rules handle follows
 //! the reload.
 //!
-//! Rebuild the plugins with `bpf/build.sh`.
+//! Rebuild the plugins with the CMake project in the repo root.
 //!
 //! Run with: cargo run -p rvm --example modding
 

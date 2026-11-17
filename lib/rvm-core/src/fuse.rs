@@ -38,6 +38,29 @@ impl Code {
         self.0.is_empty()
     }
 
+    /// Bytes the load or store in slot `pc` accesses, or `None` if the slot holds none, for reporting a
+    /// [`Flow::FailMem`] at `pc`.
+    #[cold]
+    pub fn access_size(&self, pc: u64) -> Option<usize> {
+        let byte = self.0.get(usize::try_from(pc).ok()?)?.0 as u8;
+        // the first slot of a superinstruction or r10 access holds a reserved byte in place of its opcode
+        let byte = match (STACK.iter().find(|s| s.0 == byte), SUPERS.iter().find(|s| s.0 == byte)) {
+            (Some(&(_, usual)), _) => usual,
+            (None, Some(&(_, sup))) => sup.first,
+            (None, None) => byte,
+        };
+        let opc = OpCode(byte);
+        if !matches!(opc.class(), Class::LdReg | Class::StReg | Class::StImm) {
+            return None;
+        }
+        Some(match opc.mem_size() {
+            MemSize::Byte => 1,
+            MemSize::Half => 2,
+            MemSize::Word => 4,
+            MemSize::DWord => 8,
+        })
+    }
+
     pub(crate) fn slots(&self) -> &[Instruction] {
         &self.0
     }

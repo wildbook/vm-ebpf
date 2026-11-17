@@ -9,7 +9,7 @@
 //! in front of the next chunk, so a record split across chunks is parsed once. At the end, the host reads the stats
 //! from the maps and checks them against its own tally of the events it generated.
 //!
-//! Rebuild the plugin with `bpf/build.sh`.
+//! Rebuild the plugin with the CMake project in the repo root.
 //!
 //! Run with: cargo run -p rvm --example msgpack_logs
 

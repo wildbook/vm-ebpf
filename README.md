@@ -15,9 +15,12 @@ cargo run -p rvm --example core_reloc          # one object against two struct l
 cargo run -p rvm --example hello               # hand-assembled bytecode on a bare Executor
 ```
 
-The eBPF objects under `bpf/` (`examples/`, `bench/`, `tests/`) are checked in.
-`bpf/build.sh` rebuilds them with the clang line in each source file's header,
-which needs LLVM 18 or newer for `-mcpu=v4`.
+The eBPF objects under `bpf/` (`examples/`, `bench/`, `tests/`) are checked in. The CMake project rebuilds them with
+clang, which needs LLVM 18 or newer for `-mcpu=v4`:
+
+```bash
+cmake -S . -B build -G Ninja && cmake --build build
+```
 
 ## Crates
 
@@ -78,7 +81,10 @@ let result = program.call("run", &[42])?;
 A `register_fn_with_memory` function gets the calling program's memory as a
 `GuestMemory`. Its reads and writes copy, need the same permissions as the
 guest's own loads and stores, and return a `MemoryError` for a pointer the guest
-couldn't use. A host function that returns `Err` gives the guest -1.
+couldn't use. A host function that returns `Err` fails the guest call with
+`HelperError::Host`, which holds the error. The error type must convert into
+`HelperError`, as `MemoryError` and `VmError` do. To give the guest an error
+code instead, return it as an `i64`.
 
 Registering a helper again replaces it everywhere: programs linked earlier use
 the new one from their next call.
@@ -97,7 +103,7 @@ extern has no matching helper or module export, or if a helper ID isn't
 registered. It also fails if an extern's argument count in the module's BTF
 differs from the arity of the host function registered under that name; exports
 from plugins and variadic prototypes aren't checked. Calls with more than five
-arguments fail with `VmError::InvalidArgument`. The only call resolved at run
+arguments fail with `VmError::TooManyArgs`. The only call resolved at run
 time is `callx` to a helper ID, which fails with `UnknownHelper` if no helper
 has that ID.
 

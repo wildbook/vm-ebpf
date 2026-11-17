@@ -25,7 +25,7 @@ fn store_load(program: &mut Program, addr: u64, value: u64) -> rvm::Result<u64> 
 }
 
 fn is_mem_fault(r: rvm::Result<u64>) -> bool {
-    matches!(r, Err(VmError::Exec(ExecError::MemoryFault(_))))
+    matches!(r, Err(VmError::Exec(ExecError::MemoryFault { .. })))
 }
 
 #[test]

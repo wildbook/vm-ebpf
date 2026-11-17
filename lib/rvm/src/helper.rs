@@ -92,23 +92,27 @@ macro_rules! single_arg {
 
 single_arg!(u64, u32, i64, i32);
 
-/// Trait for converting return values to u64 for r0.
+/// The value a host function puts in r0, or the error that fails the guest call.
+///
+/// `Err` fails the call into the guest with [`HelperError`], via `E: Into<HelperError>`. A host function that wants the
+/// guest to see an error code returns it as an `i64`.
 pub trait IntoReturn {
-    /// Convert to the u64 return value.
-    fn into_return(self) -> u64;
+    fn into_return(self) -> Result<u64, HelperError>;
 }
 
 impl IntoReturn for () {
-    fn into_return(self) -> u64 {
-        0
+    #[inline]
+    fn into_return(self) -> Result<u64, HelperError> {
+        Ok(0)
     }
 }
 
 macro_rules! into_return {
     ($($ty:ty),*) => {$(
         impl IntoReturn for $ty {
-            fn into_return(self) -> u64 {
-                self as u64
+            #[inline]
+            fn into_return(self) -> Result<u64, HelperError> {
+                Ok(self as u64)
             }
         }
     )*};
@@ -116,12 +120,10 @@ macro_rules! into_return {
 
 into_return!(u64, u32, i64, i32, bool);
 
-impl<T: IntoReturn, E> IntoReturn for Result<T, E> {
-    fn into_return(self) -> u64 {
-        match self {
-            Ok(v) => v.into_return(),
-            Err(_) => u64::MAX, // -1 in two's complement
-        }
+impl<T: IntoReturn, E: Into<HelperError>> IntoReturn for Result<T, E> {
+    #[inline]
+    fn into_return(self) -> Result<u64, HelperError> {
+        self.map_err(Into::into)?.into_return()
     }
 }
 
@@ -181,7 +183,7 @@ impl<M: 'static> Slot<M> {
         A: FromArgs,
         R: IntoReturn,
     {
-        Self::new(move |ctx| Ok(func(A::from_args(&ctx.args)).into_return()), Some(A::ARITY))
+        Self::new(move |ctx| func(A::from_args(&ctx.args)).into_return(), Some(A::ARITY))
     }
 }
 
@@ -194,7 +196,7 @@ impl Slot<VmMemory> {
     {
         let call = move |ctx: &mut HelperContext| {
             let args = A::from_args(&ctx.args);
-            Ok(func(&mut GuestMemory::new(ctx.memory), args).into_return())
+            func(&mut GuestMemory::new(ctx.memory), args).into_return()
         };
         Self::new(call, Some(A::ARITY))
     }
@@ -276,7 +278,7 @@ impl<M: 'static> HelperRegistry<M> {
         F: Fn(&mut HelperContext<M>) -> R + Send + Sync + 'static,
         R: IntoReturn + 'static,
     {
-        self.put_id(id, Slot::new(move |ctx| Ok(func(ctx).into_return()), None));
+        self.put_id(id, Slot::new(move |ctx| func(ctx).into_return(), None));
     }
 
     /// Register an extern function by name.

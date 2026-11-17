@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rvm::{LinkError, Program, Vm, VmError, WeakPlugin};
+use rvm::{HelperError, LinkError, Program, Vm, VmError, WeakPlugin};
 
 use crate::common::object;
 
@@ -28,7 +28,7 @@ fn plugin_calls_export_and_survives_reload() {
     a.replace(vm.load_elf(&object("tests/plugin_a3.o")).unwrap()).unwrap();
     assert_eq!(b.call("b_run", &[5]).unwrap(), 16);
     // A handle into the replaced program fails instead of running the new one at its pc.
-    assert!(matches!(a.call_func(scale, &[5]), Err(VmError::InvalidArgument(_))));
+    assert!(matches!(a.call_func(scale, &[5]), Err(VmError::ForeignFunc)));
 }
 
 #[test]
@@ -43,7 +43,11 @@ fn named_func_follows_replace() {
 
     // A program without the function fails the call, and the handle recovers when a later program has it again.
     a.replace(vm.load_elf(&object("tests/maps.o")).unwrap()).unwrap();
-    assert!(matches!(scale.call(&[5]), Err(VmError::FunctionNotFound(name)) if name == "a_scale"));
+    let err = scale.call(&[5]).unwrap_err();
+    assert!(
+        matches!(&err, VmError::FunctionNotFound { plugin: Some(p), func } if p == "a" && func == "a_scale"),
+        "{err}"
+    );
     a.replace(vm.load_elf(&object("tests/plugin_a.o")).unwrap()).unwrap();
     assert_eq!(scale.call(&[5]).unwrap(), 10);
 }
@@ -56,6 +60,7 @@ fn reentrant_call_and_replace_fail_instead_of_deadlocking() {
 
     // host_reenter calls back into b, and tries to replace it, while b is running. It holds b weakly: a strong handle
     // inside the Vm's own helper table would never be freed.
+    let is_busy = |e: Option<&VmError>| matches!(e, Some(VmError::PluginBusy(n)) if n == "b");
     let b_slot: Arc<OnceLock<WeakPlugin>> = Arc::default();
     let spare: Arc<Mutex<Option<Program>>> = Arc::default();
     let busy = Arc::new(Mutex::new((false, false)));
@@ -64,7 +69,6 @@ fn reentrant_call_and_replace_fail_instead_of_deadlocking() {
         let b = slot.get().unwrap().upgrade().unwrap();
         let call = b.call("b_run", &[x]);
         let replace = b.replace(next.lock().unwrap().take().unwrap());
-        let is_busy = |e: Option<&VmError>| matches!(e, Some(VmError::PluginBusy(n)) if n == "b");
         *seen.lock().unwrap() = (is_busy(call.as_ref().err()), is_busy(replace.as_ref().err()));
         call
     });
@@ -72,7 +76,12 @@ fn reentrant_call_and_replace_fail_instead_of_deadlocking() {
     b_slot.set(b.downgrade()).unwrap();
     *spare.lock().unwrap() = Some(vm.load_elf(&object("tests/plugin_b.o")).unwrap());
 
-    assert_eq!(b.call("b_reenter", &[5]).unwrap(), u64::MAX);
+    // the host function returns the nested call's error, which fails the outer call
+    let err = b.call("b_reenter", &[5]).unwrap_err();
+    let VmError::Helper(HelperError::Host(inner)) = &err else {
+        panic!("{err}")
+    };
+    assert!(is_busy(inner.downcast_ref()), "{err}");
     assert_eq!(*busy.lock().unwrap(), (true, true));
     assert_eq!(b.call("b_run", &[5]).unwrap(), 11);
 }
@@ -131,7 +140,8 @@ fn shared_region_is_visible_to_every_plugin() {
     assert_eq!(y.call("get", &[slot]).unwrap(), 42);
     assert_eq!(rw.read::<u64>(8).unwrap(), 42);
 
-    assert!(matches!(x.call("put", &[ro.base(), 1]).unwrap_err(), VmError::Exec(rvm::ExecError::MemoryFault(_))));
+    let err = x.call("put", &[ro.base(), 1]).unwrap_err();
+    assert!(matches!(err, VmError::Exec(rvm::ExecError::MemoryFault { .. })), "{err}");
 }
 
 /// Two plugins on two threads pass messages through a shared region (bpf/tests/acq_rel.c): the producer writes a
@@ -170,7 +180,7 @@ fn shared_region_acquire_release() {
     let misaligned: [(&str, &[u64]); 2] = [("load_u64", &[scratch + 4]), ("store_u16", &[scratch + 1, 7])];
     for (func, args) in misaligned {
         let err = consumer.call(func, args).unwrap_err();
-        assert!(matches!(err, VmError::Exec(rvm::ExecError::MemoryFault(_))), "{func}: {err}");
+        assert!(matches!(err, VmError::Exec(rvm::ExecError::MemoryFault { .. })), "{func}: {err}");
     }
 }
 
