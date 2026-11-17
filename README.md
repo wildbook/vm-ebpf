@@ -1,65 +1,60 @@
 # vm-ebpf
 
-An embeddable eBPF virtual machine for Rust: parse eBPF ELF objects, link them
-against host-registered helper functions, and run them in a bounds-checked
-guest memory space.
-
-## Building
+rvm, an embeddable eBPF runtime for Rust. It links eBPF ELF objects against
+host functions, runs them in bounds-checked guest memory, and runs them as
+plugins that call each other and share maps. Needs nightly (pinned in
+`rust-toolchain.toml`).
 
 ```bash
 cargo build --release
+cargo run --bin loader                         # loads and calls bpf/example.o
+cargo run --bin demo                           # CO-RE relocation walkthrough
+cargo run --bin emu                            # runs bpf.o, prepared into an image at build time
+cargo run -p rvm --example modding             # game mods as plugins: CO-RE, exports, borrows, shared maps, hot reload
+cargo run -p rvm --example msgpack_logs        # streams MessagePack logs through a parser plugin into maps
+cargo run -p rvm --example core_reloc          # one object against two struct layouts
+cargo run -p rvm --example hello               # hand-assembled bytecode on a bare Executor
 ```
 
-eBPF programs under `bpf/` are plain object files, built separately with
-clang:
+The eBPF objects under `bpf/` are checked in. Each source file's header has its
+build line, for example:
 
 ```bash
 clang -target bpf -O2 -g -c bpf/example.c -o bpf/example.o
 ```
 
-Each file's header has its exact build line. Benchmark programs (`workloads.c`,
-`map_bench.c`) are built with `-mcpu=v4`, which needs LLVM 18 or newer, so the
-numbers reflect clang's current ISA: sign-extending loads, `movsx`, `sdiv`/`smod`,
-`bswap` and 32-bit jumps.
-
-## Running
-
-```bash
-cargo run --bin loader   # loads and calls bpf/example.o
-cargo run --bin demo     # CO-RE relocation walkthrough
-cargo run --bin emu      # runs bpf.o, linked into an image at build time
-cargo run -p rvm --example modding       # game mods as plugins: CO-RE, exports, borrows, shared maps, hot reload
-cargo run -p rvm --example msgpack_logs  # streams MessagePack logs through a parser plugin into maps
-```
+Objects built with `-mcpu=v4` need LLVM 18 or newer.
 
 ## Crates
 
-- `lib/rvm-core`: the instruction set and interpreter loop (`run`, `step`),
-  independent of any host integration. Operates on a `Context<M>` over a
-  `Memory` trait implementation, runs helper and kfunc calls through a `Host`
-  trait implementation, and returns a `Flow` describing why execution stopped
-  (exit, an indirect call or jump, a host call the host declined, a fault, or
-  out of fuel). `run` takes a `Code`, which fuses common instruction sequences
-  into superinstructions when it is created, gives loads and stores through r10
-  a path that skips the `Memory` methods when the memory reports a `Window` for
-  the stack, and fails instructions that write r10 (read-only) with `FailCpu`.
-- `lib/rvm`: the embeddable runtime built on `rvm-core`. Parses ELF objects,
-  links them into executable programs, manages guest memory, and dispatches
-  helper calls.
-- `lib/constelf`: a `const fn` ELF reader used by `rvm`'s linker.
-- `lib/btf`: BTF (BPF Type Format) parsing and CO-RE (Compile Once, Run
-  Everywhere) relocations. The host describes its actual struct layouts as BTF,
-  with `BtfBuilder`; relocations patch field-access instructions compiled
-  against a different layout to match, exactly as kernel CO-RE matches a BPF
-  program's BTF against the kernel's. `rvm::host_struct!` describes a
-  `#[repr(C)]` Rust struct from its definition:
-  `host_struct!(vm.types(), Entity as "entity" { id, hp, pos as "position" })`.
-- `lib/ebpf-asm`: an assembler used by `bin/demo`, `lib/rvm`'s tests, benches and
-  examples to build eBPF bytecode without a C toolchain. Also has a disassembler,
-  used by its own examples and tests for debugging.
-- `bin/loader`, `bin/demo`, `bin/emu`: example programs. `loader` shows the
-  parse and link API; `demo` shows a CO-RE relocation; `emu` loads an image
-  its build script prepares, with rvm built without the linker.
+- `lib/rvm-core`: the instruction set and interpreter (`run`, `step`) over a
+  `Memory` and a `Host` trait. `run` returns a `Flow` saying why execution
+  stopped: exit, an indirect call or jump, a declined host call, a fault, or out
+  of fuel. `Code` fuses common instruction sequences into superinstructions.
+- `lib/rvm`: the runtime: ELF loading, linking, guest memory, helpers, maps and
+  plugins.
+- `lib/btf`: BTF parsing, `BtfBuilder` and CO-RE relocations.
+- `lib/constelf`: a `const fn` ELF reader for the linker.
+- `lib/ebpf-asm`: an assembler and disassembler for writing bytecode in Rust,
+  used by tests, benches and examples.
+- `bin/loader`, `bin/demo`, `bin/emu`: the programs above.
+
+## Features and profiles
+
+rvm's features:
+
+- `link` (default): ELF parsing, BTF, CO-RE and the linker (`Module`,
+  `BtfBuilder`, `Vm::types`, `Vm::prepare`, `Vm::load_elf`, `Vm::load_plugin`).
+  Without it, rvm loads prepared images only.
+- `fuel` (default): enforces `VmConfig::instruction_limit`. Without it the field
+  doesn't exist and the interpreter doesn't count instructions.
+- `fixed-hash-seed`: guest hash maps use a fixed seed, for reproducible
+  benchmarks.
+
+The `release` profile optimizes for size but builds rvm at `opt-level = 3`,
+because the interpreter inlines into rvm. The `embedded` profile
+(`cargo build --profile embedded`) also strips symbols, panic locations and
+`Debug` output, for the smallest host binary.
 
 ## Using the runtime
 
@@ -68,14 +63,14 @@ use rvm::Vm;
 
 let vm = Vm::new();
 
-// Numeric helper, called from the guest via `call <id>` with src_reg 0.
-// IDs 1 to 3 are the built-in map helpers.
+// Numeric helper, called from the guest via `call <id>`. IDs 1 to 3 are the
+// built-in map helpers.
 vm.register_helper(100, |x: u64| x * 2);
 
 // Named extern, imported by the guest as `extern u64 host_add(u64, u64);`.
 vm.register_fn("host_add", |(a, b): (u64, u64)| a + b);
 
-// Named extern that reads the guest's memory: `extern void log(const char *, u64);`.
+// Named extern that reads guest memory: `extern void log(const char *, u64);`.
 vm.register_fn_with_memory("log", |mem, (msg, len): (u64, u64)| {
     println!("{}", String::from_utf8_lossy(&mem.read_vec(msg, len as usize)?));
     Ok::<_, rvm::MemoryError>(())
@@ -85,32 +80,64 @@ let mut program = vm.load_elf(&elf_bytes)?;
 let result = program.call("run", &[42])?;
 ```
 
-A function registered with `register_fn_with_memory` gets the calling program's
-memory as a `GuestMemory`. Its reads and writes copy, need the same region
-permissions as the guest's own loads and stores, and return a `MemoryError` for
-a pointer the guest couldn't use. A host function that returns `Result` gives
-the guest -1 on `Err`.
+A `register_fn_with_memory` function gets the calling program's memory as a
+`GuestMemory`. Its reads and writes copy, need the same permissions as the
+guest's own loads and stores, and return a `MemoryError` for a pointer the guest
+couldn't use. A host function that returns `Err` gives the guest -1.
 
-`load_elf` parses and links a single module. For multi-module programs, call
-`Vm::parse_module` for each object and `Vm::link` with the set of modules.
+Registering a helper again replaces it everywhere: programs linked earlier use
+the new one from their next call.
 
-Registering a helper again replaces it everywhere: programs linked earlier
-pick up the change at their next call, and helper calls themselves take no
-lock.
+Helpers that touch host state are opt-in: `Vm::enable_time` adds `ktime_get_ns`
+(5), `Vm::enable_random` adds `get_prandom_u32` (7), and `Vm::enable_print(sink)`
+adds `trace_printk` (6), passing each line to `sink`.
+
+## Linking
+
+`load_elf` parses and links one object. For several, call `Vm::parse_module` for
+each and `Vm::link` with the set. The linker places code and data sections,
+resolves relocations between modules, and applies CO-RE relocations; loading
+binds each call to a numeric helper or named extern. Linking fails if a named
+extern has no matching helper or module export, if a helper ID isn't registered,
+or if an extern's argument count in the module's BTF differs from the host
+function's arity. An unresolved call is always a link or load error, never a
+runtime one.
+
+## CO-RE
+
+Field accesses compiled with `preserve_access_index` carry CO-RE relocations,
+which the linker patches to the host's struct layouts as kernel CO-RE does
+against kernel BTF. The host describes its layouts with `Vm::types()`, a
+`BtfBuilder`, or derives one from a `#[repr(C)]` struct:
+
+```rust
+rvm::host_struct!(vm.types(), Entity as "entity" { id, hp, pos as "position" });
+```
+
+## Prepared images
+
+`Vm::prepare(&elf)` (or `Vm::prepare_modules`) links ahead of time and returns an
+`rvm::Image`: the final code, initial data, map declarations, exports and the
+calls to bind. `Image::to_bytes` serializes it, and `Vm::load_image(&bytes)` or
+`Vm::load_plugin_image(name, &bytes)` loads it into any VM that registers the
+same externs and helper IDs. An image loads only into the rvm version that wrote
+it. Loading checks every length, index and map definition, so images may come
+from untrusted files. A host that ships images can build rvm without `link`, as
+`bin/emu` does.
 
 ## Plugins
 
 `Vm::load_plugin` links a program behind a lock, and `Vm::export(&plugin, "f")`
-publishes its function `f` as a named extern that programs linked afterwards can
-import. The call runs in the exporting plugin with its own memory and maps, so
-plain pointers mean nothing on the other side. `Plugin::replace` swaps in a new
-build, and importers use it from their next call. A `Func` from `Plugin::func`
-fails after a replace; `Plugin::named_func` returns a handle that looks the
-function up again in the new build on its next call. A call into a plugin that is
-already running fails with `VmError::PluginBusy` instead of deadlocking.
+publishes its function `f` as a named extern for programs linked afterwards. The
+call runs in the exporting plugin with its own memory and maps, so plain
+pointers mean nothing on the other side. `Plugin::replace` swaps in a new build,
+which importers use from their next call. A `Func` from `Plugin::func` fails
+after a replace; `Plugin::named_func` looks the function up again in the new
+build. Calling into a plugin that is already running fails with
+`VmError::PluginBusy`.
 
-An exported function can borrow a buffer from its caller for one call by
-tagging the pointer parameter with the index of its length parameter:
+An export can borrow a buffer from its caller for one call by tagging the
+pointer parameter with the index of its length parameter:
 
 ```c
 #define BORROW(len_arg) __attribute__((btf_decl_tag("borrow:" #len_arg)))
@@ -120,46 +147,13 @@ u64 sum(const u64 *buf BORROW_RO(1), u64 len);
 ```
 
 The runtime maps the caller's bytes into the callee at a `BORROW_FIRST_REGION`
-slot, passes that address instead, and unmaps it when the call returns. A
-length that runs past the caller's memory fails the call before the callee
-runs.
-
-## Linking
-
-`Vm::link` places code and data sections, resolves relocations between
-modules, records the remaining calls to numeric helper IDs and named externs,
-and applies CO-RE relocations. Loading then binds each recorded call to a slot
-in the program's extern table. Linking fails if a named extern has no matching
-helper or module export, if a numeric helper ID is never registered, or if a
-host extern's declared argument count does not match the registered helper's
-arity (checked against the module's BTF, when present). There is no late
-binding: an unresolved call is a link or load error, not a runtime one.
-
-## Prepared images
-
-`Vm::prepare(&elf)` (or `Vm::prepare_modules`) links ahead of time and returns
-an `rvm::Image`: the final code with every relocation applied, the initial data,
-map declarations, exported functions and the calls to bind on load.
-`Image::to_bytes` serializes it, and `Vm::load_image(&bytes)` or
-`Vm::load_plugin_image(name, &bytes)` turns it into a program in any VM that
-registers the same externs and helper IDs. Loading binds each extern by name or
-ID, allocates memory and maps, and maps the VM's shared maps and regions. An
-image loads only into the rvm version that wrote it, and loading checks every
-length, index and map definition, so images may come from untrusted files.
-
-The linker sits behind rvm's default `link` feature, together with ELF parsing,
-BTF and CO-RE (`Module`, `BtfBuilder`, `Vm::types`, `Vm::prepare`,
-`Vm::load_elf`, `Vm::load_plugin`). A host that ships prepared images can depend
-on rvm with `default-features = false` and prepare them in a build script or a
-separate tool, as `bin/emu` does.
-
-rvm's `fuel` feature, also on by default, enforces `VmConfig::instruction_limit`;
-without it, the field doesn't exist and the interpreter doesn't count instructions.
+slot for the duration of the call. A length that runs past the caller's memory
+fails the call before the callee runs.
 
 ## Guest memory
 
-A guest address is `(region << 32) | offset`. `rvm::VmMemory` holds
-`MAX_REGIONS` region slots, each with its own byte range and permissions:
+A guest address is `(region << 32) | offset`. `rvm::VmMemory` has `MAX_REGIONS`
+region slots, each with its own byte range and permissions:
 
 | Region | Contents | Permissions |
 |---|---|---|
@@ -173,27 +167,73 @@ A guest address is `(region << 32) | offset`. `rvm::VmMemory` holds
 | `SHARED_MAPS_FIRST_REGION` (32) to 63 | shared maps, one region each | RW |
 | `CODE_REGION` (64) | code addresses, never mapped | - |
 
-Host code maps its own regions with `VmMemory::map` (zeroed) or
-`VmMemory::map_bytes` (host-owned buffer), and can map existing host memory
-directly with the unsafe `VmMemory::map_host`, which requires the pointed-to
-memory to outlive the mapping.
+The host maps its own regions with `VmMemory::map` (zeroed) or
+`VmMemory::map_bytes` (host-owned buffer). The unsafe `VmMemory::map_host` maps
+existing host memory, which must outlive the mapping.
+
+`Vm::share_region(region, len, perms)` maps one buffer at the same region in
+every program linked afterwards, so plugins can pass plain pointers into it.
+The host accesses it through the returned `SharedRegion`: `read_bytes`,
+`write_bytes`, `read` and `write` copy, and `atomic_u32`/`atomic_u64` are real
+atomics. The call is unsafe: guests on different threads may only touch the
+same values with atomics, and against them host copies count as plain loads
+and stores.
+
+## Maps
+
+Array and hash maps are declared libbpf style in `.maps` (`__uint(type, ...)`,
+`__type(key, ...)`, `__type(value, ...)`, `max_entries`). Helpers 1 to 3
+(`map_lookup_elem`, `map_update_elem`, `map_delete_elem`) are built in unless the
+host registers its own under those IDs. Values live in `MAPS_REGION`, so a
+looked up pointer is an ordinary guest address.
+
+The host reaches a map through `Program::map(name)`, as bytes (`get`, `update`,
+`delete`) or as `Pod` types (`get_as`, `update_as`). `MapRef::entries` iterates
+without allocating: every element of an array map, or the present keys of a
+hash map. For a shared hash map it holds the key index read-locked until
+dropped.
+
+`Vm::share_map(name, pad_values)` makes maps of that name one instance across
+every program linked afterwards, at the same guest address in each. The first
+program to declare it creates it, and a later declaration with a different
+layout fails the link. `pad_values` puts each value on its own cache line. It
+has the same unsafe contract as `share_region`.
+
+## Instruction set
+
+The interpreter covers the ISA up to `-mcpu=v4`, with these details:
+
+- Atomics (add, or, and, xor with and without fetch, xchg, cmpxchg; 32 and 64
+  bit) through `Memory::atomic_u32`/`atomic_u64`. `VmMemory` uses host atomics
+  and faults on misaligned addresses.
+- Function pointers. A code address is `region_base(CODE_REGION)` plus a byte
+  offset into the program's code, so loads and stores through it fault. The
+  linker writes one wherever clang takes a function's address. `callx` faults
+  unless its target is an instruction in the program; a target below 2^32 is a
+  helper ID, as in libbpf's `(void *)BPF_FUNC_*` declarations.
+- Jump tables. Clang 22 lowers a dense `switch` of 13 or more cases to `gotox`
+  through `.jumptables`; the linker copies each table into `.rodata` as code
+  addresses, and `gotox` checks its target like `callx`.
+
+Not implemented: kfunc BTF ID resolution, and the legacy packet access modes
+`BPF_ABS` and `BPF_IND`, which return `Flow::Missing`.
 
 ## Tests and benchmarks
 
 ```bash
 cargo test
-cargo bench -p rvm --bench exec
+cargo test -p rvm --no-default-features --features link
+cargo bench -p rvm --bench exec        # interpreter loops from ebpf-asm, map helpers
+cargo bench -p rvm --bench workloads   # program and plugin calls, bpf/workloads.c
 ```
 
-`exec` benchmarks interpreter throughput on hand-assembled ALU, memory, and
-call-heavy loops built with `ebpf-asm`.
+The integration tests run the vendored
+[bpf_conformance](https://github.com/Alan-Jowett/bpf_conformance) suite
+(`lib/rvm/tests/conformance/`).
 
-`lib/rvm/tests/integration/conformance.rs` runs the
-[bpf_conformance](https://github.com/Alan-Jowett/bpf_conformance) suite, vendored
-under `lib/rvm/tests/conformance/`, against the interpreter.
-
-Miri checks the `unsafe` memory code. The integration tests list fixture directories,
-which Miri only supports on Unix targets, so they run as Linux (about 8 minutes):
+Miri checks the unsafe memory code. The integration tests list fixture
+directories, which Miri supports only on Unix targets, so they run as Linux
+(about 8 minutes):
 
 ```bash
 cargo miri test -p rvm-core
@@ -201,69 +241,7 @@ cargo miri test -p rvm --lib
 MIRIFLAGS=-Zmiri-disable-isolation cargo miri test -p rvm --test integration --target x86_64-unknown-linux-gnu
 ```
 
-Compare interpreter changes on plain release builds, which is what an embedder gets,
-and build both versions from the same checkout path: cargo's package IDs include the
-source path, and builds from different directories lay code out differently. Enable
-`fixed-hash-seed` so guest hash maps probe the same way in both builds. PGO is a
-bonus on top that depends on which guest programs it was trained on; to try it
-(`cargo install cargo-pgo`, `rustup component add llvm-tools-preview`), collect a
-profile per version, since a profile only matches the code it was recorded on:
-
-```bash
-cargo pgo bench -- -p rvm --bench workloads --bench exec -- --profile-time 2
-cargo pgo optimize bench -- -p rvm --bench workloads
-```
-
-## Scope
-
-Not implemented: kfunc BTF ID resolution, and the legacy packet access modes
-`BPF_ABS` and `BPF_IND`, which return `Flow::Missing`.
-
-Helpers that touch host state are off by default. `Vm::enable_time` adds
-`ktime_get_ns` (5), `Vm::enable_random` adds `get_prandom_u32` (7), and
-`Vm::enable_print(sink)` adds `trace_printk` (6), passing each line to `sink`.
-A program that calls a helper the host didn't enable fails to link.
-
-Maps: array and hash maps declared libbpf style in `.maps` (`__uint(type, ...)`,
-`__type(key, ...)`, `__type(value, ...)`, `max_entries`). Helpers 1 to 3
-(`map_lookup_elem`, `map_update_elem`, `map_delete_elem`) are built in unless the
-host registers its own under those IDs. Values live in `MAPS_REGION`, so a looked
-up pointer is an ordinary guest address. The host reads and writes maps through
-`Program::map(name)`, as bytes (`get`, `update`, `delete`) or as `Pod` types
-(`get_as`, `update_as`), such as integers, arrays and `#[repr(C)]` structs without
-padding. `MapRef::entries` iterates a map without allocating: every element of an
-array map with its index, or the keys present in a hash map with their values.
-For a shared hash map it holds the key index locked for reading until dropped.
-
-`Vm::share_map(name, pad_values)` makes maps of that name one instance across
-every program the VM links afterwards, at the same guest address in each. The
-first program to declare it creates it, and a later declaration with a
-different layout fails the link. `pad_values` puts each value on its own cache
-line. The call is `unsafe`: programs running on different threads at the same
-time may only touch shared values with atomics.
-
-`Vm::share_region(region, len, perms)` allocates a buffer and maps it at region
-`region` (between `FIRST_FREE_REGION` and `BORROW_FIRST_REGION`) into every
-program linked afterwards, so plugins can pass plain pointers into it. It has the
-same `unsafe` contract as `share_map`. The host reads and writes the bytes
-through the returned `SharedRegion`: `read_bytes`/`write_bytes` and the typed
-`read`/`write` copy, and `atomic_u32`/`atomic_u64` are real atomics. Writes take
-`&mut self`, so host accesses never race each other; against guests on other
-threads, copies count as plain loads and stores, and only the atomics may touch
-values those guests write concurrently.
-
-Atomics (`BPF_ATOMIC` add, or, and, xor with and without fetch, xchg and
-cmpxchg, 32 and 64 bit) go through `Memory::atomic_u32` and
-`Memory::atomic_u64`. `VmMemory` uses real host atomics and faults on
-misaligned addresses; the trait's default is a plain load and store.
-
-Function pointers: a code address is `region_base(CODE_REGION)` plus a byte
-offset into the linked program's code, so loads and stores through it fault.
-The linker writes one wherever clang takes a function's address (`lddw` and
-pointers in `.data` or `.rodata`). `callx` (`call` with the register bit set,
-target in `dst_reg`) calls one with a new stack frame, and faults unless the
-target is an instruction in the program. A target below 2^32 is a helper ID
-instead, matching libbpf's `(void *)BPF_FUNC_*` helper declarations. Clang 22
-at `-mcpu=v4` lowers a dense `switch` of 13 or more cases to `gotox` through a
-`.jumptables` table; the linker copies each table into `.rodata` as code
-addresses, and `gotox` checks its target the same way.
+To compare interpreter changes, benchmark plain release builds with
+`fixed-hash-seed`, and build both versions from the same checkout path: cargo's
+package IDs include the source path, and builds from different directories lay
+code out differently.

@@ -18,7 +18,7 @@ default = ["link", "fuel"]
 link = ["dep:constelf", "dep:btf"]
 # `VmConfig::instruction_limit`. Without it, the interpreter doesn't count instructions.
 fuel = ["rvm-core/fuel"]
-# Guest hash maps use a fixed hash seed (reproducible benchmarks and PGO profiles).
+# Guest hash maps use a fixed hash seed, so builds compared in benchmarks probe the same way.
 fixed-hash-seed = []
 
 [dev-dependencies]
