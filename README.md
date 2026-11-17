@@ -40,7 +40,9 @@ cargo run -p rvm --example msgpack_logs  # streams MessagePack logs through a pa
   trait implementation, and returns a `Flow` describing why execution stopped
   (exit, an indirect call or jump, a host call the host declined, a fault, or
   out of fuel). `run` takes a `Code`, which fuses common instruction sequences
-  into superinstructions when it is created.
+  into superinstructions when it is created, gives loads and stores through r10
+  a path that skips the `Memory` methods when the memory reports a `Window` for
+  the stack, and fails instructions that write r10 (read-only) with `FailCpu`.
 - `lib/rvm`: the embeddable runtime built on `rvm-core`. Parses ELF objects,
   links them into executable programs, manages guest memory, and dispatches
   helper calls.

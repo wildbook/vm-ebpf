@@ -10,10 +10,12 @@ use opcode::{Class, MemMode, MemSize, OpCode};
 
 mod debug;
 mod fuse;
+mod stack;
 
 pub mod opcode;
 
 pub use fuse::Code;
+pub use stack::Window;
 
 #[cfg(test)]
 mod tests;
@@ -171,6 +173,20 @@ pub trait Memory {
         }
         Ok(old)
     }
+
+    /// The host memory that loads and stores near `addr` may access directly.
+    /// [`run`] takes the window around r10 and runs 4 and 8 byte loads and stores
+    /// through r10 that fall inside it without calling the methods above, until
+    /// [`Memory::epoch`] changes. The default is [`Window::NONE`].
+    fn window(&self, addr: u64) -> Window {
+        let _ = addr;
+        Window::NONE
+    }
+
+    /// The epoch of the windows this memory reports now; see [`Window::new`].
+    fn epoch(&self) -> u64 {
+        0
+    }
 }
 
 /// A read-modify-write operation for [`Memory::atomic_u32`] and [`Memory::atomic_u64`].
@@ -241,6 +257,12 @@ impl<M: Memory + ?Sized> Memory for &mut M {
     }
     fn atomic_u64(&mut self, addr: u64, op: AtomicOp<u64>) -> Result<u64, Self::Err> {
         (**self).atomic_u64(addr, op)
+    }
+    fn window(&self, addr: u64) -> Window {
+        (**self).window(addr)
+    }
+    fn epoch(&self) -> u64 {
+        (**self).epoch()
     }
 }
 
@@ -715,8 +737,8 @@ pub trait Host<M: Memory> {
 pub const MAX_CALL_DEPTH: usize = 8;
 
 /// The BPF-to-BPF calls in progress, which [`run`] pushes and pops, the slot where
-/// it records where it stopped, and the [`Host`] that runs its helper and kfunc
-/// calls.
+/// it records where it stopped, the window of the stack that r10 accesses use, and
+/// the [`Host`] that runs its helper and kfunc calls.
 // `repr(C)` keeps the scalars ahead of the frames, so every handler reaches them
 // with a one-byte displacement.
 #[repr(C)]
@@ -725,6 +747,7 @@ pub struct CallStack<H> {
     /// Bytes r10 moves down per nested call.
     frame_size: u64,
     stop: Stop,
+    stack: stack::Cache,
     pub host: H,
 
     /// `frames[..depth]` are initialised.
@@ -747,6 +770,7 @@ impl<H> CallStack<H> {
             depth: 0,
             frame_size,
             stop: Stop { pc: 0, fuel: 0 },
+            stack: stack::Cache::STALE,
             host,
             frames: [const { MaybeUninit::uninit() }; MAX_CALL_DEPTH],
         }
@@ -818,8 +842,8 @@ type Handler<M, H> = extern "rust-preserve-none" fn(
 
 /// The handler of every opcode byte. Each runs [`step`] with its opcode as a
 /// constant, so the class, operation, source, mode and size matches fold away; the
-/// superinstruction bytes get theirs from [`fuse::install`]. With `FUEL`, the
-/// handlers meter fuel; without it, they never read it.
+/// bytes of superinstructions and r10 accesses get theirs from [`fuse::install`].
+/// With `FUEL`, the handlers meter fuel; without it, they never read it.
 struct Handlers<M, H, const FUEL: bool>(PhantomData<(M, H)>);
 
 impl<M: Memory, H: Host<M>, const FUEL: bool> Handlers<M, H, FUEL> {
@@ -934,6 +958,7 @@ extern "rust-preserve-none" fn host_call<M: Memory, H: Host<M>, const FUEL: bool
     let Some(r0) = r0 else {
         return calls.stop.at(pc, fuel, flow);
     };
+    calls.stack.revalidate(&ctx.data);
     ctx.regs[0] = r0;
 
     let pc = pc + 1;
@@ -1014,6 +1039,7 @@ pub fn run<M: Memory, H: Host<M>>(
     let fuel = &mut 0;
 
     let code = code.slots();
+    calls.stack.revalidate(&ctx.data);
     let (first, insn) = match fetch::<M, H, METERED>(code, *pc, *fuel) {
         Ok(next) => next,
         Err(flow) => return flow,

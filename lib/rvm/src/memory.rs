@@ -13,13 +13,13 @@
 
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::ptr::NonNull;
-use std::sync::atomic::Ordering::SeqCst;
+use std::sync::atomic::Ordering::{Relaxed, SeqCst};
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::Arc;
 
-use rvm_core::AtomicOp;
 // Re-export the Memory trait from rvm-core
 pub use rvm_core::Memory;
+use rvm_core::{AtomicOp, Window};
 
 use crate::error::MemoryError;
 
@@ -87,7 +87,12 @@ pub struct VmMemory {
     owned: u64,
     // buffer behind each region mapped with `map_shared`, kept alive while mapped
     shared: [Option<Arc<SharedBuffer>>; MAX_REGIONS],
+    // changes with every mapping, to a value no memory had before; see `Window::new`
+    epoch: u64,
 }
+
+/// The last epoch any `VmMemory` took.
+static EPOCH: AtomicU64 = AtomicU64::new(0);
 
 // SAFETY: owned regions are plain heap allocations exclusively owned by this value.
 // Host regions are only created through `map_host`, whose contract requires the
@@ -112,6 +117,7 @@ impl VmMemory {
             perms: [Perms::NONE; MAX_REGIONS],
             owned: 0,
             shared: [const { None }; MAX_REGIONS],
+            epoch: 0,
         }
     }
 
@@ -201,6 +207,7 @@ impl VmMemory {
             self.owned &= !(1 << idx);
         }
         self.shared[idx] = None;
+        self.epoch = EPOCH.fetch_add(1, Relaxed) + 1;
         region_base(idx)
     }
 
@@ -601,6 +608,23 @@ impl Memory for VmMemory {
 
     guest_atomic!(atomic_u32, u32, AtomicU32);
     guest_atomic!(atomic_u64, u64, AtomicU64);
+
+    fn window(&self, addr: u64) -> Window {
+        let idx = (addr >> REGION_SHIFT) as usize;
+        if idx >= MAX_REGIONS {
+            return Window::NONE;
+        }
+        let (read_len, write_len) = (self.read_end[idx] as u64, self.write_end[idx] as u64);
+        // SAFETY: the region's allocation backs `read_end` and `write_end` bytes until
+        // the next `set`, which moves to a new epoch, or drop; `guest_ptr` resolves
+        // guest accesses to the same bytes. Epoch 0 has nothing mapped. `ptrs` holds
+        // raw pointers, not references into `self`.
+        unsafe { Window::new(region_base(idx), self.ptrs[idx].as_ptr(), read_len, write_len, self.epoch) }
+    }
+
+    fn epoch(&self) -> u64 {
+        self.epoch
+    }
 }
 
 /// Fixed-size little-endian scalar of at most 8 bytes, for host-side reads and writes.
