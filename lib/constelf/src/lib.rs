@@ -1,4 +1,5 @@
 mod util;
+pub use util::cstr_at;
 
 pub mod err;
 pub mod raw;

@@ -5,6 +5,7 @@ use crate::err::{self, ElfError, ErrHeader};
 use crate::raw::Elf64Ehdr;
 use crate::relocs::ElfRelocs;
 use crate::sections::ElfSections;
+use crate::util::cast_slice;
 use crate::{ensure, relocs, tryres};
 
 #[derive(Clone, Copy)]
@@ -25,7 +26,7 @@ impl ElfFile<'_> {
         Ok(())
     }
 
-    /// `header` dereferences the image unchecked, so every `ElfFile` must pass through here.
+    /// `header` panics on an image shorter than `Elf64Ehdr`, so every `ElfFile` must pass through here.
     pub const fn validated(self) -> ElfResult<Self> {
         tryres!(self.validate());
         Ok(self)
@@ -42,7 +43,11 @@ impl<'a> ElfFile<'a> {
     }
 
     pub const fn header(self) -> &'a Elf64Ehdr {
-        unsafe { &*(self.image().as_ptr().cast::<Elf64Ehdr>()) }
+        let (head, _) = self.0.split_at(mem::size_of::<Elf64Ehdr>());
+        match cast_slice(head) {
+            Some([ehdr]) => ehdr,
+            _ => unreachable!(),
+        }
     }
 
     pub const fn sections(self) -> ElfResult<ElfSections<'a>> {

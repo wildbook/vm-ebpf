@@ -5,14 +5,14 @@ use std::ops::Deref;
 use super::file::ElfFile;
 use super::ElfResult;
 use crate::err::{self, ElfError};
-use crate::raw::{self, Elf64Ehdr, Elf64Shdr, Elf64Sym};
+use crate::raw::{self, Elf64Ehdr, Elf64Shdr};
 use crate::symtab::ElfSymTab;
 use crate::{ensure, tryopt, tryres, util};
 
 #[derive(Copy, Clone)]
 pub struct ElfSections<'a> {
     file: ElfFile<'a>,
-    ehdr: &'a Elf64Ehdr,
+    headers: &'a [Elf64Shdr],
 }
 
 #[derive(Copy, Clone)]
@@ -52,21 +52,22 @@ impl<'a> Deref for ElfSection<'a> {
 }
 
 impl<'a> ElfSections<'a> {
-    #[rustfmt::skip]
     pub const fn new(file: ElfFile<'a>, ehdr: &'a Elf64Ehdr) -> ElfResult<Self> {
-        ensure!(ElfError::Sections, ehdr.e_shoff as usize <= file.image().len());
-        ensure!(ElfError::Sections, ehdr.e_shoff as usize + ehdr.e_shentsize as usize * ehdr.e_shnum as usize <= file.image().len());
         ensure!(ElfError::Sections, ehdr.e_shentsize as usize == mem::size_of::<Elf64Shdr>());
 
-        Ok(Self { file, ehdr })
+        let len = ehdr.e_shentsize as usize * ehdr.e_shnum as usize;
+        let Ok(bytes) = util::derva_slice(file.image(), ehdr.e_shoff as usize, len) else {
+            return Err(ElfError::Sections);
+        };
+        let Some(headers) = util::cast_slice(bytes) else {
+            return Err(ElfError::Sections);
+        };
+
+        Ok(Self { file, headers })
     }
 
     pub const fn headers(self) -> &'a [Elf64Shdr] {
-        let beg = self.ehdr.e_shoff as usize;
-        let len = self.ehdr.e_shnum as usize;
-        let ptr = unsafe { self.file.image().as_ptr().add(beg).cast() };
-
-        unsafe { std::slice::from_raw_parts(ptr, len) }
+        self.headers
     }
 
     pub const fn header_by_index(self, index: usize) -> Option<&'a Elf64Shdr> {
@@ -95,11 +96,9 @@ impl<'a> ElfSections<'a> {
 
             if header.sh_type == raw::sht::SYMTAB {
                 let bytes = tryres!(self.bytes(header));
-                ensure!(ElfError::InvalidData, bytes.len() % mem::size_of::<Elf64Sym>() == 0);
-
-                let ptr = bytes.as_ptr().cast::<Elf64Sym>();
-                let len = bytes.len() / mem::size_of::<Elf64Sym>();
-                let raw = unsafe { std::slice::from_raw_parts(ptr, len) };
+                let Some(raw) = util::cast_slice(bytes) else {
+                    return Err(ElfError::InvalidData);
+                };
 
                 return Ok(ElfSymTab { raw });
             }
@@ -115,20 +114,14 @@ impl<'a> ElfSections<'a> {
     }
 
     pub const fn name(self, header: &Elf64Shdr) -> ElfResult<&'a CStr> {
-        let nsect = match self.header_by_index(self.file.header().e_shstrndx as usize) {
-            Some(nsect) => nsect,
-            None => return Err(err::ElfError::SectionMissing),
+        let Some(nsect) = self.header_by_index(self.file.header().e_shstrndx as usize) else {
+            return Err(ElfError::SectionMissing);
         };
 
         let ndata = tryres!(self.bytes(nsect));
-        let ndata = match util::slice_from(ndata, header.sh_name as usize) {
-            Some(ndata) => ndata,
-            None => return Err(err::ElfError::InvalidData),
-        };
-
-        match CStr::from_bytes_until_nul(ndata) {
-            Ok(name) => Ok(name),
-            Err(_) => Err(err::ElfError::InvalidData),
+        match util::cstr_at(ndata, header.sh_name as usize) {
+            Some(name) => Ok(name),
+            None => Err(ElfError::InvalidData),
         }
     }
 

@@ -1,9 +1,9 @@
-use std::mem;
-
+use crate::err::ElfError;
 use crate::file::ElfFile;
 use crate::raw::{sht, Elf64Rel, Elf64Rela, Elf64Shdr};
 use crate::sections::{ElfSection, ElfSections};
-use crate::{err, tryres, ElfResult};
+use crate::util::cast_slice;
+use crate::{tryres, ElfResult};
 
 #[derive(Copy, Clone, Debug)]
 pub enum ElfRelocsChunk<'a> {
@@ -94,33 +94,19 @@ impl<'a> ElfRelocSection<'a> {
     pub const fn relocs(self) -> ElfResult<ElfRelocsChunk<'a>> {
         let bytes = tryres!(self.sects.bytes(self.source));
 
-        match self.source.sh_type {
-            sht::REL => {
-                if bytes.len() % mem::size_of::<Elf64Rel>() != 0 {
-                    return Err(err::ElfError::InvalidData);
-                }
+        let chunk = match self.source.sh_type {
+            sht::REL => match cast_slice(bytes) {
+                Some(rel) => ElfRelocsChunk::Rel(rel),
+                None => return Err(ElfError::InvalidData),
+            },
+            sht::RELA => match cast_slice(bytes) {
+                Some(rela) => ElfRelocsChunk::Rela(rela),
+                None => return Err(ElfError::InvalidData),
+            },
+            _ => return Err(ElfError::Unsupported),
+        };
 
-                let ptr = bytes.as_ptr().cast::<Elf64Rel>();
-                let len = bytes.len() / mem::size_of::<Elf64Rel>();
-
-                let slc = unsafe { std::slice::from_raw_parts(ptr, len) };
-
-                Ok(ElfRelocsChunk::Rel(slc))
-            }
-            sht::RELA => {
-                if bytes.len() % mem::size_of::<Elf64Rela>() != 0 {
-                    return Err(err::ElfError::InvalidData);
-                }
-
-                let ptr = bytes.as_ptr().cast::<Elf64Rela>();
-                let len = bytes.len() / mem::size_of::<Elf64Rela>();
-
-                let slc = unsafe { std::slice::from_raw_parts(ptr, len) };
-
-                Ok(ElfRelocsChunk::Rela(slc))
-            }
-            _ => Err(err::ElfError::Unsupported),
-        }
+        Ok(chunk)
     }
 }
 

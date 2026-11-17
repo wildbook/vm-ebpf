@@ -1,37 +1,52 @@
+use std::ffi::CStr;
+use std::mem;
+
 use crate::err::ElfError;
+use crate::raw::{Elf64Ehdr, Elf64Rel, Elf64Rela, Elf64Shdr, Elf64Sym};
 use crate::{tryopt, ElfResult};
 
+/// Types that `cast_slice` may produce: `repr(C, packed)` integer structs, valid for every bit pattern.
+///
+/// # Safety
+///
+/// The type must have alignment 1, no padding, and no invalid bit patterns.
+pub unsafe trait Plain {}
+
+unsafe impl Plain for Elf64Ehdr {}
+unsafe impl Plain for Elf64Shdr {}
+unsafe impl Plain for Elf64Sym {}
+unsafe impl Plain for Elf64Rel {}
+unsafe impl Plain for Elf64Rela {}
+
+/// Reinterprets `bytes` as a slice of `T`, or `None` if the length is not a multiple of `size_of::<T>()`.
+pub const fn cast_slice<T: Plain>(bytes: &[u8]) -> Option<&[T]> {
+    const { assert!(mem::align_of::<T>() == 1 && mem::size_of::<T>() != 0) };
+    if !bytes.len().is_multiple_of(mem::size_of::<T>()) {
+        return None;
+    }
+
+    let len = bytes.len() / mem::size_of::<T>();
+    // SAFETY: `Plain` makes any byte pattern a valid `T`, and the assert above rules out misalignment.
+    Some(unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast(), len) })
+}
+
 pub const fn derva_slice(image: &[u8], beg: usize, len: usize) -> ElfResult<&[u8]> {
-    let Some(end) = beg.checked_add(len) else {
+    let Some((_, tail)) = image.split_at_checked(beg) else {
         return Err(ElfError::DeRvaBounds);
     };
-    match slice(image, beg, end) {
-        Some(slice) => Ok(slice),
+    match tail.split_at_checked(len) {
+        Some((data, _)) => Ok(data),
         None => Err(ElfError::DeRvaBounds),
     }
 }
 
-pub const fn slice_from(data: &[u8], beg: usize) -> Option<&[u8]> {
-    let len = tryopt!(data.len().checked_sub(beg));
-    let ptr = unsafe { data.as_ptr().add(beg) };
-
-    Some(unsafe { std::slice::from_raw_parts(ptr, len) })
-}
-
-pub const fn slice_until(data: &[u8], end: usize) -> Option<&[u8]> {
-    tryopt!(data.len().checked_sub(end));
-    let ptr = data.as_ptr();
-
-    Some(unsafe { std::slice::from_raw_parts(ptr, end) })
-}
-
-pub const fn slice(data: &[u8], beg: usize, end: usize) -> Option<&[u8]> {
-    tryopt!(end.checked_sub(beg));
-
-    let data = tryopt!(slice_from(data, beg));
-    let data = tryopt!(slice_until(data, end - beg));
-
-    Some(data)
+/// The NUL-terminated string at `off` in a string table such as `.strtab` or `.shstrtab`.
+pub const fn cstr_at(table: &[u8], off: usize) -> Option<&CStr> {
+    let (_, tail) = tryopt!(table.split_at_checked(off));
+    match CStr::from_bytes_until_nul(tail) {
+        Ok(name) => Some(name),
+        Err(_) => None,
+    }
 }
 
 pub const fn slice_eq(lhs: &[u8], rhs: &[u8]) -> bool {
