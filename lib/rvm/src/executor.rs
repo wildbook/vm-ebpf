@@ -86,11 +86,6 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
     }
 
     /// Call the function at `pc` (instruction index) with `args` in r1-r5; returns r0.
-    // The whole interpreter inlines into this function. Code changes elsewhere moved
-    // where it starts within a cache line, which alone moved guest timings by ~7%, so
-    // it stays a separate function pinned to a line.
-    #[inline(never)]
-    #[rustc_align(64)]
     pub fn call(&mut self, pc: u64, args: &[u64]) -> Result<u64> {
         let mut ctx = Context::new(&mut *self.memory);
         for (i, &arg) in args.iter().take(5).enumerate() {

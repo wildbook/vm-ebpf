@@ -1,4 +1,8 @@
+#![feature(explicit_tail_calls, rust_preserve_none_cc)]
+#![allow(incomplete_features)]
+
 use std::fmt::Debug;
+use std::marker::PhantomData;
 use std::ops::ControlFlow;
 
 use opcode::{Class, MemMode, MemSize, OpCode};
@@ -681,60 +685,111 @@ pub fn step<M: Memory>(ctx: &mut Context<M>, instr: Instruction) -> ControlFlow<
     }
 }
 
-/// [`step`] behind one jump on the full opcode byte. Each arm runs `step` with the
-/// opcode as a constant, so the class, operation, source, mode and size matches fold
-/// away at compile time instead of being decoded and dispatched on per instruction.
-///
-/// A taken jump moves `*pc` to the slot before its target and returns [`Flow::Next`],
-/// so the caller advances by one for both. Applying the offset inside the arm keeps it
-/// in a register; returned through the shared `Flow`, it goes through a stack slot.
-#[inline(always)]
-fn step_by_opcode<M: Memory>(
-    ctx: &mut Context<M>,
-    instr: Instruction,
-    pc: &mut u64,
-) -> ControlFlow<Flow<M>, Instruction> {
+/// Where [`run`] stopped, written once when execution leaves the handler chain.
+struct Stop {
+    pc: u64,
+    fuel: u64,
+}
+
+impl Stop {
     #[inline(always)]
-    fn with_opcode<M: Memory, const OP: u8>(
-        ctx: &mut Context<M>,
-        instr: Instruction,
-        pc: &mut u64,
-    ) -> ControlFlow<Flow<M>, Instruction> {
-        match step(ctx, Instruction(instr.0 & !0xFF | OP as u64)) {
-            ControlFlow::Break(Flow::Jump(offset)) => {
-                *pc = pc.wrapping_add_signed(offset);
-                ControlFlow::Break(Flow::Next)
-            }
-            other => other,
+    fn at<M: Memory>(&mut self, pc: u64, fuel: u64, flow: Flow<M>) -> Flow<M> {
+        core::hint::cold_path();
+        (self.pc, self.fuel) = (pc, fuel);
+        flow
+    }
+}
+
+/// Runs the instruction `insn` at `pc` and continues with the next one. `fuel` has
+/// already been charged for `insn`.
+///
+/// `preserve_none` passes all arguments in registers (the Windows x64 C convention
+/// has four) and saves no registers, so a tail call between handlers is a jump.
+type Handler<M> =
+    extern "rust-preserve-none" fn(&mut Context<M>, &[Instruction], Instruction, u64, u64, &mut Stop) -> Flow<M>;
+
+/// The handler of every opcode byte, each running [`step`] with its opcode as a
+/// constant, so the class, operation, source, mode and size matches fold away.
+struct Handlers<M>(PhantomData<M>);
+
+impl<M: Memory> Handlers<M> {
+    const TABLE: [Handler<M>; 256] = {
+        macro_rules! table {
+            ($($op:literal)*) => {
+                [$(handler::<M, $op> as Handler<M>,)*]
+            };
         }
-    }
 
-    macro_rules! dispatch {
-        ($($op:literal)*) => {
-            match instr.0 as u8 {
-                $($op => with_opcode::<M, $op>(ctx, instr, pc),)*
+        table!(
+            0x00 0x01 0x02 0x03 0x04 0x05 0x06 0x07 0x08 0x09 0x0a 0x0b 0x0c 0x0d 0x0e 0x0f
+            0x10 0x11 0x12 0x13 0x14 0x15 0x16 0x17 0x18 0x19 0x1a 0x1b 0x1c 0x1d 0x1e 0x1f
+            0x20 0x21 0x22 0x23 0x24 0x25 0x26 0x27 0x28 0x29 0x2a 0x2b 0x2c 0x2d 0x2e 0x2f
+            0x30 0x31 0x32 0x33 0x34 0x35 0x36 0x37 0x38 0x39 0x3a 0x3b 0x3c 0x3d 0x3e 0x3f
+            0x40 0x41 0x42 0x43 0x44 0x45 0x46 0x47 0x48 0x49 0x4a 0x4b 0x4c 0x4d 0x4e 0x4f
+            0x50 0x51 0x52 0x53 0x54 0x55 0x56 0x57 0x58 0x59 0x5a 0x5b 0x5c 0x5d 0x5e 0x5f
+            0x60 0x61 0x62 0x63 0x64 0x65 0x66 0x67 0x68 0x69 0x6a 0x6b 0x6c 0x6d 0x6e 0x6f
+            0x70 0x71 0x72 0x73 0x74 0x75 0x76 0x77 0x78 0x79 0x7a 0x7b 0x7c 0x7d 0x7e 0x7f
+            0x80 0x81 0x82 0x83 0x84 0x85 0x86 0x87 0x88 0x89 0x8a 0x8b 0x8c 0x8d 0x8e 0x8f
+            0x90 0x91 0x92 0x93 0x94 0x95 0x96 0x97 0x98 0x99 0x9a 0x9b 0x9c 0x9d 0x9e 0x9f
+            0xa0 0xa1 0xa2 0xa3 0xa4 0xa5 0xa6 0xa7 0xa8 0xa9 0xaa 0xab 0xac 0xad 0xae 0xaf
+            0xb0 0xb1 0xb2 0xb3 0xb4 0xb5 0xb6 0xb7 0xb8 0xb9 0xba 0xbb 0xbc 0xbd 0xbe 0xbf
+            0xc0 0xc1 0xc2 0xc3 0xc4 0xc5 0xc6 0xc7 0xc8 0xc9 0xca 0xcb 0xcc 0xcd 0xce 0xcf
+            0xd0 0xd1 0xd2 0xd3 0xd4 0xd5 0xd6 0xd7 0xd8 0xd9 0xda 0xdb 0xdc 0xdd 0xde 0xdf
+            0xe0 0xe1 0xe2 0xe3 0xe4 0xe5 0xe6 0xe7 0xe8 0xe9 0xea 0xeb 0xec 0xed 0xee 0xef
+            0xf0 0xf1 0xf2 0xf3 0xf4 0xf5 0xf6 0xf7 0xf8 0xf9 0xfa 0xfb 0xfc 0xfd 0xfe 0xff
+        )
+    };
+}
+
+/// The [`Handler`] of opcode `OP`. Each handler fetches the next instruction itself
+/// and ends in its own indirect jump, so the branch predictor tracks the successors
+/// of every opcode separately.
+// PGO promotes a profiled tail call to a compare against its usual target; inlining
+// that target as well would copy whole handler chains of the profiled programs.
+#[inline(never)]
+extern "rust-preserve-none" fn handler<M: Memory, const OP: u8>(
+    ctx: &mut Context<M>,
+    code: &[Instruction],
+    insn: Instruction,
+    mut pc: u64,
+    mut fuel: u64,
+    stop: &mut Stop,
+) -> Flow<M> {
+    match step(ctx, Instruction(insn.0 & !0xFF | OP as u64)) {
+        ControlFlow::Break(Flow::Next) => {}
+        ControlFlow::Break(Flow::Jump(offset)) => pc = pc.wrapping_add_signed(offset),
+        ControlFlow::Continue(first) => {
+            pc += 1;
+            let Some(&second) = code.get(pc as usize) else {
+                return stop.at(pc, fuel, Flow::BadPc);
+            };
+            fuel = fuel.saturating_sub(1);
+            match step_ld64(ctx, first, second) {
+                Flow::Next => {}
+                flow => return stop.at(pc, fuel, flow),
             }
-        };
+        }
+        ControlFlow::Break(flow) => return stop.at(pc, fuel, flow),
     }
 
-    dispatch!(
-        0x00 0x01 0x02 0x03 0x04 0x05 0x06 0x07 0x08 0x09 0x0a 0x0b 0x0c 0x0d 0x0e 0x0f
-        0x10 0x11 0x12 0x13 0x14 0x15 0x16 0x17 0x18 0x19 0x1a 0x1b 0x1c 0x1d 0x1e 0x1f
-        0x20 0x21 0x22 0x23 0x24 0x25 0x26 0x27 0x28 0x29 0x2a 0x2b 0x2c 0x2d 0x2e 0x2f
-        0x30 0x31 0x32 0x33 0x34 0x35 0x36 0x37 0x38 0x39 0x3a 0x3b 0x3c 0x3d 0x3e 0x3f
-        0x40 0x41 0x42 0x43 0x44 0x45 0x46 0x47 0x48 0x49 0x4a 0x4b 0x4c 0x4d 0x4e 0x4f
-        0x50 0x51 0x52 0x53 0x54 0x55 0x56 0x57 0x58 0x59 0x5a 0x5b 0x5c 0x5d 0x5e 0x5f
-        0x60 0x61 0x62 0x63 0x64 0x65 0x66 0x67 0x68 0x69 0x6a 0x6b 0x6c 0x6d 0x6e 0x6f
-        0x70 0x71 0x72 0x73 0x74 0x75 0x76 0x77 0x78 0x79 0x7a 0x7b 0x7c 0x7d 0x7e 0x7f
-        0x80 0x81 0x82 0x83 0x84 0x85 0x86 0x87 0x88 0x89 0x8a 0x8b 0x8c 0x8d 0x8e 0x8f
-        0x90 0x91 0x92 0x93 0x94 0x95 0x96 0x97 0x98 0x99 0x9a 0x9b 0x9c 0x9d 0x9e 0x9f
-        0xa0 0xa1 0xa2 0xa3 0xa4 0xa5 0xa6 0xa7 0xa8 0xa9 0xaa 0xab 0xac 0xad 0xae 0xaf
-        0xb0 0xb1 0xb2 0xb3 0xb4 0xb5 0xb6 0xb7 0xb8 0xb9 0xba 0xbb 0xbc 0xbd 0xbe 0xbf
-        0xc0 0xc1 0xc2 0xc3 0xc4 0xc5 0xc6 0xc7 0xc8 0xc9 0xca 0xcb 0xcc 0xcd 0xce 0xcf
-        0xd0 0xd1 0xd2 0xd3 0xd4 0xd5 0xd6 0xd7 0xd8 0xd9 0xda 0xdb 0xdc 0xdd 0xde 0xdf
-        0xe0 0xe1 0xe2 0xe3 0xe4 0xe5 0xe6 0xe7 0xe8 0xe9 0xea 0xeb 0xec 0xed 0xee 0xef
-        0xf0 0xf1 0xf2 0xf3 0xf4 0xf5 0xf6 0xf7 0xf8 0xf9 0xfa 0xfb 0xfc 0xfd 0xfe 0xff
-    )
+    // a negative jump target wraps to a huge pc and fails the fetch
+    let pc = pc.wrapping_add(1);
+    match fetch(code, pc, fuel) {
+        Ok((next, insn)) => become next(ctx, code, insn, pc, fuel - 1, stop),
+        Err(flow) => stop.at(pc, fuel, flow),
+    }
+}
+
+/// The instruction at `pc` and its handler, or why it can't run.
+#[inline(always)]
+fn fetch<M: Memory>(code: &[Instruction], pc: u64, fuel: u64) -> Result<(Handler<M>, Instruction), Flow<M>> {
+    if fuel == 0 {
+        return Err(Flow::OutOfFuel);
+    }
+    let Some(&insn) = code.get(pc as usize) else {
+        return Err(Flow::BadPc);
+    };
+    Ok((Handlers::<M>::TABLE[usize::from(insn.0 as u8)], insn))
 }
 
 #[inline(always)]
@@ -761,42 +816,19 @@ pub fn step_ld64<M: Memory>(ctx: &mut Context<M>, instr: Instruction, second: In
 
 /// Execute from `*pc` until an instruction the caller must handle.
 ///
-/// Plain ALU, memory and jump instructions stay inside this loop, so each one costs a
-/// single dispatch. The loop returns calls (local, helper and indirect), indirect jumps,
-/// [`Flow::Exit`] and faults with `*pc` at the instruction that produced them, and
-/// [`Flow::OutOfFuel`] or [`Flow::BadPc`] with `*pc` at the instruction that could not
-/// run. Each executed instruction (both slots of LD_IMM64) consumes one unit of `fuel`.
+/// Plain ALU, memory and jump instructions stay inside the handler chain, so each one
+/// costs a single dispatch. Execution returns calls (local, helper and indirect),
+/// indirect jumps, [`Flow::Exit`] and faults with `*pc` at the instruction that
+/// produced them, and [`Flow::OutOfFuel`] or [`Flow::BadPc`] with `*pc` at the
+/// instruction that could not run. Each executed instruction (both slots of
+/// LD_IMM64) consumes one unit of `fuel`.
 #[inline]
 pub fn run<M: Memory>(ctx: &mut Context<M>, code: &[Instruction], pc: &mut u64, fuel: &mut u64) -> Flow<M> {
-    // locals, written back once on exit, so the loop never stores through the pointers
-    let (mut p, mut f) = (*pc, *fuel);
-    let flow = loop {
-        if f == 0 {
-            break Flow::OutOfFuel;
-        }
-        let Some(&insn) = code.get(p as usize) else {
-            break Flow::BadPc;
-        };
-        f -= 1;
-
-        let flow = match step_by_opcode(ctx, insn, &mut p) {
-            ControlFlow::Break(flow) => flow,
-            ControlFlow::Continue(first) => {
-                p += 1;
-                let Some(&second) = code.get(p as usize) else {
-                    break Flow::BadPc;
-                };
-                f = f.saturating_sub(1);
-                step_ld64(ctx, first, second)
-            }
-        };
-
-        match flow {
-            // a negative jump target wraps to a huge pc and fails the next fetch
-            Flow::Next => p = p.wrapping_add(1),
-            other => break other,
-        }
+    let mut stop = Stop { pc: *pc, fuel: *fuel };
+    let flow = match fetch(code, *pc, *fuel) {
+        Ok((first, insn)) => first(ctx, code, insn, *pc, *fuel - 1, &mut stop),
+        Err(flow) => flow,
     };
-    (*pc, *fuel) = (p, f);
+    (*pc, *fuel) = (stop.pc, stop.fuel);
     flow
 }
