@@ -1,5 +1,4 @@
-//! A parsed eBPF ELF file: its loadable sections, symbols, exports, imports and
-//! relocations, for the linker.
+//! A parsed eBPF ELF file: its loadable sections, symbols, exports, imports and relocations, for the linker.
 
 use std::ffi::CStr;
 
@@ -24,8 +23,8 @@ pub struct Relocation {
     pub symbol_idx: usize,
     /// Relocation type.
     pub rel_type: u32,
-    /// Byte offset added to the symbol address. For REL relocations this is
-    /// decoded from the instruction's `imm` at parse time.
+    /// Byte offset added to the symbol address. For REL relocations this is decoded from the instruction's `imm` at
+    /// parse time.
     pub addend: i64,
 }
 

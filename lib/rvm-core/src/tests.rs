@@ -1,5 +1,4 @@
-//! Single-instruction semantics of [`step`], with the edge cases the eBPF spec
-//! (RFC 9669) defines.
+//! Single-instruction semantics of [`step`], with the edge cases the eBPF spec (RFC 9669) defines.
 
 use std::ops::ControlFlow;
 
@@ -134,8 +133,8 @@ fn jmp_conditions() {
     let i = instr(OpCode::jmp32_from_parts(JmpOpc::Ja, Source::Imm), 0, 0, 99, 12345);
     assert!(matches!(exec(&mut ctx, i), Flow::Jump(12345)));
 
-    // CALL distinguishes a helper call (src=0, imm is the helper id) from a
-    // local call (src=1, imm is the branch offset).
+    // CALL distinguishes a helper call (src=0, imm is the helper id) from a local call (src=1, imm is the branch
+    // offset).
     let mut ctx = Context::new(TestMem::new());
     let i = instr(OpCode::jmp64_from_parts(JmpOpc::Call, Source::Imm), 0, 0, 0, 1);
     assert!(matches!(exec(&mut ctx, i), Flow::CallHelper(1)));

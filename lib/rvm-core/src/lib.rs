@@ -26,8 +26,7 @@ mod tests;
 #[derive(Copy, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Instruction(pub u64);
 
-/// Decode little-endian bytecode (a trailing partial word is ignored) and prepare
-/// it for [`run`].
+/// Decode little-endian bytecode (a trailing partial word is ignored) and prepare it for [`run`].
 pub fn instructions_from_bytes(bytes: &[u8]) -> Code {
     let insns: Box<[Instruction]> = bytes
         .as_chunks::<8>()
@@ -89,8 +88,8 @@ pub enum Flow<C: Memory> {
 
     /// Call a helper by its numeric ID (`src_reg = 0`).
     CallHelper(u32),
-    /// Call an external function by ID (`src_reg = BPF_PSEUDO_KFUNC_CALL`); the
-    /// runtime defines what the ID indexes (rvm: the program's extern table).
+    /// Call an external function by ID (`src_reg = BPF_PSEUDO_KFUNC_CALL`); the runtime defines what the ID indexes
+    /// (rvm: the program's extern table).
     CallKfunc(u32),
 
     /// An invalid or reserved instruction.
@@ -99,13 +98,11 @@ pub enum Flow<C: Memory> {
 
     /// A valid instruction that rvm doesn't implement.
     Missing,
-    /// [`run`] used up its instruction budget before the next instruction. Only
-    /// with the `fuel` feature.
+    /// [`run`] used up its instruction budget before the next instruction. Only with the `fuel` feature.
     OutOfFuel,
     /// [`run`] reached a `pc` outside the code slice.
     BadPc,
-    /// A local call found all [`MAX_CALL_DEPTH`] frames in use, or `r10` below the
-    /// frame size.
+    /// A local call found all [`MAX_CALL_DEPTH`] frames in use, or `r10` below the frame size.
     StackOverflow,
 
     /// `callx`: call through the address in `dst_reg`, which the runtime decodes.
@@ -156,8 +153,8 @@ pub trait Memory {
 
     /// Apply `op` to the `u32` at `addr` and return the previous value.
     ///
-    /// The default is a load followed by a store, which is atomic for memory only
-    /// this executor can reach. Override it for memory shared with other threads.
+    /// The default is a load followed by a store, which is atomic for memory only this executor can reach. Override it
+    /// for memory shared with other threads.
     fn atomic_u32(&mut self, addr: u64, op: AtomicOp<u32>) -> Result<u32, Self::Err> {
         let old = self.load_u32(addr)?;
         if let Some(new) = op.apply(old) {
@@ -175,9 +172,8 @@ pub trait Memory {
         Ok(old)
     }
 
-    /// The host memory that loads and stores near `addr` may access directly.
-    /// [`run`] takes the window around r10 and runs 4 and 8 byte loads and stores
-    /// through r10 that fall inside it without calling the methods above, until
+    /// The host memory that loads and stores near `addr` may access directly. [`run`] takes the window around r10 and
+    /// runs 4 and 8 byte loads and stores through r10 that fall inside it without calling the methods above, until
     /// [`Memory::epoch`] changes. The default is [`Window::NONE`].
     fn window(&self, addr: u64) -> Window {
         let _ = addr;
@@ -410,9 +406,9 @@ mod alu {
                 _ => return Flow::FailCpu,
             },
             AluOpc::Xor => d ^ s,
-            // MOV (offset=0) or MOVSX (offset=8/16/32, register source only; 32 is ALU64-only).
-            // Without the cold path, LLVM merges the `offset == 0` test into the movsx
-            // switch and lowers all of it to a jump table on `offset`.
+            // MOV (offset=0) or MOVSX (offset=8/16/32, register source only; 32 is ALU64-only). Without the cold path,
+            // LLVM merges the `offset == 0` test into the movsx switch and lowers all of it to a jump table on
+            // `offset`.
             AluOpc::Mov if offset == 0 => s,
             AluOpc::Mov => {
                 core::hint::cold_path();
@@ -427,9 +423,8 @@ mod alu {
                 BITS_64 => ((d as i64) >> (s & 63)) as u64,
                 BITS_32 => ((d as i32) >> (s & 31)) as u64,
             },
-            // END: width comes from imm and the result is not zero-extended by class.
-            // Guest memory is little-endian, so LE truncates and BE swaps; ALU64 TO_LE is the
-            // unconditional BSWAP and ALU64 TO_BE is reserved.
+            // END: width comes from imm and the result is not zero-extended by class. Guest memory is little-endian, so
+            // LE truncates and BE swaps; ALU64 TO_LE is the unconditional BSWAP and ALU64 TO_BE is reserved.
             AluOpc::End => {
                 let full_d = ctx.regs[dst_reg];
                 let swap = match (BITS, alu_end) {
@@ -718,9 +713,8 @@ pub(crate) fn step<M: Memory>(ctx: &mut Context<M>, instr: Instruction) -> Contr
 
 /// Host functions the `call` handler runs without leaving [`run`].
 ///
-/// Each method gets the arguments in `ctx.regs[1..=5]` and returns the new r0. It
-/// returns `None` to stop [`run`] at the `call` with [`Flow::CallHelper`] or
-/// [`Flow::CallKfunc`], having recorded whatever its caller needs to handle that.
+/// Each method gets the arguments in `ctx.regs[1..=5]` and returns the new r0. It returns `None` to stop [`run`] at the
+/// `call` with [`Flow::CallHelper`] or [`Flow::CallKfunc`], having recorded whatever its caller needs to handle that.
 pub trait Host<M: Memory> {
     /// Call helper `id` (`src_reg = 0`).
     fn helper(&mut self, ctx: &mut Context<M>, id: u32) -> Option<u64>;
@@ -731,11 +725,9 @@ pub trait Host<M: Memory> {
 /// Maximum nesting of BPF-to-BPF calls below the entry frame.
 pub const MAX_CALL_DEPTH: usize = 8;
 
-/// The BPF-to-BPF calls in progress, which [`run`] pushes and pops, the slot where
-/// it records where it stopped, the window of the stack that r10 accesses use, and
-/// the [`Host`] that runs its helper and kfunc calls.
-// `repr(C)` keeps the scalars ahead of the frames, so every handler reaches them
-// with a one-byte displacement.
+/// The BPF-to-BPF calls in progress, which [`run`] pushes and pops, the slot where it records where it stopped, the
+/// window of the stack that r10 accesses use, and the [`Host`] that runs its helper and kfunc calls.
+// `repr(C)` keeps the scalars ahead of the frames, so every handler reaches them with a one-byte displacement.
 #[repr(C)]
 pub struct CallStack<H> {
     depth: usize,
@@ -771,8 +763,8 @@ impl<H> CallStack<H> {
         }
     }
 
-    /// Save the caller's state for the call at `call_pc` and give the callee its stack
-    /// frame. Returns false, changing nothing, on a [`Flow::StackOverflow`].
+    /// Save the caller's state for the call at `call_pc` and give the callee its stack frame. Returns false, changing
+    /// nothing, on a [`Flow::StackOverflow`].
     #[inline(always)]
     #[must_use]
     pub fn push(&mut self, regs: &mut [u64; 16], call_pc: u64) -> bool {
@@ -791,8 +783,7 @@ impl<H> CallStack<H> {
         true
     }
 
-    /// Restore the caller's state and return the pc of its `call`, or `None` in the
-    /// entry frame.
+    /// Restore the caller's state and return the pc of its `call`, or `None` in the entry frame.
     #[inline(always)]
     fn pop(&mut self, regs: &mut [u64; 16]) -> Option<u64> {
         // depth 0 wraps and fails the bounds check
@@ -821,11 +812,11 @@ impl Stop {
     }
 }
 
-/// Runs the instruction `insn` at `pc` and continues with the next one. A metering
-/// handler receives `fuel` already charged for `insn`; the others pass it on as is.
+/// Runs the instruction `insn` at `pc` and continues with the next one. A metering handler receives `fuel` already
+/// charged for `insn`; the others pass it on as is.
 ///
-/// `preserve_none` passes all arguments in registers (the Windows x64 C convention
-/// has four) and saves no registers, so a tail call between handlers is a jump.
+/// `preserve_none` passes all arguments in registers (the Windows x64 C convention has four) and saves no registers, so
+/// a tail call between handlers is a jump.
 type Handler<M, H> = extern "rust-preserve-none" fn(
     &mut Context<M>,
     &[Instruction],
@@ -835,9 +826,8 @@ type Handler<M, H> = extern "rust-preserve-none" fn(
     &mut CallStack<H>,
 ) -> Flow<M>;
 
-/// The handler of every opcode byte. Each runs [`step`] with its opcode as a
-/// constant, so the class, operation, source, mode and size matches fold away; the
-/// bytes of superinstructions and r10 accesses get theirs from [`fuse::install`].
+/// The handler of every opcode byte. Each runs [`step`] with its opcode as a constant, so the class, operation, source,
+/// mode and size matches fold away; the bytes of superinstructions and r10 accesses get theirs from [`fuse::install`].
 /// With `FUEL`, the handlers meter fuel; without it, they never read it.
 struct Handlers<M, H, const FUEL: bool>(PhantomData<(M, H)>);
 
@@ -872,9 +862,8 @@ impl<M: Memory, H: Host<M>, const FUEL: bool> Handlers<M, H, FUEL> {
     };
 }
 
-/// The [`Handler`] of opcode `OP`. Each handler fetches the next instruction itself
-/// and ends in its own indirect jump, so the branch predictor tracks the successors
-/// of every opcode separately.
+/// The [`Handler`] of opcode `OP`. Each handler fetches the next instruction itself and ends in its own indirect jump,
+/// so the branch predictor tracks the successors of every opcode separately.
 #[inline(never)]
 extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, const OP: u8>(
     ctx: &mut Context<M>,
@@ -884,8 +873,8 @@ extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, 
     mut fuel: u64,
     calls: &mut CallStack<H>,
 ) -> Flow<M> {
-    // Only jump-class opcodes jump, call or exit. Without the guards, a handler whose
-    // `step` returns from an outlined call (atomics) would test for those flows too.
+    // Only jump-class opcodes jump, call or exit. Without the guards, a handler whose `step` returns from an outlined
+    // call (atomics) would test for those flows too.
     let jumps = matches!(OpCode(OP).class(), Class::Jmp32 | Class::Jmp64);
     match step(ctx, Instruction(insn.0 & !0xFF | OP as u64)) {
         ControlFlow::Break(Flow::Next) => {}
@@ -930,10 +919,9 @@ extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, 
     }
 }
 
-/// The rest of the handler of a helper `call`, or with `KFUNC` a kfunc `call`: runs
-/// it on the host and continues with the next instruction.
-// Out of line, so that the handler, which also runs local calls, calls no function
-// and needs no stack frame.
+/// The rest of the handler of a helper `call`, or with `KFUNC` a kfunc `call`: runs it on the host and continues with
+/// the next instruction.
+// Out of line, so that the handler, which also runs local calls, calls no function and needs no stack frame.
 #[inline(never)]
 extern "rust-preserve-none" fn host_call<M: Memory, H: Host<M>, const FUEL: bool, const KFUNC: bool>(
     ctx: &mut Context<M>,
@@ -1010,16 +998,13 @@ const METERED: bool = cfg!(feature = "fuel");
 
 /// Execute from `*pc` until an instruction the caller must handle.
 ///
-/// ALU, memory and jump instructions, local calls and their returns, and helper and
-/// kfunc calls that `calls.host` runs stay inside the handler chain, so each one
-/// costs a single dispatch. `calls` holds the frames of the local calls in progress
-/// and keeps them from one `run` to the next. Execution returns helper and kfunc
-/// calls that the host declined, indirect calls and jumps, [`Flow::Exit`] from the
-/// entry frame and faults with `*pc` at the instruction that produced them, and
-/// [`Flow::OutOfFuel`] or [`Flow::BadPc`] with `*pc` at the instruction that could
-/// not run. With the `fuel` feature, each executed instruction (both slots of
-/// LD_IMM64) consumes one unit of `fuel`; without it, `run` takes no `fuel` and
-/// never runs out.
+/// ALU, memory and jump instructions, local calls and their returns, and helper and kfunc calls that `calls.host` runs
+/// stay inside the handler chain, so each one costs a single dispatch. `calls` holds the frames of the local calls in
+/// progress and keeps them from one `run` to the next. Execution returns helper and kfunc calls that the host declined,
+/// indirect calls and jumps, [`Flow::Exit`] from the entry frame and faults with `*pc` at the instruction that produced
+/// them, and [`Flow::OutOfFuel`] or [`Flow::BadPc`] with `*pc` at the instruction that could not run. With the `fuel`
+/// feature, each executed instruction (both slots of LD_IMM64) consumes one unit of `fuel`; without it, `run` takes no
+/// `fuel` and never runs out.
 #[inline]
 pub fn run<M: Memory, H: Host<M>>(
     ctx: &mut Context<M>,

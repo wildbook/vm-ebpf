@@ -1,22 +1,18 @@
 //! A game that runs its mods as rvm plugins.
 //!
-//! - `bpf/game_rules.c` spawns monster waves through the host function `spawn`
-//!   and exports `record_kills`, which keeps each hero's score in a map.
-//! - `bpf/game_combat.c` moves monsters, attacks through the host function
-//!   `damage`, and passes each tick's kills to `record_kills` in one buffer that
-//!   the rules plugin borrows for the call.
+//! - `bpf/game_rules.c` spawns monster waves through the host function `spawn` and exports `record_kills`, which keeps
+//!   each hero's score in a map.
+//! - `bpf/game_combat.c` moves monsters, attacks through the host function `damage`, and passes each tick's kills to
+//!   `record_kills` in one buffer that the rules plugin borrows for the call.
 //!
-//! Both log through the host function `print`, which reads the line from the
-//! calling plugin's memory. The entities live in a region that the host shares
-//! with every plugin and reads and writes field by field. The host describes its
-//! `Entity` layout with `host_struct!`, and CO-RE patches the plugins' field
-//! offsets and array stride to match it: `bpf/game_sdk.h` declares the struct with
-//! other field order and size. `scores` and the rules plugin's `waves` are maps
-//! that the VM shares, so they belong to the VM and keep their contents when the
-//! host replaces the rules with `game_rules_v2.o` halfway through. The host links
-//! the combat plugin ahead of time into an image and loads it from bytes, and calls
-//! both plugins every tick through function handles it looks up once; the rules
-//! handle follows the reload.
+//! Both log through the host function `print`, which reads the line from the calling plugin's memory. The entities live
+//! in a region that the host shares with every plugin and reads and writes field by field. The host describes its
+//! `Entity` layout with `host_struct!`, and CO-RE patches the plugins' field offsets and array stride to match it:
+//! `bpf/game_sdk.h` declares the struct with other field order and size. `scores` and the rules plugin's `waves` are
+//! maps that the VM shares, so they belong to the VM and keep their contents when the host replaces the rules with
+//! `game_rules_v2.o` halfway through. The host links the combat plugin ahead of time into an image and loads it from
+//! bytes, and calls both plugins every tick through function handles it looks up once; the rules handle follows the
+//! reload.
 //!
 //! Rebuild the plugins with:
 //!   clang -target bpf -mcpu=v4 -O2 -g -c bpf/game_rules.c -o bpf/game_rules.o
@@ -82,8 +78,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let rules = vm.load_plugin("rules", RULES)?;
     vm.export(&rules, "record_kills")?;
-    // A game would prepare the image when it installs the mod; this links the
-    // plugin against the host's externs and entity layout.
+    // A game would prepare the image when it installs the mod; this links the plugin against the host's externs and
+    // entity layout.
     let combat_image = vm.prepare(COMBAT)?.to_bytes();
     let combat = vm.load_plugin_image("combat", &combat_image)?;
 
@@ -171,8 +167,7 @@ fn print_summary(world: &World, rules: &Plugin) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// The host's entity. Its field order and size differ from `struct entity` in
-/// `bpf/game_sdk.h`.
+/// The host's entity. Its field order and size differ from `struct entity` in `bpf/game_sdk.h`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Entity {
@@ -193,8 +188,7 @@ struct Stats {
     armor: i32,
 }
 
-/// Entities in a region shared with every plugin, as an array the host appends to
-/// and compacts.
+/// Entities in a region shared with every plugin, as an array the host appends to and compacts.
 struct World {
     base: u64,
     state: Mutex<WorldState>,

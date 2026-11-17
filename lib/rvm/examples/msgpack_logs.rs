@@ -1,17 +1,13 @@
 //! Streams MessagePack log events through a parser plugin in fixed-size chunks.
 //!
-//! `bpf/msgpack_logs.c` decodes records with a `switch` over the MessagePack tag
-//! bytes, which clang compiles to a jump table (`gotox`), hands known keys to
-//! handlers through a table of function pointers (`callx`), and adds each event to
-//! per-service stats in a hash map and two array maps. The decoder is split into
-//! BPF-to-BPF calls.
+//! `bpf/msgpack_logs.c` decodes records with a `switch` over the MessagePack tag bytes, which clang compiles to a jump
+//! table (`gotox`), hands known keys to handlers through a table of function pointers (`callx`), and adds each event to
+//! per-service stats in a hash map and two array maps. The decoder is split into BPF-to-BPF calls.
 //!
-//! The host maps a read-only input region into the program, copies each chunk in
-//! and calls `parse` through a function handle. `parse` returns how many bytes of
-//! complete records it consumed. The host keeps the rest and passes it again in
-//! front of the next chunk, so a record split across chunks is parsed once. At the
-//! end, the host reads the stats from the maps and checks them against its own
-//! tally of the events it generated.
+//! The host maps a read-only input region into the program, copies each chunk in and calls `parse` through a function
+//! handle. `parse` returns how many bytes of complete records it consumed. The host keeps the rest and passes it again
+//! in front of the next chunk, so a record split across chunks is parsed once. At the end, the host reads the stats
+//! from the maps and checks them against its own tally of the events it generated.
 //!
 //! Rebuild the plugin with:
 //!   clang -target bpf -mcpu=v4 -O2 -g -c bpf/msgpack_logs.c -o bpf/msgpack_logs.o
@@ -161,13 +157,11 @@ struct SvcStats {
     bytes: u64,
 }
 
-// SAFETY: integer fields only, and the `u64`s start at an 8 byte offset, so there is
-// no padding.
+// SAFETY: integer fields only, and the `u64`s start at an 8 byte offset, so there is no padding.
 unsafe impl Pod for SvcStats {}
 
-/// Encodes `records` log records and tallies what the parser should make of them.
-/// Every 40th record is a heartbeat and every 57th a map without a service name;
-/// the rest are events, some with fields the parser doesn't know.
+/// Encodes `records` log records and tallies what the parser should make of them. Every 40th record is a heartbeat and
+/// every 57th a map without a service name; the rest are events, some with fields the parser doesn't know.
 fn generate(records: usize) -> (Vec<u8>, Stats) {
     let mut rng = Rng(0x2545_f491_4f6c_dd1d);
     let mut stream = Vec::new();

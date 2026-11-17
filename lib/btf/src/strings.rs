@@ -2,8 +2,7 @@
 
 /// BTF string table.
 ///
-/// The string table is a sequence of null-terminated strings.
-/// The first string is always empty (null).
+/// The string table is a sequence of null-terminated strings. The first string is always empty (null).
 #[derive(Debug, Clone)]
 pub struct BtfStrings<'a> {
     data: &'a [u8],

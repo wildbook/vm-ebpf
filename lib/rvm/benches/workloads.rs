@@ -1,5 +1,5 @@
-//! Costs a plugin host sees: entering a program, calling between plugins, and
-//! clang-compiled workloads (bpf/workloads.c). Compare against a saved baseline:
+//! Costs a plugin host sees: entering a program, calling between plugins, and clang-compiled workloads
+//! (bpf/workloads.c). Compare against a saved baseline:
 //!
 //!   cargo bench -p rvm --bench workloads -- --save-baseline before
 //!   cargo bench -p rvm --bench workloads -- --baseline before

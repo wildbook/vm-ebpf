@@ -1,12 +1,10 @@
-//! Runs the [bpf_conformance](https://github.com/Alan-Jowett/bpf_conformance) suite
-//! against the rvm interpreter. The `.data` files under `tests/conformance/data/`
-//! are vendored verbatim from commit `698e379525f44cf422bc1dbd43efe8495a76ab87`
-//! (MIT or Apache-2.0 per file, see the SPDX header in each and
-//! `tests/conformance/LICENSE`); `asm` assembles their ubpf-style syntax and
-//! `data` parses the file format itself.
+//! Runs the [bpf_conformance](https://github.com/Alan-Jowett/bpf_conformance) suite against the rvm interpreter. The
+//! `.data` files under `tests/conformance/data/` are vendored verbatim from commit
+//! `698e379525f44cf422bc1dbd43efe8495a76ab87` (MIT or Apache-2.0 per file, see the SPDX header in each and
+//! `tests/conformance/LICENSE`); `asm` assembles their ubpf-style syntax and `data` parses the file format itself.
 //!
-//! A test file's `r1`/`r2` on entry are a pointer to its `-- mem` bytes and their
-//! length, the calling convention every reference plugin in the suite uses.
+//! A test file's `r1`/`r2` on entry are a pointer to its `-- mem` bytes and their length, the calling convention every
+//! reference plugin in the suite uses.
 
 mod asm;
 mod data;
@@ -60,8 +58,8 @@ fn run_one(text: &str) -> Result<(), String> {
     let mem_ptr = memory.map_bytes(FIRST_FREE_REGION, &case.mem, case.mem.len(), Perms::RW);
 
     let mut helpers = HelperRegistry::new();
-    // helper 5 is `unwind` in the classic interpreter test ABI; call_unwind_fail.data
-    // and callx.data only check that calling it doesn't abort the program
+    // helper 5 is `unwind` in the classic interpreter test ABI; call_unwind_fail.data and callx.data only check that
+    // calling it doesn't abort the program
     helpers.register(5, |_: ()| 0u64);
 
     let mut exec = Executor::new(&code, &mut memory, &helpers, stack_top);

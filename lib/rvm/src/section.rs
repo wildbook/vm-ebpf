@@ -15,8 +15,7 @@ pub enum SectionKind {
     Bss,
     /// Maps section.
     Maps,
-    /// Jump tables for `gotox` (`.jumptables`): byte offsets into the code section
-    /// that references them.
+    /// Jump tables for `gotox` (`.jumptables`): byte offsets into the code section that references them.
     JumpTable,
     /// Other/unknown.
     Other,

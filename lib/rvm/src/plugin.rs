@@ -1,17 +1,14 @@
 //! Programs that call each other.
 //!
-//! A [`Plugin`] is a linked program behind a lock. [`crate::Vm::export`] publishes one
-//! of its functions as a named extern, so programs linked afterwards can import it
-//! like a host function. The call runs in the exporting plugin, with its memory,
-//! maps and helpers.
+//! A [`Plugin`] is a linked program behind a lock. [`crate::Vm::export`] publishes one of its functions as a named
+//! extern, so programs linked afterwards can import it like a host function. The call runs in the exporting plugin,
+//! with its memory, maps and helpers.
 //!
-//! Arguments and the result are plain values: a pointer from one plugin means nothing
-//! in another's memory, unless the exported function tags the parameter as a borrow
-//! (see [`Borrow`]). Then the caller's buffer is mapped into the callee at a
-//! [`BORROW_FIRST_REGION`] slot for the duration of the call, and the callee gets
-//! that address instead. A call into a plugin that is already running, from the host
-//! or through a chain of plugin calls, fails with [`VmError::PluginBusy`] instead of
-//! deadlocking.
+//! Arguments and the result are plain values: a pointer from one plugin means nothing in another's memory, unless the
+//! exported function tags the parameter as a borrow (see [`Borrow`]). Then the caller's buffer is mapped into the
+//! callee at a [`BORROW_FIRST_REGION`] slot for the duration of the call, and the callee gets that address instead. A
+//! call into a plugin that is already running, from the host or through a chain of plugin calls, fails with
+//! [`VmError::PluginBusy`] instead of deadlocking.
 
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
 
@@ -45,8 +42,8 @@ impl Plugin {
         self.lock()?.call(func, args)
     }
 
-    /// Look up `func` for [`Plugin::call_func`]. [`Plugin::replace`] invalidates the
-    /// handle; [`Plugin::named_func`] gives one that follows the replacement.
+    /// Look up `func` for [`Plugin::call_func`]. [`Plugin::replace`] invalidates the handle; [`Plugin::named_func`]
+    /// gives one that follows the replacement.
     pub fn func(&self, func: &str) -> Result<Func> {
         self.lock()?.func(func)
     }
@@ -56,9 +53,8 @@ impl Plugin {
         self.lock()?.call_func(func, args)
     }
 
-    /// Look up `func` for repeated calls through [`NamedFunc::call`]. After
-    /// [`Plugin::replace`], the next call looks `func` up again in the new program. The
-    /// handle keeps the plugin alive.
+    /// Look up `func` for repeated calls through [`NamedFunc::call`]. After [`Plugin::replace`], the next call looks
+    /// `func` up again in the new program. The handle keeps the plugin alive.
     pub fn named_func(&self, func: &str) -> Result<NamedFunc> {
         let slot = FuncSlot::new(self.func(func)?);
         Ok(NamedFunc {
@@ -73,16 +69,15 @@ impl Plugin {
         try_lock(&self.program, &self.name)
     }
 
-    /// Swap in a new build of this plugin. Exports keep working; they find their
-    /// function by name in the new program. Blocks until a running call finishes.
+    /// Swap in a new build of this plugin. Exports keep working; they find their function by name in the new program.
+    /// Blocks until a running call finishes.
     pub fn replace(&self, program: Program) {
         *self.program.lock().unwrap_or_else(|e| e.into_inner()) = program;
         self.program.clear_poison();
     }
 
-    /// A handle that doesn't keep the plugin alive. Host functions that call back into
-    /// a plugin should hold this: they live in the `Vm` that every plugin's program
-    /// refers to, so a strong handle would be a cycle that frees neither.
+    /// A handle that doesn't keep the plugin alive. Host functions that call back into a plugin should hold this: they
+    /// live in the `Vm` that every plugin's program refers to, so a strong handle would be a cycle that frees neither.
     pub fn downgrade(&self) -> WeakPlugin {
         WeakPlugin {
             name: self.name.clone(),
@@ -127,8 +122,8 @@ impl Plugin {
                     }
                 };
                 let region = BORROW_FIRST_REGION + arg as usize;
-                // SAFETY: the caller is blocked in this call; the regions are unmapped
-                // before it returns, or on the next lock after a panic.
+                // SAFETY: the caller is blocked in this call; the regions are unmapped before it returns, or on the
+                // next lock after a panic.
                 unsafe { program.memory_mut().map_host(region, ptr, len, perms) };
                 args[arg as usize] = region_base(region);
             }
@@ -159,8 +154,7 @@ impl WeakPlugin {
     }
 }
 
-/// A function of a [`Plugin`] that follows [`Plugin::replace`]; see
-/// [`Plugin::named_func`].
+/// A function of a [`Plugin`] that follows [`Plugin::replace`]; see [`Plugin::named_func`].
 #[derive(Debug)]
 pub struct NamedFunc {
     plugin: Plugin,
@@ -169,8 +163,8 @@ pub struct NamedFunc {
 }
 
 impl NamedFunc {
-    /// Call the function in the plugin's current program; arguments go in r1-r5. Fails
-    /// with [`VmError::FunctionNotFound`] if that program lacks it.
+    /// Call the function in the plugin's current program; arguments go in r1-r5. Fails with
+    /// [`VmError::FunctionNotFound`] if that program lacks it.
     pub fn call(&self, args: &[u64]) -> Result<u64> {
         self.func.call(&mut *self.plugin.lock()?, &self.name, args)
     }
@@ -180,8 +174,8 @@ fn try_lock<'a>(program: &'a Mutex<Program>, name: &str) -> Result<MutexGuard<'a
     match program.try_lock() {
         Ok(guard) => Ok(guard),
         Err(TryLockError::WouldBlock) => Err(VmError::PluginBusy(name.to_string())),
-        // a panic during a call poisons the lock and may have skipped unmapping borrowed
-        // caller memory, which may be gone by now
+        // a panic during a call poisons the lock and may have skipped unmapping borrowed caller memory, which may be
+        // gone by now
         Err(TryLockError::Poisoned(e)) => {
             let mut guard = e.into_inner();
             for region in BORROW_FIRST_REGION..BORROW_FIRST_REGION + BORROW_REGIONS {

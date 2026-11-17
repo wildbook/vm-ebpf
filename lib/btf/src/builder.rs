@@ -1,9 +1,8 @@
 //! Builder for host-defined BTF.
 //!
-//! The host describes its own types the same way a compiler describes a program's:
-//! as standard BTF. [`BtfBuilder`] assembles that BTF incrementally and [`encode`]
-//! produces bytes [`Btf::parse`] can read back, so CO-RE relocations resolve against
-//! the host's types as they would against a second translation unit.
+//! The host describes its own types the same way a compiler describes a program's: as standard BTF. [`BtfBuilder`]
+//! assembles that BTF incrementally and [`encode`] produces bytes [`Btf::parse`] can read back, so CO-RE relocations
+//! resolve against the host's types as they would against a second translation unit.
 //!
 //! [`encode`]: BtfBuilder::encode
 
@@ -21,8 +20,8 @@ struct MemberEntry {
     bitfield_size: u32,
 }
 
-/// One BTF type, pending encoding. Mirrors [`BtfTypeInfo`] but owns its data, so
-/// `member`/`enumerator` can keep extending a struct or enum after it is created.
+/// One BTF type, pending encoding. Mirrors [`BtfTypeInfo`] but owns its data, so `member`/`enumerator` can keep
+/// extending a struct or enum after it is created.
 enum TypeEntry {
     Int {
         name: u32,
@@ -107,9 +106,8 @@ enum TypeEntry {
 
 /// Builds standard BTF describing the host's types.
 ///
-/// Type IDs are assigned in creation order starting at 1 (0 is always `void`), the
-/// same scheme `Btf::parse` uses, so IDs returned by this builder and IDs read back
-/// from `encode()`'s output agree.
+/// Type IDs are assigned in creation order starting at 1 (0 is always `void`), the same scheme `Btf::parse` uses, so
+/// IDs returned by this builder and IDs read back from `encode()`'s output agree.
 pub struct BtfBuilder {
     strings: Vec<u8>,
     string_offsets: HashMap<String, u32>,
@@ -214,8 +212,8 @@ impl BtfBuilder {
         }
     }
 
-    /// Add an enum with no enumerators yet; add them with
-    /// [`enumerator`](Self::enumerator). Encoded as `ENUM64` if a value needs it.
+    /// Add an enum with no enumerators yet; add them with [`enumerator`](Self::enumerator). Encoded as `ENUM64` if a
+    /// value needs it.
     pub fn add_enum(&mut self, name: &str, size: u32, signed: bool) -> u32 {
         let name = self.string(name);
         self.push(TypeEntry::Enum {
@@ -257,10 +255,9 @@ impl BtfBuilder {
         self.push(TypeEntry::Fwd { name, is_union })
     }
 
-    /// Append a BTF blob compiled from C (clang `-g`, or pahole output), remapping
-    /// its type IDs and string offsets so it coexists with types already in this
-    /// builder. This is how a host ships its layout as a compiled header instead of
-    /// describing it field by field.
+    /// Append a BTF blob compiled from C (clang `-g`, or pahole output), remapping its type IDs and string offsets so
+    /// it coexists with types already in this builder. This is how a host ships its layout as a compiled header instead
+    /// of describing it field by field.
     pub fn append_btf(&mut self, bytes: &[u8]) -> Result<(), BtfError> {
         let foreign = Btf::parse(bytes)?;
         let id_base = self.types.len() as u32;
@@ -393,8 +390,8 @@ impl BtfBuilder {
         self.types.len() as u32
     }
 
-    /// Intern `name` in the string table, returning its offset. Reuses an existing
-    /// offset for a name already interned, same as kernel BTF producers do.
+    /// Intern `name` in the string table, returning its offset. Reuses an existing offset for a name already interned,
+    /// same as kernel BTF producers do.
     pub fn string(&mut self, name: &str) -> u32 {
         if name.is_empty() {
             return 0;
@@ -523,8 +520,8 @@ impl TypeEntry {
         }
     }
 
-    /// Enums encode as 8-byte `BTF_KIND_ENUM` entries unless a value needs the full
-    /// 64 bits, in which case the kernel's `BTF_KIND_ENUM64` format is used instead.
+    /// Enums encode as 8-byte `BTF_KIND_ENUM` entries unless a value needs the full 64 bits, in which case the kernel's
+    /// `BTF_KIND_ENUM64` format is used instead.
     fn encode_enum(out: &mut Vec<u8>, name: u32, size: u32, is_signed: bool, variants: &[(u32, i64)]) {
         if variants.iter().all(|&(_, v)| i32::try_from(v).is_ok()) {
             header(out, name, BtfKind::Enum, variants.len() as u16, is_signed, size);

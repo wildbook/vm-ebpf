@@ -95,8 +95,7 @@ impl AssembledProgram {
     }
 }
 
-/// A branch target, created with `Assembler::create_label` and bound with
-/// `Assembler::set_label`.
+/// A branch target, created with `Assembler::create_label` and bound with `Assembler::set_label`.
 #[derive(Debug, Clone)]
 pub struct Label {
     id: usize,
@@ -127,8 +126,8 @@ struct AsmInsn {
     raw2: Option<RawInstruction>,
 }
 
-/// Emits a register/immediate pair of ALU instruction methods for one opcode. `$off`
-/// is the ALU `offset` nibble eBPF uses to pick the signed variant of DIV/MOD.
+/// Emits a register/immediate pair of ALU instruction methods for one opcode. `$off` is the ALU `offset` nibble eBPF
+/// uses to pick the signed variant of DIV/MOD.
 macro_rules! alu_family {
     ($class:ident; $( $name:ident, $name_imm:ident = $op:ident, $off:expr; )+) => {
         $(
@@ -149,8 +148,8 @@ macro_rules! alu_family {
     };
 }
 
-/// Emits one sign-extending move method per (source width, class) row. `$off`
-/// is the ALU `offset` nibble that selects the source width to sign-extend from.
+/// Emits one sign-extending move method per (source width, class) row. `$off` is the ALU `offset` nibble that selects
+/// the source width to sign-extend from.
 macro_rules! movsx_family {
     ($( $name:ident = $class:ident, $off:expr );+ $(;)?) => {
         $(
@@ -229,9 +228,8 @@ macro_rules! st_family {
     };
 }
 
-/// Emits a non-fetch/fetch pair of atomic read-modify-write methods per op, for
-/// one memory size. `xchg` and `cmpxchg` always report the prior value, so they
-/// are defined separately instead of through this macro.
+/// Emits a non-fetch/fetch pair of atomic read-modify-write methods per op, for one memory size. `xchg` and `cmpxchg`
+/// always report the prior value, so they are defined separately instead of through this macro.
 macro_rules! atomic_family {
     ($size:ident; $( $name:ident, $name_fetch:ident = $op:ident );+ $(;)?) => {
         $(
@@ -253,9 +251,8 @@ macro_rules! atomic_family {
     };
 }
 
-/// Emits one byte-swap method per bit width, for a fixed class and source type
-/// (`le*`/`be*` are ALU32 and truncate; `swap*` is ALU64 and always swaps the
-/// full width regardless of host endianness).
+/// Emits one byte-swap method per bit width, for a fixed class and source type (`le*`/`be*` are ALU32 and truncate;
+/// `swap*` is ALU64 and always swaps the full width regardless of host endianness).
 macro_rules! endian_family {
     ($class:ident, $src:ident; $( $name:ident = $bits:expr ),+) => {
         $(
@@ -420,8 +417,7 @@ impl Assembler {
         self
     }
 
-    /// Assemble the program and resolve each CO-RE relocation's `insn_off` to the
-    /// byte offset of its instruction.
+    /// Assemble the program and resolve each CO-RE relocation's `insn_off` to the byte offset of its instruction.
     pub fn assemble_with_core(&mut self) -> Result<AssembledProgram, AsmError> {
         let byte_offsets: Vec<u32> = self.slot_prefix().iter().map(|&s| (s * 8) as u32).collect();
 
@@ -562,16 +558,16 @@ impl Assembler {
         self
     }
 
-    /// `lock cmpxchg [dst+off], src`: 64-bit atomic compare-and-exchange against `r0`;
-    /// always reports the prior value in `r0`.
+    /// `lock cmpxchg [dst+off], src`: 64-bit atomic compare-and-exchange against `r0`; always reports the prior value
+    /// in `r0`.
     pub fn atomic_cmpxchg64(&mut self, dst: Register, offset: i16, src: Register) -> &mut Self {
         let opcode = class::STX | size::DW | mode::ATOMIC;
         self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, atomic::CMPXCHG));
         self
     }
 
-    /// `lock cmpxchg32 [dst+off], src`: 32-bit atomic compare-and-exchange against `r0`;
-    /// always reports the prior value in `r0`.
+    /// `lock cmpxchg32 [dst+off], src`: 32-bit atomic compare-and-exchange against `r0`; always reports the prior value
+    /// in `r0`.
     pub fn atomic_cmpxchg32(&mut self, dst: Register, offset: i16, src: Register) -> &mut Self {
         let opcode = class::STX | size::W | mode::ATOMIC;
         self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, atomic::CMPXCHG));
@@ -595,8 +591,8 @@ impl Assembler {
         self
     }
 
-    /// `ja32 label`: unconditional jump in the JMP32 class, whose offset sits in the
-    /// 32-bit `imm` field instead of the 16-bit `offset` (RFC 9669 Section 4.3).
+    /// `ja32 label`: unconditional jump in the JMP32 class, whose offset sits in the 32-bit `imm` field instead of the
+    /// 16-bit `offset` (RFC 9669 Section 4.3).
     pub fn ja32(&mut self, label: &Label) -> &mut Self {
         let opcode = class::JMP32 | jmp::JA;
         self.emit(RawInstruction::from_parts(opcode, 0, 0, 0, 0));

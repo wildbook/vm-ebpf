@@ -1,18 +1,13 @@
-//! Superinstructions: common instruction sequences that [`run`](crate::run)
-//! executes with one dispatch.
+//! Superinstructions: common instruction sequences that [`run`](crate::run) executes with one dispatch.
 //!
-//! [`Code::new`] gives the first slot of each sequence it recognises the opcode
-//! byte of a superinstruction, one of the LD-class bytes that rvm doesn't run (see
-//! [`MISSING`]). The other slots keep their instructions, so a jump into the
-//! middle of a sequence runs them one by one. A superinstruction behaves exactly
-//! like its sequence:
-//! - it charges one unit of fuel per instruction, and runs only the first
-//!   instruction when the fuel would run out inside the sequence;
-//! - an instruction that faults stops execution at its own pc, with the effects
-//!   of the instructions before it.
+//! [`Code::new`] gives the first slot of each sequence it recognises the opcode byte of a superinstruction, one of the
+//! LD-class bytes that rvm doesn't run (see [`MISSING`]). The other slots keep their instructions, so a jump into the
+//! middle of a sequence runs them one by one. A superinstruction behaves exactly like its sequence:
+//! - it charges one unit of fuel per instruction, and runs only the first instruction when the fuel would run out
+//!   inside the sequence;
+//! - an instruction that faults stops execution at its own pc, with the effects of the instructions before it.
 //!
-//! The same bytes mark the loads and stores through r10 that [`stack::access`]
-//! runs.
+//! The same bytes mark the loads and stores through r10 that [`stack::access`] runs.
 
 use std::ops::ControlFlow;
 
@@ -24,12 +19,10 @@ use crate::{handler_of, stack, step, CallStack, Context, Flow, Handler, Handlers
 pub struct Code(Box<[Instruction]>);
 
 impl Code {
-    /// Prepare `insns` for [`run`](crate::run): fuse the sequences that have a
-    /// superinstruction.
+    /// Prepare `insns` for [`run`](crate::run): fuse the sequences that have a superinstruction.
     ///
-    /// r10 is read-only, so an instruction that would write it fails with
-    /// [`Flow::FailCpu`]: an ALU, ALU64 or LDX instruction or LD_IMM64 with
-    /// `dst_reg` 10, and an atomic that fetches into `src_reg` 10.
+    /// r10 is read-only, so an instruction that would write it fails with [`Flow::FailCpu`]: an ALU, ALU64 or LDX
+    /// instruction or LD_IMM64 with `dst_reg` 10, and an atomic that fetches into `src_reg` 10.
     pub fn new(insns: impl Into<Box<[Instruction]>>) -> Self {
         let mut insns = insns.into();
         fuse(&mut insns);
@@ -50,8 +43,8 @@ impl Code {
     }
 }
 
-/// Give r10 writes and the bytes rvm doesn't run their failing bytes, and the
-/// sequences with a superinstruction and r10 accesses theirs.
+/// Give r10 writes and the bytes rvm doesn't run their failing bytes, and the sequences with a superinstruction and r10
+/// accesses theirs.
 fn fuse(code: &mut [Instruction]) {
     // Only the opcode byte changes, so the second slot of LD_IMM64 keeps its `imm`.
     for insn in code.iter_mut() {
@@ -62,11 +55,10 @@ fn fuse(code: &mut [Instruction]) {
         }
     }
 
-    // A superinstruction or r10 access changes only its first slot, and there only
-    // the opcode byte, unless the slot holds a register `mov` with `imm` 0: then it
-    // also puts its operand in `imm`, which a register `mov` ignores. So the code
-    // from slot `i` on is still as loaded, and a tail, which reads only its slot's
-    // fields, later reads an instruction that runs the same.
+    // A superinstruction or r10 access changes only its first slot, and there only the opcode byte, unless the slot
+    // holds a register `mov` with `imm` 0: then it also puts its operand in `imm`, which a register `mov` ignores. So
+    // the code from slot `i` on is still as loaded, and a tail, which reads only its slot's fields, later reads an
+    // instruction that runs the same.
     for i in 0..code.len() {
         // the slot after LD_IMM64 holds the upper half of its immediate
         if i > 0 && code[i - 1].0 as u8 == LD_IMM64 {
@@ -135,14 +127,13 @@ const fn jmp(opc: JmpOpc, src: Source) -> u8 {
     OpCode::jmp64_from_parts(opc, src).0
 }
 
-/// Every opcode byte of the LD class but LD_IMM64, the legacy packet loads among
-/// them, runs as the same unsupported instruction ([`Flow::Missing`]).
-/// [`Code::new`] rewrites them all to this one, which frees the others for
+/// Every opcode byte of the LD class but LD_IMM64, the legacy packet loads among them, runs as the same unsupported
+/// instruction ([`Flow::Missing`]). [`Code::new`] rewrites them all to this one, which frees the others for
 /// superinstructions and r10 accesses.
 const MISSING: u8 = Class::LdImm as u8;
 
-/// An undefined ALU64 operation, which always fails with [`Flow::FailCpu`]; the
-/// byte of every instruction that would write r10.
+/// An undefined ALU64 operation, which always fails with [`Flow::FailCpu`]; the byte of every instruction that would
+/// write r10.
 const INVALID: u8 = AluOpc::UndefE as u8 | Class::Alu64 as u8;
 
 const fn is_reserved(byte: u8) -> bool {
@@ -152,13 +143,12 @@ const fn is_reserved(byte: u8) -> bool {
 /// The opcodes of the sequence a superinstruction runs.
 #[derive(Clone, Copy)]
 struct Super {
-    /// The first instruction. With `alu`, a register `mov` whose slot also holds
-    /// the source operand of `alu` in its `imm` field.
+    /// The first instruction. With `alu`, a register `mov` whose slot also holds the source operand of `alu` in its
+    /// `imm` field.
     first: u8,
     /// An ALU instruction on the destination of the `mov`, or 0.
     alu: u8,
-    /// The next instructions, each of which the superinstruction reads from its
-    /// own slot; 0 after the last.
+    /// The next instructions, each of which the superinstruction reads from its own slot; 0 after the last.
     tail: [u8; 3],
 }
 
@@ -276,9 +266,8 @@ impl Super {
         panic!("not a superinstruction");
     }
 
-    /// Pairs the superinstruction with its opcode `byte`, and fails to compile one
-    /// that [`fused`] can't run: only the last instruction may branch, none may
-    /// call or exit, and none may be LD_IMM64.
+    /// Pairs the superinstruction with its opcode `byte`, and fails to compile one that [`fused`] can't run: only the
+    /// last instruction may branch, none may call or exit, and none may be LD_IMM64.
     const fn checked(self, byte: u8) -> (u8, Self) {
         assert!(self.len() > 1);
         let mut k = 0;
@@ -325,8 +314,8 @@ impl Super {
         }
     }
 
-    /// The instructions of the sequence, from its first slot `slot` and the code
-    /// `window` that starts there; entries past [`Super::len`] are filler.
+    /// The instructions of the sequence, from its first slot `slot` and the code `window` that starts there; entries
+    /// past [`Super::len`] are filler.
     #[inline(always)]
     fn decode(self, slot: Instruction, window: &[Instruction]) -> [Instruction; MAX_LEN] {
         let mut insns = [self.first_of(slot); MAX_LEN];
@@ -345,8 +334,8 @@ impl Super {
         insns
     }
 
-    /// The first slot of this superinstruction, with opcode byte `byte`, for the
-    /// sequence at the start of `window`, if it has one.
+    /// The first slot of this superinstruction, with opcode byte `byte`, for the sequence at the start of `window`, if
+    /// it has one.
     fn encode(self, byte: u8, window: &[Instruction]) -> Option<Instruction> {
         let sequence = window.get(..self.len())?;
         let first = sequence[0];
@@ -370,8 +359,8 @@ impl Super {
     }
 }
 
-/// The handler of superinstruction `S`. It runs the sequence as the handlers of
-/// its instructions would, one after another.
+/// The handler of superinstruction `S`. It runs the sequence as the handlers of its instructions would, one after
+/// another.
 #[inline(never)]
 extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool, const S: u8>(
     ctx: &mut Context<M>,

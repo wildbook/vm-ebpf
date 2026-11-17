@@ -84,8 +84,8 @@ pub use register::{Register, FP, R0, R1, R10, R2, R3, R4, R5, R6, R7, R8, R9};
 mod tests {
     use super::*;
 
-    /// Runs every assembler instruction through `assemble` and `decode_all` and checks
-    /// that every emitted opcode decodes.
+    /// Runs every assembler instruction through `assemble` and `decode_all` and checks that every emitted opcode
+    /// decodes.
     #[test]
     fn round_trip_every_instruction() {
         let mut asm = Assembler::new();
@@ -188,8 +188,8 @@ mod tests {
         assert!(insns.iter().all(|i| i.mnemonic != Mnemonic::Unknown), "every emitted opcode must decode");
     }
 
-    /// The v4 forms that share an opcode with an older instruction and differ only in
-    /// `off`, the class or the source bit, plus extreme offsets.
+    /// The v4 forms that share an opcode with an older instruction and differ only in `off`, the class or the source
+    /// bit, plus extreme offsets.
     #[test]
     fn v4_forms_disassemble_distinctly() {
         let mut asm = Assembler::new();

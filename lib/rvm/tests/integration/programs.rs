@@ -1,12 +1,12 @@
-//! Clang-compiled programs exercising atomics, maps, data relocations, function
-//! pointers, CO-RE and the standard helpers.
+//! Clang-compiled programs exercising atomics, maps, data relocations, function pointers, CO-RE and the standard
+//! helpers.
 
 use rvm::{region_base, ExecError, Perms, Vm, VmError, CODE_REGION, DATA_REGION, FIRST_FREE_REGION, REGION_SHIFT};
 
 use crate::common::object;
 
-/// Every atomic form clang emits (bpf/atomics.c), with the expected values worked
-/// out by hand from the RFC 9669 semantics.
+/// Every atomic form clang emits (bpf/atomics.c), with the expected values worked out by hand from the RFC 9669
+/// semantics.
 #[test]
 fn test_clang_atomics() {
     let mut program = Vm::new().load_elf(&object("atomics.o")).unwrap();
@@ -18,17 +18,16 @@ fn test_clang_atomics() {
     assert_eq!(program.memory().read::<u32>(bss + 8).unwrap(), 0xFFFF_FFFF);
 }
 
-/// Pointers in `.data` and `.rodata` (bpf/data_ptrs.c) are relocated at link time,
-/// including an addend into the middle of an array.
+/// Pointers in `.data` and `.rodata` (bpf/data_ptrs.c) are relocated at link time, including an addend into the middle
+/// of an array.
 #[test]
 fn data_pointers_are_relocated() {
     let mut program = Vm::new().load_elf(&object("data_ptrs.o")).unwrap();
     assert_eq!(program.call("deref", &[]).unwrap(), 42 + 10 + 30);
 }
 
-/// Function pointers (bpf/func_ptr.c): callback tables in `.rodata` and `.data`, a
-/// callback passed as an argument, a switch lowered to a `gotox` jump table, and
-/// `callx` faulting on anything but an instruction in the program.
+/// Function pointers (bpf/func_ptr.c): callback tables in `.rodata` and `.data`, a callback passed as an argument, a
+/// switch lowered to a `gotox` jump table, and `callx` faulting on anything but an instruction in the program.
 #[test]
 fn function_pointers_and_jump_tables() {
     let mut program = Vm::new().load_elf(&object("func_ptr.o")).unwrap();
@@ -74,9 +73,8 @@ fn function_pointers_and_jump_tables() {
     }
 }
 
-/// CO-RE against a host whose `struct event` moved `pid` and lacks `flags`
-/// (bpf/core_guard.c): field accesses follow the host layout, an existence check
-/// takes the fallback, and an unguarded access to the missing field fails when run.
+/// CO-RE against a host whose `struct event` moved `pid` and lacks `flags` (bpf/core_guard.c): field accesses follow
+/// the host layout, an existence check takes the fallback, and an unguarded access to the missing field fails when run.
 #[test]
 fn core_relocations_follow_host_layout() {
     let vm = Vm::new();
@@ -96,9 +94,8 @@ fn core_relocations_follow_host_layout() {
     assert!(matches!(err, VmError::Exec(ExecError::UnresolvedCoreRelo { .. })), "{err}");
 }
 
-/// A host can ship its actual layout as BTF compiled from a C header
-/// (bpf/host_event.c), instead of describing it field by field: `append_btf` reads
-/// the struct straight out of the compiled object.
+/// A host can ship its actual layout as BTF compiled from a C header (bpf/host_event.c), instead of describing it field
+/// by field: `append_btf` reads the struct straight out of the compiled object.
 #[test]
 fn core_relocations_follow_appended_host_btf() {
     let host_module = rvm::Module::from_elf("host_event", &object("host_event.o")).unwrap();
@@ -116,10 +113,10 @@ fn core_relocations_follow_appended_host_btf() {
     assert_eq!(program.call("read_flags_unguarded", &[event]).unwrap(), 0xABCD);
 }
 
-/// A CO-RE bitfield read (bpf/core_bitfield.c) written out in `bpf_core_read.h`'s
-/// `BPF_CORE_READ_BITFIELD` style, exercising `FieldLShiftU64`/`FieldRShiftU64`/
-/// `FieldSigned` together: the host's bitfield sits at a different bit position than
-/// the one the program was compiled against, and is signed.
+/// A CO-RE bitfield read (bpf/core_bitfield.c) written out in `bpf_core_read.h`'s `BPF_CORE_READ_BITFIELD` style,
+/// exercising `FieldLShiftU64`/`FieldRShiftU64`/
+/// `FieldSigned` together: the host's bitfield sits at a different bit position than the one the program was compiled
+/// against, and is signed.
 #[test]
 fn core_relocations_read_signed_bitfield() {
     let vm = Vm::new();

@@ -1,5 +1,4 @@
-//! Runs eBPF bytecode on rvm-core and dispatches helper calls to a
-//! [`HelperRegistry`].
+//! Runs eBPF bytecode on rvm-core and dispatches helper calls to a [`HelperRegistry`].
 
 use std::fmt::Debug;
 use std::mem::ManuallyDrop;
@@ -15,16 +14,13 @@ use crate::memory::{region_base, VmMemory};
 /// Default stack bytes reserved per call frame (eBPF's `MAX_BPF_STACK`).
 pub const DEFAULT_FRAME_SIZE: u64 = 512;
 
-/// Helper ID of the call the linker plants for a CO-RE relocation the host can't
-/// resolve (`btf::CORE_POISON_HELPER`).
+/// Helper ID of the call the linker plants for a CO-RE relocation the host can't resolve (`btf::CORE_POISON_HELPER`).
 pub const CORE_POISON_HELPER: u32 = 0xbad2310;
 
-/// Runs functions of one piece of code against one memory, with BPF-to-BPF calls
-/// on their own stack frames.
+/// Runs functions of one piece of code against one memory, with BPF-to-BPF calls on their own stack frames.
 ///
-/// Code is a separate instruction slice, so the guest can neither read nor modify
-/// it through memory. Generic over any [`Memory`]; memory stays borrowed, so it
-/// survives errors.
+/// Code is a separate instruction slice, so the guest can neither read nor modify it through memory. Generic over any
+/// [`Memory`]; memory stays borrowed, so it survives errors.
 pub struct Executor<'a, M: Memory = VmMemory> {
     code: &'a Code,
     memory: &'a mut M,
@@ -130,8 +126,8 @@ impl<'a, M: Memory<Err: Debug> + 'static> Executor<'a, M> {
 struct Helpers<'a, M> {
     registry: &'a HelperRegistry<M>,
     maps: Option<&'a mut Maps>,
-    /// Why the call that stopped [`run`] failed. The executor takes it as soon as
-    /// `run` stops, so it never needs dropping and costs no check on the way out.
+    /// Why the call that stopped [`run`] failed. The executor takes it as soon as `run` stops, so it never needs
+    /// dropping and costs no check on the way out.
     error: ManuallyDrop<Option<HelperError>>,
 }
 
@@ -155,9 +151,8 @@ impl<M: Memory<Err: Debug> + 'static> Helpers<'_, M> {
 }
 
 impl<M: Memory<Err: Debug> + 'static> Host<&mut M> for Helpers<'_, M> {
-    // Raw bytecode calls helpers by ID; linked programs call slots only, except for
-    // calls the linker planted for unresolved CO-RE relocations, which the executor
-    // reports.
+    // Raw bytecode calls helpers by ID; linked programs call slots only, except for calls the linker planted for
+    // unresolved CO-RE relocations, which the executor reports.
     #[inline]
     fn helper(&mut self, ctx: &mut Context<&mut M>, id: u32) -> Option<u64> {
         if id == CORE_POISON_HELPER {
@@ -182,8 +177,8 @@ impl<M: Memory<Err: Debug> + 'static> Host<&mut M> for Helpers<'_, M> {
     }
 }
 
-/// `callx` at `pc`: enter the function at code address `target`, or call the helper
-/// whose ID is `target`. Returns the next pc.
+/// `callx` at `pc`: enter the function at code address `target`, or call the helper whose ID is `target`. Returns the
+/// next pc.
 #[cold]
 #[inline(never)]
 fn call_indirect<M: Memory<Err: Debug> + 'static>(
@@ -200,8 +195,7 @@ fn call_indirect<M: Memory<Err: Debug> + 'static>(
         return Ok(callee);
     }
 
-    // A helper's address is its ID, as in libbpf's `(void *)BPF_FUNC_*` helper
-    // declarations.
+    // A helper's address is its ID, as in libbpf's `(void *)BPF_FUNC_*` helper declarations.
     let id = u32::try_from(target).map_err(|_| ExecError::BadCodeAddress { pc, target })?;
     let helpers = &mut calls.host;
     let slot = helpers.registry.slot_of_id(id).ok_or(HelperError::UnknownHelper(id))?;
@@ -216,8 +210,7 @@ fn jump_indirect(target: u64, pc: u64, code: &Code) -> Result<u64> {
     code_index(target, code).ok_or_else(|| ExecError::BadCodeAddress { pc, target }.into())
 }
 
-/// Instruction index of the guest code address `addr`, if it is an instruction
-/// boundary inside `code`.
+/// Instruction index of the guest code address `addr`, if it is an instruction boundary inside `code`.
 fn code_index(addr: u64, code: &Code) -> Option<u64> {
     let offset = addr.checked_sub(region_base(CODE_REGION))?;
     (offset % 8 == 0 && offset / 8 < code.len() as u64).then_some(offset / 8)
@@ -293,8 +286,7 @@ mod tests {
         assert_eq!(run(&mut asm, &[]).unwrap(), 300);
     }
 
-    // helper calls run inside the handler chain; this is the lib test that takes Miri
-    // through that path
+    // helper calls run inside the handler chain; this is the lib test that takes Miri through that path
     #[test]
     fn test_helper_calls() {
         let run = |asm: &mut Assembler| {
@@ -330,8 +322,8 @@ mod tests {
         assert!(matches!(run(&mut asm), Err(VmError::Helper(HelperError::UnknownHelper(2)))));
     }
 
-    // a host function with memory access runs inside the handler chain too, and a
-    // pointer the guest couldn't use itself fails the access, not the program
+    // a host function with memory access runs inside the handler chain too, and a pointer the guest couldn't use itself
+    // fails the access, not the program
     #[test]
     fn test_memory_fn() {
         let mut helpers = HelperRegistry::new();

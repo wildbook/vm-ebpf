@@ -58,9 +58,8 @@ impl OpCode {
     pub const fn mem_mode(self) -> MemMode { MemMode::from_u8(self.0 & 0b111_00_000) }
 }
 
-/// Declares a `#[repr(u8)]` enum covering every value of `mask` and a `from_u8`
-/// decoder for it. `mask` documents which bits belong to the enum; `from_u8`
-/// asserts the input carries no other bits.
+/// Declares a `#[repr(u8)]` enum covering every value of `mask` and a `from_u8` decoder for it. `mask` documents which
+/// bits belong to the enum; `from_u8` asserts the input carries no other bits.
 macro_rules! bits_enum {
     ($vis:vis enum $name:ident : $mask:literal { $($variant:ident = $val:expr),+ $(,)? }) => {
         #[repr(u8)]

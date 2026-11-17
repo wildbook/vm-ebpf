@@ -1,6 +1,5 @@
-//! Parser for the bpf_conformance suite's `.data` test file format: a sequence of
-//! `-- <section>` headers followed by their content, as documented in the
-//! project's README. `# ...` comments are stripped from every line first, exactly
+//! Parser for the bpf_conformance suite's `.data` test file format: a sequence of `-- <section>` headers followed by
+//! their content, as documented in the project's README. `# ...` comments are stripped from every line first, exactly
 //! as the reference parser does, so they can trail any section's content.
 
 /// One parsed `.data` file.
@@ -24,9 +23,8 @@ enum Section {
     Error,
 }
 
-/// Parses one `.data` file's text. Returns `Err` for a file with neither a `-- raw`
-/// nor an `-- asm` section, or neither a result nor an error, matching the
-/// reference parser's "nothing to run" skip.
+/// Parses one `.data` file's text. Returns `Err` for a file with neither a `-- raw` nor an `-- asm` section, or neither
+/// a result nor an error, matching the reference parser's "nothing to run" skip.
 pub fn parse(text: &str) -> Result<TestCase, String> {
     let mut section = Section::Ignore;
     let mut asm_source = String::new();
@@ -95,8 +93,8 @@ pub fn parse(text: &str) -> Result<TestCase, String> {
     })
 }
 
-/// `-- raw` holds whole little-endian instruction words (`0x...` hex or decimal),
-/// one or two per logical instruction (LDDW spans two).
+/// `-- raw` holds whole little-endian instruction words (`0x...` hex or decimal), one or two per logical instruction
+/// (LDDW spans two).
 fn parse_raw_words(words: &str) -> Result<Vec<u8>, String> {
     let mut code = Vec::new();
     for word in words.split_whitespace() {

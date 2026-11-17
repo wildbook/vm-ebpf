@@ -28,8 +28,7 @@ pub enum Register {
 }
 
 impl Register {
-    /// Create a register from a 4-bit value (0-10).
-    /// Returns `None` if the value is out of range.
+    /// Create a register from a 4-bit value (0-10). Returns `None` if the value is out of range.
     #[inline]
     pub const fn from_u8(value: u8) -> Option<Register> {
         match value {

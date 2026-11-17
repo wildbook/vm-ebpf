@@ -40,8 +40,8 @@ impl std::error::Error for BtfError {}
 ///
 /// # Panics
 ///
-/// Panics if the word does not fit in `b`; callers only use it on slices already
-/// bounds-checked against the record size they are reading.
+/// Panics if the word does not fit in `b`; callers only use it on slices already bounds-checked against the record size
+/// they are reading.
 pub fn word(b: &[u8], i: usize) -> u32 {
     let o = i * 4;
     u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
@@ -308,8 +308,8 @@ impl<'a> Btf<'a> {
 
     /// Resolve a type through modifiers (const, volatile, restrict, typedef).
     ///
-    /// Returns the underlying "real" type ID and info, or `None` for a missing type
-    /// or a chain of over 32 modifiers, which a cycle makes endless.
+    /// Returns the underlying "real" type ID and info, or `None` for a missing type or a chain of over 32 modifiers,
+    /// which a cycle makes endless.
     pub fn resolve_type(&self, mut type_id: u32) -> Option<(u32, &BtfTypeInfo<'a>)> {
         for _ in 0..=MAX_RESOLVE_DEPTH {
             let ty = self.type_by_id(type_id)?;
@@ -327,11 +327,10 @@ impl<'a> Btf<'a> {
         None
     }
 
-    /// Byte size of a type, resolving through typedefs/modifiers/vars and, like libbpf's
-    /// `btf__resolve_size`, multiplying an array's element size by its length.
+    /// Byte size of a type, resolving through typedefs/modifiers/vars and, like libbpf's `btf__resolve_size`,
+    /// multiplying an array's element size by its length.
     ///
-    /// `None` for a missing type, a size that overflows `u64`, or a chain of over 32
-    /// modifiers and arrays.
+    /// `None` for a missing type, a size that overflows `u64`, or a chain of over 32 modifiers and arrays.
     pub fn resolve_size(&self, mut id: u32) -> Option<u64> {
         let mut count = 1u64;
         for _ in 0..=MAX_RESOLVE_DEPTH {
@@ -360,6 +359,5 @@ impl<'a> Btf<'a> {
     }
 }
 
-/// Longest chain of modifiers, typedefs and arrays that resolution follows, as in
-/// libbpf.
+/// Longest chain of modifiers, typedefs and arrays that resolution follows, as in libbpf.
 pub const MAX_RESOLVE_DEPTH: usize = 32;

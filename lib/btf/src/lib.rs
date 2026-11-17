@@ -7,9 +7,9 @@
 //!
 //! # Host types as the target
 //!
-//! The host application's types stand in for the kernel's: eBPF programs compiled with
-//! BTF have their field accesses relocated to match the host's actual layouts, as
-//! kernel CO-RE relocates a program's accesses against the running kernel's BTF.
+//! The host application's types stand in for the kernel's: eBPF programs compiled with BTF have their field accesses
+//! relocated to match the host's actual layouts, as kernel CO-RE relocates a program's accesses against the running
+//! kernel's BTF.
 //!
 //! # Example
 //!

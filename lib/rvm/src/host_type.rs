@@ -2,8 +2,8 @@
 
 use btf::BtfBuilder;
 
-/// A Rust type that adds its C equivalent to a [`BtfBuilder`]. [`crate::host_struct!`]
-/// needs it for every field it lists.
+/// A Rust type that adds its C equivalent to a [`BtfBuilder`]. [`crate::host_struct!`] needs it for every field it
+/// lists.
 ///
 /// Implement it for a nested struct with [`crate::host_struct!`]:
 ///
@@ -75,10 +75,9 @@ impl<T: HostType, const N: usize> HostType for [T; N] {
 
 /// Describe a `#[repr(C)]` host struct to CO-RE, as `struct name` in C.
 ///
-/// Adds the struct to a [`BtfBuilder`] with its size and the listed fields at their
-/// offsets, each typed by its [`HostType`], and evaluates to the struct's BTF type ID.
-/// `field as "c_name"` gives a field another name in C. Plugins can't relocate
-/// accesses to fields left out. `types` is a `&mut BtfBuilder` or the guard from
+/// Adds the struct to a [`BtfBuilder`] with its size and the listed fields at their offsets, each typed by its
+/// [`HostType`], and evaluates to the struct's BTF type ID. `field as "c_name"` gives a field another name in C.
+/// Plugins can't relocate accesses to fields left out. `types` is a `&mut BtfBuilder` or the guard from
 /// [`crate::Vm::types`].
 ///
 /// ```

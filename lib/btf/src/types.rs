@@ -41,9 +41,8 @@ pub enum BtfTypeInfo<'a> {
         members: Vec<Member<'a>>,
     },
 
-    /// Enum type. `is_64` tells apart the kernel's 32-bit `BTF_KIND_ENUM` and 64-bit
-    /// `BTF_KIND_ENUM64` encodings; `kind()` reports them separately, but every other
-    /// consumer treats the two the same.
+    /// Enum type. `is_64` tells apart the kernel's 32-bit `BTF_KIND_ENUM` and 64-bit `BTF_KIND_ENUM64` encodings;
+    /// `kind()` reports them separately, but every other consumer treats the two the same.
     Enum {
         name: &'a str,
         size: u32,
@@ -180,8 +179,8 @@ pub struct Member<'a> {
     pub bitfield_size: u32,
 }
 
-/// An enum value. 32-bit `BTF_KIND_ENUM` values are sign-extended to `i64` at parse time,
-/// the same widening libbpf applies when comparing a 32-bit enum against a 64-bit one.
+/// An enum value. 32-bit `BTF_KIND_ENUM` values are sign-extended to `i64` at parse time, the same widening libbpf
+/// applies when comparing a 32-bit enum against a 64-bit one.
 #[derive(Debug, Clone)]
 pub struct EnumValue<'a> {
     /// Variant name.

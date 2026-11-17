@@ -1,5 +1,4 @@
-//! Prepared images: they run like programs linked from ELF, plugins load from them,
-//! and malformed ones fail to load.
+//! Prepared images: they run like programs linked from ELF, plugins load from them, and malformed ones fail to load.
 
 use rvm::{region_base, Image, Import, LinkError, Module, Vm, VmError, FIRST_FREE_REGION, MAX_REGION_LEN};
 

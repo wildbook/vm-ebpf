@@ -1,5 +1,5 @@
-//! Runs `bpf_main` from `bpf.o`, linked into an rvm image at build time (see
-//! `build.rs`), with zeroed input and output structs.
+//! Runs `bpf_main` from `bpf.o`, linked into an rvm image at build time (see `build.rs`), with zeroed input and output
+//! structs.
 
 use rvm::{Perms, Vm, FIRST_FREE_REGION};
 

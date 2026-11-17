@@ -1,5 +1,4 @@
-//! Decodes eBPF bytecode and prints it with `DefaultFormatter`, and inspects the
-//! decoded fields.
+//! Decodes eBPF bytecode and prints it with `DefaultFormatter`, and inspects the decoded fields.
 //!
 //! Run with: cargo run --example disassembly
 

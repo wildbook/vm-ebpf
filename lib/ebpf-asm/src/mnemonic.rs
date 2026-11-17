@@ -8,8 +8,8 @@
 
 use std::fmt;
 
-/// Declares the `Mnemonic` enum together with its `name()` method, so each variant's
-/// display name sits next to its definition instead of in a separate match.
+/// Declares the `Mnemonic` enum together with its `name()` method, so each variant's display name sits next to its
+/// definition instead of in a separate match.
 macro_rules! mnemonics {
     ($( $variant:ident = $name:literal ),+ $(,)?) => {
         /// eBPF instruction mnemonic.

@@ -1,6 +1,5 @@
-//! Loads `bpf/example.o` (falling back to `bpf.o`), prints what
-//! `Vm::parse_module` and `Vm::link_one` produce, and calls its exported
-//! functions.
+//! Loads `bpf/example.o` (falling back to `bpf.o`), prints what `Vm::parse_module` and `Vm::link_one` produce, and
+//! calls its exported functions.
 
 use anyhow::{Context, Result};
 use rvm::{Module, Perms, Program, Vm};

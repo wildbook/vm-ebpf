@@ -37,8 +37,7 @@ pub enum VmError {
     /// Invalid argument.
     InvalidArgument(String),
 
-    /// The program's code, rodata or data (named) exceeds
-    /// [`MAX_REGION_LEN`](crate::MAX_REGION_LEN) bytes.
+    /// The program's code, rodata or data (named) exceeds [`MAX_REGION_LEN`](crate::MAX_REGION_LEN) bytes.
     ProgramTooLarge(&'static str),
 
     /// The plugin is already running a call.
@@ -175,8 +174,8 @@ pub enum ExecError {
     InvalidPc(u64),
     /// Ran an instruction whose CO-RE relocation the host couldn't resolve.
     UnresolvedCoreRelo { pc: u64 },
-    /// `callx` or `gotox` at `pc` targeted something other than an instruction in the
-    /// program (or, for `callx`, a helper ID).
+    /// `callx` or `gotox` at `pc` targeted something other than an instruction in the program (or, for `callx`, a
+    /// helper ID).
     BadCodeAddress { pc: u64, target: u64 },
 }
 

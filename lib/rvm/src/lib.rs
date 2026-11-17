@@ -35,24 +35,21 @@
 //!
 //! ## Components
 //!
-//! - [`Vm`]: the entry point. Holds the shared helper table, type registry, and the
-//!   maps and regions shared across the programs it loads.
+//! - [`Vm`]: the entry point. Holds the shared helper table, type registry, and the maps and regions shared across the
+//!   programs it loads.
 //! - [`Module`]: a parsed eBPF ELF file, not yet linked.
 //! - [`Image`]: a linked program, before binding and allocation; serializable.
-//! - [`Program`]: a loaded, executable program with its own memory, maps and
-//!   function table.
+//! - [`Program`]: a loaded, executable program with its own memory, maps and function table.
 //! - [`Plugin`]: a loaded program that other programs can call into.
 //! - [`HelperRegistry`]: the extern table of host functions callable from eBPF.
-//! - [`BtfBuilder`]: the host's types, as BTF, for CO-RE relocations;
-//!   [`host_struct!`] fills it from Rust struct definitions.
+//! - [`BtfBuilder`]: the host's types, as BTF, for CO-RE relocations; [`host_struct!`] fills it from Rust struct
+//!   definitions.
 //!
 //! ## Cargo features
 //!
-//! - `link` (default): ELF parsing, CO-RE and the linker ([`Module`],
-//!   [`BtfBuilder`], `Vm::prepare`, `Vm::load_elf` and friends). Without it, rvm
-//!   loads prepared images only.
-//! - `fixed-hash-seed`: guest hash maps use a fixed hash seed, for reproducible
-//!   benchmarks.
+//! - `link` (default): ELF parsing, CO-RE and the linker ([`Module`], [`BtfBuilder`], `Vm::prepare`, `Vm::load_elf` and
+//!   friends). Without it, rvm loads prepared images only.
+//! - `fixed-hash-seed`: guest hash maps use a fixed hash seed, for reproducible benchmarks.
 
 mod error;
 mod executor;

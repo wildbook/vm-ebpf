@@ -1,14 +1,13 @@
-//! End-to-end CO-RE relocation tests: a local (compile-time) BTF is relocated against a
-//! target (host) BTF, exactly like a BPF program's debug info gets relocated against the
-//! kernel's BTF. Both are encoded with [`BtfBuilder`] so each test controls, and can
-//! hand-derive, the exact offsets/values the relocation must produce.
+//! End-to-end CO-RE relocation tests: a local (compile-time) BTF is relocated against a target (host) BTF, exactly like
+//! a BPF program's debug info gets relocated against the kernel's BTF. Both are encoded with [`BtfBuilder`] so each
+//! test controls, and can hand-derive, the exact offsets/values the relocation must produce.
 
 use crate::builder::BtfBuilder;
 use crate::core_relo::{apply_core_relocations, CoreRelo, CoreReloError, CoreReloKind, Unresolved, CORE_POISON_HELPER};
 use crate::parse::Btf;
 
-/// Encode a single `CoreRelo` whose access string is appended to a scratch `BtfBuilder`'s
-/// string table (CO-RE access strings live in the *local* BTF's strings).
+/// Encode a single `CoreRelo` whose access string is appended to a scratch `BtfBuilder`'s string table (CO-RE access
+/// strings live in the *local* BTF's strings).
 fn relo(local: &mut BtfBuilder, type_id: u32, access_str: &str, kind: CoreReloKind) -> CoreRelo {
     let access_str_off = local.string(access_str);
     CoreRelo {
@@ -66,8 +65,8 @@ fn moved_field_offset() {
     assert_eq!(off_of(insns[0]), 8);
 }
 
-/// A field nested inside a target-only anonymous union is still found by name, and its
-/// offset includes the anonymous union's own offset.
+/// A field nested inside a target-only anonymous union is still found by name, and its offset includes the anonymous
+/// union's own offset.
 #[test]
 fn nested_anonymous_member() {
     let mut local = BtfBuilder::new();
@@ -124,8 +123,7 @@ fn array_element_offset() {
     assert_eq!(off_of(insns[0]), 16); // 8 (array start) + 2 * 4 (element size)
 }
 
-/// Bitfield relocations extract the exact bits libbpf's formulas derive, not just the
-/// right byte offset.
+/// Bitfield relocations extract the exact bits libbpf's formulas derive, not just the right byte offset.
 #[test]
 fn bitfield_signed_and_shifts() {
     let mut local = BtfBuilder::new();
@@ -157,16 +155,15 @@ fn bitfield_signed_and_shifts() {
     apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r_rshift]).unwrap();
     assert_eq!(imm_of(insns[0]), 59);
 
-    // FieldLShiftU64 = 64 - (bit_off + bit_size - byte_off*8): 56 locally, 39 on the target;
-    // bitfields are never validated against the instruction's current value, so the
-    // starting imm is irrelevant here.
+    // FieldLShiftU64 = 64 - (bit_off + bit_size - byte_off*8): 56 locally, 39 on the target; bitfields are never
+    // validated against the instruction's current value, so the starting imm is irrelevant here.
     let mut insns = [insn(ALU64_MOV_K, 0, 0, 0, 0)];
     apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r_lshift]).unwrap();
     assert_eq!(imm_of(insns[0]), 39);
 }
 
-/// A field whose unsigned integer type widened gets its `LDX` memory access size adjusted;
-/// the same change on a signed field poisons rather than risk sign-extending wrongly.
+/// A field whose unsigned integer type widened gets its `LDX` memory access size adjusted; the same change on a signed
+/// field poisons rather than risk sign-extending wrongly.
 #[test]
 fn size_change_adjusts_or_poisons_memory_access() {
     let mut local = BtfBuilder::new();
@@ -303,9 +300,8 @@ fn type_id_target_relocation() {
     assert_eq!(imm_of(insns[0]) as u32, t_cfg);
 }
 
-/// `TYPE_MATCHES` structurally compares local and target: a superset of fields matches,
-/// a missing field doesn't (and, since it's an "exists"-family kind, resolves to 0 rather
-/// than poisoning).
+/// `TYPE_MATCHES` structurally compares local and target: a superset of fields matches, a missing field doesn't (and,
+/// since it's an "exists"-family kind, resolves to 0 rather than poisoning).
 #[test]
 fn type_matches_true_and_false() {
     let mut local = BtfBuilder::new();
@@ -341,9 +337,9 @@ fn type_matches_true_and_false() {
     assert_eq!(imm_of(insns[0]), 0);
 }
 
-/// A type absent from the target poisons a field relocation's instruction (it's returned
-/// as `Unresolved`), but a plain existence check patches to `0`, and so does every
-/// type-based kind (not just `TYPE_EXISTS`/`TYPE_MATCHES`): libbpf never poisons those.
+/// A type absent from the target poisons a field relocation's instruction (it's returned as `Unresolved`), but a plain
+/// existence check patches to `0`, and so does every type-based kind (not just `TYPE_EXISTS`/`TYPE_MATCHES`): libbpf
+/// never poisons those.
 #[test]
 fn missing_type_poisons_or_reads_as_absent() {
     let mut local = BtfBuilder::new();
@@ -380,8 +376,8 @@ fn missing_type_poisons_or_reads_as_absent() {
     assert!(unresolved.is_empty());
     assert_eq!(imm_of(insns[0]), 0);
 
-    // TYPE_SIZE's orig_val is the local type's own size (4), validated against the
-    // instruction; a missing target still patches 0 rather than poisoning.
+    // TYPE_SIZE's orig_val is the local type's own size (4), validated against the instruction; a missing target still
+    // patches 0 rather than poisoning.
     let mut insns = [insn(ALU64_MOV_K, 0, 0, 0, 4)];
     let unresolved = apply_core_relocations(&mut insns, &local_btf, &target_btf, &[r_size]).unwrap();
     assert!(unresolved.is_empty());
@@ -394,8 +390,8 @@ fn missing_type_poisons_or_reads_as_absent() {
     assert_eq!(imm_of(insns[0]), 0);
 }
 
-/// `TYPE_SIZE` checks the instruction against the local type's size and patches in the
-/// target's, here a struct that grew a field.
+/// `TYPE_SIZE` checks the instruction against the local type's size and patches in the target's, here a struct that
+/// grew a field.
 #[test]
 fn type_size_follows_target() {
     let mut local = BtfBuilder::new();
@@ -420,8 +416,8 @@ fn type_size_follows_target() {
     assert_eq!(imm_of(insns[0]), 8);
 }
 
-/// `FieldByteSize` on an array member is the whole array's size (element size times
-/// length), matching libbpf's `btf__resolve_size`, not just the element's size.
+/// `FieldByteSize` on an array member is the whole array's size (element size times length), matching libbpf's
+/// `btf__resolve_size`, not just the element's size.
 #[test]
 fn array_field_byte_size_multiplies_by_length() {
     let mut local = BtfBuilder::new();
@@ -442,9 +438,8 @@ fn array_field_byte_size_multiplies_by_length() {
     assert_eq!(imm_of(insns[0]), 16);
 }
 
-/// A two-dimensional array's second-level index is scaled by the inner array's whole
-/// size, not just its element's: `a[i][j]`'s offset is `i * (inner_len * elem_sz) + j *
-/// elem_sz`.
+/// A two-dimensional array's second-level index is scaled by the inner array's whole size, not just its element's:
+/// `a[i][j]`'s offset is `i * (inner_len * elem_sz) + j * elem_sz`.
 #[test]
 fn two_dimensional_array_offset() {
     let mut local = BtfBuilder::new();
@@ -454,8 +449,8 @@ fn two_dimensional_array_offset() {
     let s = local.add_struct("with2d", 52);
     local.member(s, "before", 0, int_ty);
     local.member(s, "grid", 4, outer);
-    // idx1 selects "grid" (the struct's second member), idx2 selects the outer
-    // dimension's element 1, idx3 selects the inner dimension's element 2.
+    // idx1 selects "grid" (the struct's second member), idx2 selects the outer dimension's element 1, idx3 selects the
+    // inner dimension's element 2.
     let r = relo(&mut local, s, "0:1:1:2", CoreReloKind::FieldByteOffset);
     let local_bytes = local.encode();
     let local_btf = Btf::parse(&local_bytes).unwrap();

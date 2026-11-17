@@ -1,15 +1,13 @@
 //! Linker for combining multiple eBPF modules.
 //!
-//! The linker resolves symbol references between modules, applies relocations,
-//! and produces an [`Image`] for [`crate::image::load`] to bind and allocate.
+//! The linker resolves symbol references between modules, applies relocations, and produces an [`Image`] for
+//! [`crate::image::load`] to bind and allocate.
 //!
-//! Code and data live in separate address spaces. Code sections are concatenated
-//! into one instruction array (addressed by byte offset during linking, by
-//! instruction index at runtime) that the guest cannot read or write. A function
-//! pointer or jump table entry is a byte offset into that array in
-//! [`CODE_REGION`], which `callx` and `gotox` accept and loads and stores reject.
-//! Data sections go into guest memory regions; see [`crate::layout`] for the
-//! complete table.
+//! Code and data live in separate address spaces. Code sections are concatenated into one instruction array (addressed
+//! by byte offset during linking, by instruction index at runtime) that the guest cannot read or write. A function
+//! pointer or jump table entry is a byte offset into that array in [`CODE_REGION`], which `callx` and `gotox` accept
+//! and loads and stores reject. Data sections go into guest memory regions; see [`crate::layout`] for the complete
+//! table.
 
 use btf::{apply_core_relocations, Btf, BtfBuilder, BtfTypeInfo};
 use constelf::raw::reloc;
@@ -38,8 +36,8 @@ enum Addr {
 }
 
 impl Addr {
-    /// The address `by` bytes on. A symbol value or relocation offset past the end
-    /// of its section wraps here and fails where the address is used.
+    /// The address `by` bytes on. A symbol value or relocation offset past the end of its section wraps here and fails
+    /// where the address is used.
     fn offset(self, by: u64) -> Self {
         match self {
             Self::Code(a) => Self::Code(a.wrapping_add(by)),
@@ -60,8 +58,8 @@ impl Addr {
 #[derive(Debug, Clone, Default)]
 struct ModuleLayout {
     sections: HashMap<usize, Addr>,
-    /// (code section, `.jumptables` section) -> copy of the tables in `.rodata` with
-    /// each entry turned into a guest code address.
+    /// (code section, `.jumptables` section) -> copy of the tables in `.rodata` with each entry turned into a guest
+    /// code address.
     jump_tables: HashMap<(usize, usize), Addr>,
 }
 
@@ -89,8 +87,7 @@ impl Image {
     }
 }
 
-/// Link modules into an image, binding extern calls against `helpers` and CO-RE
-/// relocations against `types`.
+/// Link modules into an image, binding extern calls against `helpers` and CO-RE relocations against `types`.
 pub fn link<'m>(helpers: &HelperRegistry, types: &BtfBuilder, modules: &[&'m Module]) -> Result<Image> {
     if modules.is_empty() {
         return Err(VmError::InvalidArgument("no modules to link".to_string()));
@@ -102,8 +99,8 @@ pub fn link<'m>(helpers: &HelperRegistry, types: &BtfBuilder, modules: &[&'m Mod
         .map(|m| m.btf_data.as_deref().map(Btf::parse).transpose())
         .collect::<std::result::Result<Vec<Option<Btf<'m>>>, _>>()?;
 
-    // The host's types, encoded once as standard BTF and shared by every
-    // CO-RE relocation below, the same way a second translation unit would be.
+    // The host's types, encoded once as standard BTF and shared by every CO-RE relocation below, the same way a second
+    // translation unit would be.
     let target_bytes = types.encode();
     let target = Btf::parse(&target_bytes)?;
 
@@ -149,8 +146,7 @@ fn trim_zeros(bytes: &mut Vec<u8>) -> usize {
 
 /// Place every allocatable section and copy its contents into the image.
 fn lay_out(modules: &[&Module]) -> Result<(Image, Vec<ModuleLayout>)> {
-    // Checks the size before growing `buf`, so a section header can't ask for more
-    // than a region holds.
+    // Checks the size before growing `buf`, so a section header can't ask for more than a region holds.
     fn place(buf: &mut Vec<u8>, region: &'static str, section: &Section, align: usize) -> Result<u64> {
         let align = section.align.max(align as u64);
         let end = (buf.len() as u64)
@@ -191,9 +187,8 @@ fn lay_out(modules: &[&Module]) -> Result<(Image, Vec<ModuleLayout>)> {
     Ok((image, layouts))
 }
 
-/// Copy each jump table section that `module`'s code loads into `rodata`, once per
-/// code section that loads it. Entries are byte offsets into that code section; the
-/// copy holds guest code addresses, which `gotox` takes.
+/// Copy each jump table section that `module`'s code loads into `rodata`, once per code section that loads it. Entries
+/// are byte offsets into that code section; the copy holds guest code addresses, which `gotox` takes.
 fn lay_out_jump_tables(module: &Module, layout: &mut ModuleLayout, rodata: &mut Vec<u8>) {
     for reloc in &module.relocations {
         let Some(&Addr::Code(code)) = layout.sections.get(&reloc.section_idx) else {
@@ -223,9 +218,8 @@ fn lay_out_jump_tables(module: &Module, layout: &mut ModuleLayout, rodata: &mut 
     }
 }
 
-/// Compare each host-bound extern's BTF prototype with the registered function's
-/// argument count. Modules without BTF and host functions without a known arity
-/// (raw and context helpers) are not checked.
+/// Compare each host-bound extern's BTF prototype with the registered function's argument count. Modules without BTF
+/// and host functions without a known arity (raw and context helpers) are not checked.
 fn check_extern_signatures(helpers: &HelperRegistry, btfs: &[Option<Btf<'_>>]) -> Result<()> {
     const BTF_FUNC_EXTERN: u16 = 2;
 
@@ -263,8 +257,7 @@ fn check_extern_signatures(helpers: &HelperRegistry, btfs: &[Option<Btf<'_>>]) -
     Ok(())
 }
 
-/// Every module's exported symbols by name; two different definitions of one name
-/// fail.
+/// Every module's exported symbols by name; two different definitions of one name fail.
 fn build_symbol_table(modules: &[&Module], layouts: &[ModuleLayout]) -> Result<HashMap<String, Addr>> {
     let mut symbols = HashMap::new();
 
@@ -359,8 +352,8 @@ fn apply_relocation(
     Ok(())
 }
 
-/// Record every `call <helper id>` as an extern, so loaded programs never look
-/// helpers up at runtime. Unregistered IDs fail the link.
+/// Record every `call <helper id>` as an extern, so loaded programs never look helpers up at runtime. Unregistered IDs
+/// fail the link.
 fn mark_helper_calls(helpers: &HelperRegistry, image: &mut Image) -> Result<()> {
     const BPF_LD_IMM64: u8 = 0x18;
 
@@ -382,16 +375,15 @@ fn mark_helper_calls(helpers: &HelperRegistry, image: &mut Image) -> Result<()> 
     Ok(())
 }
 
-/// Record the call at code offset `at` as an extern. Until loading binds it, it
-/// calls a slot no table has.
+/// Record the call at code offset `at` as an extern. Until loading binds it, it calls a slot no table has.
 fn mark_extern(image: &mut Image, at: u64, import: Import) -> Result<()> {
     set_slot_call(image.insn_mut(at)?, u32::MAX);
     image.externs.push(((at / 8) as u32, import));
     Ok(())
 }
 
-/// Apply CO-RE relocations. Instructions whose target the host lacks become calls
-/// that fail when run; malformed or unsupported relocations fail the link.
+/// Apply CO-RE relocations. Instructions whose target the host lacks become calls that fail when run; malformed or
+/// unsupported relocations fail the link.
 fn apply_core_relocations_pass(
     modules: &[&Module],
     layouts: &[ModuleLayout],
@@ -434,8 +426,7 @@ fn apply_core_relocations_pass(
     Ok(())
 }
 
-/// Exported functions by name, or each code section by name if no module exports a
-/// function.
+/// Exported functions by name, or each code section by name if no module exports a function.
 fn build_function_table(
     modules: &[&Module],
     layouts: &[ModuleLayout],

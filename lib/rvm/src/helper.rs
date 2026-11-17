@@ -130,8 +130,8 @@ struct Slot<M> {
     data: *const (),
     // keeps `data` alive; the call path never touches it
     _owner: Arc<dyn Send + Sync>,
-    // argument count, if registered with typed arguments; `None` for raw and context
-    // helpers, which read registers themselves
+    // argument count, if registered with typed arguments; `None` for raw and context helpers, which read registers
+    // themselves
     arity: Option<u8>,
 }
 
@@ -201,11 +201,10 @@ impl Slot<VmMemory> {
 
 /// Extern table: host functions callable from eBPF, stored in dense slots.
 ///
-/// Functions are registered either by numeric helper ID (standard BPF helpers,
-/// `call <id>`) or by name (extern functions declared in the program). The linker
-/// rewrites every call into a slot call, so linked programs dispatch by index.
-/// Re-registering an ID or name replaces the function in its existing slot, which
-/// keeps linked call sites valid (hot reload).
+/// Functions are registered either by numeric helper ID (standard BPF helpers, `call <id>`) or by name (extern
+/// functions declared in the program). The linker rewrites every call into a slot call, so linked programs dispatch by
+/// index. Re-registering an ID or name replaces the function in its existing slot, which keeps linked call sites valid
+/// (hot reload).
 pub struct HelperRegistry<M = VmMemory> {
     slots: Vec<Slot<M>>,
     by_id: HashMap<u32, u32>,
@@ -238,8 +237,8 @@ impl HelperRegistry {
         Self::default()
     }
 
-    /// Register an extern function by name that reads or writes the calling
-    /// program's memory through [`GuestMemory`], with typed arguments.
+    /// Register an extern function by name that reads or writes the calling program's memory through [`GuestMemory`],
+    /// with typed arguments.
     pub fn register_fn_with_memory<F, A, R>(&mut self, name: impl Into<String>, func: F)
     where
         F: Fn(&mut GuestMemory, A) -> R + Send + Sync + 'static,
@@ -361,9 +360,8 @@ impl<M> std::fmt::Debug for HelperRegistry<M> {
 
 /// The extern table a [`crate::Vm`] shares with the programs it links.
 ///
-/// Every change bumps a version. A program keeps its own copy of the table and
-/// re-copies it on entry when the version moved, so helper calls never touch a lock
-/// and a change takes effect at each program's next call.
+/// Every change bumps a version. A program keeps its own copy of the table and re-copies it on entry when the version
+/// moved, so helper calls never touch a lock and a change takes effect at each program's next call.
 #[derive(Debug, Default)]
 pub struct SharedHelpers {
     registry: RwLock<HelperRegistry>,

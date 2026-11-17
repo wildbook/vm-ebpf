@@ -51,9 +51,8 @@ impl SharedMaps {
         lock(&self.state).declared.insert(name.to_string(), pad_values);
     }
 
-    /// The shared instance for `def`, created by the first program that declares it.
-    /// `None` if maps with this name aren't shared. Running out of regions fails with
-    /// `bad_map`.
+    /// The shared instance for `def`, created by the first program that declares it. `None` if maps with this name
+    /// aren't shared. Running out of regions fails with `bad_map`.
     pub fn bind(&self, def: &MapDef, bad_map: fn(String) -> VmError) -> Result<Option<Arc<SharedMap>>> {
         use crate::layout::SHARED_MAPS_FIRST_REGION;
 

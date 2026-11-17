@@ -1,21 +1,18 @@
 //! BPF maps.
 //!
-//! Programs declare maps libbpf style in the `.maps` section; the linker reads the
-//! definitions from BTF. All map values live in guest memory region
-//! [`crate::layout::MAPS_REGION`], so the pointer `map_lookup_elem` returns is an
-//! ordinary guest address the program can load from, store to and use with atomics.
+//! Programs declare maps libbpf style in the `.maps` section; the linker reads the definitions from BTF. All map values
+//! live in guest memory region [`crate::layout::MAPS_REGION`], so the pointer `map_lookup_elem` returns is an ordinary
+//! guest address the program can load from, store to and use with atomics.
 //!
 //! - Array maps: value `i` is at `base + i * stride`. Lookups are pure arithmetic.
-//! - Hash maps: values sit in fixed slots of the same layout; a host-side index maps
-//!   keys to slots. Deleting a key frees its slot for reuse, so a pointer the program
-//!   kept across a delete then aliases whichever value takes the slot next, as with
-//!   kernel hash maps.
+//! - Hash maps: values sit in fixed slots of the same layout; a host-side index maps keys to slots. Deleting a key
+//!   frees its slot for reuse, so a pointer the program kept across a delete then aliases whichever value takes the
+//!   slot next, as with kernel hash maps.
 //!
-//! Each map starts on a cache line, and values are padded to 8 bytes so 64 bit
-//! atomics on them are aligned.
+//! Each map starts on a cache line, and values are padded to 8 bytes so 64 bit atomics on them are aligned.
 //!
-//! The guest refers to a map by its handle: the `lddw` the program uses to load a map
-//! gets the map's index in this program.
+//! The guest refers to a map by its handle: the `lddw` the program uses to load a map gets the map's index in this
+//! program.
 
 use std::ops::Range;
 use std::sync::{Arc, RwLockReadGuard};
@@ -133,9 +130,8 @@ enum Index {
 }
 
 impl Maps {
-    /// Lay out `defs`, binding those declared shared to the VM-wide instance, and
-    /// return the maps and the size of the private region they need. Definitions that
-    /// can't be laid out fail with `bad_map`.
+    /// Lay out `defs`, binding those declared shared to the VM-wide instance, and return the maps and the size of the
+    /// private region they need. Definitions that can't be laid out fail with `bad_map`.
     pub fn new(defs: Vec<MapDef>, shared: &SharedMaps, bad_map: fn(String) -> VmError) -> Result<(Self, usize)> {
         let mut maps = Self::default();
         let mut len = 0;
@@ -196,8 +192,8 @@ impl Maps {
         map.slot(key).map(|slot| map.addr(slot))
     }
 
-    /// Find or create the slot for `key` and return its guest address; the caller
-    /// writes the value. `flags` is `BPF_ANY`, `BPF_NOEXIST` or `BPF_EXIST`.
+    /// Find or create the slot for `key` and return its guest address; the caller writes the value. `flags` is
+    /// `BPF_ANY`, `BPF_NOEXIST` or `BPF_EXIST`.
     pub fn upsert(&mut self, handle: u32, key: &[u8], flags: u64) -> std::result::Result<u64, MapError> {
         let map = self.maps.get_mut(handle as usize).ok_or(MapError::Invalid)?;
         if flags > BPF_EXIST {
@@ -207,8 +203,7 @@ impl Maps {
         Ok(map.addr(slot))
     }
 
-    /// Remove `key` and return the guest address of its freed value. Array maps
-    /// don't support deletion.
+    /// Remove `key` and return the guest address of its freed value. Array maps don't support deletion.
     pub fn remove(&mut self, handle: u32, key: &[u8]) -> std::result::Result<u64, MapError> {
         let map = self.maps.get_mut(handle as usize).ok_or(MapError::Invalid)?;
         let slot = map.with_hash(|index| index.remove(key)).ok_or(MapError::Invalid)??;
@@ -254,9 +249,8 @@ impl<'a> MapRef<'a> {
         Ok(())
     }
 
-    /// The value for `key`, copied out as a `V`. Fails with [`MapError::NotFound`] if
-    /// the key is absent, and with [`MapError::Invalid`] if `K` or `V` differs in size
-    /// from the map's keys or values.
+    /// The value for `key`, copied out as a `V`. Fails with [`MapError::NotFound`] if the key is absent, and with
+    /// [`MapError::Invalid`] if `K` or `V` differs in size from the map's keys or values.
     pub fn get_as<K: Pod, V: Pod>(&self, key: K) -> std::result::Result<V, MapError> {
         check_sizes::<K, V>(self.def())?;
         let value = self.get(key.as_bytes()).ok_or(MapError::NotFound)?;
@@ -289,9 +283,8 @@ impl<'a> MapRef<'a> {
 
 /// The entries of one map, from [`MapRef::entries`].
 ///
-/// For a shared hash map, this holds the map's key index locked for reading until it
-/// is dropped. Guests that insert or delete keys meanwhile wait, and one that runs on
-/// this thread deadlocks.
+/// For a shared hash map, this holds the map's key index locked for reading until it is dropped. Guests that insert or
+/// delete keys meanwhile wait, and one that runs on this thread deadlocks.
 pub struct Entries<'a> {
     map: &'a Map,
     memory: &'a VmMemory,
@@ -305,8 +298,8 @@ enum EntriesIndex<'a> {
 }
 
 impl Entries<'_> {
-    /// Every element of an array map with its index, in index order, or the keys
-    /// present in a hash map with their values, in no particular order.
+    /// Every element of an array map with its index, in index order, or the keys present in a hash map with their
+    /// values, in no particular order.
     pub fn iter(&self) -> MapIter<'_> {
         let slots = match &self.index {
             EntriesIndex::Array => Slots::Array(0..self.map.def.max_entries),
@@ -320,9 +313,8 @@ impl Entries<'_> {
         }
     }
 
-    /// [`Entries::iter`] with keys and values copied out as `K` and `V`; an array
-    /// index is a 4 byte key. Fails with [`MapError::Invalid`] if `K` or `V` differs in
-    /// size from the map's keys or values.
+    /// [`Entries::iter`] with keys and values copied out as `K` and `V`; an array index is a 4 byte key. Fails with
+    /// [`MapError::Invalid`] if `K` or `V` differs in size from the map's keys or values.
     pub fn iter_as<K: Pod, V: Pod>(&self) -> std::result::Result<impl Iterator<Item = (K, V)> + '_, MapError> {
         check_sizes::<K, V>(&self.map.def)?;
         Ok(self.iter().map(|(key, value)| {
@@ -354,8 +346,7 @@ pub enum MapKey<'a> {
     Bytes(&'a [u8]),
 }
 
-/// The keys and values of a map, read in place from guest memory; see
-/// [`Entries::iter`].
+/// The keys and values of a map, read in place from guest memory; see [`Entries::iter`].
 pub struct MapIter<'a> {
     map: &'a Map,
     memory: &'a VmMemory,
@@ -448,8 +439,8 @@ impl Map {
     }
 }
 
-/// Reject a map no program can use, or whose values or keys don't fit in a region
-/// with values padded to a cache line, as shared maps may be.
+/// Reject a map no program can use, or whose values or keys don't fit in a region with values padded to a cache line,
+/// as shared maps may be.
 pub fn check_def(def: &MapDef) -> std::result::Result<(), String> {
     let bad = |what: &str| Err(format!("map {}: {what}", def.name));
     if def.value_size == 0 || def.max_entries == 0 {

@@ -40,8 +40,8 @@ impl Default for VmConfig {
     }
 }
 
-/// The entry point: holds the helper table, the host types for CO-RE, and the maps
-/// and regions shared between the programs it links and loads.
+/// The entry point: holds the helper table, the host types for CO-RE, and the maps and regions shared between the
+/// programs it links and loads.
 pub struct Vm {
     /// Extern table shared with every program this VM links.
     helpers: Arc<SharedHelpers>,
@@ -88,8 +88,8 @@ impl Vm {
     // Helper Registration
     // =========================================================================
     //
-    // Changes reach programs linked earlier at their next call. Replacing a
-    // function keeps its slot, so linked call sites stay valid.
+    // Changes reach programs linked earlier at their next call. Replacing a function keeps its slot, so linked call
+    // sites stay valid.
 
     /// Register a helper function with type-safe argument extraction.
     ///
@@ -114,8 +114,8 @@ impl Vm {
         self.helpers.update(|h| h.register(id, func));
     }
 
-    /// Register an extern function that programs import by name
-    /// (`extern u64 name(...);` in C). Unresolved names fail at link time.
+    /// Register an extern function that programs import by name (`extern u64 name(...);` in C). Unresolved names fail
+    /// at link time.
     pub fn register_fn<F, A, R>(&self, name: impl Into<String>, func: F)
     where
         F: Fn(A) -> R + Send + Sync + 'static,
@@ -125,10 +125,9 @@ impl Vm {
         self.helpers.update(|h| h.register_fn(name, func));
     }
 
-    /// Register an extern function that reads or writes the calling program's
-    /// memory, such as `void log(const char *msg, u64 len);` in C. `func` gets the
-    /// program's memory, where every access needs the guest's permissions and
-    /// fails on a bad pointer, followed by the typed arguments.
+    /// Register an extern function that reads or writes the calling program's memory, such as
+    /// `void log(const char *msg, u64 len);` in C. `func` gets the program's memory, where every access needs the
+    /// guest's permissions and fails on a bad pointer, followed by the typed arguments.
     ///
     /// # Example
     ///
@@ -163,32 +162,26 @@ impl Vm {
         self.helpers.update(|h| std_helpers::register_print(h, sink));
     }
 
-    /// Share maps called `name` between every program linked afterwards: they bind to
-    /// one instance, created by the first program that declares it, and later
-    /// declarations must match its layout. `pad_values` puts each value on its own
-    /// cache line, so atomics on neighbouring values from different threads don't
-    /// contend.
+    /// Share maps called `name` between every program linked afterwards: they bind to one instance, created by the
+    /// first program that declares it, and later declarations must match its layout. `pad_values` puts each value on
+    /// its own cache line, so atomics on neighbouring values from different threads don't contend.
     ///
-    /// Values live at the same guest address in every program, from region
-    /// [`crate::SHARED_MAPS_FIRST_REGION`] up.
+    /// Values live at the same guest address in every program, from region [`crate::SHARED_MAPS_FIRST_REGION`] up.
     ///
     /// # Safety
     ///
-    /// As [`VmMemory::map_shared`](crate::VmMemory::map_shared), for every program
-    /// linked afterwards.
+    /// As [`VmMemory::map_shared`](crate::VmMemory::map_shared), for every program linked afterwards.
     pub unsafe fn share_map(&self, name: &str, pad_values: bool) {
         self.shared_maps.declare(name, pad_values);
     }
 
-    /// Allocate `len` zeroed bytes and map them as region `region` into every program
-    /// linked afterwards, so plugins can exchange data through plain pointers.
-    /// `region` must lie in `FIRST_FREE_REGION..BORROW_FIRST_REGION` and not be
+    /// Allocate `len` zeroed bytes and map them as region `region` into every program linked afterwards, so plugins can
+    /// exchange data through plain pointers. `region` must lie in `FIRST_FREE_REGION..BORROW_FIRST_REGION` and not be
     /// shared already.
     ///
     /// # Safety
     ///
-    /// As [`VmMemory::map_shared`](crate::VmMemory::map_shared), for every program
-    /// linked afterwards.
+    /// As [`VmMemory::map_shared`](crate::VmMemory::map_shared), for every program linked afterwards.
     pub unsafe fn share_region(&self, region: usize, len: usize, perms: Perms) -> Result<SharedRegion> {
         let mut regions = self.shared_regions.lock().unwrap_or_else(|e| e.into_inner());
         let usable = (FIRST_FREE_REGION..BORROW_FIRST_REGION).contains(&region);
@@ -209,9 +202,8 @@ impl Vm {
 
     /// Load an image written by [`Image::to_bytes`] as a program.
     ///
-    /// Binds the image's extern calls by name or helper ID in this VM, allocates
-    /// its memory and maps, and maps the maps and regions this VM shares. Fails on
-    /// a malformed image, one written by another rvm version, or an extern this VM
+    /// Binds the image's extern calls by name or helper ID in this VM, allocates its memory and maps, and maps the maps
+    /// and regions this VM shares. Fails on a malformed image, one written by another rvm version, or an extern this VM
     /// lacks.
     pub fn load_image(&self, bytes: &[u8]) -> Result<Program> {
         self.load(Image::from_bytes(bytes)?, VmError::InvalidImage)
@@ -229,8 +221,8 @@ impl Vm {
 
     /// Publish `func` from `plugin` as an extern of the same name.
     ///
-    /// Programs linked afterwards can import it; programs that already import it pick
-    /// up the new target at their next call.
+    /// Programs linked afterwards can import it; programs that already import it pick up the new target at their next
+    /// call.
     pub fn export(&self, plugin: &Plugin, func: &str) -> Result<()> {
         if plugin.lock()?.function(func).is_none() {
             return Err(VmError::FunctionNotFound(format!("{}::{func}", plugin.name())));
@@ -244,8 +236,7 @@ impl Vm {
 /// ELF parsing, CO-RE and linking.
 #[cfg(feature = "link")]
 impl Vm {
-    /// The host's types, as BTF, for CO-RE. Linking takes the same lock, so drop the
-    /// guard before linking.
+    /// The host's types, as BTF, for CO-RE. Linking takes the same lock, so drop the guard before linking.
     ///
     /// # Example
     ///
@@ -269,9 +260,8 @@ impl Vm {
 
     /// Link one ELF file into an image, to load later with [`Vm::load_image`].
     ///
-    /// Externs and helper IDs must be registered here as they will be in the
-    /// loading VM, so the link checks signatures and fails on unknown names early;
-    /// CO-RE resolves against [`Vm::types`].
+    /// Externs and helper IDs must be registered here as they will be in the loading VM, so the link checks signatures
+    /// and fails on unknown names early; CO-RE resolves against [`Vm::types`].
     pub fn prepare(&self, elf_bytes: &[u8]) -> Result<Image> {
         let module = self.parse_module("main", elf_bytes)?;
         self.prepare_modules(&[&module])

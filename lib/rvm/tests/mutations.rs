@@ -1,12 +1,11 @@
-//! Seeded mutations of the fixtures under `bpf/` and of the images prepared from
-//! them. Loading a mutated file must return `Ok` or `Err`; a panic, an overflow or
-//! an allocation over [`ALLOC_CAP`] fails the test.
+//! Seeded mutations of the fixtures under `bpf/` and of the images prepared from them. Loading a mutated file must
+//! return `Ok` or `Err`; a panic, an overflow or an allocation over [`ALLOC_CAP`] fails the test.
 //!
-//! Inputs that ask for a large region or map are valid, so a case whose parsed
-//! sizes exceed [`REGION_CAP`] stops before the allocation.
+//! Inputs that ask for a large region or map are valid, so a case whose parsed sizes exceed [`REGION_CAP`] stops before
+//! the allocation.
 //!
-//! `RVM_FUZZ_ITERS` sets the cases per fixture. A failure prints its fixture and
-//! seed; `RVM_FUZZ_SEED=<seed>` runs only that case for every fixture.
+//! `RVM_FUZZ_ITERS` sets the cases per fixture. A failure prints its fixture and seed; `RVM_FUZZ_SEED=<seed>` runs only
+//! that case for every fixture.
 
 #![cfg(feature = "link")]
 #![feature(alloc_error_hook)]
@@ -23,8 +22,7 @@ use rvm::{Image, MapKind, Module, Perms, SectionKind, Vm, FIRST_FREE_REGION};
 /// Largest region or map storage a case may allocate.
 const REGION_CAP: u64 = 64 << 20;
 
-/// The allocator refuses anything larger, which fails the case: no single
-/// allocation of a capped load comes close.
+/// The allocator refuses anything larger, which fails the case: no single allocation of a capped load comes close.
 const ALLOC_CAP: usize = 2 * REGION_CAP as usize;
 
 /// Cases per fixture and loader, about a second in a debug build.
@@ -74,8 +72,8 @@ fn mutated_elf_files_load_or_fail() {
     fuzz.finish();
 }
 
-/// A VM with every extern, helper and host type the fixtures use, so most of them
-/// link and their CO-RE relocations have candidates to match.
+/// A VM with every extern, helper and host type the fixtures use, so most of them link and their CO-RE relocations have
+/// candidates to match.
 fn host_vm() -> Vm {
     let vm = Vm::new();
     let host = Module::from_elf("host_event", &fixture("host_event.o")).unwrap();
@@ -153,8 +151,7 @@ fn image_size(image: &Image) -> u64 {
     maps.max(image.rodata_len as u64).max(image.data_len as u64)
 }
 
-/// The image header and each length-prefixed section, so edits land in every
-/// section as often as in the code.
+/// The image header and each length-prefixed section, so edits land in every section as often as in the code.
 fn image_regions(image: &[u8]) -> Vec<Range<usize>> {
     let u32_at = |at: usize| u32::from_le_bytes(image[at..][..4].try_into().unwrap()) as usize;
     let u64_at = |at: usize| u64::from_le_bytes(image[at..][..8].try_into().unwrap()) as usize;
@@ -170,8 +167,8 @@ fn image_regions(image: &[u8]) -> Vec<Range<usize>> {
     regions
 }
 
-/// The ELF header, the section header table and each section's contents (symbol
-/// table, relocations, `.BTF`, `.BTF.ext`, `.maps`, code and data alike).
+/// The ELF header, the section header table and each section's contents (symbol table, relocations, `.BTF`, `.BTF.ext`,
+/// `.maps`, code and data alike).
 fn elf_regions(elf: &[u8]) -> Vec<Range<usize>> {
     let u16_at = |at: usize| u16::from_le_bytes(elf[at..][..2].try_into().unwrap()) as usize;
     let u32_at = |at: usize| u32::from_le_bytes(elf[at..][..4].try_into().unwrap());
@@ -213,8 +210,7 @@ impl Fuzz {
         }
     }
 
-    /// Run [`DEFAULT_ITERS`] or `RVM_FUZZ_ITERS` mutations of `original`, or the one
-    /// case `RVM_FUZZ_SEED` names.
+    /// Run [`DEFAULT_ITERS`] or `RVM_FUZZ_ITERS` mutations of `original`, or the one case `RVM_FUZZ_SEED` names.
     fn run(&mut self, fixture: &str, original: &[u8], regions: &[Range<usize>], load: impl Fn(&[u8]) -> Outcome) {
         let seeds: Vec<u64> = match env_u64("RVM_FUZZ_SEED") {
             Some(seed) => vec![seed],
@@ -251,8 +247,7 @@ impl Fuzz {
     }
 }
 
-/// Apply one to four edits, fewer more often, each inside a random region of the
-/// original.
+/// Apply one to four edits, fewer more often, each inside a random region of the original.
 fn mutate(rng: &mut Rng, bytes: &mut Vec<u8>, regions: &[Range<usize>]) {
     for _ in 0..1 + (rng.next() | 1 << 3).trailing_zeros() {
         let region = &regions[rng.below(regions.len())];
@@ -275,8 +270,8 @@ fn mutate(rng: &mut Rng, bytes: &mut Vec<u8>, regions: &[Range<usize>]) {
             }
             4 => bytes.truncate(at),
             _ => {
-                // overwrite an integer field, most often a length, offset or index;
-                // ELF and BTF fields sit at multiples of their width in the region
+                // overwrite an integer field, most often a length, offset or index; ELF and BTF fields sit at multiples
+                // of their width in the region
                 let width = [1, 2, 4, 8][rng.below(4)];
                 let at = match rng.below(2) {
                     0 => start + (at - start) / width * width,
@@ -340,9 +335,8 @@ thread_local! {
     static PANIC: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-/// Record panics inside a case instead of printing them, with a backtrace under
-/// `RUST_BACKTRACE`, and turn a refused allocation into a panic so it fails the
-/// case like any other.
+/// Record panics inside a case instead of printing them, with a backtrace under `RUST_BACKTRACE`, and turn a refused
+/// allocation into a panic so it fails the case like any other.
 fn install_hooks() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {

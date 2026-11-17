@@ -35,8 +35,7 @@ pub fn map_defs(module: &Module, btf: Option<&Btf<'_>>) -> Result<Vec<MapDef>> {
     Ok(defs)
 }
 
-/// Parse one libbpf map definition: `__uint(field, n)` is `int (*field)[n]`, and
-/// `__type(field, T)` is `T *field`.
+/// Parse one libbpf map definition: `__uint(field, n)` is `int (*field)[n]`, and `__type(field, T)` is `T *field`.
 fn parse_def(btf: &Btf<'_>, name: &str, type_id: u32) -> Result<MapDef> {
     let bad = |what: &str| VmError::from(LinkError::InvalidMap(format!("map {name}: {what}")));
 

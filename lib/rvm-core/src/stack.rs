@@ -1,20 +1,17 @@
 //! Loads and stores through r10 that skip the [`Memory`] methods.
 //!
-//! [`Code::new`](crate::Code::new) gives each 4 and 8 byte `ldx`, `stx` and `st`
-//! with base register r10 an opcode byte of its own. Its handler, [`access`],
-//! checks the address against the [`Window`] that the memory reports around r10
-//! and accesses the host memory directly. An address outside the window takes the
-//! usual handler of the instruction, so the access behaves exactly as it does
-//! there. Guest code can't write r10, so it stays in the stack, inside the
-//! window of the stack.
+//! [`Code::new`](crate::Code::new) gives each 4 and 8 byte `ldx`, `stx` and `st` with base register r10 an opcode byte
+//! of its own. Its handler, [`access`], checks the address against the [`Window`] that the memory reports around r10
+//! and accesses the host memory directly. An address outside the window takes the usual handler of the instruction, so
+//! the access behaves exactly as it does there. Guest code can't write r10, so it stays in the stack, inside the window
+//! of the stack.
 
 use std::ptr;
 
 use crate::opcode::{Class, MemSize, OpCode};
 use crate::{fetch, CallStack, Context, Flow, Handlers, Host, Instruction, Memory};
 
-/// Host memory that guest loads and stores near some address reach directly; see
-/// [`Memory::window`].
+/// Host memory that guest loads and stores near some address reach directly; see [`Memory::window`].
 #[derive(Clone, Copy, Debug)]
 pub struct Window {
     base: u64,
@@ -34,20 +31,17 @@ impl Window {
         epoch: 0,
     };
 
-    /// The `read_len` readable and `write_len` writable bytes at guest address
-    /// `base`, which are the host bytes at `ptr`, valid while the memory's
-    /// [`Memory::epoch`] is `epoch`.
+    /// The `read_len` readable and `write_len` writable bytes at guest address `base`, which are the host bytes at
+    /// `ptr`, valid while the memory's [`Memory::epoch`] is `epoch`.
     ///
     /// # Safety
     ///
-    /// Whenever a memory's [`Memory::epoch`] returns `epoch`, `ptr` must be valid
-    /// for reads of `read_len` bytes and for writes of `write_len` bytes, and a
-    /// guest load (store) of `n` bytes at `base + i` with `i + n <= read_len`
-    /// (`write_len`) on that memory must do nothing but read (write) the `n` bytes
-    /// at `ptr + i`, unaligned and little-endian. So a memory must give each change
-    /// of the host memory behind its windows an epoch that no memory used before,
-    /// and 0, the default, only to empty windows. `ptr` must not come from a
-    /// reference to the memory, which a call of a [`Memory`] method would invalidate.
+    /// Whenever a memory's [`Memory::epoch`] returns `epoch`, `ptr` must be valid for reads of `read_len` bytes and for
+    /// writes of `write_len` bytes, and a guest load (store) of `n` bytes at `base + i` with `i + n <= read_len`
+    /// (`write_len`) on that memory must do nothing but read (write) the `n` bytes at `ptr + i`, unaligned and
+    /// little-endian. So a memory must give each change of the host memory behind its windows an epoch that no memory
+    /// used before, and 0, the default, only to empty windows. `ptr` must not come from a reference to the memory,
+    /// which a call of a [`Memory`] method would invalidate.
     pub const unsafe fn new(base: u64, ptr: *mut u8, read_len: u64, write_len: u64, epoch: u64) -> Self {
         Self {
             base,
@@ -59,13 +53,11 @@ impl Window {
     }
 }
 
-/// The [`Window`] that [`access`] checks addresses against, kept in the
-/// [`CallStack`].
+/// The [`Window`] that [`access`] checks addresses against, kept in the [`CallStack`].
 pub struct Cache {
     base: u64,
     ptr: *mut u8,
-    /// By [`kind`]: the number of offsets from `base` at which the access fits in
-    /// the window. All 0 when `epoch` is 0.
+    /// By [`kind`]: the number of offsets from `base` at which the access fits in the window. All 0 when `epoch` is 0.
     fits: [u64; 4],
     epoch: u64,
 }
@@ -78,8 +70,8 @@ impl Cache {
         epoch: 0,
     };
 
-    /// Forget the window unless `memory` is still at its epoch; [`run`](crate::run)
-    /// calls this whenever code outside the handler chain may have changed the memory.
+    /// Forget the window unless `memory` is still at its epoch; [`run`](crate::run) calls this whenever code outside
+    /// the handler chain may have changed the memory.
     #[inline(always)]
     pub fn revalidate<M: Memory>(&mut self, memory: &M) {
         // a window of epoch 0 is empty

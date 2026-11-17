@@ -69,8 +69,7 @@ impl DefaultFormatter {
                 write!(out, " {}, {}, {dst_as:#x}, {src_as:#x}", insn.dst, insn.src).unwrap();
             }
             _ if insn.mnemonic.is_conditional_jump() => {
-                // Conditional jumps carry their offset in the raw instruction, not in
-                // the decoded src/dst operands.
+                // Conditional jumps carry their offset in the raw instruction, not in the decoded src/dst operands.
                 let offset = ((insn.raw >> 16) & 0xFFFF) as i16;
                 write!(out, " {}, {}, {}", insn.dst, insn.src, Operand::Off(offset.into())).unwrap();
             }

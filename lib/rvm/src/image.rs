@@ -1,19 +1,15 @@
 //! Prepared programs.
 //!
-//! An [`Image`] is everything linking produces except runtime binding and
-//! allocation: the final code with every relocation, CO-RE adjustment and jump
-//! table applied, the initial data, map declarations, exported functions, and the
-//! call sites that bind to host functions. [`crate::Vm::load_image`] binds those call
-//! sites in the loading VM, allocates memory and maps, maps the VM's shared maps and
-//! regions, and returns a [`Program`].
+//! An [`Image`] is everything linking produces except runtime binding and allocation: the final code with every
+//! relocation, CO-RE adjustment and jump table applied, the initial data, map declarations, exported functions, and the
+//! call sites that bind to host functions. [`crate::Vm::load_image`] binds those call sites in the loading VM,
+//! allocates memory and maps, maps the VM's shared maps and regions, and returns a [`Program`].
 //!
 //! # Format
 //!
-//! Little endian. A header: `RVMI`, the format version as `u32`, and the version of
-//! rvm that wrote the image as a string. Then six sections, each a `u64` byte length
-//! and its contents: code, rodata, data, maps, functions, externs. A string is a
-//! `u32` length and UTF-8 bytes. An image loads only into the rvm version that
-//! wrote it.
+//! Little endian. A header: `RVMI`, the format version as `u32`, and the version of rvm that wrote the image as a
+//! string. Then six sections, each a `u64` byte length and its contents: code, rodata, data, maps, functions, externs.
+//! A string is a `u32` length and UTF-8 bytes. An image loads only into the rvm version that wrote it.
 
 use std::sync::Arc;
 
@@ -42,8 +38,7 @@ pub struct Image {
     /// Initial bytes of the `.rodata` region; the rest of its `rodata_len` bytes are zero.
     pub rodata: Vec<u8>,
     pub rodata_len: usize,
-    /// Initial bytes of the `.data` and `.bss` region; the rest of its `data_len`
-    /// bytes are zero.
+    /// Initial bytes of the `.data` and `.bss` region; the rest of its `data_len` bytes are zero.
     pub data: Vec<u8>,
     pub data_len: usize,
     /// Maps in handle order: the `lddw` that loads a map holds its index here.
@@ -124,8 +119,7 @@ impl Image {
         w.0
     }
 
-    /// Parse an image written by [`Image::to_bytes`]. Contents are checked when the
-    /// image is loaded.
+    /// Parse an image written by [`Image::to_bytes`]. Contents are checked when the image is loaded.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader(bytes);
         if r.take(MAGIC.len())? != MAGIC {
@@ -204,8 +198,8 @@ impl Image {
     }
 }
 
-/// Check `image`, bind its extern calls to `helpers`, and allocate its memory and
-/// maps. Map definitions that can't be laid out fail with `bad_map`.
+/// Check `image`, bind its extern calls to `helpers`, and allocate its memory and maps. Map definitions that can't be
+/// laid out fail with `bad_map`.
 pub fn load(
     image: Image,
     helpers: &Arc<SharedHelpers>,
@@ -279,8 +273,7 @@ pub fn load(
     if maps_len != 0 {
         memory.map(MAPS_REGION, maps_len, Perms::RW);
     }
-    // SAFETY: the callers of `Vm::share_map`/`Vm::share_region` accepted the
-    // `map_shared` contract.
+    // SAFETY: the callers of `Vm::share_map`/`Vm::share_region` accepted the `map_shared` contract.
     unsafe {
         for shared in maps.shared() {
             memory.map_shared(shared.region, shared.storage.clone(), Perms::RW);

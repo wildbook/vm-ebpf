@@ -12,8 +12,7 @@ pub const E2BIG: i64 = 7;
 pub const EEXIST: i64 = 17;
 pub const EINVAL: i64 = 22;
 
-/// Bind helpers 1 to 3 to the built-in map implementation unless the host registered
-/// its own under those IDs.
+/// Bind helpers 1 to 3 to the built-in map implementation unless the host registered its own under those IDs.
 pub fn register_helpers(helpers: &mut HelperRegistry) {
     // one closure type per helper, so each slot calls its body directly
     if helpers.slot_of_id(BPF_FUNC_MAP_LOOKUP_ELEM).is_none() {

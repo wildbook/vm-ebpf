@@ -1,7 +1,6 @@
 //! Linked eBPF program ready for execution.
 //!
-//! A `Program` is a loaded [`crate::Image`]: the executable code, data, maps and
-//! function table.
+//! A `Program` is a loaded [`crate::Image`]: the executable code, data, maps and function table.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -28,8 +27,8 @@ pub struct FunctionInfo {
     pub borrows: Vec<Borrow>,
 }
 
-/// A pointer parameter tagged `borrow:N` (writable) or `borrow_ro:N` in BTF, where
-/// parameter `N` holds the buffer's length in bytes.
+/// A pointer parameter tagged `borrow:N` (writable) or `borrow_ro:N` in BTF, where parameter `N` holds the buffer's
+/// length in bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Borrow {
     pub arg: u8,
@@ -44,8 +43,7 @@ impl Borrow {
     }
 }
 
-/// A function of one [`Program`], looked up by name once so that repeated calls skip
-/// the lookup. See [`Program::func`].
+/// A function of one [`Program`], looked up by name once so that repeated calls skip the lookup. See [`Program::func`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Func {
     program: u64,
@@ -54,9 +52,8 @@ pub struct Func {
 
 /// A linked eBPF program ready for execution.
 ///
-/// Holds the code (outside guest memory), guest memory regions (stack, data),
-/// and function table. Use `call()` to execute a function by name, or look it up
-/// once with `func()` and call it with `call_func()`.
+/// Holds the code (outside guest memory), guest memory regions (stack, data), and function table. Use `call()` to
+/// execute a function by name, or look it up once with `func()` and call it with `call_func()`.
 ///
 /// # Example
 ///
@@ -209,9 +206,8 @@ impl Program {
     }
 }
 
-/// A [`Func`] that follows its function into whichever program it is called with, for
-/// handles that outlive the program they were looked up in. Callers serialize access
-/// per slot, e.g. under a plugin's lock.
+/// A [`Func`] that follows its function into whichever program it is called with, for handles that outlive the program
+/// they were looked up in. Callers serialize access per slot, e.g. under a plugin's lock.
 #[derive(Debug)]
 pub struct FuncSlot {
     program: AtomicU64,
@@ -226,8 +222,7 @@ impl FuncSlot {
         }
     }
 
-    /// Call the function in `program`, looking `name` up again if the slot holds a
-    /// function of another program.
+    /// Call the function in `program`, looking `name` up again if the slot holds a function of another program.
     #[inline]
     pub fn call(&self, program: &mut Program, name: &str, args: &[u64]) -> Result<u64> {
         let mut pc = self.pc.load(Ordering::Relaxed);

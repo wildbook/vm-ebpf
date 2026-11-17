@@ -1,5 +1,5 @@
-//! Interpreter throughput baselines. Each program runs `N` loop iterations;
-//! criterion reports time per full call, so divide by `N` for per-iteration cost.
+//! Interpreter throughput baselines. Each program runs `N` loop iterations; criterion reports time per full call, so
+//! divide by `N` for per-iteration cost.
 
 use std::hint::black_box;
 

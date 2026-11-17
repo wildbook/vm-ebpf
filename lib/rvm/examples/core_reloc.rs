@@ -1,6 +1,5 @@
-//! Runs `bpf/core_example.o`, compiled against one `struct event` layout,
-//! first without host BTF and then against a host layout with the fields
-//! reordered. The linker patches each field access through its CO-RE relocation.
+//! Runs `bpf/core_example.o`, compiled against one `struct event` layout, first without host BTF and then against a
+//! host layout with the fields reordered. The linker patches each field access through its CO-RE relocation.
 //!
 //! Run with: cargo run -p rvm --example core_reloc
 

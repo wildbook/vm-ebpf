@@ -1,6 +1,5 @@
-//! Standard BPF helpers that touch host state. None is registered by default; a
-//! host enables each with the matching `Vm::enable_*` call, and a program calling a
-//! disabled one fails to link.
+//! Standard BPF helpers that touch host state. None is registered by default; a host enables each with the matching
+//! `Vm::enable_*` call, and a program calling a disabled one fails to link.
 
 use std::cell::Cell;
 use std::hash::BuildHasher;
@@ -38,8 +37,8 @@ pub fn register_time(helpers: &mut HelperRegistry) {
     helpers.register(BPF_FUNC_KTIME_GET_NS, move |_: ()| start.elapsed().as_nanos() as u64);
 }
 
-/// Register `get_prandom_u32`: a per-thread xorshift generator with a random seed.
-/// Not cryptographically secure, like the kernel's.
+/// Register `get_prandom_u32`: a per-thread xorshift generator with a random seed. Not cryptographically secure, like
+/// the kernel's.
 pub fn register_random(helpers: &mut HelperRegistry) {
     thread_local! {
         // foldhash seeds from address-space layout, so this needs no OS randomness
@@ -59,9 +58,8 @@ pub fn register_random(helpers: &mut HelperRegistry) {
 
 /// Register `trace_printk`, passing each formatted line to `sink`.
 ///
-/// Supports the kernel's conversions: `%d %i %u %x %X %p %c %s %%` with `l`/`ll`
-/// length modifiers, and up to three arguments. Returns the formatted length, or
-/// -EINVAL if the format string isn't readable.
+/// Supports the kernel's conversions: `%d %i %u %x %X %p %c %s %%` with `l`/`ll` length modifiers, and up to three
+/// arguments. Returns the formatted length, or -EINVAL if the format string isn't readable.
 pub fn register_print(helpers: &mut HelperRegistry, sink: impl Fn(&str) + Send + Sync + 'static) {
     helpers.register_with_ctx(BPF_FUNC_TRACE_PRINTK, move |ctx: &mut HelperContext| -> i64 {
         const EINVAL: i64 = 22;

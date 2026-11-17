@@ -1,9 +1,8 @@
 //! eBPF bytecode decoder.
 //!
-//! Acceptance follows llvm-objdump: a field the instruction defines must hold a valid
-//! value, a field it does not define is ignored, and anything else decodes as
-//! `Mnemonic::Unknown` with no operands. Register numbers above 10 are invalid, so
-//! llvm's internal `r11` decodes as `Unknown` too.
+//! Acceptance follows llvm-objdump: a field the instruction defines must hold a valid value, a field it does not define
+//! is ignored, and anything else decodes as `Mnemonic::Unknown` with no operands. Register numbers above 10 are
+//! invalid, so llvm's internal `r11` decodes as `Unknown` too.
 
 use crate::instruction::{alu, atomic, class, jmp, mode, size, Instruction, RawInstruction, SRC_REG};
 use crate::mnemonic::Mnemonic;
@@ -49,8 +48,7 @@ impl<'a> Iterator for Decoder<'a> {
         let mut size = 8;
         let mut raw2 = None;
         let decoded = if raw.opcode() == LDDW {
-            // the second slot only contributes its imm; an invalid first slot leaves it to
-            // decode on its own
+            // the second slot only contributes its imm; an invalid first slot leaves it to decode on its own
             match (decode_lddw_head(raw), self.slot(self.offset)) {
                 (Some(dst), Some(next)) => {
                     self.offset += 8;
@@ -126,8 +124,8 @@ fn decode_lddw_head(raw: RawInstruction) -> Option<Register> {
     reg(raw.dst())
 }
 
-/// Decode a 64-bit immediate load; a nonzero `src_reg` selects a pseudo kind (map fd,
-/// map value, BTF id, ...) whose meaning the loader resolves.
+/// Decode a 64-bit immediate load; a nonzero `src_reg` selects a pseudo kind (map fd, map value, BTF id, ...) whose
+/// meaning the loader resolves.
 fn decode_lddw(raw: RawInstruction, dst: Register, next: RawInstruction) -> (Mnemonic, Operand, Operand) {
     let imm64 = (u64::from(next.imm() as u32) << 32) | u64::from(raw.imm() as u32);
     let mnemonic = match raw.src() {
@@ -197,8 +195,8 @@ fn decode_alu(raw: RawInstruction, is_64: bool) -> Decoded {
         (alu::XOR, 0) => pick(Mnemonic::Xor64, Mnemonic::Xor32),
         (alu::MOV, 0) => pick(Mnemonic::Mov64, Mnemonic::Mov32),
         (alu::ARSH, 0) => pick(Mnemonic::Arsh64, Mnemonic::Arsh32),
-        // register-only moves: `off` is the source width of a sign-extending move, or 1
-        // for an address space cast whose two address spaces are packed into `imm`
+        // register-only moves: `off` is the source width of a sign-extending move, or 1 for an address space cast whose
+        // two address spaces are packed into `imm`
         (alu::MOV, 8) if is_reg => pick(Mnemonic::Movsx864, Mnemonic::Movsx832),
         (alu::MOV, 16) if is_reg => pick(Mnemonic::Movsx1664, Mnemonic::Movsx1632),
         (alu::MOV, 32) if is_reg && is_64 => Mnemonic::Movsx3264,
@@ -296,9 +294,9 @@ fn decode_stx(raw: RawInstruction) -> Decoded {
     Some((mnemonic, mem(raw.dst(), raw)?, Operand::Reg(reg(raw.src())?)))
 }
 
-/// Pick the atomic operation from `imm`: bits 4-7 hold the operation and bits 0-3 the
-/// fetch flag. As in llvm, the remaining bits are ignored, except that bits 4-8 equal to
-/// 0x10 or 0x11 select the unsupported load-acquire and store-release.
+/// Pick the atomic operation from `imm`: bits 4-7 hold the operation and bits 0-3 the fetch flag. As in llvm, the
+/// remaining bits are ignored, except that bits 4-8 equal to 0x10 or 0x11 select the unsupported load-acquire and
+/// store-release.
 fn decode_atomic(mem_size: u8, imm: i32) -> Option<Mnemonic> {
     let pick = |m64, m32| match mem_size {
         size::DW => Some(m64),
@@ -347,10 +345,9 @@ mod tests {
     use super::*;
     use crate::DefaultFormatter;
 
-    /// Encodings where field validation matters, with llvm-objdump 22's text for the
-    /// same bytes. llvm ignores fields an instruction does not define and rejects
-    /// defined fields with invalid values; register 11, which llvm prints as `r11`,
-    /// is out of the ISA's range.
+    /// Encodings where field validation matters, with llvm-objdump 22's text for the same bytes. llvm ignores fields an
+    /// instruction does not define and rejects defined fields with invalid values; register 11, which llvm prints as
+    /// `r11`, is out of the ISA's range.
     #[test]
     fn field_validation_matches_llvm() {
         #[rustfmt::skip]

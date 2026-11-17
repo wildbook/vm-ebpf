@@ -1,10 +1,9 @@
 //! CO-RE (Compile Once - Run Everywhere) relocation support.
 //!
-//! This module parses `.BTF.ext` sections and applies CO-RE relocations to eBPF
-//! instructions the way libbpf does against kernel BTF: the host's types are a
-//! "target" BTF, the eBPF program's own debug info is the "local" BTF, and a
-//! relocation's access string names a path through the local type that gets re-resolved
-//! against whichever matching type the target actually has.
+//! This module parses `.BTF.ext` sections and applies CO-RE relocations to eBPF instructions the way libbpf does
+//! against kernel BTF: the host's types are a "target" BTF, the eBPF program's own debug info is the "local" BTF, and a
+//! relocation's access string names a path through the local type that gets re-resolved against whichever matching type
+//! the target actually has.
 
 use crate::parse::{word, Btf, BtfError, MAX_RESOLVE_DEPTH};
 use crate::raw::{BtfKind, BTF_INT_SIGNED};
@@ -120,8 +119,8 @@ impl CoreRelo {
     }
 }
 
-/// Minimum size of a `.BTF.ext` header: magic, version, flags, hdr_len, and the
-/// (unused) func_info/line_info offset/length fields.
+/// Minimum size of a `.BTF.ext` header: magic, version, flags, hdr_len, and the (unused) func_info/line_info
+/// offset/length fields.
 const BTF_EXT_HDR_MIN_SIZE: usize = 24;
 /// Header size once the (optional, added later) CO-RE relocation fields are present.
 const BTF_EXT_HDR_SIZE_WITH_CORE: usize = 32;
@@ -242,8 +241,8 @@ pub enum CoreReloError {
     InvalidTypeId(u32),
     /// The access string attached to the relocation is malformed.
     InvalidAccessString(String),
-    /// A relocation that needs target candidates refers to an anonymous local type;
-    /// libbpf can't look those up by name either.
+    /// A relocation that needs target candidates refers to an anonymous local type; libbpf can't look those up by name
+    /// either.
     AnonymousRootType(CoreReloKind),
     /// A struct/union/array access path nests deeper than CO-RE supports.
     SpecTooDeep,
@@ -259,8 +258,8 @@ pub enum CoreReloError {
     UnpatchableInstruction(u32),
     /// Relocation kind not recognized, or not applicable to an array-element accessor.
     UnsupportedRelo(CoreReloKind),
-    /// Nothing in the target BTF matched the local type (and field, for field
-    /// relocations); stored in [`Unresolved`] rather than failing the whole load.
+    /// Nothing in the target BTF matched the local type (and field, for field relocations); stored in [`Unresolved`]
+    /// rather than failing the whole load.
     NoMatchingTarget { type_name: String, access_str: String },
 }
 
@@ -295,13 +294,13 @@ impl core::fmt::Display for CoreReloError {
 
 impl std::error::Error for CoreReloError {}
 
-/// Helper ID that unresolved relocations call, as in libbpf: running such an
-/// instruction must fail, while a program that never reaches it still works.
+/// Helper ID that unresolved relocations call, as in libbpf: running such an instruction must fail, while a program
+/// that never reaches it still works.
 pub const CORE_POISON_HELPER: u32 = 0xbad2310;
 
-/// A relocation whose instruction was poisoned: either the target BTF had nothing matching
-/// the local type (and field, for field relocations), or a matching field had an
-/// incompatible type or size. The program still loads; only running the instruction fails.
+/// A relocation whose instruction was poisoned: either the target BTF had nothing matching the local type (and field,
+/// for field relocations), or a matching field had an incompatible type or size. The program still loads; only running
+/// the instruction fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unresolved {
     /// Byte offset of the poisoned instruction in its section.
@@ -310,9 +309,8 @@ pub struct Unresolved {
     pub error: CoreReloError,
 }
 
-/// Apply CO-RE relocations to eBPF instructions, resolving `local`'s access paths against
-/// the matching types in `target` (the host's types), exactly as libbpf resolves a BPF
-/// program's debug BTF against the kernel's BTF.
+/// Apply CO-RE relocations to eBPF instructions, resolving `local`'s access paths against the matching types in
+/// `target` (the host's types), exactly as libbpf resolves a BPF program's debug BTF against the kernel's BTF.
 pub fn apply_core_relocations(
     instructions: &mut [u64],
     local: &Btf<'_>,
@@ -337,15 +335,13 @@ pub fn apply_core_relocations(
     Ok(unresolved)
 }
 
-/// The two values and flags a relocation resolves to, mirroring libbpf's
-/// `bpf_core_relo_res`: `orig_val` is what the instruction should already encode (given
-/// `local`), `new_val` is what it gets patched to (given `target`).
+/// The two values and flags a relocation resolves to, mirroring libbpf's `bpf_core_relo_res`: `orig_val` is what the
+/// instruction should already encode (given `local`), `new_val` is what it gets patched to (given `target`).
 struct ResolvedRelo {
     orig_val: u64,
     new_val: u64,
-    /// The field, type, or enum value this relocation refers to doesn't exist in `target`
-    /// (or an existing field has an incompatibly sized access), so the instruction is
-    /// poisoned instead of patched.
+    /// The field, type, or enum value this relocation refers to doesn't exist in `target` (or an existing field has an
+    /// incompatibly sized access), so the instruction is poisoned instead of patched.
     poison: bool,
     /// Whether `orig_val` must match what's already encoded in the instruction.
     validate: bool,
@@ -355,12 +351,11 @@ struct ResolvedRelo {
     new_sz: Option<u32>,
 }
 
-/// Relocations that resolve to "does it exist" patch to `0` when nothing in `target`
-/// matches, rather than poisoning the instruction: the compiled check still runs, it just
-/// comes back false. Type-based relocations (`TYPE_ID_TARGET`, `TYPE_SIZE`, ...) do the
-/// same for every kind, not just the existence ones: libbpf's `bpf_core_calc_type_relo`
-/// returns `0` unconditionally when no candidate matched, since a missing type can't even
-/// provide a byte size to poison a size mismatch against.
+/// Relocations that resolve to "does it exist" patch to `0` when nothing in `target` matches, rather than poisoning the
+/// instruction: the compiled check still runs, it just comes back false. Type-based relocations (`TYPE_ID_TARGET`,
+/// `TYPE_SIZE`, ...) do the same for every kind, not just the existence ones: libbpf's `bpf_core_calc_type_relo`
+/// returns `0` unconditionally when no candidate matched, since a missing type can't even provide a byte size to poison
+/// a size mismatch against.
 fn poisons_on_missing(kind: CoreReloKind) -> bool {
     if kind.is_type_relo() {
         return false;
@@ -375,8 +370,8 @@ fn resolve_relocation(local: &Btf<'_>, target: &Btf<'_>, relo: &CoreRelo) -> Res
         .ok_or_else(|| CoreReloError::InvalidAccessString(format!("offset {}", relo.access_str_off)))?;
     let local_spec = parse_spec(local, relo, access_str)?;
 
-    // TYPE_ID_LOCAL never needs a target: the local type ID is both the expected and the
-    // patched value (its encoded imm may simply be stale after linking).
+    // TYPE_ID_LOCAL never needs a target: the local type ID is both the expected and the patched value (its encoded imm
+    // may simply be stale after linking).
     if relo.kind == CoreReloKind::TypeIdLocal {
         let v = u64::from(relo.type_id);
         return Ok(ResolvedRelo {
@@ -425,9 +420,9 @@ fn resolve_relocation(local: &Btf<'_>, target: &Btf<'_>, relo: &CoreRelo) -> Res
         None => (0, poisons_on_missing(relo.kind), None),
     };
 
-    // A field that moved between an unsigned integer (or pointer) of a different size can
-    // be read with an adjusted memory access size without changing its value; anything
-    // else poisons rather than risk reading the wrong bytes or sign-extending wrongly.
+    // A field that moved between an unsigned integer (or pointer) of a different size can be read with an adjusted
+    // memory access size without changing its value; anything else poisons rather than risk reading the wrong bytes or
+    // sign-extending wrongly.
     if let (Some((orig_sz, orig_tid)), Some((new_sz, new_tid))) = (orig.mem, new_mem) {
         if orig_sz != new_sz {
             let orig_t = local
@@ -456,8 +451,8 @@ fn is_unsigned_int(t: &BtfTypeInfo<'_>) -> bool {
     matches!(t, BtfTypeInfo::Int { encoding, .. } if encoding & BTF_INT_SIGNED == 0)
 }
 
-/// Patch the relocated value into an instruction, as libbpf's `bpf_core_patch_insn` does.
-/// Returns whether the instruction was poisoned instead (for the caller's `Unresolved` list).
+/// Patch the relocated value into an instruction, as libbpf's `bpf_core_patch_insn` does. Returns whether the
+/// instruction was poisoned instead (for the caller's `Unresolved` list).
 fn patch_instruction(instructions: &mut [u64], relo: &CoreRelo, res: &ResolvedRelo) -> Result<bool, CoreReloError> {
     const CLASS_MASK: u8 = 0x07;
     const ALU: u8 = 0x04;
@@ -594,8 +589,8 @@ fn bytes_to_mem_size(bytes: u32) -> Option<u8> {
     }
 }
 
-/// One step of a resolved access path: a named struct/union field, or an unnamed array
-/// index (including the implicit `[idx]` on the root type).
+/// One step of a resolved access path: a named struct/union field, or an unnamed array index (including the implicit
+/// `[idx]` on the root type).
 struct Accessor {
     /// The field/array-element type (or, for an enum accessor, the enum type).
     type_id: u32,
@@ -605,21 +600,19 @@ struct Accessor {
     name: Option<String>,
 }
 
-/// A parsed CO-RE access spec: libbpf's `bpf_core_spec`, minus the raw low-level path
-/// (we bound recursion depth with a counter instead of a fixed-size array, see
-/// [`MAX_SPEC_DEPTH`]).
+/// A parsed CO-RE access spec: libbpf's `bpf_core_spec`, minus the raw low-level path (we bound recursion depth with a
+/// counter instead of a fixed-size array, see [`MAX_SPEC_DEPTH`]).
 struct Spec {
     kind: CoreReloKind,
-    /// For a local spec, `relo.type_id` unresolved; for a target spec, the matched
-    /// candidate's ID unresolved. Either way this is what `TYPE_ID_TARGET`/`TYPE_SIZE`
-    /// read back.
+    /// For a local spec, `relo.type_id` unresolved; for a target spec, the matched candidate's ID unresolved. Either
+    /// way this is what `TYPE_ID_TARGET`/`TYPE_SIZE` read back.
     root_type_id: u32,
     accessors: Vec<Accessor>,
     bit_offset: u64,
 }
 
-/// Matches libbpf's `BPF_CORE_SPEC_MAX_LEN`: how many struct/union/array levels (including
-/// ones hidden behind anonymous members) a single access path may nest.
+/// Matches libbpf's `BPF_CORE_SPEC_MAX_LEN`: how many struct/union/array levels (including ones hidden behind anonymous
+/// members) a single access path may nest.
 const MAX_SPEC_DEPTH: usize = 64;
 
 /// Parse a relocation's access string against its local type (`bpf_core_parse_spec`).
@@ -735,8 +728,8 @@ fn elem_bits(idx: u32, size: u64) -> Option<u64> {
     u64::from(idx).checked_mul(size)?.checked_mul(8)
 }
 
-/// A trailing, size-0 array that is the last member of its enclosing struct: clang's
-/// encoding of a C flexible array member, which isn't bounds-checked against `nelems`.
+/// A trailing, size-0 array that is the last member of its enclosing struct: clang's encoding of a C flexible array
+/// member, which isn't bounds-checked against `nelems`.
 fn is_flex_array(btf: &Btf<'_>, prev: Option<&Accessor>, nelems: u32) -> bool {
     let Some(prev) = prev else { return false };
     if prev.name.is_none() || nelems > 0 {
@@ -749,8 +742,8 @@ fn is_flex_array(btf: &Btf<'_>, prev: Option<&Accessor>, nelems: u32) -> bool {
     prev.idx as usize + 1 == members.len()
 }
 
-/// Find every type in `target` with the same essential name (and a compatible kind) as
-/// `local`'s root type: libbpf's `bpf_core_add_cands`.
+/// Find every type in `target` with the same essential name (and a compatible kind) as `local`'s root type: libbpf's
+/// `bpf_core_add_cands`.
 fn find_candidates(target: &Btf<'_>, local_name: &str, local_kind: BtfKind) -> Vec<u32> {
     target
         .types()
@@ -762,9 +755,8 @@ fn find_candidates(target: &Btf<'_>, local_name: &str, local_kind: BtfKind) -> V
         .collect()
 }
 
-/// Try to match a local spec against one target candidate, producing the equivalent target
-/// spec on success (`bpf_core_spec_match`). `Ok(None)` means the candidate doesn't match;
-/// errors are malformed BTF, not mismatches.
+/// Try to match a local spec against one target candidate, producing the equivalent target spec on success
+/// (`bpf_core_spec_match`). `Ok(None)` means the candidate doesn't match; errors are malformed BTF, not mismatches.
 fn spec_match(
     local: &Btf<'_>,
     local_spec: &Spec,
@@ -848,8 +840,8 @@ fn spec_match(
     Ok(Some(spec))
 }
 
-/// Find a target enum variant with the same essential name as the local one
-/// (`bpf_core_spec_match`'s enum-value branch).
+/// Find a target enum variant with the same essential name as the local one (`bpf_core_spec_match`'s enum-value
+/// branch).
 fn match_enumval(local_spec: &Spec, target: &Btf<'_>, cand_id: u32) -> Result<Option<Spec>, CoreReloError> {
     let (resolved_id, t) = target
         .resolve_type(cand_id)
@@ -878,8 +870,8 @@ fn match_enumval(local_spec: &Spec, target: &Btf<'_>, cand_id: u32) -> Result<Op
     Ok(None)
 }
 
-/// Find a target struct/union member matching `local_name`, recursing into anonymous
-/// members (`bpf_core_match_member`). Returns the member's type ID on success.
+/// Find a target struct/union member matching `local_name`, recursing into anonymous members (`bpf_core_match_member`).
+/// Returns the member's type ID on success.
 fn match_member(
     local: &Btf<'_>,
     local_acc: &Accessor,
@@ -1017,8 +1009,8 @@ fn calc_field_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<Hal
         let sz = resolve_size(btf, field_type_id)? as u32;
         (sz, bit_off / 8, u64::from(sz) * 8)
     };
-    // Bitfields are ambiguous about which exact bytes the compiler loads, so only
-    // signedness (checked explicitly below) is validated against the instruction.
+    // Bitfields are ambiguous about which exact bytes the compiler loads, so only signedness (checked explicitly below)
+    // is validated against the instruction.
     let validate = !is_bitfield;
 
     match kind {
@@ -1067,8 +1059,8 @@ fn calc_field_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<Hal
 fn calc_type_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<Half, CoreReloError> {
     match kind {
         CoreReloKind::TypeIdTarget => {
-            // The type ID embedded in the instruction can change again during linking, so
-            // it's never validated against what's already there.
+            // The type ID embedded in the instruction can change again during linking, so it's never validated against
+            // what's already there.
             Ok(Half {
                 val: u64::from(spec.root_type_id),
                 validate: false,
@@ -1116,8 +1108,8 @@ fn calc_enumval_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<H
     }
 }
 
-/// Follow nested array element types down to the innermost non-array type: the memory
-/// access size CO-RE cares about for arrays is always the element's, never the array's.
+/// Follow nested array element types down to the innermost non-array type: the memory access size CO-RE cares about for
+/// arrays is always the element's, never the array's.
 fn unwrap_arrays(btf: &Btf<'_>, id: u32) -> Result<u32, CoreReloError> {
     let (mut id, mut t) = btf.resolve_type(id).ok_or(CoreReloError::InvalidTypeId(id))?;
     for _ in 0..=MAX_RESOLVE_DEPTH {
@@ -1131,8 +1123,7 @@ fn unwrap_arrays(btf: &Btf<'_>, id: u32) -> Result<u32, CoreReloError> {
     Err(CoreReloError::SpecTooDeep)
 }
 
-/// Byte size of a type, resolving through typedefs/modifiers/arrays, like libbpf's
-/// `btf__resolve_size`.
+/// Byte size of a type, resolving through typedefs/modifiers/arrays, like libbpf's `btf__resolve_size`.
 fn resolve_size(btf: &Btf<'_>, id: u32) -> Result<u64, CoreReloError> {
     btf.resolve_size(id).ok_or(CoreReloError::InvalidTypeId(id))
 }
@@ -1152,8 +1143,8 @@ fn is_any_enum(k: BtfKind) -> bool {
     matches!(k, BtfKind::Enum | BtfKind::Enum64)
 }
 
-/// `btf_kind_core_compat`: struct and union are never interchangeable for candidate
-/// search, but 32- and 64-bit enums are.
+/// `btf_kind_core_compat`: struct and union are never interchangeable for candidate search, but 32- and 64-bit enums
+/// are.
 fn kind_core_compat(a: BtfKind, b: BtfKind) -> bool {
     a == b || (is_any_enum(a) && is_any_enum(b))
 }
@@ -1163,8 +1154,8 @@ fn is_flavor_sep(s: &[u8]) -> bool {
     s.len() >= 5 && s[0] != b'_' && s[1] == b'_' && s[2] == b'_' && s[3] == b'_' && s[4] != b'_'
 }
 
-/// Length of a type name before its last `___flavor` suffix, or the whole name if it has
-/// none (`bpf_core_essential_name_len`).
+/// Length of a type name before its last `___flavor` suffix, or the whole name if it has none
+/// (`bpf_core_essential_name_len`).
 fn essential_name_len(name: &str) -> usize {
     let bytes = name.as_bytes();
     if bytes.len() < 5 {
@@ -1176,24 +1167,23 @@ fn essential_name_len(name: &str) -> usize {
         .map_or(bytes.len(), |i| i + 1)
 }
 
-/// Two type/field names match if they have the same name ignoring flavor suffixes
-/// (`bpf_core_names_match`); two empty (anonymous) names also match each other.
+/// Two type/field names match if they have the same name ignoring flavor suffixes (`bpf_core_names_match`); two empty
+/// (anonymous) names also match each other.
 fn names_match(a: &str, b: &str) -> bool {
     let la = essential_name_len(a);
     let lb = essential_name_len(b);
     la == lb && a.as_bytes()[..la] == b.as_bytes()[..lb]
 }
 
-/// Whether a local and target name match for `FWD`/`ENUM` field-type compatibility: either
-/// side being anonymous is itself a match, since an anonymous enum or forward declaration
-/// is compatible with anything of the same kind.
+/// Whether a local and target name match for `FWD`/`ENUM` field-type compatibility: either side being anonymous is
+/// itself a match, since an anonymous enum or forward declaration is compatible with anything of the same kind.
 fn fwd_or_enum_names_match(a: &str, b: &str) -> bool {
     essential_name_len(a) == 0 || essential_name_len(b) == 0 || names_match(a, b)
 }
 
-/// Whether a local field and a target field of the given types can be relocated onto each
-/// other (`bpf_core_fields_are_compat`): looser than [`types_match`], e.g. any two structs
-/// (or two pointers, or two floats) are compatible regardless of their contents.
+/// Whether a local field and a target field of the given types can be relocated onto each other
+/// (`bpf_core_fields_are_compat`): looser than [`types_match`], e.g. any two structs (or two pointers, or two floats)
+/// are compatible regardless of their contents.
 fn fields_are_compat(
     local: &Btf<'_>,
     mut local_id: u32,
@@ -1245,9 +1235,8 @@ fn fields_are_compat(
 }
 
 /// Whether a local and target type are compatible for `TYPE_ID_TARGET`/`TYPE_EXISTS`/
-/// `TYPE_SIZE` (`bpf_core_types_are_compat`): same shallow checks as [`fields_are_compat`]
-/// but entered via a kind check on the *un*resolved root types, and recursing through
-/// function pointers too.
+/// `TYPE_SIZE` (`bpf_core_types_are_compat`): same shallow checks as [`fields_are_compat`] but entered via a kind check
+/// on the *un*resolved root types, and recursing through function pointers too.
 fn types_are_compat(local: &Btf<'_>, local_id: u32, target: &Btf<'_>, targ_id: u32) -> Result<bool, CoreReloError> {
     let lt0 = local
         .type_by_id(local_id)
@@ -1352,10 +1341,9 @@ fn types_are_compat_at(
     }
 }
 
-/// Whether a local and target type structurally match for `TYPE_MATCHES`
-/// (`__bpf_core_types_match`): unlike [`types_are_compat`], member and enumerator names
-/// (modulo flavor suffix) and values are checked recursively, though only shallowly once
-/// behind a pointer (to avoid chasing self-referential structs forever).
+/// Whether a local and target type structurally match for `TYPE_MATCHES` (`__bpf_core_types_match`): unlike
+/// [`types_are_compat`], member and enumerator names (modulo flavor suffix) and values are checked recursively, though
+/// only shallowly once behind a pointer (to avoid chasing self-referential structs forever).
 fn types_match(local: &Btf<'_>, local_id: u32, target: &Btf<'_>, targ_id: u32) -> Result<bool, CoreReloError> {
     types_match_at(local, local_id, target, targ_id, false, 32)
 }

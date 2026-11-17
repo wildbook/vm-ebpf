@@ -41,8 +41,7 @@ fn named_func_follows_replace() {
     a.replace(vm.load_elf(&object("plugin_a3.o")).unwrap());
     assert_eq!(scale.call(&[5]).unwrap(), 15);
 
-    // A program without the function fails the call, and the handle recovers when a
-    // later program has it again.
+    // A program without the function fails the call, and the handle recovers when a later program has it again.
     a.replace(vm.load_elf(&object("maps.o")).unwrap());
     assert!(matches!(scale.call(&[5]), Err(VmError::FunctionNotFound(name)) if name == "a_scale"));
     a.replace(vm.load_elf(&object("plugin_a.o")).unwrap());
@@ -55,8 +54,8 @@ fn reentrant_call_fails_instead_of_deadlocking() {
     let a = vm.load_plugin("a", &object("plugin_a.o")).unwrap();
     vm.export(&a, "a_scale").unwrap();
 
-    // host_reenter calls back into b while b is running. It holds b weakly: a strong
-    // handle inside the Vm's own helper table would never be freed.
+    // host_reenter calls back into b while b is running. It holds b weakly: a strong handle inside the Vm's own helper
+    // table would never be freed.
     let b_slot: Arc<OnceLock<WeakPlugin>> = Arc::default();
     let reentrant_busy = Arc::new(Mutex::new(false));
     let (slot, busy) = (b_slot.clone(), reentrant_busy.clone());

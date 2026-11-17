@@ -1,11 +1,10 @@
-//! Minimal text assembler for the ubpf-style syntax the bpf_conformance suite's
-//! `.data` files use (`mov32 %r0, 0`, `ldxb %r0, [%r1+0x2]`, `jgt %r1, 0x2, L3`, ...).
+//! Minimal text assembler for the ubpf-style syntax the bpf_conformance suite's `.data` files use (`mov32 %r0, 0`,
+//! `ldxb %r0, [%r1+0x2]`, `jgt %r1, 0x2, L3`, ...).
 //!
-//! Instructions go through [`ebpf_asm::Assembler`]; this module tokenizes lines and
-//! resolves jump targets. A target is a label name or a `+N`/`-N` offset, and both
-//! resolve to a code slot up front, so one `Label` per target slot covers either.
-//! `exit` also names the slot of the first `exit` instruction, like the reference
-//! parser's default exit label, so branches to a bare `exit` need no `label:` line.
+//! Instructions go through [`ebpf_asm::Assembler`]; this module tokenizes lines and resolves jump targets. A target is
+//! a label name or a `+N`/`-N` offset, and both resolve to a code slot up front, so one `Label` per target slot covers
+//! either. `exit` also names the slot of the first `exit` instruction, like the reference parser's default exit label,
+//! so branches to a bare `exit` need no `label:` line.
 
 use std::collections::HashMap;
 
@@ -24,8 +23,8 @@ pub fn assemble(source: &str) -> Result<Vec<u8>, String> {
     let (insns, label_slot) = parse_lines(source)?;
     let mut asm = Assembler::new();
 
-    // Every slot a jump or local call targets needs one `Label`, created up front so
-    // backward and forward references resolve the same way.
+    // Every slot a jump or local call targets needs one `Label`, created up front so backward and forward references
+    // resolve the same way.
     let mut label_by_slot: HashMap<usize, Label> = HashMap::new();
     for insn in &insns {
         if let Some(target) = label_operand(insn, &label_slot)? {
@@ -43,8 +42,8 @@ pub fn assemble(source: &str) -> Result<Vec<u8>, String> {
     asm.assemble().map_err(|e| e.to_string())
 }
 
-/// Tokenizes `source` into instructions and resolves every label (including the
-/// implicit `exit` one) to the slot of the instruction it precedes.
+/// Tokenizes `source` into instructions and resolves every label (including the implicit `exit` one) to the slot of the
+/// instruction it precedes.
 fn parse_lines(source: &str) -> Result<(Vec<Insn>, HashMap<String, usize>), String> {
     let mut insns = Vec::new();
     let mut pending_labels: Vec<String> = Vec::new();
@@ -65,8 +64,8 @@ fn parse_lines(source: &str) -> Result<(Vec<Insn>, HashMap<String, usize>), Stri
         }
 
         let mut operands: Vec<String> = rest.iter().map(|&s| s.to_string()).collect();
-        // `call <id>` and `call local <label>` both parse to two operands; a bare
-        // numeric or register target means the mode defaults to `helper`.
+        // `call <id>` and `call local <label>` both parse to two operands; a bare numeric or register target means the
+        // mode defaults to `helper`.
         if head == "call" && operands.len() == 1 {
             operands.insert(0, "helper".to_string());
         }
@@ -100,9 +99,8 @@ fn label_operand(insn: &Insn, label_slot: &HashMap<String, usize>) -> Result<Opt
     resolve_target(token, insn.slot, label_slot).map(Some)
 }
 
-/// A `+N`/`-N` literal resolves relative to the next slot, like a label would after
-/// going through [`ebpf_asm::Assembler`]'s own offset math; a bare name looks up
-/// `label_slot`.
+/// A `+N`/`-N` literal resolves relative to the next slot, like a label would after going through
+/// [`ebpf_asm::Assembler`]'s own offset math; a bare name looks up `label_slot`.
 fn resolve_target(token: &str, slot: usize, label_slot: &HashMap<String, usize>) -> Result<usize, String> {
     if token.starts_with(['+', '-']) {
         let offset = parse_number(token)?;
@@ -148,8 +146,8 @@ fn mem(token: &str) -> Result<(Register, i16), String> {
     }
 }
 
-/// Hex (`0x...`) is an unsigned bit pattern; decimal is signed. Both match the
-/// reference assembler's `_decode_imm32`/`_decode_imm64`.
+/// Hex (`0x...`) is an unsigned bit pattern; decimal is signed. Both match the reference assembler's
+/// `_decode_imm32`/`_decode_imm64`.
 fn parse_number(token: &str) -> Result<i64, String> {
     let (negative, rest) = match token.strip_prefix('-') {
         Some(rest) => (true, rest),
