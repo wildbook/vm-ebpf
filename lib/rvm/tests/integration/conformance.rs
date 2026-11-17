@@ -60,10 +60,8 @@ fn run_one(text: &str) -> Result<(), String> {
     let mem_ptr = memory.map_bytes(FIRST_FREE_REGION, &case.mem, case.mem.len(), Perms::RW);
 
     let mut helpers = HelperRegistry::new();
-    // Helper 5 is "unwind" in the classic interpreter test ABI that call_unwind_fail.data
-    // and callx.data (through a register holding the ID) exercise: the tests only check
-    // that calling it doesn't abort the program, not what it returns, since `mov %r0, 2`
-    // overwrites r0 right after the call either way.
+    // helper 5 is `unwind` in the classic interpreter test ABI; call_unwind_fail.data
+    // and callx.data only check that calling it doesn't abort the program
     helpers.register(5, |_: ()| 0u64);
 
     let mut exec = Executor::new(&code, &mut memory, &helpers, stack_top);
@@ -75,7 +73,6 @@ fn run_one(text: &str) -> Result<(), String> {
         (Ok(r0), Some(expected), _) if r0 == expected => Ok(()),
         (Ok(r0), Some(expected), _) => Err(format!("expected r0 = {expected:#x}, got {r0:#x}")),
         (Ok(r0), None, Some(expected)) => Err(format!("expected error {expected:?}, got r0 = {r0:#x}")),
-        // `data::parse` rejects a file with neither section.
         (Ok(_), None, None) => unreachable!("parsed test case has neither a result nor an error"),
         // No vendored file sets `-- error`; a real one would need to compare `e`'s text.
         (Err(_), _, Some(_)) => Ok(()),

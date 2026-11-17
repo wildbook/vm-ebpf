@@ -11,8 +11,7 @@ pub struct TestCase {
     pub mem: Vec<u8>,
     /// Expected `r0` on exit, from `-- result` (hex with a `0x` prefix, or decimal).
     pub result: Option<u64>,
-    /// Expected error text from `-- error`. The vendored suite has no file that sets
-    /// this; a test hitting it needs a real comparison, not just "did it fail".
+    /// Expected error text from `-- error`.
     pub error: Option<String>,
 }
 

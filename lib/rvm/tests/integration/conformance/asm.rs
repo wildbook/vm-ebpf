@@ -1,14 +1,11 @@
 //! Minimal text assembler for the ubpf-style syntax the bpf_conformance suite's
 //! `.data` files use (`mov32 %r0, 0`, `ldxb %r0, [%r1+0x2]`, `jgt %r1, 0x2, L3`, ...).
 //!
-//! Every instruction goes through [`ebpf_asm::Assembler`], so this module only
-//! tokenizes lines and resolves jump targets; it never builds raw opcode bytes
-//! itself. A jump target is either a label name or a `+N`/`-N` literal relative
-//! offset (both forms appear in the suite); both resolve to a code slot index
-//! up front, so a single `Label` per target slot covers either form. `exit` is
-//! additionally bound to the slot of the first `exit` instruction, matching the
-//! reference parser's implicit "default exit label" so branches to a bare
-//! `exit` resolve without a `label:` line.
+//! Instructions go through [`ebpf_asm::Assembler`]; this module tokenizes lines and
+//! resolves jump targets. A target is a label name or a `+N`/`-N` offset, and both
+//! resolve to a code slot up front, so one `Label` per target slot covers either.
+//! `exit` also names the slot of the first `exit` instruction, like the reference
+//! parser's default exit label, so branches to a bare `exit` need no `label:` line.
 
 use std::collections::HashMap;
 

@@ -173,9 +173,9 @@ pub enum ExecError {
 impl fmt::Display for ExecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CpuFault => write!(f, "CPU fault: invalid instruction"),
+            Self::CpuFault => write!(f, "invalid instruction"),
             Self::MemoryFault(msg) => write!(f, "memory fault: {msg}"),
-            Self::Unimplemented => write!(f, "unimplemented: instruction not implemented"),
+            Self::Unimplemented => write!(f, "instruction not implemented"),
             #[cfg(feature = "fuel")]
             Self::InstructionLimit(count) => write!(f, "instruction limit exceeded: {count}"),
             Self::StackOverflow => write!(f, "stack overflow"),

@@ -18,7 +18,7 @@ use hashbrown::HashMap;
 use crate::error::{LinkError, Result, VmError};
 use crate::executor::CORE_POISON_HELPER;
 use crate::helper::HelperRegistry;
-use crate::image::{set_slot_call, Image, Import};
+use crate::image::{set_slot_call, Image, Import, BPF_CALL};
 use crate::layout::{CODE_REGION, DATA_REGION, RODATA_REGION};
 use crate::maps::map_defs;
 use crate::memory::{region_base, MAX_REGION_LEN, REGION_SHIFT};
@@ -265,7 +265,8 @@ fn check_extern_signatures(helpers: &HelperRegistry, btfs: &[Option<Btf<'_>>]) -
     Ok(())
 }
 
-/// Build a global symbol table from all modules.
+/// Every module's exported symbols by name; two different definitions of one name
+/// fail.
 fn build_symbol_table(modules: &[&Module], layouts: &[ModuleLayout]) -> Result<HashMap<String, Addr>> {
     let mut symbols = HashMap::new();
 
@@ -285,7 +286,7 @@ fn build_symbol_table(modules: &[&Module], layouts: &[ModuleLayout]) -> Result<H
     Ok(symbols)
 }
 
-/// Apply a single relocation.
+/// Patch the instruction or data that `reloc` points at.
 fn apply_relocation(
     helpers: &HelperRegistry,
     module: &Module,
@@ -363,7 +364,6 @@ fn apply_relocation(
 /// Record every `call <helper id>` as an extern, so loaded programs never look
 /// helpers up at runtime. Unregistered IDs fail the link.
 fn mark_helper_calls(helpers: &HelperRegistry, image: &mut Image) -> Result<()> {
-    const BPF_CALL: u8 = 0x85;
     const BPF_LD_IMM64: u8 = 0x18;
 
     let mut i = 0;
@@ -436,7 +436,8 @@ fn apply_core_relocations_pass(
     Ok(())
 }
 
-/// Build the function table.
+/// Exported functions by name, or each code section by name if no module exports a
+/// function.
 fn build_function_table(
     modules: &[&Module],
     layouts: &[ModuleLayout],
@@ -462,7 +463,6 @@ fn build_function_table(
         }
     }
 
-    // If no named functions, use code sections as entry points.
     if functions.is_empty() {
         for (module, layout) in modules.iter().zip(layouts) {
             for (idx, section) in module.sections.iter().enumerate() {
@@ -504,17 +504,15 @@ fn function_borrows(btf: Option<&Btf<'_>>) -> Result<HashMap<String, Vec<Borrow>
         let Some(BtfTypeInfo::Func { name, .. }) = btf.type_by_id(*type_id) else {
             continue;
         };
-        let bad = || LinkError::InvalidReference(format!("{name}: bad tag {tag} on parameter {component_idx}"));
-        let arg = u8::try_from(*component_idx).ok().filter(|&a| a < 5).ok_or_else(bad)?;
-        let len_arg = len_arg
-            .parse::<u8>()
+        let borrow = u8::try_from(*component_idx)
             .ok()
-            .filter(|&a| a < 5 && a != arg)
-            .ok_or_else(bad)?;
-        borrows
-            .entry(name.to_string())
-            .or_default()
-            .push(Borrow { arg, len_arg, writable });
+            .zip(len_arg.parse::<u8>().ok())
+            .map(|(arg, len_arg)| Borrow { arg, len_arg, writable })
+            .filter(Borrow::in_range)
+            .ok_or_else(|| {
+                LinkError::InvalidReference(format!("{name}: bad tag {tag} on parameter {component_idx}"))
+            })?;
+        borrows.entry(name.to_string()).or_default().push(borrow);
     }
     Ok(borrows)
 }

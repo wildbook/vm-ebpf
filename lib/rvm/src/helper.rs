@@ -1,6 +1,4 @@
-//! Helper function support for the eBPF VM.
-//!
-//! This module provides type-safe helper function registration and dispatch.
+//! Host functions callable from eBPF: typed registration and slot dispatch.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
@@ -11,9 +9,7 @@ use crate::error::HelperError;
 use crate::maps::Maps;
 use crate::memory::{GuestMemory, VmMemory};
 
-/// Arguments passed to a helper function.
-///
-/// Contains the values of registers r1-r5 at the time of the call.
+/// Registers r1-r5 at the time of a helper call.
 #[derive(Debug, Clone, Copy)]
 pub struct HelperArgs {
     pub r1: u64,
@@ -46,9 +42,7 @@ pub struct HelperContext<'a, M = VmMemory> {
     pub maps: Option<&'a mut Maps>,
 }
 
-/// Trait for extracting typed arguments from helper args.
-///
-/// This trait enables type-safe argument extraction from the raw u64 registers.
+/// Typed helper arguments, read from r1 onwards.
 pub trait FromArgs: Sized {
     /// Number of argument registers (r1..) this type reads.
     const ARITY: u8;
@@ -344,12 +338,6 @@ impl<M: 'static> HelperRegistry<M> {
     /// Slot of a named extern function.
     pub fn slot_of_name(&self, name: &str) -> Option<u32> {
         self.by_name.get(name).copied()
-    }
-
-    /// Call a helper by ID.
-    pub fn call(&self, id: u32, ctx: &mut HelperContext<M>) -> Result<u64, HelperError> {
-        let slot = self.slot_of_id(id).ok_or(HelperError::UnknownHelper(id))?;
-        self.call_slot(slot, ctx)
     }
 
     /// Call the function in `slot`.

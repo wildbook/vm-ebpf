@@ -1,7 +1,5 @@
-//! Execution engine for eBPF programs.
-//!
-//! The executor runs eBPF bytecode using the rvm-core instruction stepping,
-//! and dispatches helper function calls to the registered helpers.
+//! Runs eBPF bytecode on rvm-core and dispatches helper calls to a
+//! [`HelperRegistry`].
 
 use std::fmt::Debug;
 use std::mem::ManuallyDrop;
@@ -21,13 +19,8 @@ pub const DEFAULT_FRAME_SIZE: u64 = 512;
 /// resolve (`btf::CORE_POISON_HELPER`).
 pub const CORE_POISON_HELPER: u32 = 0xbad2310;
 
-/// Executor for eBPF programs.
-///
-/// Handles the main execution loop, including:
-/// - Instruction fetching and execution via rvm-core
-/// - Helper function dispatch
-/// - BPF-to-BPF function calls, each with its own stack frame
-/// - Instruction limit enforcement (the `fuel` feature)
+/// Runs functions of one piece of code against one memory, with BPF-to-BPF calls
+/// on their own stack frames.
 ///
 /// Code is a separate instruction slice, so the guest can neither read nor modify
 /// it through memory. Generic over any [`Memory`]; memory stays borrowed, so it

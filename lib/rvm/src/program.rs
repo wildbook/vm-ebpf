@@ -37,6 +37,13 @@ pub struct Borrow {
     pub writable: bool,
 }
 
+impl Borrow {
+    /// Both parameters are argument registers, and different ones.
+    pub(crate) fn in_range(&self) -> bool {
+        self.arg < 5 && self.len_arg < 5 && self.arg != self.len_arg
+    }
+}
+
 /// A function of one [`Program`], looked up by name once so that repeated calls skip
 /// the lookup. See [`Program::func`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,8 +98,7 @@ pub struct Program {
 }
 
 impl Program {
-    /// Create a new program. Loading an image is the usual caller.
-    pub fn new(
+    pub(crate) fn new(
         code: Code,
         memory: VmMemory,
         maps: Maps,
@@ -117,11 +123,6 @@ impl Program {
             instruction_limit: config.instruction_limit,
             frame_size: config.frame_size as u64,
         }
-    }
-
-    /// The program's code, prepared for execution.
-    pub fn code(&self) -> &Code {
-        &self.code
     }
 
     /// Get guest memory.

@@ -57,9 +57,8 @@ impl fmt::Display for Section {
     }
 }
 
-/// Determine section kind from name.
+/// Section kind from its name, for sections not flagged executable.
 pub fn section_kind_from_name(name: &str) -> SectionKind {
-    // Check for well-known section names
     if name == ".text" || name.starts_with(".text.") {
         return SectionKind::Code;
     }
@@ -79,8 +78,7 @@ pub fn section_kind_from_name(name: &str) -> SectionKind {
         return SectionKind::JumpTable;
     }
 
-    // eBPF programs often use section names like "prog", "xdp", "kprobe", etc.
-    // These are typically code sections
+    // program sections such as SEC("xdp") or SEC("kprobe/...")
     if !name.starts_with('.') && !name.is_empty() {
         return SectionKind::Code;
     }

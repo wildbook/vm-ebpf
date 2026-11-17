@@ -1,14 +1,12 @@
-//! Module representation for eBPF programs.
-//!
-//! A module represents a single parsed ELF file with its sections, symbols,
-//! imports, and exports. Modules are combined by the linker to create an
-//! executable program.
+//! A parsed eBPF ELF file: its loadable sections, symbols, exports, imports and
+//! relocations, for the linker.
 
 use std::ffi::CStr;
 
 use constelf::err::ElfError;
 use constelf::file::ElfFile;
 use constelf::raw::{reloc, shf, sht, stb, stt};
+use constelf::relocs::ElfRelocsChunk;
 use hashbrown::HashMap;
 
 use crate::error::{Result, VmError};
@@ -74,21 +72,19 @@ impl Module {
             ..Default::default()
         };
 
-        // First pass: collect sections
+        // sections
         for (idx, header) in elf_sections.headers().iter().enumerate() {
             let section_name = elf_sections
                 .name(header)
                 .map_err(|e| VmError::Elf(format!("failed to get section name: {e:?}")))?;
             let name_str = section_name.to_str().unwrap_or("");
 
-            // Determine section kind
             let kind = if (header.sh_flags & shf::EXECINSTR as u64) != 0 {
                 SectionKind::Code
             } else {
                 section_kind_from_name(name_str)
             };
 
-            // Handle BTF sections specially
             match name_str {
                 ".BTF" => {
                     if let Some(sect) = elf_sections.by_index(idx) {
@@ -105,13 +101,11 @@ impl Module {
                 _ => {}
             }
 
-            // Skip non-ALLOC sections (except we already handled BTF); clang emits
-            // `.jumptables` without the flag
+            // clang emits `.jumptables` without SHF_ALLOC
             if (header.sh_flags & shf::ALLOC as u64) == 0 && kind != SectionKind::JumpTable {
                 continue;
             }
 
-            // Get section data
             let data = if header.sh_type == sht::NOBITS {
                 Vec::new() // .bss has no data
             } else if let Some(sect) = elf_sections.by_index(idx) {
@@ -134,18 +128,16 @@ impl Module {
             module.sections.push(section);
         }
 
-        // Second pass: collect symbols
+        // symbols, indexed like the ELF symbol table
         let symtab = match elf_sections.symtab() {
             Ok(symtab) => Some(symtab),
             Err(ElfError::SectionMissing) => None,
             Err(e) => return Err(VmError::Elf(format!("failed to get symbols: {e:?}"))),
         };
         if let Some(symtab) = symtab {
-            // Get symbol string table
             let strtab = elf_sections.sym_strtab().ok();
 
             for sym in symtab.iter() {
-                // Get symbol name from string table
                 let sym_name = match (sym.st_name != 0, strtab) {
                     (true, Some(strtab)) => get_string_from_table(strtab, sym.st_name as usize),
                     _ => String::new(),
@@ -165,18 +157,15 @@ impl Module {
                 let is_global = sym.bind() == stb::GLOBAL;
                 let is_function = sym.typ() == stt::FUNC;
 
-                // Map ELF section index to our section index
                 let section_idx = if sym.st_shndx == 0 {
-                    None // Undefined
+                    None
                 } else {
-                    // Find the section by its ELF index
                     module
                         .sections
                         .iter()
                         .position(|s| s.elf_index == sym.st_shndx as usize)
                 };
 
-                // Track exports and imports
                 match (is_global, section_idx) {
                     (true, Some(sect_idx)) => {
                         module.exports.insert(
@@ -201,7 +190,7 @@ impl Module {
             }
         }
 
-        // Third pass: collect relocations
+        // relocations
         let mut reloc_iter = elf
             .relocs()
             .iter()
@@ -215,14 +204,11 @@ impl Module {
                 break;
             };
 
-            // Find the target section in our list
             let target_elf_idx = chunk.target_idx();
             let Some(section_idx) = module.sections.iter().position(|s| s.elf_index == target_elf_idx) else {
-                continue; // Relocations for non-ALLOC sections
+                continue; // relocations for sections that aren't loaded
             };
 
-            // Get relocations
-            use constelf::relocs::ElfRelocsChunk;
             match chunk
                 .relocs()
                 .map_err(|e| VmError::Elf(format!("failed to get relocs: {e:?}")))?

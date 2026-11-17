@@ -32,7 +32,7 @@ const MAGIC: &[u8; 4] = b"RVMI";
 const FORMAT_VERSION: u32 = 1;
 const RVM_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const BPF_CALL: u8 = 0x85;
+pub(crate) const BPF_CALL: u8 = 0x85;
 
 /// A linked program, ready to load into a [`crate::Vm`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -254,8 +254,7 @@ pub fn load(
     let functions = functions
         .into_iter()
         .map(|(name, info)| {
-            let borrow_ok = |b: &Borrow| b.arg < 5 && b.len_arg < 5 && b.arg != b.len_arg;
-            if info.pc >= insn_count || !info.borrows.iter().all(borrow_ok) {
+            if info.pc >= insn_count || !info.borrows.iter().all(Borrow::in_range) {
                 return Err(invalid(format!("function {name}: entry or borrows out of range")));
             }
             Ok((name, info))

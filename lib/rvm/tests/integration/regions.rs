@@ -62,9 +62,9 @@ fn bpf_main_globals_do_not_clobber_code() {
     let input = Input {
         a: 5,
         b: 7,
-        op: 2,
+        op: 2, // mul
         flags: 0,
-    }; // mul
+    };
     let mut output = Output::default();
     let mut program = example();
     let mem = program.memory_mut();

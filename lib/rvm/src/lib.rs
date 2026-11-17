@@ -2,13 +2,6 @@
 //!
 //! `rvm` is an embeddable eBPF virtual machine library for Rust.
 //!
-//! ## Features
-//!
-//! - **Type-safe helpers**: Register host functions with automatic argument extraction
-//! - **CO-RE support**: Compile-Once, Run-Everywhere with BTF type registration
-//! - **Multi-module linking**: Dynamic linking of multiple eBPF ELF files
-//! - **Memory safe**: Bounds-checked memory access with configurable limits
-//!
 //! ## Quick Start
 //!
 //! ```ignore
@@ -82,8 +75,6 @@ mod std_helpers;
 #[cfg(feature = "link")]
 mod symbol;
 mod vm;
-
-// Public API re-exports
 
 #[cfg(feature = "link")]
 pub use btf::BtfBuilder;

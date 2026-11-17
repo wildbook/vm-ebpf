@@ -17,7 +17,6 @@ use std::sync::atomic::Ordering::{Relaxed, SeqCst};
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::Arc;
 
-// Re-export the Memory trait from rvm-core
 pub use rvm_core::Memory;
 use rvm_core::{AtomicOp, Window};
 

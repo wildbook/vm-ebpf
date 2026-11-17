@@ -8,9 +8,9 @@ use hashbrown::HashTable;
 use super::{MapError, BPF_EXIST, BPF_NOEXIST};
 
 // The default seed comes from address-space layout, which Windows randomizes per
-// executable per boot: two builds of the same source then probe differently, which
-// changes guest timing and PGO profiles. Benchmarks fix it; a fixed seed lets guest
-// code choose colliding keys, so production builds keep the random one.
+// executable per boot, so two builds of the same source probe differently and time
+// differently. Benchmarks fix it; a fixed seed lets guest code choose colliding
+// keys, so production builds keep the random one.
 #[cfg(feature = "fixed-hash-seed")]
 type Seed = foldhash::fast::FixedState;
 #[cfg(not(feature = "fixed-hash-seed"))]

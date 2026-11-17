@@ -1,8 +1,4 @@
-//! The main VM entry point.
-//!
-//! The `Vm` struct is the central registry for helper functions, types,
-//! and configuration. Use it to prepare images and load them as programs.
-//! See the crate documentation for a usage example.
+//! [`Vm`], the entry point. See the crate documentation for a usage example.
 
 use std::sync::{Arc, Mutex};
 
@@ -44,14 +40,8 @@ impl Default for VmConfig {
     }
 }
 
-/// The main eBPF virtual machine.
-///
-/// This is the entry point for using the rvm library. It holds:
-/// - Registered helper functions
-/// - Type registry for CO-RE relocations
-/// - Configuration
-///
-/// Use it to load modules and link them into executable programs.
+/// The entry point: holds the helper table, the host types for CO-RE, and the maps
+/// and regions shared between the programs it links and loads.
 pub struct Vm {
     /// Extern table shared with every program this VM links.
     helpers: Arc<SharedHelpers>,
