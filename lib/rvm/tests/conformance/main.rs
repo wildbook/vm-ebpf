@@ -9,10 +9,7 @@
 mod asm;
 mod data;
 
-use rvm::{Executor, HelperRegistry, Perms, VmMemory, FIRST_FREE_REGION, STACK_REGION};
-
-/// Comfortably covers the suite's deepest call nesting (`DEFAULT_FRAME_SIZE` per level).
-const STACK_SIZE: usize = 8192;
+use rvm::{FunctionInfo, Image, Perms, Vm, FIRST_FREE_REGION};
 
 /// Files that exercise something rvm deliberately does not implement, with why.
 const SKIP: &[(&str, &str)] = &[];
@@ -51,21 +48,27 @@ fn bpf_conformance_suite() {
 /// Assembles and runs one parsed `.data` file, and checks its outcome.
 fn run_one(text: &str) -> Result<(), String> {
     let case = data::parse(text)?;
-    let code = rvm::instructions_from_bytes(&case.code);
 
-    let mut memory = VmMemory::new();
-    let stack_top = memory.map(STACK_REGION, STACK_SIZE, Perms::RW) + STACK_SIZE as u64;
-    let mem_ptr = memory.map_bytes(FIRST_FREE_REGION, &case.mem, case.mem.len(), Perms::RW);
-
-    let mut helpers = HelperRegistry::new();
+    let vm = Vm::new();
     // helper 5 is `unwind` in the classic interpreter test ABI; call_unwind_fail.data and callx.data only check that
     // calling it doesn't abort the program
-    helpers.register(5, |_: ()| 0u64);
-
-    let mut exec = Executor::new(&code, &mut memory, &helpers, stack_top);
-    #[cfg(feature = "fuel")]
-    exec.set_instruction_limit(1_000_000);
-    let outcome = exec.call(0, &[mem_ptr, case.mem.len() as u64]);
+    vm.register_helper(5, |_: ()| 0u64);
+    let main = FunctionInfo {
+        pc: 0,
+        size: case.code.len() as u64,
+        borrows: Vec::new(),
+    };
+    let image = Image {
+        code: case.code,
+        functions: vec![("main".into(), main)],
+        ..Image::default()
+    };
+    let mut program = vm.load(image).map_err(|e| e.to_string())?;
+    let mem_ptr = program
+        .memory_mut()
+        .map_bytes(FIRST_FREE_REGION, &case.mem, case.mem.len(), Perms::RW)
+        .map_err(|e| e.to_string())?;
+    let outcome = program.call("main", &[mem_ptr, case.mem.len() as u64]);
 
     match (outcome, case.result, case.error) {
         (Ok(r0), Some(expected), _) if r0 == expected => Ok(()),

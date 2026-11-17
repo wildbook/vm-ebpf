@@ -1,6 +1,9 @@
 //! Prepared images: they run like programs linked from ELF, plugins load from them, and malformed ones fail to load.
 
-use rvm::{region_base, Image, Import, LinkError, Module, Vm, VmError, FIRST_FREE_REGION, MAX_REGION_LEN};
+use rvm::{
+    region_base, FunctionInfo, Image, Import, LinkError, Module, Plugin, Program, Vm, VmError, FIRST_FREE_REGION,
+    MAX_REGION_LEN,
+};
 
 use crate::common::object;
 
@@ -63,19 +66,25 @@ fn images_run_like_elf() {
 
     for &(objects, calls) in cases {
         let elfs: Vec<_> = objects.iter().map(|name| object(name)).collect();
-        let modules: Vec<Module> = elfs.iter().map(|elf| vm.parse_module("main", elf).unwrap()).collect();
+        let modules: Vec<Module> = elfs.iter().map(|elf| Module::from_elf("main", elf).unwrap()).collect();
         let modules: Vec<&Module> = modules.iter().collect();
 
         let mut linked = vm.link(&modules).unwrap();
         let image = vm.prepare_modules(&modules).unwrap().to_bytes();
         let mut loaded = vm.load_image(&image).unwrap();
 
-        assert_eq!(linked.functions(), loaded.functions(), "{objects:?}");
+        assert_eq!(functions(&linked), functions(&loaded), "{objects:?}");
         for (func, args) in calls {
             let want = format!("{:?}", linked.call(func, args));
             assert_eq!(format!("{:?}", loaded.call(func, args)), want, "{objects:?} {func}");
         }
     }
+}
+
+fn functions(program: &Program) -> Vec<(&str, &FunctionInfo)> {
+    let mut functions: Vec<_> = program.functions().collect();
+    functions.sort_by_key(|&(name, _)| name);
+    functions
 }
 
 /// Plugins loaded from images bind exports by name and hot reload from images.
@@ -85,10 +94,10 @@ fn plugins_from_images() {
     vm.register_fn("host_reenter", |x: u64| x);
     let image = |name: &str| vm.prepare(&object(name)).unwrap().to_bytes();
 
-    let a = vm.load_plugin_image("a", &image("tests/plugin_a.o")).unwrap();
+    let a = Plugin::new("a", vm.load_image(&image("tests/plugin_a.o")).unwrap());
     vm.export(&a, "a_scale").unwrap();
     let b_image = image("tests/plugin_b.o");
-    let b = vm.load_plugin_image("b", &b_image).unwrap();
+    let b = Plugin::new("b", vm.load_image(&b_image).unwrap());
     assert_eq!(b.call("b_run", &[5]).unwrap(), 11);
 
     a.replace(vm.load_image(&image("tests/plugin_a3.o")).unwrap()).unwrap();

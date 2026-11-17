@@ -33,12 +33,12 @@ impl HelperArgs {
     }
 }
 
-/// Context available to helper functions.
-pub struct HelperContext<'a, M = VmMemory> {
+/// What a raw host function sees: the argument registers, the calling program's memory and its maps.
+pub struct HelperContext<'a> {
     /// Helper arguments (r1-r5).
     pub args: HelperArgs,
     /// Memory access.
-    pub memory: &'a mut M,
+    pub memory: &'a mut VmMemory,
     /// The calling program's maps (if it has any).
     pub maps: Option<&'a mut Maps>,
 }
@@ -128,49 +128,40 @@ impl<T: IntoReturn, E: Into<HelperError>> IntoReturn for Result<T, E> {
 }
 
 /// A registered function, called directly through `call` with `data` as its closure.
-struct Slot<M> {
-    call: unsafe fn(*const (), &mut HelperContext<M>) -> Result<u64, HelperError>,
+#[derive(Clone)]
+struct Slot {
+    call: unsafe fn(*const (), &mut HelperContext) -> Result<u64, HelperError>,
     data: *const (),
     // keeps `data` alive; the call path never touches it
     _owner: Arc<dyn Send + Sync>,
-    // argument count, if registered with typed arguments; `None` for raw and context helpers, which read registers
-    // themselves
+    // argument count, if registered with typed arguments; `None` for raw helpers, which read registers themselves. Only
+    // the linker reads it.
+    #[cfg_attr(not(feature = "link"), allow(dead_code))]
     arity: Option<u8>,
 }
 
 // SAFETY: `data` points into `_owner`, which is `Send + Sync` and lives as long as the slot.
-unsafe impl<M> Send for Slot<M> {}
-unsafe impl<M> Sync for Slot<M> {}
+unsafe impl Send for Slot {}
+unsafe impl Sync for Slot {}
 
-impl<M> Clone for Slot<M> {
-    fn clone(&self) -> Self {
-        Self {
-            call: self.call,
-            data: self.data,
-            _owner: self._owner.clone(),
-            arity: self.arity,
-        }
-    }
-}
-
-impl<M: 'static> Slot<M> {
+impl Slot {
     fn new<F>(func: F, arity: Option<u8>) -> Self
     where
-        F: Fn(&mut HelperContext<M>) -> Result<u64, HelperError> + Send + Sync + 'static,
+        F: Fn(&mut HelperContext) -> Result<u64, HelperError> + Send + Sync + 'static,
     {
         /// # Safety
         ///
         /// `data` must point to a live `F`.
-        unsafe fn trampoline<M, F>(data: *const (), ctx: &mut HelperContext<M>) -> Result<u64, HelperError>
+        unsafe fn trampoline<F>(data: *const (), ctx: &mut HelperContext) -> Result<u64, HelperError>
         where
-            F: Fn(&mut HelperContext<M>) -> Result<u64, HelperError>,
+            F: Fn(&mut HelperContext) -> Result<u64, HelperError>,
         {
             unsafe { (*data.cast::<F>())(ctx) }
         }
 
         let owner = Arc::new(func);
         Self {
-            call: trampoline::<M, F>,
+            call: trampoline::<F>,
             data: Arc::as_ptr(&owner).cast(),
             _owner: owner,
             arity,
@@ -185,9 +176,7 @@ impl<M: 'static> Slot<M> {
     {
         Self::new(move |ctx| func(A::from_args(&ctx.args)).into_return(), Some(A::ARITY))
     }
-}
 
-impl Slot<VmMemory> {
     fn with_memory<F, A, R>(func: F) -> Self
     where
         F: Fn(&mut GuestMemory, A) -> R + Send + Sync + 'static,
@@ -208,36 +197,41 @@ impl Slot<VmMemory> {
 /// functions declared in the program). The linker rewrites every call into a slot call, so linked programs dispatch by
 /// index. Re-registering an ID or name replaces the function in its existing slot, which keeps linked call sites valid
 /// (hot reload).
-pub struct HelperRegistry<M = VmMemory> {
-    slots: Vec<Slot<M>>,
+#[derive(Default, Clone)]
+pub struct HelperRegistry {
+    slots: Vec<Slot>,
     by_id: HashMap<u32, u32>,
     by_name: HashMap<String, u32>,
 }
 
-impl<M> Default for HelperRegistry<M> {
-    fn default() -> Self {
-        Self {
-            slots: Vec::new(),
-            by_id: HashMap::new(),
-            by_name: HashMap::new(),
-        }
-    }
-}
-
-impl<M> Clone for HelperRegistry<M> {
-    fn clone(&self) -> Self {
-        Self {
-            slots: self.slots.clone(),
-            by_id: self.by_id.clone(),
-            by_name: self.by_name.clone(),
-        }
-    }
-}
-
 impl HelperRegistry {
-    /// Create a new empty registry for [`VmMemory`]; use `default()` for other memories.
-    pub fn new() -> Self {
-        Self::default()
+    /// Register a helper function by ID, with typed arguments.
+    pub fn register_helper<F, A, R>(&mut self, id: u32, func: F)
+    where
+        F: Fn(A) -> R + Send + Sync + 'static,
+        A: FromArgs + 'static,
+        R: IntoReturn + 'static,
+    {
+        self.put_id(id, Slot::typed(func));
+    }
+
+    /// Register a helper function by ID that reads its arguments and memory from the context.
+    pub fn register_helper_raw<F, R>(&mut self, id: u32, func: F)
+    where
+        F: Fn(&mut HelperContext) -> R + Send + Sync + 'static,
+        R: IntoReturn + 'static,
+    {
+        self.put_id(id, Slot::new(move |ctx| func(ctx).into_return(), None));
+    }
+
+    /// Register an extern function by name, with typed arguments.
+    pub fn register_fn<F, A, R>(&mut self, name: impl Into<String>, func: F)
+    where
+        F: Fn(A) -> R + Send + Sync + 'static,
+        A: FromArgs + 'static,
+        R: IntoReturn + 'static,
+    {
+        self.put_name(name.into(), Slot::typed(func));
     }
 
     /// Register an extern function by name that reads or writes the calling program's memory through [`GuestMemory`],
@@ -250,71 +244,31 @@ impl HelperRegistry {
     {
         self.put_name(name.into(), Slot::with_memory(func));
     }
-}
-
-impl<M: 'static> HelperRegistry<M> {
-    /// Register a helper function by ID.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// registry.register(1, |arg: u64| -> u64 {
-    ///     println!("Got: {}", arg);
-    ///     0
-    /// });
-    /// ```
-    pub fn register<F, A, R>(&mut self, id: u32, func: F)
-    where
-        F: Fn(A) -> R + Send + Sync + 'static,
-        A: FromArgs + 'static,
-        R: IntoReturn + 'static,
-    {
-        self.put_id(id, Slot::typed(func));
-    }
-
-    /// Register a helper that needs access to the context.
-    pub fn register_with_ctx<F, R>(&mut self, id: u32, func: F)
-    where
-        F: Fn(&mut HelperContext<M>) -> R + Send + Sync + 'static,
-        R: IntoReturn + 'static,
-    {
-        self.put_id(id, Slot::new(move |ctx| func(ctx).into_return(), None));
-    }
-
-    /// Register an extern function by name.
-    pub fn register_fn<F, A, R>(&mut self, name: impl Into<String>, func: F)
-    where
-        F: Fn(A) -> R + Send + Sync + 'static,
-        A: FromArgs + 'static,
-        R: IntoReturn + 'static,
-    {
-        self.put_name(name.into(), Slot::typed(func));
-    }
 
     /// Register a raw extern function by name, called directly with the context.
     pub fn register_fn_raw<F>(&mut self, name: impl Into<String>, func: F)
     where
-        F: Fn(&mut HelperContext<M>) -> Result<u64, HelperError> + Send + Sync + 'static,
+        F: Fn(&mut HelperContext) -> Result<u64, HelperError> + Send + Sync + 'static,
     {
         self.put_name(name.into(), Slot::new(func, None));
     }
 
     /// Replace the function registered under `id`, or append a new slot.
-    fn put_id(&mut self, id: u32, helper: Slot<M>) {
+    fn put_id(&mut self, id: u32, helper: Slot) {
         let slot = self.by_id.get(&id).copied();
         let slot = self.put(slot, helper);
         self.by_id.insert(id, slot);
     }
 
     /// Replace the function registered under `name`, or append a new slot.
-    fn put_name(&mut self, name: String, helper: Slot<M>) {
+    fn put_name(&mut self, name: String, helper: Slot) {
         let slot = self.by_name.get(&name).copied();
         let slot = self.put(slot, helper);
         self.by_name.insert(name, slot);
     }
 
     /// Replace the function in `slot`, or append a new slot.
-    fn put(&mut self, slot: Option<u32>, helper: Slot<M>) -> u32 {
+    fn put(&mut self, slot: Option<u32>, helper: Slot) -> u32 {
         match slot {
             Some(slot) => {
                 self.slots[slot as usize] = helper;
@@ -328,6 +282,7 @@ impl<M: 'static> HelperRegistry<M> {
     }
 
     /// Argument count of the function in `slot`, if it was registered with typed arguments.
+    #[cfg(feature = "link")]
     pub fn arity(&self, slot: u32) -> Option<u8> {
         self.slots.get(slot as usize)?.arity
     }
@@ -344,14 +299,14 @@ impl<M: 'static> HelperRegistry<M> {
 
     /// Call the function in `slot`.
     #[inline]
-    pub fn call_slot(&self, slot: u32, ctx: &mut HelperContext<M>) -> Result<u64, HelperError> {
+    pub fn call_slot(&self, slot: u32, ctx: &mut HelperContext) -> Result<u64, HelperError> {
         let helper = self.slots.get(slot as usize).ok_or(HelperError::UnknownSlot(slot))?;
         // SAFETY: `Slot::new` paired `call` with a `data` pointer of the type it expects.
         unsafe { (helper.call)(helper.data, ctx) }
     }
 }
 
-impl<M> std::fmt::Debug for HelperRegistry<M> {
+impl std::fmt::Debug for HelperRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HelperRegistry")
             .field("slots", &self.slots.len())

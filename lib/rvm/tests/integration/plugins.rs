@@ -21,21 +21,22 @@ fn plugin_calls_export_and_survives_reload() {
     vm.export(&a, "a_scale").unwrap();
     let b = vm.load_plugin("b", &object("tests/plugin_b.o")).unwrap();
     assert_eq!(b.call("b_run", &[5]).unwrap(), 11);
-    let scale = a.func("a_scale").unwrap();
-    assert_eq!(a.call_func(scale, &[5]).unwrap(), a.call("a_scale", &[5]).unwrap());
+    let scale = a.lock().unwrap().func("a_scale").unwrap();
+    let direct = a.lock().unwrap().call_func(scale, &[5]).unwrap();
+    assert_eq!(direct, a.call("a_scale", &[5]).unwrap());
 
     // Replacing A's code is picked up by B's next call without relinking B.
     a.replace(vm.load_elf(&object("tests/plugin_a3.o")).unwrap()).unwrap();
     assert_eq!(b.call("b_run", &[5]).unwrap(), 16);
     // A handle into the replaced program fails instead of running the new one at its pc.
-    assert!(matches!(a.call_func(scale, &[5]), Err(VmError::ForeignFunc)));
+    assert!(matches!(a.lock().unwrap().call_func(scale, &[5]), Err(VmError::ForeignFunc)));
 }
 
 #[test]
-fn named_func_follows_replace() {
+fn plugin_func_follows_replace() {
     let vm = Vm::new();
     let a = vm.load_plugin("a", &object("tests/plugin_a.o")).unwrap();
-    let scale = a.named_func("a_scale").unwrap();
+    let scale = a.func("a_scale").unwrap();
     assert_eq!(scale.call(&[5]).unwrap(), 10);
 
     a.replace(vm.load_elf(&object("tests/plugin_a3.o")).unwrap()).unwrap();
@@ -99,7 +100,14 @@ fn shared_map_is_one_instance_across_plugins() {
     let y = vm.load_plugin("y", &object("tests/shared_counter.o")).unwrap();
     assert_eq!(x.call("bump", &[]).unwrap(), 1);
     assert_eq!(y.call("bump", &[]).unwrap(), 2);
-    assert_eq!(x.lock().unwrap().map("hits").unwrap().get(&0u32.to_le_bytes()), Some(&2u64.to_le_bytes()[..]));
+    let mut x = x.lock().unwrap();
+    let mut hits = x.map("hits").unwrap();
+    assert_eq!(hits.get_as::<u32, u64>(0), Ok(Some(2)));
+    // other programs may write a shared value while the host holds a reference to it
+    assert_eq!(hits.get(&0u32.to_le_bytes()), Err(rvm::MapError::Shared));
+    hits.update_as(0u32, 9u64, rvm::BPF_ANY).unwrap();
+    drop(x);
+    assert_eq!(y.call("bump", &[]).unwrap(), 10);
 
     assert!(matches!(
         vm.load_plugin("z", &object("tests/shared_counter_u32.o")).unwrap_err(),

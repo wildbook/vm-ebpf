@@ -43,6 +43,9 @@ pub enum VmError {
     /// No function `func`, in the plugin `plugin` if the lookup went through one.
     FunctionNotFound { plugin: Option<String>, func: String },
 
+    /// No map with this name.
+    MapNotFound(String),
+
     /// A function handle looked up in another program.
     ForeignFunc,
 
@@ -80,6 +83,7 @@ impl fmt::Display for VmError {
                 plugin: Some(plugin),
                 func,
             } => write!(f, "function not found: {plugin}::{func}"),
+            Self::MapNotFound(name) => write!(f, "map not found: {name}"),
             Self::ForeignFunc => write!(f, "function handle belongs to another program; look the function up again"),
             Self::TooManyArgs(count) => write!(f, "{count} arguments, but eBPF functions take at most 5"),
             Self::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),

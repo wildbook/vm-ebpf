@@ -14,10 +14,10 @@ use std::sync::atomic::Ordering::{Acquire, Relaxed, Release, SeqCst};
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8};
 use std::sync::Arc;
 
-pub use rvm_core::Memory;
-use rvm_core::{AtomicOp, Window};
+use rvm_core::{AtomicOp, Memory, Window};
 
-use crate::error::MemoryError;
+use crate::error::{MemoryError, VmError};
+use crate::layout::{BORROW_FIRST_REGION, FIRST_FREE_REGION};
 
 /// Number of region slots in a [`VmMemory`].
 pub const MAX_REGIONS: usize = 64;
@@ -64,14 +64,15 @@ const _: () = assert!(MAX_REGIONS <= 64);
 /// # Example
 ///
 /// ```
-/// use rvm::{region_base, Perms, VmMemory};
+/// use rvm::{region_base, Perms, VmMemory, FIRST_FREE_REGION, STACK_REGION};
 ///
 /// let mut mem = VmMemory::new();
-/// let base = mem.map(1, 4096, Perms::RW);
-/// assert_eq!(base, region_base(1));
+/// let base = mem.map(FIRST_FREE_REGION, 4096, Perms::RW).unwrap();
+/// assert_eq!(base, region_base(FIRST_FREE_REGION));
 /// mem.write(base + 8, 42u64).unwrap();
 /// assert_eq!(mem.read::<u64>(base + 8).unwrap(), 42);
 /// assert!(mem.read::<u8>(0).is_err()); // region 0 is never mapped
+/// assert!(mem.map(STACK_REGION, 4096, Perms::RW).is_err()); // reserved for the program's stack
 /// ```
 pub struct VmMemory {
     // Guest loads and stores read only `ptrs` and the end arrays. Invariant: each end is its region's length or 0, so
@@ -121,10 +122,50 @@ impl VmMemory {
 
     /// Map `len` zeroed bytes as region `idx`, replacing any previous mapping. Returns the region's guest base address.
     ///
+    /// Fails with [`VmError::InvalidArgument`] unless `idx` is one of the regions the layout leaves to the host,
+    /// [`FIRST_FREE_REGION`]`..`[`BORROW_FIRST_REGION`], and `len` is at most [`MAX_REGION_LEN`].
+    pub fn map(&mut self, idx: usize, len: usize, perms: Perms) -> crate::Result<u64> {
+        check_host_region(idx, len)?;
+        Ok(self.map_any(idx, len, perms))
+    }
+
+    /// Map region `idx` with `len` bytes, initialized from `init` (rest zeroed). Fails as [`map`](Self::map) does, and
+    /// if `init` is longer than `len`.
+    pub fn map_bytes(&mut self, idx: usize, init: &[u8], len: usize, perms: Perms) -> crate::Result<u64> {
+        check_host_region(idx, len)?;
+        if init.len() > len {
+            let msg = format!("{} initial bytes in a {len} byte region", init.len());
+            return Err(VmError::InvalidArgument(msg));
+        }
+        Ok(self.map_bytes_any(idx, init, len, perms))
+    }
+
+    /// Expose host memory as region `idx`. Guest accesses go straight to `ptr`. Fails as [`map`](Self::map) does.
+    ///
+    /// # Safety
+    ///
+    /// `ptr..ptr+len` must stay valid (and writable if `perms` allows writes) until the region is unmapped or this
+    /// `VmMemory` is dropped, must not be accessed through other references in ways that conflict with guest/helper
+    /// accesses while the VM runs, and must be usable from any thread that uses this memory.
+    pub unsafe fn map_host(&mut self, idx: usize, ptr: NonNull<u8>, len: usize, perms: Perms) -> crate::Result<u64> {
+        check_host_region(idx, len)?;
+        // SAFETY: the caller's contract.
+        Ok(unsafe { self.map_host_any(idx, ptr, len, perms) })
+    }
+
+    /// Unmap region `idx`, freeing it if it was allocated by [`map`](Self::map). Fails as [`map`](Self::map) does.
+    pub fn unmap(&mut self, idx: usize) -> crate::Result<()> {
+        check_host_region(idx, 0)?;
+        self.unmap_any(idx);
+        Ok(())
+    }
+
+    /// [`map`](Self::map) for any region index, the ones the layout reserves included.
+    ///
     /// # Panics
     ///
     /// Panics if `idx` is 0 or out of range, or `len` exceeds [`MAX_REGION_LEN`].
-    pub fn map(&mut self, idx: usize, len: usize, perms: Perms) -> u64 {
+    pub(crate) fn map_any(&mut self, idx: usize, len: usize, perms: Perms) -> u64 {
         assert!(len <= MAX_REGION_LEN, "region too large: {len}");
         let ptr = if len == 0 {
             NonNull::dangling()
@@ -136,26 +177,21 @@ impl VmMemory {
         self.set(idx, ptr, len, perms, true)
     }
 
-    /// Map region `idx` with `len` bytes, initialized from `init` (rest zeroed).
-    ///
-    /// # Panics
-    ///
-    /// As [`map`](Self::map), and if `init` is longer than `len`.
-    pub fn map_bytes(&mut self, idx: usize, init: &[u8], len: usize, perms: Perms) -> u64 {
+    /// [`map_bytes`](Self::map_bytes) for any region index; panics as [`map_any`](Self::map_any) does, and if `init` is
+    /// longer than `len`.
+    pub(crate) fn map_bytes_any(&mut self, idx: usize, init: &[u8], len: usize, perms: Perms) -> u64 {
         assert!(init.len() <= len, "init ({}) larger than region ({len})", init.len());
-        let base = self.map(idx, len, perms);
+        let base = self.map_any(idx, len, perms);
         self.write_bytes(base, init).expect("freshly mapped region");
         base
     }
 
-    /// Expose host memory as region `idx`. Guest accesses go straight to `ptr`.
+    /// [`map_host`](Self::map_host) for any region index; panics as [`map_any`](Self::map_any) does.
     ///
     /// # Safety
     ///
-    /// `ptr..ptr+len` must stay valid (and writable if `perms` allows writes) until the region is unmapped or this
-    /// `VmMemory` is dropped, must not be accessed through other references in ways that conflict with guest/helper
-    /// accesses while the VM runs, and must be usable from any thread that uses this memory.
-    pub unsafe fn map_host(&mut self, idx: usize, ptr: NonNull<u8>, len: usize, perms: Perms) -> u64 {
+    /// As [`map_host`](Self::map_host).
+    pub(crate) unsafe fn map_host_any(&mut self, idx: usize, ptr: NonNull<u8>, len: usize, perms: Perms) -> u64 {
         assert!(len <= MAX_REGION_LEN, "region too large: {len}");
         self.set(idx, ptr, len, perms, false)
     }
@@ -165,20 +201,16 @@ impl VmMemory {
     ///
     /// # Safety
     ///
-    /// While a reference from [`bytes`](Self::bytes) or [`bytes_mut`](Self::bytes_mut) into the buffer is alive,
-    /// neither another memory that maps it nor a [`SharedRegion`] over it may access it. Code on different threads may
-    /// only touch bytes another thread writes concurrently with atomics, guest load-acquire and store-release among
-    /// them; other guest stores, map helper writes and host writes all count as plain stores, and host reads,
-    /// including [`GuestMemory`] and [`SharedRegion`] copies, as plain loads.
-    pub unsafe fn map_shared(&mut self, idx: usize, buffer: Arc<SharedBuffer>, perms: Perms) -> u64 {
+    /// As [`Vm::share_region`](crate::Vm::share_region).
+    pub(crate) unsafe fn map_shared(&mut self, idx: usize, buffer: Arc<SharedBuffer>, perms: Perms) -> u64 {
         // SAFETY: `self.shared[idx]` keeps the buffer alive until the region is replaced.
-        let base = unsafe { self.map_host(idx, buffer.as_ptr(), buffer.len(), perms) };
+        let base = unsafe { self.map_host_any(idx, buffer.as_ptr(), buffer.len(), perms) };
         self.shared[idx] = Some(buffer);
         base
     }
 
-    /// Unmap region `idx`, freeing it if it was allocated by [`map`](Self::map).
-    pub fn unmap(&mut self, idx: usize) {
+    /// [`unmap`](Self::unmap) for any region index.
+    pub(crate) fn unmap_any(&mut self, idx: usize) {
         self.set(idx, NonNull::dangling(), 0, Perms::NONE, false);
     }
 
@@ -247,8 +279,10 @@ impl VmMemory {
         self.resolve(addr, len, need).ok_or(MemoryError { addr, size: len })
     }
 
-    /// Borrow `len` bytes at guest address `addr` (host access, ignores perms).
+    /// Borrow `len` bytes at guest address `addr` (host access, ignores perms). Fails on a region shared with other
+    /// programs, which may change its bytes during the borrow; [`read_bytes`](Self::read_bytes) copies them instead.
     pub fn bytes(&self, addr: u64, len: usize) -> Result<&[u8], MemoryError> {
+        self.check_unshared(addr, len)?;
         self.slice(addr, len, Perms::NONE)
     }
 
@@ -259,16 +293,44 @@ impl VmMemory {
         Ok(unsafe { std::slice::from_raw_parts(ptr.as_ptr(), len) })
     }
 
-    /// Mutably borrow `len` bytes at guest address `addr` (host access, ignores perms).
+    /// Mutably borrow `len` bytes at guest address `addr` (host access, ignores perms). Fails on a shared region, as
+    /// [`bytes`](Self::bytes) does.
     pub fn bytes_mut(&mut self, addr: u64, len: usize) -> Result<&mut [u8], MemoryError> {
+        self.check_unshared(addr, len)?;
         let ptr = self.host_ptr(addr, len, Perms::NONE)?;
-        // SAFETY: as `bytes`; `&mut self` guarantees exclusive access.
+        // SAFETY: as `slice`; `&mut self` guarantees exclusive access.
         Ok(unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), len) })
+    }
+
+    /// Fail unless `addr..addr+len` lies outside the regions mapped with `map_shared`.
+    fn check_unshared(&self, addr: u64, len: usize) -> Result<(), MemoryError> {
+        match self.shared.get((addr >> REGION_SHIFT) as usize) {
+            Some(Some(_)) => Err(MemoryError { addr, size: len }),
+            _ => Ok(()),
+        }
+    }
+
+    /// Copy `buf.len()` bytes from guest address `addr` into `buf` (host access).
+    pub fn read_bytes(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemoryError> {
+        let src = self.host_ptr(addr, buf.len(), Perms::NONE)?;
+        // SAFETY: `host_ptr` checked the range; `ptr::copy` allows `buf` to alias a host-mapped region.
+        unsafe { std::ptr::copy(src.as_ptr(), buf.as_mut_ptr(), buf.len()) };
+        Ok(())
     }
 
     /// Copy `data` to guest address `addr` (host access).
     pub fn write_bytes(&mut self, addr: u64, data: &[u8]) -> Result<(), MemoryError> {
-        self.bytes_mut(addr, data.len())?.copy_from_slice(data);
+        let dst = self.host_ptr(addr, data.len(), Perms::NONE)?;
+        // SAFETY: as `read_bytes`.
+        unsafe { std::ptr::copy(data.as_ptr(), dst.as_ptr(), data.len()) };
+        Ok(())
+    }
+
+    /// Zero `len` bytes at guest address `addr` (host access).
+    pub(crate) fn zero(&mut self, addr: u64, len: usize) -> Result<(), MemoryError> {
+        let dst = self.host_ptr(addr, len, Perms::NONE)?;
+        // SAFETY: `host_ptr` checked the range.
+        unsafe { dst.write_bytes(0, len) };
         Ok(())
     }
 
@@ -283,14 +345,38 @@ impl VmMemory {
 
     /// Read a little-endian scalar at guest address `addr` (host access).
     pub fn read<T: Scalar>(&self, addr: u64) -> Result<T, MemoryError> {
-        Ok(T::read_le(self.bytes(addr, T::SIZE)?))
+        let mut bytes = [0; 8];
+        let bytes = &mut bytes[..T::SIZE];
+        self.read_bytes(addr, bytes)?;
+        Ok(T::read_le(bytes))
+    }
+
+    /// Copy the `V` at guest address `addr` out (host access).
+    pub(crate) fn read_pod<V: Pod>(&self, addr: u64) -> Result<V, MemoryError> {
+        let src = self.host_ptr(addr, size_of::<V>(), Perms::NONE)?;
+        // SAFETY: `host_ptr` checked the range, and `Pod` types accept every bit pattern.
+        Ok(unsafe { src.cast::<V>().read_unaligned() })
     }
 
     /// Write a little-endian scalar at guest address `addr` (host access).
     pub fn write<T: Scalar>(&mut self, addr: u64, value: T) -> Result<(), MemoryError> {
-        value.write_le(self.bytes_mut(addr, T::SIZE)?);
-        Ok(())
+        let mut bytes = [0; 8];
+        let bytes = &mut bytes[..T::SIZE];
+        value.write_le(bytes);
+        self.write_bytes(addr, bytes)
     }
+}
+
+/// Fail unless region `idx` is one the layout leaves to the host and `len` fits in a region.
+fn check_host_region(idx: usize, len: usize) -> crate::Result<()> {
+    if !(FIRST_FREE_REGION..BORROW_FIRST_REGION).contains(&idx) {
+        let msg = format!("region {idx} is reserved; the host may map {FIRST_FREE_REGION}..{BORROW_FIRST_REGION}");
+        return Err(VmError::InvalidArgument(msg));
+    }
+    if len > MAX_REGION_LEN {
+        return Err(VmError::InvalidArgument(format!("region length {len} exceeds {MAX_REGION_LEN}")));
+    }
+    Ok(())
 }
 
 impl Drop for VmMemory {
@@ -312,7 +398,7 @@ pub struct GuestMemory<'a> {
 
 impl<'a> GuestMemory<'a> {
     /// The guest's view of `memory`.
-    pub fn new(memory: &'a mut VmMemory) -> Self {
+    pub(crate) fn new(memory: &'a mut VmMemory) -> Self {
         Self { memory }
     }
 
@@ -320,7 +406,7 @@ impl<'a> GuestMemory<'a> {
     pub fn read_bytes(&self, addr: u64, buf: &mut [u8]) -> Result<(), MemoryError> {
         let src = self.memory.host_ptr(addr, buf.len(), Perms::R)?;
         // SAFETY: `host_ptr` checked that the range lies inside a live region. `buf` can't overlap it: this view
-        // borrows the memory mutably, and the `map_host` and `map_shared` contracts forbid references into those
+        // borrows the memory mutably, and the `map_host` and `Vm::share_region` contracts forbid references into those
         // regions while guest code runs.
         unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), buf.as_mut_ptr(), buf.len()) };
         Ok(())
@@ -366,12 +452,12 @@ impl<'a> GuestMemory<'a> {
 
 /// Zeroed, cache-line aligned host memory that several programs map at once.
 #[derive(Debug)]
-pub struct SharedBuffer {
+pub(crate) struct SharedBuffer {
     ptr: NonNull<u8>,
     len: usize,
 }
 
-// SAFETY: plain heap memory owned by this value; access from guests follows the `VmMemory::map_shared` contract.
+// SAFETY: plain heap memory owned by this value; access from guests follows the `Vm::share_region` contract.
 unsafe impl Send for SharedBuffer {}
 unsafe impl Sync for SharedBuffer {}
 
@@ -398,10 +484,6 @@ impl SharedBuffer {
     /// Length in bytes.
     pub fn len(&self) -> usize {
         self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
     }
 
     fn layout(len: usize) -> Layout {
@@ -446,7 +528,7 @@ macro_rules! region_atomic {
                 });
             }
             // SAFETY: in bounds and aligned; other threads reach this memory through guest atomics or under the
-            // `map_shared` contract.
+            // `Vm::share_region` contract.
             let cell = unsafe { $atomic::from_ptr(ptr.as_ptr().cast()) };
             Ok(fetch_op!(cell, op))
         }
@@ -460,10 +542,11 @@ macro_rules! region_atomic {
 /// that maps the buffer is running on the same thread. Writes and atomics take `&mut self`, so host accesses through
 /// this handle never race each other.
 ///
-/// Guest code on other threads may access the buffer at the same time, under the [`VmMemory::map_shared`] contract the
-/// host accepted when it shared the region: copies count as plain loads and stores there, so bytes that guests on other
-/// threads write concurrently may only be touched with [`atomic_u32`](Self::atomic_u32) and
-/// [`atomic_u64`](Self::atomic_u64), which are real atomics. `AtomicOp::Or(0)` reads such a value.
+/// Guest code on other threads may access the buffer at the same time, under the
+/// [`Vm::share_region`](crate::Vm::share_region) contract the host accepted when it shared the region: copies count as
+/// plain loads and stores there, so bytes that guests on other threads write concurrently may only be touched with
+/// [`atomic_u32`](Self::atomic_u32) and [`atomic_u64`](Self::atomic_u64), which are real atomics. `AtomicOp::Or(0)`
+/// reads such a value.
 #[derive(Debug)]
 pub struct SharedRegion {
     region: usize,
@@ -475,7 +558,7 @@ impl SharedRegion {
     /// # Safety
     ///
     /// While this handle is in use on one thread, no other `SharedRegion` over `buffer` may be used on another.
-    pub unsafe fn new(region: usize, perms: Perms, buffer: Arc<SharedBuffer>) -> Self {
+    pub(crate) unsafe fn new(region: usize, perms: Perms, buffer: Arc<SharedBuffer>) -> Self {
         Self { region, perms, buffer }
     }
 
@@ -495,7 +578,7 @@ impl SharedRegion {
     }
 
     /// The host memory behind the region.
-    pub fn buffer(&self) -> &Arc<SharedBuffer> {
+    pub(crate) fn buffer(&self) -> &Arc<SharedBuffer> {
         &self.buffer
     }
 
@@ -503,8 +586,8 @@ impl SharedRegion {
     pub fn read_bytes(&self, offset: usize, buf: &mut [u8]) -> Result<(), MemoryError> {
         let src = self.ptr(offset, buf.len())?;
         // SAFETY: `ptr` checked the range. `buf` can't overlap it: references into the buffer only come from
-        // `VmMemory::bytes` and `bytes_mut`, and the `map_shared` contract keeps this handle off the buffer while one
-        // is alive.
+        // `MapRef::entries` over a shared map, and the `Vm::share_region` contract keeps this handle off the buffer
+        // while one is alive.
         unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), buf.as_mut_ptr(), buf.len()) };
         Ok(())
     }
@@ -735,7 +818,7 @@ mod tests {
     #[test]
     fn null_region_and_bounds_fault() {
         let mut mem = VmMemory::new();
-        let base = mem.map(1, 16, Perms::RW);
+        let base = mem.map_any(1, 16, Perms::RW);
         assert_eq!(mem.load_u8(0), Err(0));
         assert_eq!(mem.load_u8(7), Err(7));
         assert!(mem.load_u64(base + 8).is_ok());
@@ -750,13 +833,13 @@ mod tests {
     #[test]
     fn perms_apply_to_guest_not_host() {
         let mut mem = VmMemory::new();
-        let ro = mem.map_bytes(2, &[1, 2, 3, 4], 8, Perms::R);
+        let ro = mem.map_bytes_any(2, &[1, 2, 3, 4], 8, Perms::R);
         assert_eq!(mem.load_u32(ro), Ok(0x0403_0201));
         assert_eq!(mem.store_u8(ro, 9), Err(ro));
         mem.write(ro, 9u8).unwrap(); // host may still patch read-only regions
         assert_eq!(mem.load_u8(ro), Ok(9));
 
-        let wo = mem.map(3, 8, Perms::W);
+        let wo = mem.map_any(3, 8, Perms::W);
         assert!(mem.store_u64(wo, 1).is_ok());
         assert_eq!(mem.load_u64(wo), Err(wo));
     }
@@ -764,7 +847,7 @@ mod tests {
     #[test]
     fn unaligned_little_endian_access() {
         let mut mem = VmMemory::new();
-        let base = mem.map(1, 16, Perms::RW);
+        let base = mem.map_any(1, 16, Perms::RW);
         mem.store_u64(base + 3, 0x1122_3344_5566_7788).unwrap();
         assert_eq!(mem.bytes(base + 3, 2).unwrap(), &[0x88, 0x77]);
         assert_eq!(mem.load_u16(base + 4), Ok(0x6677));
@@ -775,9 +858,9 @@ mod tests {
         let mut buf = [0u8; 8];
         let mut mem = VmMemory::new();
         // SAFETY: `buf` outlives `mem` and isn't touched while mapped.
-        let base = unsafe { mem.map_host(4, NonNull::from(&mut buf).cast(), buf.len(), Perms::RW) };
+        let base = unsafe { mem.map_host_any(4, NonNull::from(&mut buf).cast(), buf.len(), Perms::RW) };
         mem.store_u32(base + 4, 0xAABB_CCDD).unwrap();
-        mem.unmap(4);
+        mem.unmap_any(4);
         assert_eq!(mem.load_u8(base), Err(base));
         drop(mem);
         assert_eq!(buf, [0, 0, 0, 0, 0xDD, 0xCC, 0xBB, 0xAA]);
@@ -787,9 +870,9 @@ mod tests {
     #[test]
     fn guest_memory_needs_guest_perms() {
         let mut mem = VmMemory::new();
-        let rw = mem.map(1, 16, Perms::RW);
-        let ro = mem.map_bytes(2, b"hi", 8, Perms::R);
-        let wo = mem.map(3, 8, Perms::W);
+        let rw = mem.map_any(1, 16, Perms::RW);
+        let ro = mem.map_bytes_any(2, b"hi", 8, Perms::R);
+        let wo = mem.map_any(3, 8, Perms::W);
         let mut guest = GuestMemory::new(&mut mem);
         let fault = |addr, size| MemoryError { addr, size };
 
@@ -847,22 +930,22 @@ mod tests {
         let regions = lens.into_iter().flat_map(|len| PERMS.map(|p| (len, p)));
         for (idx, (len, perms)) in (1..).zip(regions) {
             // SAFETY: `buf` outlives `mem` and is only accessed through it.
-            unsafe { mem.map_host(idx, host, len, perms) };
+            unsafe { mem.map_host_any(idx, host, len, perms) };
             table[idx] = (host, len, perms);
         }
         check_regions(&mut mem, &table);
 
         // replace owned regions with host ones of other perms, or unmap them
         for (idx, region) in table.iter_mut().enumerate().skip(1).take(MAPPED) {
-            mem.map(idx, 16, Perms::RW);
+            mem.map_any(idx, 16, Perms::RW);
             if idx % 5 == 0 {
-                mem.unmap(idx);
+                mem.unmap_any(idx);
                 *region = (NonNull::dangling(), 0, Perms::NONE);
             } else {
                 let (ptr, len, perms) = *region;
                 let perms = PERMS[(perms.0 as usize + 1) % 4];
                 // SAFETY: as above.
-                unsafe { mem.map_host(idx, ptr, len, perms) };
+                unsafe { mem.map_host_any(idx, ptr, len, perms) };
                 region.2 = perms;
             }
         }

@@ -2,12 +2,11 @@
 
 use std::sync::{Arc, Mutex};
 
-#[cfg(feature = "link")]
-use btf::BtfBuilder;
-
 use crate::error::{Result, VmError};
 use crate::executor::DEFAULT_FRAME_SIZE;
 use crate::helper::{FromArgs, IntoReturn, SharedHelpers};
+#[cfg(feature = "link")]
+use crate::host_type::HostTypes;
 use crate::image::{self, Image};
 use crate::layout::{BORROW_FIRST_REGION, FIRST_FREE_REGION};
 #[cfg(feature = "link")]
@@ -53,7 +52,7 @@ pub struct Vm {
     shared_regions: Mutex<Vec<SharedRegion>>,
     /// Host BTF the program's own BTF resolves CO-RE relocations against.
     #[cfg(feature = "link")]
-    types: Mutex<BtfBuilder>,
+    types: Mutex<HostTypes>,
     /// VM configuration.
     config: VmConfig,
 }
@@ -113,7 +112,7 @@ impl Vm {
         A: FromArgs + 'static,
         R: IntoReturn + 'static,
     {
-        self.helpers.update(|h| h.register(id, func));
+        self.helpers.update(|h| h.register_helper(id, func));
     }
 
     /// Register an extern function that programs import by name (`extern u64 name(...);` in C). Unresolved names fail
@@ -172,7 +171,7 @@ impl Vm {
     ///
     /// # Safety
     ///
-    /// As [`VmMemory::map_shared`](crate::VmMemory::map_shared), for every program linked afterwards.
+    /// As [`Vm::share_region`], for the maps' values.
     pub unsafe fn share_map(&self, name: &str, pad_values: bool) {
         self.shared_maps.declare(name, pad_values);
     }
@@ -183,7 +182,12 @@ impl Vm {
     ///
     /// # Safety
     ///
-    /// As [`VmMemory::map_shared`](crate::VmMemory::map_shared), for every program linked afterwards.
+    /// For every program linked afterwards: while a value from [`MapRef::entries`](crate::MapRef::entries) over a
+    /// shared map is borrowed, neither another program that maps the map nor a [`SharedRegion`] over the region may
+    /// access its bytes. Code on different threads may only touch bytes another thread writes concurrently with
+    /// atomics, guest load-acquire and store-release among them; other guest stores, map helper writes and host writes
+    /// all count as plain stores, and host reads, including [`GuestMemory`] and [`SharedRegion`] copies, as plain
+    /// loads.
     pub unsafe fn share_region(&self, region: usize, len: usize, perms: Perms) -> Result<SharedRegion> {
         let mut regions = lock(&self.shared_regions);
         let invalid = |msg: String| Err(VmError::InvalidArgument(msg));
@@ -208,21 +212,31 @@ impl Vm {
     // Loading
     // =========================================================================
 
-    /// Load an image written by [`Image::to_bytes`] as a program.
-    ///
-    /// Binds the image's extern calls by name or helper ID in this VM, allocates its memory and maps, and maps the maps
-    /// and regions this VM shares. Fails on a malformed image, one written by another rvm version, or an extern this VM
-    /// lacks.
+    /// Load an image written by [`Image::to_bytes`] as a program; [`Vm::load`] with the parsed image.
     pub fn load_image(&self, bytes: &[u8]) -> Result<Program> {
         self.load(Image::from_bytes(bytes)?)
     }
 
-    /// Load an image as a plugin that other programs can call into.
-    pub fn load_plugin_image(&self, name: &str, bytes: &[u8]) -> Result<Plugin> {
-        Ok(Plugin::new(name, self.load_image(bytes)?))
-    }
-
-    fn load(&self, image: Image) -> Result<Program> {
+    /// Load an image as a program: from `Vm::prepare`, [`Image::from_bytes`], or built by hand around raw bytecode,
+    /// whose `call <id>` instructions reach the helpers registered here by ID.
+    ///
+    /// Binds the image's extern calls by name or helper ID in this VM, allocates its memory and maps, and maps the maps
+    /// and regions this VM shares. Fails on a malformed image or an extern this VM lacks.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rvm::{FunctionInfo, Image, Vm};
+    ///
+    /// // r0 = r1 + 10
+    /// let code = [0xbf, 0x10, 0, 0, 0, 0, 0, 0, 0x07, 0, 0, 0, 10, 0, 0, 0, 0x95, 0, 0, 0, 0, 0, 0, 0];
+    /// let main = FunctionInfo { pc: 0, size: code.len() as u64, borrows: Vec::new() };
+    /// let image = Image { code: code.to_vec(), functions: vec![("main".into(), main)], ..Image::default() };
+    /// let mut program = Vm::new().load(image)?;
+    /// assert_eq!(program.call("main", &[32])?, 42);
+    /// # Ok::<_, rvm::VmError>(())
+    /// ```
+    pub fn load(&self, image: Image) -> Result<Program> {
         image::load(image, &self.helpers, &self.shared_maps, &lock(&self.shared_regions), &self.config)
     }
 
@@ -240,40 +254,37 @@ impl Vm {
 /// ELF parsing, CO-RE and linking.
 #[cfg(feature = "link")]
 impl Vm {
-    /// The host's types, as BTF, for CO-RE. Linking takes the same lock, so drop the guard before linking.
+    /// Run `f` on the host's types, as BTF, for CO-RE; returns what `f` returns. Linking reads the same types, so `f`
+    /// must not link or load ELF files through this VM.
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```
     /// #[repr(C)]
     /// struct Event {
     ///     timestamp: u64,
     ///     pid: u32,
     /// }
     ///
-    /// rvm::host_struct!(vm.types(), Event as "event" { timestamp, pid });
+    /// let vm = rvm::Vm::new();
+    /// vm.with_types(|types| rvm::host_struct!(types, Event as "event" { timestamp, pid }));
     /// ```
-    pub fn types(&self) -> std::sync::MutexGuard<'_, BtfBuilder> {
-        lock(&self.types)
+    pub fn with_types<R>(&self, f: impl FnOnce(&mut HostTypes) -> R) -> R {
+        f(&mut lock(&self.types))
     }
 
-    /// Parse a module from ELF bytes, for [`Vm::link`] or [`Vm::prepare_modules`].
-    pub fn parse_module(&self, name: &str, elf_bytes: &[u8]) -> Result<Module> {
-        Module::from_elf(name, elf_bytes)
-    }
-
-    /// Link one ELF file into an image, to load later with [`Vm::load_image`].
+    /// Link one ELF file into an image, to load later with [`Vm::load`] or, written out, [`Vm::load_image`].
     ///
     /// Externs and helper IDs must be registered here as they will be in the loading VM, so the link checks signatures
-    /// and fails on unknown names early; CO-RE resolves against [`Vm::types`].
+    /// and fails on unknown names early; CO-RE resolves against the types from [`Vm::with_types`].
     pub fn prepare(&self, elf_bytes: &[u8]) -> Result<Image> {
-        let module = self.parse_module("main", elf_bytes)?;
+        let module = Module::from_elf("main", elf_bytes)?;
         self.prepare_modules(&[&module])
     }
 
     /// Link modules into one image, resolving symbols between them.
     pub fn prepare_modules(&self, modules: &[&Module]) -> Result<Image> {
-        linker::link(&self.helpers.read(), &self.types(), modules)
+        linker::link(&self.helpers.read(), &lock(&self.types), modules)
     }
 
     /// Link modules into an executable program: [`Vm::prepare_modules`], then load.
@@ -281,17 +292,12 @@ impl Vm {
     /// # Example
     ///
     /// ```ignore
-    /// let utils = vm.parse_module("utils", &utils_elf)?;
-    /// let main = vm.parse_module("main", &main_elf)?;
+    /// let utils = Module::from_elf("utils", &utils_elf)?;
+    /// let main = Module::from_elf("main", &main_elf)?;
     /// let program = vm.link(&[&utils, &main])?;
     /// ```
     pub fn link(&self, modules: &[&Module]) -> Result<Program> {
         self.load(self.prepare_modules(modules)?)
-    }
-
-    /// Link a single module into a program.
-    pub fn link_one(&self, module: &Module) -> Result<Program> {
-        self.link(&[module])
     }
 
     /// Parse and link a single ELF file into a program.
@@ -308,8 +314,8 @@ impl Vm {
 
     /// Load an ELF file as a plugin that other programs can call into.
     pub fn load_plugin(&self, name: &str, elf_bytes: &[u8]) -> Result<Plugin> {
-        let module = self.parse_module(name, elf_bytes)?;
-        Ok(Plugin::new(name, self.link_one(&module)?))
+        let module = Module::from_elf(name, elf_bytes)?;
+        Ok(Plugin::new(name, self.link(&[&module])?))
     }
 }
 

@@ -22,7 +22,7 @@ use std::error::Error;
 use std::mem::{offset_of, size_of};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use rvm::{MapError, MemoryError, Perms, Plugin, Scalar, SharedRegion, Vm};
+use rvm::{MemoryError, Perms, Plugin, Scalar, SharedRegion, Vm};
 
 const RULES: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/examples/game_rules.o"));
 const RULES_V2: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/examples/game_rules_v2.o"));
@@ -60,7 +60,7 @@ const HEROES: [(&str, Stats); 2] = [
 fn main() -> Result<(), Box<dyn Error>> {
     let vm = Vm::new();
     // CO-RE patches the plugins' accesses to `struct entity` to match `Entity`
-    rvm::host_struct!(vm.types(), Entity as "entity" { id, hp, armor, kind, x, y, attack });
+    vm.with_types(|types| rvm::host_struct!(types, Entity as "entity" { id, hp, armor, kind, x, y, attack }));
     // SAFETY: plugins only run on this thread.
     unsafe {
         vm.share_map("scores", false);
@@ -78,7 +78,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // A game would prepare the image when it installs the mod; this links the plugin against the host's externs and
     // entity layout.
     let combat_image = vm.prepare(COMBAT)?.to_bytes();
-    let combat = vm.load_plugin_image("combat", &combat_image)?;
+    let combat = Plugin::new("combat", vm.load_image(&combat_image)?);
 
     run(&vm, &world, &rules, &combat)?;
     print_summary(&world, &rules)
@@ -121,8 +121,8 @@ fn register_host_fns(vm: &Vm, world: &Arc<World>) {
 
 /// Runs the game, swapping in the second version of the rules at `RELOAD_AT`.
 fn run(vm: &Vm, world: &World, rules: &Plugin, combat: &Plugin) -> rvm::Result<()> {
-    // a named function follows the rules into the program that replaces them
-    let rules_tick = rules.named_func("on_tick")?;
+    // a plugin function follows the rules into the program that replaces them
+    let rules_tick = rules.func("on_tick")?;
     let combat_tick = combat.func("on_tick")?;
 
     for tick in 0..TICKS {
@@ -133,7 +133,7 @@ fn run(vm: &Vm, world: &World, rules: &Plugin, combat: &Plugin) -> rvm::Result<(
         }
 
         rules_tick.call(&[tick.into()])?;
-        combat.call_func(combat_tick, &[world.base(), world.len() as u64])?;
+        combat_tick.call(&[world.base(), world.len() as u64])?;
         world.remove_dead();
     }
     Ok(())
@@ -144,21 +144,18 @@ fn print_summary(world: &World, rules: &Plugin) -> Result<(), Box<dyn Error>> {
     let alive = world.entities();
 
     // `struct wave_state` and `struct score` are two `u64`s each
-    let waves = rules.map("waves").ok_or("rules has no waves map")?;
-    let [wave, spawned]: [u64; 2] = waves.get_as(0u32)?;
+    let waves = rules.map("waves")?;
+    let [wave, spawned]: [u64; 2] = waves.get_as(0u32)?.ok_or("no wave state")?;
     let monsters: Vec<_> = alive.iter().filter(|e| e.kind != HERO).collect();
     let oldest = monsters.iter().map(|e| e.spawned_at).min().unwrap_or(TICKS);
     let left = monsters.len();
     println!("{wave} waves, {spawned} monsters spawned, {left} left (oldest from tick {oldest})");
 
-    let scores = rules.map("scores").ok_or("rules has no scores map")?;
+    let scores = rules.map("scores")?;
     for (i, (name, _)) in HEROES.iter().enumerate() {
         let id = i as u32 + 1;
         let hp = alive.iter().find(|e| e.id == id).map_or(0, |e| e.hp);
-        let [points, kills]: [u64; 2] = match scores.get_as(id) {
-            Err(MapError::NotFound) => [0, 0],
-            score => score?,
-        };
+        let [points, kills]: [u64; 2] = scores.get_as(id)?.unwrap_or_default();
         println!("{name}: {hp} hp, {points} points, {kills} kills");
     }
     Ok(())

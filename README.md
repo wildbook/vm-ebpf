@@ -12,7 +12,7 @@ cargo run --bin emu                            # runs the same object, prepared 
 cargo run -p rvm --example modding             # game mods as plugins: CO-RE, exports, borrows, shared maps, hot reload
 cargo run -p rvm --example msgpack_logs        # streams MessagePack logs through a parser plugin into maps
 cargo run -p rvm --example core_reloc          # one object against two struct layouts
-cargo run -p rvm --example hello               # hand-assembled bytecode on a bare Executor
+cargo run -p rvm --example hello               # hand-assembled bytecode loaded as an Image, no ELF
 ```
 
 The eBPF objects under `bpf/` (`examples/`, `bench/`, `tests/`) are checked in. The CMake project rebuilds them with
@@ -42,7 +42,7 @@ cmake -S . -B build -G Ninja && cmake --build build
 rvm's features:
 
 - `link` (default): ELF parsing, BTF, CO-RE and the linker (`Module`,
-  `BtfBuilder`, `Vm::types`, `Vm::prepare`, `Vm::load_elf`, `Vm::load_plugin`).
+  `HostTypes`, `Vm::with_types`, `Vm::prepare`, `Vm::load_elf`, `Vm::load_plugin`).
   Without it, rvm loads prepared images only.
 - `fuel` (default): enforces `VmConfig::instruction_limit`. Without it the field
   doesn't exist and the interpreter doesn't count instructions.
@@ -95,7 +95,7 @@ adds `trace_printk` (6), passing each line to `sink`.
 
 ## Linking
 
-`load_elf` parses and links one object. For several, call `Vm::parse_module` for
+`load_elf` parses and links one object. For several, call `Module::from_elf` for
 each and `Vm::link` with the set. The linker places code and data sections,
 resolves relocations between modules, and applies CO-RE relocations; loading
 binds each call to a numeric helper or named extern. Linking fails if a named
@@ -111,23 +111,25 @@ has that ID.
 
 Field accesses compiled with `preserve_access_index` carry CO-RE relocations,
 which the linker patches to the host's struct layouts as kernel CO-RE does
-against kernel BTF. The host describes its layouts with `Vm::types()`, a
-`BtfBuilder`, or derives one from a `#[repr(C)]` struct:
+against kernel BTF. The host describes its layouts in `Vm::with_types`, whose
+`HostTypes` is a `BtfBuilder`, or derives one from a `#[repr(C)]` struct; a Rust
+type is described once however often it is added:
 
 ```rust
-rvm::host_struct!(vm.types(), Entity as "entity" { id, hp, pos as "position" });
+vm.with_types(|types| rvm::host_struct!(types, Entity as "entity" { id, hp, pos as "position" }));
 ```
 
 ## Prepared images
 
 `Vm::prepare(&elf)` (or `Vm::prepare_modules`) links ahead of time and returns an
 `rvm::Image`: the final code, initial data, map declarations, exports and the
-calls to bind. `Image::to_bytes` serializes it, and `Vm::load_image(&bytes)` or
-`Vm::load_plugin_image(name, &bytes)` loads it into any VM that registers the
-same externs and helper IDs. An image loads only into the rvm version that wrote
-it. Loading checks every length, index and map definition, so images may come
-from untrusted files. A host that ships images can build rvm without `link`, as
-`bin/emu` does.
+calls to bind. `Image::to_bytes` serializes it, and `Vm::load_image(&bytes)`
+loads it into any VM that registers the same externs and helper IDs. An image
+loads only into the rvm version that wrote it. Loading checks every length,
+index and map definition, so images may come from untrusted files. `Vm::load`
+takes an `Image` directly, including one built by hand around raw bytecode,
+whose `call <id>` instructions reach the helpers registered under those IDs. A
+host that ships images can build rvm without `link`, as `bin/emu` does.
 
 ## Plugins
 
@@ -135,12 +137,12 @@ from untrusted files. A host that ships images can build rvm without `link`, as
 publishes its function `f` as a named extern for programs linked afterwards. The
 call runs in the exporting plugin with its own memory and maps, so plain
 pointers mean nothing on the other side. `Plugin::replace` swaps in a new build,
-which importers use from their next call. A `Func` from `Plugin::func` fails
-after a replace; `Plugin::named_func` looks the function up again in the new
-build. A plugin runs one call at a time: calling into it, or replacing it, while
-a call runs fails with `VmError::PluginBusy` instead of blocking. When the call
-comes through another plugin's import, the importer's caller gets
-`HelperError::Plugin`, which names the export and wraps the inner `VmError`.
+which importers use from their next call. `Plugin::func` returns a handle that
+looks the function up again in the new build. A plugin runs one call at a time:
+calling into it, or replacing it, while a call runs fails with
+`VmError::PluginBusy` instead of blocking. When the call comes through another
+plugin's import, the importer's caller gets `HelperError::Plugin`, which names
+the export and wraps the inner `VmError`.
 
 An export can borrow a buffer from its caller for one call by tagging the
 pointer parameter with the index of its length parameter:
@@ -173,9 +175,11 @@ region slots, each with its own byte range and permissions:
 | `SHARED_MAPS_FIRST_REGION` (32) to 63 | shared maps, one region each | RW |
 | `CODE_REGION` (64) | code addresses, never mapped | - |
 
-The host maps its own regions with `VmMemory::map` (zeroed) or
-`VmMemory::map_bytes` (initialized from a slice). The unsafe `VmMemory::map_host`
-maps existing host memory, which must outlive the mapping.
+The host maps its own regions, `FIRST_FREE_REGION` up to `BORROW_FIRST_REGION`,
+with `VmMemory::map` (zeroed) or `VmMemory::map_bytes` (initialized from a
+slice); the others belong to the program and the runtime, and mapping or
+unmapping them fails. The unsafe `VmMemory::map_host` maps existing host memory,
+which must outlive the mapping.
 
 `Vm::share_region(region, len, perms)` maps one buffer at the same region in
 every program linked afterwards, so plugins can pass plain pointers into it.
@@ -183,7 +187,8 @@ The host accesses it through the returned `SharedRegion`: `read_bytes`,
 `write_bytes`, `read` and `write` copy, and `atomic_u32`/`atomic_u64` are real
 atomics. The call is unsafe: guests on different threads may only touch the
 same values with atomics, and against them host copies count as plain loads
-and stores.
+and stores. `VmMemory::bytes` and `bytes_mut` refuse shared regions, since other
+programs may write them during the borrow; `VmMemory::read_bytes` copies instead.
 
 ## Maps
 
@@ -195,10 +200,10 @@ their own region for a shared map, so a looked up pointer is an ordinary guest
 address.
 
 The host reaches a map through `Program::map(name)`, as bytes (`get`, `update`,
-`delete`) or as `Pod` types (`get_as`, `update_as`). `MapRef::entries` iterates
-without allocating: every element of an array map, or the present keys of a
-hash map. For a shared hash map it holds the key index read-locked until
-dropped.
+`delete`) or as `Pod` types (`get_as`, `update_as`). `get` borrows the value
+and refuses shared maps; `get_as` copies. `MapRef::entries` iterates without
+allocating: every element of an array map, or the present keys of a hash map.
+For a shared hash map it holds the key index read-locked until dropped.
 
 `Vm::share_map(name, pad_values)` makes maps of that name one instance across
 every program linked afterwards, at the same guest address in each. The first

@@ -1,9 +1,9 @@
-//! Runs hand-assembled bytecode directly on an `Executor`, without a `Vm`.
+//! Runs hand-assembled bytecode, loaded as an `Image` without ELF or linker.
 //!
 //! Run with: cargo run -p rvm --example hello
 
 use ebpf_asm::{Assembler, R0, R1};
-use rvm::{Perms, VmMemory};
+use rvm::{FunctionInfo, Image, Vm};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // r0 = r1 + 10
@@ -12,16 +12,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     asm.add64_imm(R0, 10);
     asm.exit();
 
-    let bytes = asm.assemble()?;
-    let code = rvm::instructions_from_bytes(&bytes);
-
-    // Code stays outside guest memory, so only the stack is mapped.
-    let mut memory = VmMemory::new();
-    let stack_top = memory.map(rvm::STACK_REGION, 512, Perms::RW) + 512;
-
-    let helpers = rvm::HelperRegistry::new();
-    let mut executor = rvm::Executor::new(&code, &mut memory, &helpers, stack_top);
-    let result = executor.call(0, &[32])?;
+    let code = asm.assemble()?;
+    let main = FunctionInfo {
+        pc: 0,
+        size: code.len() as u64,
+        borrows: Vec::new(),
+    };
+    let image = Image {
+        code,
+        functions: vec![("main".into(), main)],
+        ..Image::default()
+    };
+    let mut program = Vm::new().load(image)?;
+    let result = program.call("main", &[32])?;
 
     println!("32 + 10 = {result}");
     if result != 42 {

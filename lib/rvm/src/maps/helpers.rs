@@ -22,13 +22,13 @@ pub const EINVAL: i64 = 22;
 pub fn register_helpers(helpers: &mut HelperRegistry) {
     // one closure type per helper, so each slot calls its body directly
     if helpers.slot_of_id(BPF_FUNC_MAP_LOOKUP_ELEM).is_none() {
-        helpers.register_with_ctx(BPF_FUNC_MAP_LOOKUP_ELEM, |ctx: &mut HelperContext| lookup_elem(ctx));
+        helpers.register_helper_raw(BPF_FUNC_MAP_LOOKUP_ELEM, |ctx: &mut HelperContext| lookup_elem(ctx));
     }
     if helpers.slot_of_id(BPF_FUNC_MAP_UPDATE_ELEM).is_none() {
-        helpers.register_with_ctx(BPF_FUNC_MAP_UPDATE_ELEM, |ctx: &mut HelperContext| update_elem(ctx));
+        helpers.register_helper_raw(BPF_FUNC_MAP_UPDATE_ELEM, |ctx: &mut HelperContext| update_elem(ctx));
     }
     if helpers.slot_of_id(BPF_FUNC_MAP_DELETE_ELEM).is_none() {
-        helpers.register_with_ctx(BPF_FUNC_MAP_DELETE_ELEM, |ctx: &mut HelperContext| delete_elem(ctx));
+        helpers.register_helper_raw(BPF_FUNC_MAP_DELETE_ELEM, |ctx: &mut HelperContext| delete_elem(ctx));
     }
 }
 
@@ -87,10 +87,7 @@ fn delete_elem(ctx: &mut HelperContext) -> i64 {
     };
     match maps.remove(handle, key) {
         Ok(addr) => {
-            ctx.memory
-                .bytes_mut(addr, value_size)
-                .expect("map slots are mapped")
-                .fill(0);
+            ctx.memory.zero(addr, value_size).expect("map slots are mapped");
             0
         }
         Err(e) => -e.errno(),

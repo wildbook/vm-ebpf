@@ -40,8 +40,7 @@ fn run_against(layout: &[Field]) -> Result<(), Box<dyn Error>> {
     let vm = Vm::new();
     let size = layout.iter().map(|&(_, size, _)| size).sum();
     let mut fields = Vec::new();
-    {
-        let mut types = vm.types();
+    vm.with_types(|types| {
         let u32_t = types.int("__u32", 4, false);
         let u64_t = types.int("__u64", 8, false);
         let event = types.add_struct("event", size);
@@ -53,11 +52,11 @@ fn run_against(layout: &[Field]) -> Result<(), Box<dyn Error>> {
             fields.push((offset, size, value));
             offset += size;
         }
-    }
+    });
 
     let mut program = vm.load_elf(OBJECT)?;
     let mem = program.memory_mut();
-    let event_ptr = mem.map(rvm::FIRST_FREE_REGION, size as usize, Perms::RW);
+    let event_ptr = mem.map(rvm::FIRST_FREE_REGION, size as usize, Perms::RW)?;
     for &(offset, size, value) in &fields {
         let addr = event_ptr + u64::from(offset);
         match size {

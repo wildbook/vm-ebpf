@@ -34,7 +34,7 @@ pub fn helper_name(id: u32) -> Option<&'static str> {
 pub fn register_time(helpers: &mut HelperRegistry) {
     static START: LazyLock<Instant> = LazyLock::new(Instant::now);
     let start = *START;
-    helpers.register(BPF_FUNC_KTIME_GET_NS, move |_: ()| start.elapsed().as_nanos() as u64);
+    helpers.register_helper(BPF_FUNC_KTIME_GET_NS, move |_: ()| start.elapsed().as_nanos() as u64);
 }
 
 /// Register `get_prandom_u32`: a per-thread xorshift generator with a random seed. Not cryptographically secure, like
@@ -44,7 +44,7 @@ pub fn register_random(helpers: &mut HelperRegistry) {
         // foldhash seeds from address-space layout, so this needs no OS randomness
         static STATE: Cell<u64> = Cell::new(foldhash::fast::RandomState::default().hash_one(0u64) | 1);
     }
-    helpers.register(BPF_FUNC_GET_PRANDOM_U32, |_: ()| {
+    helpers.register_helper(BPF_FUNC_GET_PRANDOM_U32, |_: ()| {
         STATE.with(|state| {
             let mut x = state.get();
             x ^= x << 13;
@@ -62,7 +62,7 @@ pub fn register_random(helpers: &mut HelperRegistry) {
 /// arguments. Returns the formatted length, or -EINVAL if the format string isn't readable. The format string and `%s`
 /// arguments are read with the guest's permissions.
 pub fn register_print(helpers: &mut HelperRegistry, sink: impl Fn(&str) + Send + Sync + 'static) {
-    helpers.register_with_ctx(BPF_FUNC_TRACE_PRINTK, move |ctx: &mut HelperContext| -> i64 {
+    helpers.register_helper_raw(BPF_FUNC_TRACE_PRINTK, move |ctx: &mut HelperContext| -> i64 {
         const EINVAL: i64 = 22;
         let mem = GuestMemory::new(ctx.memory);
         let Ok(fmt) = mem.read_vec(ctx.args.r1, ctx.args.r2 as usize) else {

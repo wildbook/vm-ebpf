@@ -80,14 +80,16 @@ fn function_pointers_and_jump_tables() {
 #[test]
 fn core_relocations_follow_host_layout() {
     let vm = Vm::new();
-    let u64_t = vm.types().int("u64", 8, false);
-    let u32_t = vm.types().int("u32", 4, false);
-    let event_ty = vm.types().add_struct("event", 16);
-    vm.types().member(event_ty, "timestamp", 0, u64_t);
-    vm.types().member(event_ty, "pid", 12, u32_t);
+    vm.with_types(|types| {
+        let u64_t = types.int("u64", 8, false);
+        let u32_t = types.int("u32", 4, false);
+        let event_ty = types.add_struct("event", 16);
+        types.member(event_ty, "timestamp", 0, u64_t);
+        types.member(event_ty, "pid", 12, u32_t);
+    });
     let mut program = vm.load_elf(&object("tests/core_guard.o")).unwrap();
 
-    let event = program.memory_mut().map(FIRST_FREE_REGION, 16, Perms::R);
+    let event = program.memory_mut().map(FIRST_FREE_REGION, 16, Perms::R).unwrap();
     program.memory_mut().write::<u32>(event + 12, 77).unwrap();
 
     assert_eq!(program.call("read_pid", &[event]).unwrap(), 77);
@@ -102,11 +104,11 @@ fn core_relocations_follow_host_layout() {
 fn core_relocations_follow_appended_host_btf() {
     let host_module = rvm::Module::from_elf("host_event", &object("tests/host_event.o")).unwrap();
     let vm = Vm::new();
-    vm.types().append_btf(host_module.btf_data.as_ref().unwrap()).unwrap();
+    vm.with_types(|types| types.append_btf(host_module.btf_data.as_ref().unwrap()).unwrap());
     let mut program = vm.load_elf(&object("tests/core_guard.o")).unwrap();
 
     // Host layout: flags(0), pid(4), timestamp(8); every field present, reordered.
-    let event = program.memory_mut().map(FIRST_FREE_REGION, 16, Perms::R);
+    let event = program.memory_mut().map(FIRST_FREE_REGION, 16, Perms::R).unwrap();
     program.memory_mut().write::<u32>(event, 0xABCD).unwrap(); // flags
     program.memory_mut().write::<u32>(event + 4, 77).unwrap(); // pid
 
@@ -121,16 +123,18 @@ fn core_relocations_follow_appended_host_btf() {
 #[test]
 fn core_relocations_read_signed_bitfield() {
     let vm = Vm::new();
-    let u32_t = vm.types().int("unsigned int", 4, false);
-    let i32_t = vm.types().int("int", 4, true);
-    let bits = vm.types().add_struct("bits", 4);
-    vm.types().bitfield_member(bits, "reserved", 0, 20, u32_t);
-    vm.types().bitfield_member(bits, "b", 20, 12, i32_t);
+    vm.with_types(|types| {
+        let u32_t = types.int("unsigned int", 4, false);
+        let i32_t = types.int("int", 4, true);
+        let bits = types.add_struct("bits", 4);
+        types.bitfield_member(bits, "reserved", 0, 20, u32_t);
+        types.bitfield_member(bits, "b", 20, 12, i32_t);
+    });
     let mut program = vm.load_elf(&object("tests/core_bitfield.o")).unwrap();
 
     // b = -5 (12-bit two's complement) at bit 20, with arbitrary bits below it.
     let word: u32 = (0xABCDE) | (0xFFBu32 << 20);
-    let ptr = program.memory_mut().map(FIRST_FREE_REGION, 4, Perms::R);
+    let ptr = program.memory_mut().map(FIRST_FREE_REGION, 4, Perms::R).unwrap();
     program.memory_mut().write::<u32>(ptr, word).unwrap();
 
     assert_eq!(program.call("read_b", &[ptr]).unwrap(), -5i64 as u64);
@@ -150,8 +154,8 @@ fn test_maps() {
     assert_eq!(program.call("count", &[5]).unwrap(), 2);
     assert_eq!(program.call("count", &[2]).unwrap(), 1);
     let counters = program.map("counters").unwrap();
-    assert_eq!(counters.get(&1u32.to_le_bytes()), Some(&2u64.to_le_bytes()[..]));
-    assert_eq!(counters.get(&4u32.to_le_bytes()), None); // out of range
+    assert_eq!(counters.get(&1u32.to_le_bytes()), Ok(Some(&2u64.to_le_bytes()[..])));
+    assert_eq!(counters.get(&4u32.to_le_bytes()), Ok(None)); // out of range
 
     // Hash: NOEXIST inserts, capacity is 2, delete frees a slot.
     assert_eq!(program.call("remember", &[7]).unwrap(), 0);
@@ -165,7 +169,7 @@ fn test_maps() {
 
     // The host sees and edits the same values.
     let mut seen = program.map("seen").unwrap();
-    assert_eq!(seen.get(&8u64.to_le_bytes()), Some(&80u64.to_le_bytes()[..]));
+    assert_eq!(seen.get(&8u64.to_le_bytes()), Ok(Some(&80u64.to_le_bytes()[..])));
     seen.update(&9u64.to_le_bytes(), &99u64.to_le_bytes(), rvm::BPF_ANY)
         .unwrap();
     assert_eq!(program.call("recall", &[9]).unwrap(), 99);

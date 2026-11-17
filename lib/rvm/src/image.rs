@@ -284,13 +284,13 @@ pub fn load(
     let (maps, maps_len) = Maps::new(maps, shared_maps)?;
 
     let mut memory = VmMemory::new();
-    memory.map(STACK_REGION, stack_len as usize, Perms::RW);
-    memory.map_bytes(RODATA_REGION, &rodata, rodata_len, Perms::R);
-    memory.map_bytes(DATA_REGION, &data, data_len, Perms::RW);
+    let stack_top = memory.map_any(STACK_REGION, stack_len as usize, Perms::RW) + stack_len;
+    memory.map_bytes_any(RODATA_REGION, &rodata, rodata_len, Perms::R);
+    memory.map_bytes_any(DATA_REGION, &data, data_len, Perms::RW);
     if maps_len != 0 {
-        memory.map(MAPS_REGION, maps_len, Perms::RW);
+        memory.map_any(MAPS_REGION, maps_len, Perms::RW);
     }
-    // SAFETY: the callers of `Vm::share_map`/`Vm::share_region` accepted the `map_shared` contract.
+    // SAFETY: the callers of `Vm::share_map`/`Vm::share_region` accepted the `Vm::share_region` contract.
     unsafe {
         for shared in maps.shared() {
             memory.map_shared(shared.region, shared.storage.clone(), Perms::RW);
@@ -301,7 +301,8 @@ pub fn load(
     }
 
     let code = instructions_from_bytes(&code);
-    Ok(Program::new(code, memory, maps, functions, helpers.clone(), (table, version), config))
+    let helpers = (helpers.clone(), table, version);
+    Ok(Program::new(code, memory, stack_top, maps, functions, helpers, config))
 }
 
 /// Turn a call instruction into a call to extern-table `slot`.

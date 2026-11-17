@@ -11,9 +11,8 @@ use rvm_core::Code;
 use crate::error::{Result, VmError};
 use crate::executor::Executor;
 use crate::helper::{HelperRegistry, SharedHelpers};
-use crate::layout::STACK_REGION;
 use crate::maps::{MapRef, Maps};
-use crate::memory::{region_base, VmMemory};
+use crate::memory::VmMemory;
 use crate::vm::VmConfig;
 
 /// Information about an executable function.
@@ -98,17 +97,17 @@ pub struct Program {
 }
 
 impl Program {
+    /// `helpers` is the VM's extern table, the copy of it the image was bound against, and that copy's version.
     pub(crate) fn new(
         code: Code,
         memory: VmMemory,
+        stack_top: u64,
         maps: Maps,
         functions: HashMap<String, FunctionInfo>,
-        shared_helpers: Arc<SharedHelpers>,
-        helpers: (HelperRegistry, u64),
+        helpers: (Arc<SharedHelpers>, HelperRegistry, u64),
         config: &VmConfig,
     ) -> Self {
-        let stack_top = region_base(STACK_REGION) + memory.region_len(STACK_REGION) as u64;
-        let (helpers, helpers_version) = helpers;
+        let (shared_helpers, helpers, helpers_version) = helpers;
         Self {
             id: NEXT_PROGRAM_ID.fetch_add(1, Ordering::Relaxed),
             code,
@@ -135,25 +134,23 @@ impl Program {
         &mut self.memory
     }
 
-    /// Host access to the map called `name`.
-    pub fn map(&mut self, name: &str) -> Option<MapRef<'_>> {
-        let handle = self.maps.handle(name)?;
-        Some(MapRef::new(&mut self.maps, &mut self.memory, handle))
+    /// Host access to the map called `name`. Fails with [`VmError::MapNotFound`] if the program has none.
+    pub fn map(&mut self, name: &str) -> Result<MapRef<'_>> {
+        let handle = self
+            .maps
+            .handle(name)
+            .ok_or_else(|| VmError::MapNotFound(name.to_string()))?;
+        Ok(MapRef::new(&mut self.maps, &mut self.memory, handle))
     }
 
-    /// Get the function table.
-    pub fn functions(&self) -> &HashMap<String, FunctionInfo> {
-        &self.functions
+    /// The exported functions, in no particular order.
+    pub fn functions(&self) -> impl ExactSizeIterator<Item = (&str, &FunctionInfo)> {
+        self.functions.iter().map(|(name, info)| (name.as_str(), info))
     }
 
     /// Get information about a function by name.
     pub fn function(&self, name: &str) -> Option<&FunctionInfo> {
         self.functions.get(name)
-    }
-
-    /// Get the stack top address.
-    pub fn stack_top(&self) -> u64 {
-        self.stack_top
     }
 
     /// Call a function by name; arguments go in r1-r5.
@@ -201,7 +198,9 @@ impl Program {
         self.call_pc(func.pc, args)
     }
 
-    #[inline]
+    // Out of line: the executor and interpreter compile once, in this crate, behind one call. Inlined into the
+    // embedder's crate, this either calls the executor separately or compiles another copy of the interpreter, which
+    // measured slower.
     fn call_pc(&mut self, pc: u64, args: &[u64]) -> Result<u64> {
         if self.shared_helpers.version() != self.helpers_version {
             self.refresh_helpers();

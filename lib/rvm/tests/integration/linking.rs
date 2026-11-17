@@ -1,6 +1,6 @@
 //! Cross-module linking: externs, numeric helpers, and hot-reloading a helper.
 
-use rvm::{LinkError, Vm, VmError};
+use rvm::{LinkError, Module, Vm, VmError};
 
 use crate::common::object;
 
@@ -13,8 +13,8 @@ fn full_vm() -> Vm {
 }
 
 fn link(vm: &Vm) -> rvm::Result<rvm::Program> {
-    let main = vm.parse_module("main", &object("tests/link_main.o"))?;
-    let lib = vm.parse_module("lib", &object("tests/link_lib.o"))?;
+    let main = Module::from_elf("main", &object("tests/link_main.o"))?;
+    let lib = Module::from_elf("lib", &object("tests/link_lib.o"))?;
     vm.link(&[&main, &lib])
 }
 
@@ -80,8 +80,8 @@ fn replacing_extern_rebinds_linked_calls() {
 #[test]
 fn global_named_like_a_map_is_data() {
     let vm = Vm::new();
-    let counter = vm.parse_module("counter", &object("tests/shared_counter.o")).unwrap();
-    let global = vm.parse_module("global", &object("tests/global_hits.o")).unwrap();
+    let counter = Module::from_elf("counter", &object("tests/shared_counter.o")).unwrap();
+    let global = Module::from_elf("global", &object("tests/global_hits.o")).unwrap();
     let mut program = vm.link(&[&counter, &global]).unwrap();
     assert_eq!(program.call("get", &[]).unwrap(), 5);
     assert_eq!(program.call("bump", &[]).unwrap(), 1);

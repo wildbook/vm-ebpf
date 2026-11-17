@@ -21,7 +21,7 @@ use hashbrown::{hash_table, HashMap};
 
 use crate::error::{LinkError, Result};
 use crate::layout::MAPS_REGION;
-use crate::memory::{region_base, Pod, VmMemory, MAX_REGION_LEN};
+use crate::memory::{region_base, Perms, Pod, VmMemory, MAX_REGION_LEN};
 use crate::sync::{read, write};
 
 #[cfg(feature = "link")]
@@ -74,6 +74,8 @@ pub enum MapError {
     Full,
     /// Bad key or value size, unknown flags, or delete on an array map (`EINVAL`).
     Invalid,
+    /// A borrow of a value in a shared map, which other programs may change meanwhile; [`MapRef::get_as`] copies it.
+    Shared,
 }
 
 impl MapError {
@@ -82,7 +84,7 @@ impl MapError {
             Self::NotFound => helpers::ENOENT,
             Self::Exists => helpers::EEXIST,
             Self::Full => helpers::E2BIG,
-            Self::Invalid => helpers::EINVAL,
+            Self::Invalid | Self::Shared => helpers::EINVAL,
         }
     }
 }
@@ -94,6 +96,7 @@ impl std::fmt::Display for MapError {
             Self::Exists => "key already present",
             Self::Full => "map full, or array index out of range",
             Self::Invalid => "wrong key or value size, unknown flags, or delete on an array map",
+            Self::Shared => "values of a shared map can't be borrowed; copy them out with get_as",
         })
     }
 }
@@ -189,6 +192,11 @@ impl Maps {
         self.maps.get(handle as usize).map(|m| &m.def)
     }
 
+    /// Whether the map with `handle` is shared with other programs.
+    fn is_shared(&self, handle: u32) -> bool {
+        matches!(self.maps[handle as usize].index, Index::Shared(_))
+    }
+
     /// Guest address of the value for `key`, if present.
     #[inline]
     pub fn lookup(&self, handle: u32, key: &[u8]) -> Option<u64> {
@@ -226,13 +234,23 @@ impl<'a> MapRef<'a> {
         self.maps.def(self.handle).expect("handle comes from this map set")
     }
 
-    /// The value for `key`, read in place from guest memory.
-    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
-        let addr = self.maps.lookup(self.handle, key)?;
-        self.memory.bytes(addr, self.def().value_size as usize).ok()
+    /// The value for `key`, read in place from guest memory; `Ok(None)` if the key is absent. Fails with
+    /// [`MapError::Shared`] on a shared map, whose values other programs may change during the borrow.
+    pub fn get(&self, key: &[u8]) -> std::result::Result<Option<&[u8]>, MapError> {
+        if self.maps.is_shared(self.handle) {
+            return Err(MapError::Shared);
+        }
+        let Some(addr) = self.maps.lookup(self.handle, key) else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.memory
+                .bytes(addr, self.def().value_size as usize)
+                .expect("map slots are mapped"),
+        ))
     }
 
-    /// Insert or replace the value for `key`; see [`Maps::upsert`] for `flags`.
+    /// Insert or replace the value for `key`; `flags` is [`BPF_ANY`], [`BPF_NOEXIST`] or [`BPF_EXIST`].
     pub fn update(&mut self, key: &[u8], value: &[u8], flags: u64) -> std::result::Result<(), MapError> {
         if self
             .maps
@@ -250,16 +268,18 @@ impl<'a> MapRef<'a> {
     pub fn delete(&mut self, key: &[u8]) -> std::result::Result<(), MapError> {
         let addr = self.maps.remove(self.handle, key)?;
         let len = self.def().value_size as usize;
-        self.memory.bytes_mut(addr, len).expect("map slots are mapped").fill(0);
+        self.memory.zero(addr, len).expect("map slots are mapped");
         Ok(())
     }
 
-    /// The value for `key`, copied out as a `V`. Fails with [`MapError::NotFound`] if the key is absent, and with
-    /// [`MapError::Invalid`] if `K` or `V` differs in size from the map's keys or values.
-    pub fn get_as<K: Pod, V: Pod>(&self, key: K) -> std::result::Result<V, MapError> {
+    /// The value for `key`, copied out as a `V`; `Ok(None)` if the key is absent. Fails with [`MapError::Invalid`] if
+    /// `K` or `V` differs in size from the map's keys or values.
+    pub fn get_as<K: Pod, V: Pod>(&self, key: K) -> std::result::Result<Option<V>, MapError> {
         check_sizes::<K, V>(self.def())?;
-        let value = self.get(key.as_bytes()).ok_or(MapError::NotFound)?;
-        Ok(V::from_bytes(value).expect("value size checked"))
+        let Some(addr) = self.maps.lookup(self.handle, key.as_bytes()) else {
+            return Ok(None);
+        };
+        Ok(Some(self.memory.read_pod(addr).expect("map slots are mapped")))
     }
 
     /// [`MapRef::update`] with the bytes of `key` and `value`.
@@ -379,7 +399,8 @@ impl<'a> Iterator for MapIter<'a> {
             }
         };
         let (addr, len) = (self.map.addr(slot), self.map.def.value_size as usize);
-        let value = self.memory.bytes(addr, len).expect("map slots are mapped");
+        // a value of a shared map is a reference into shared memory, which the `Vm::share_region` contract covers
+        let value = self.memory.slice(addr, len, Perms::NONE).expect("map slots are mapped");
         Some((key, value))
     }
 
@@ -472,7 +493,6 @@ fn check_sizes<K: Pod, V: Pod>(def: &MapDef) -> std::result::Result<(), MapError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::Perms;
 
     #[test]
     fn typed_access_and_iteration() {
@@ -486,11 +506,11 @@ mod tests {
         let defs = vec![def("hash", MapKind::Hash, 8, 8), def("array", MapKind::Array, 4, 16)];
         let (mut maps, len) = Maps::new(defs, &SharedMaps::default()).unwrap();
         let mut memory = VmMemory::new();
-        memory.map(MAPS_REGION, len, Perms::RW);
+        memory.map_any(MAPS_REGION, len, Perms::RW);
 
         let mut hash = MapRef::new(&mut maps, &mut memory, 0);
         assert_eq!(hash.entries().iter().len(), 0);
-        assert_eq!(hash.get_as::<u64, u64>(1), Err(MapError::NotFound));
+        assert_eq!(hash.get_as::<u64, u64>(1), Ok(None));
         assert_eq!(hash.get_as::<u64, u32>(1), Err(MapError::Invalid));
         assert_eq!(hash.get_as::<u32, u64>(1), Err(MapError::Invalid));
         assert_eq!(hash.update_as(1u64, 10u32, BPF_ANY), Err(MapError::Invalid));
@@ -508,7 +528,7 @@ mod tests {
         let mut entries: Vec<(u64, u64)> = hash.entries().iter_as().unwrap().collect();
         entries.sort();
         assert_eq!(entries, [(1, 10), (3, 30), (4, 40)]);
-        assert_eq!(hash.get_as::<u64, u64>(2), Err(MapError::NotFound));
+        assert_eq!(hash.get_as::<u64, u64>(2), Ok(None));
 
         // every array index exists, zeroed until written
         let mut array = MapRef::new(&mut maps, &mut memory, 1);
@@ -516,6 +536,6 @@ mod tests {
         let values: Vec<(u32, [u64; 2])> = array.entries().iter_as().unwrap().collect();
         assert_eq!(values, [(0, [0, 0]), (1, [7, 8]), (2, [0, 0])]);
         assert_eq!(array.entries().iter().nth(1).unwrap().0, MapKey::Index(1));
-        assert_eq!(array.get_as::<u32, [u64; 2]>(3), Err(MapError::NotFound));
+        assert_eq!(array.get_as::<u32, [u64; 2]>(3), Ok(None));
     }
 }

@@ -5,20 +5,38 @@ use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use ebpf_asm::{Assembler, R0, R1, R10, R2, R6};
-use rvm::{Code, Executor, HelperRegistry, Instruction, Perms, VmMemory};
+use rvm::{FunctionInfo, Image, Import, Program, Vm};
 
 const N: i32 = 10_000;
-const STACK: usize = 4096;
 
-fn load(asm: &mut Assembler) -> (Code, VmMemory, u64) {
-    load_bytes(&asm.assemble().unwrap())
-}
+/// Opcode byte of `call`.
+const CALL: u8 = 0x85;
 
-fn load_bytes(bytes: &[u8]) -> (Code, VmMemory, u64) {
-    let code = rvm::instructions_from_bytes(bytes);
-    let mut mem = VmMemory::new();
-    let stack_top = mem.map(rvm::STACK_REGION, STACK, Perms::RW) + STACK as u64;
-    (code, mem, stack_top)
+/// `asm` as the program's `main`; with `slot_calls`, its `call <id>` instructions bind to helper slots at load time,
+/// as linked calls do.
+fn load(vm: &Vm, asm: &mut Assembler, slot_calls: bool) -> Program {
+    let code = asm.assemble().unwrap();
+    let externs = if slot_calls {
+        let (insns, _) = code.as_chunks::<8>();
+        let calls = insns.iter().enumerate().filter(|(_, insn)| insn[0] == CALL);
+        calls
+            .map(|(at, insn)| (at as u32, Import::Helper(u32::from_le_bytes(insn[4..].try_into().unwrap()))))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let main = FunctionInfo {
+        pc: 0,
+        size: code.len() as u64,
+        borrows: Vec::new(),
+    };
+    let image = Image {
+        code,
+        functions: vec![("main".into(), main)],
+        externs,
+        ..Image::default()
+    };
+    vm.load(image).unwrap()
 }
 
 /// r0 += r1 * 3 ^ r1, N times: pure ALU + one conditional branch per iteration.
@@ -61,42 +79,25 @@ fn helper_loop() -> Assembler {
     asm
 }
 
-/// Rewrite `call <id>` into a slot call (`src_reg = 2`), as the linker does.
-fn as_slot_calls(asm: &mut Assembler, helpers: &HelperRegistry) -> (Code, VmMemory, u64) {
-    use rvm_core::opcode::OpCode;
-
-    let mut bytes = asm.assemble().unwrap();
-    for word in bytes.as_chunks_mut::<8>().0 {
-        let insn = Instruction(u64::from_le_bytes(*word));
-        if insn.opcode().0 == 0x85 && insn.src_reg() == 0 {
-            let slot = helpers.slot_of_id(insn.imm() as u32).unwrap();
-            let call = Instruction::from_parts(OpCode(0x85), insn.dst_reg(), 2, insn.offset(), slot as i32);
-            *word = call.0.to_le_bytes();
-        }
-    }
-    load_bytes(&bytes)
-}
-
 fn bench(c: &mut Criterion) {
-    let mut helpers = HelperRegistry::new();
-    helpers.register(1, |x: u64| x);
+    let vm = Vm::with_config(rvm::VmConfig {
+        #[cfg(feature = "fuel")]
+        instruction_limit: 0,
+        ..rvm::VmConfig::default()
+    });
+    vm.register_helper(1, |x: u64| x);
 
     let mut group = c.benchmark_group("exec");
     group.throughput(Throughput::Elements(N as u64));
     let programs = [
-        ("alu_loop", load(&mut alu_loop())),
-        ("mem_loop", load(&mut mem_loop())),
-        ("helper_loop", load(&mut helper_loop())),
-        ("slot_call_loop", as_slot_calls(&mut helper_loop(), &helpers)),
+        ("alu_loop", load(&vm, &mut alu_loop(), false)),
+        ("mem_loop", load(&vm, &mut mem_loop(), false)),
+        ("helper_loop", load(&vm, &mut helper_loop(), false)),
+        ("slot_call_loop", load(&vm, &mut helper_loop(), true)),
     ];
-    for (name, (code, mut mem, stack_top)) in programs {
-        group.bench_function(name, |b| {
-            b.iter(|| {
-                Executor::new(&code, &mut mem, &helpers, stack_top)
-                    .call(0, black_box(&[]))
-                    .unwrap()
-            })
-        });
+    for (name, mut program) in programs {
+        let main = program.func("main").unwrap();
+        group.bench_function(name, |b| b.iter(|| program.call_func(main, black_box(&[])).unwrap()));
     }
     group.finish();
 

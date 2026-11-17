@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let vm = Vm::new();
     let mut parser = vm.load_elf(PARSER)?;
-    let input = parser.memory_mut().map(rvm::FIRST_FREE_REGION, INPUT_LEN, Perms::R);
+    let input = parser.memory_mut().map(rvm::FIRST_FREE_REGION, INPUT_LEN, Perms::R)?;
     let parse = parser.func("parse")?;
 
     let mut pending = Vec::new();
@@ -61,10 +61,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn read_stats(parser: &mut Program) -> Result<Stats, Box<dyn Error>> {
-    let totals = parser.map("totals").ok_or("no totals map")?;
-    let [events, services, skipped_fields, other_records]: [u64; 4] = totals.get_as(0u32)?;
+    let totals = parser.map("totals")?;
+    let [events, services, skipped_fields, other_records]: [u64; 4] = totals.get_as(0u32)?.ok_or("no totals")?;
 
-    let map = parser.map("services").ok_or("no services map")?;
+    let map = parser.map("services")?;
     let entries = map.entries();
     let services = entries.iter_as::<u32, SvcStats>()?.take(services as usize);
     let services = services.map(|(_, s)| s.into()).collect();

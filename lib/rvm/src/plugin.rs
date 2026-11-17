@@ -45,25 +45,14 @@ impl Plugin {
         self.lock()?.call(func, args).map_err(|e| in_plugin(e, &self.name))
     }
 
-    /// Look up `func` for [`Plugin::call_func`]. [`Plugin::replace`] invalidates the handle; [`Plugin::named_func`]
-    /// gives one that follows the replacement.
-    pub fn func(&self, func: &str) -> Result<Func> {
-        self.lock()?.func(func).map_err(|e| in_plugin(e, &self.name))
-    }
-
-    /// Call a function looked up with [`Plugin::func`]; arguments go in r1-r5.
-    pub fn call_func(&self, func: Func, args: &[u64]) -> Result<u64> {
-        self.lock()?.call_func(func, args)
-    }
-
-    /// Look up `func` for repeated calls through [`NamedFunc::call`]. After [`Plugin::replace`], the next call looks
+    /// Look up `func` for repeated calls through [`PluginFunc::call`]. After [`Plugin::replace`], the next call looks
     /// `func` up again in the new program. The handle keeps the plugin alive.
-    pub fn named_func(&self, func: &str) -> Result<NamedFunc> {
-        let slot = FuncSlot::new(self.func(func)?);
-        Ok(NamedFunc {
+    pub fn func(&self, func: &str) -> Result<PluginFunc> {
+        let found = self.lock()?.func(func).map_err(|e| in_plugin(e, &self.name))?;
+        Ok(PluginFunc {
             plugin: self.clone(),
             name: func.into(),
-            func: slot,
+            func: FuncSlot::new(found),
         })
     }
 
@@ -89,7 +78,7 @@ impl Plugin {
     }
 
     /// The extern that calls `func` in this plugin. Fails with [`VmError::FunctionNotFound`] if the plugin lacks it.
-    pub fn export_fn(
+    pub(crate) fn export_fn(
         &self,
         func: &str,
     ) -> Result<impl Fn(&mut HelperContext) -> std::result::Result<u64, HelperError> + Send + Sync + 'static> {
@@ -141,13 +130,15 @@ impl Plugin {
                 let region = BORROW_FIRST_REGION + arg as usize;
                 // SAFETY: the caller is blocked in this call; the regions are unmapped before it returns, or on the
                 // next lock after a panic.
-                unsafe { program.memory_mut().map_host(region, ptr, len, perms) };
+                unsafe { program.memory_mut().map_host_any(region, ptr, len, perms) };
                 args[arg as usize] = region_base(region);
             }
 
             let result = mapped.and_then(|()| program.call_func(target.entry, &args).map_err(failed));
             for borrow in target.borrows() {
-                program.memory_mut().unmap(BORROW_FIRST_REGION + borrow.arg as usize);
+                program
+                    .memory_mut()
+                    .unmap_any(BORROW_FIRST_REGION + borrow.arg as usize);
             }
             result
         })
@@ -202,15 +193,15 @@ impl WeakPlugin {
     }
 }
 
-/// A function of a [`Plugin`] that follows [`Plugin::replace`]; see [`Plugin::named_func`].
+/// A function of a [`Plugin`] that follows [`Plugin::replace`]; see [`Plugin::func`].
 #[derive(Debug)]
-pub struct NamedFunc {
+pub struct PluginFunc {
     plugin: Plugin,
     name: Arc<str>,
     func: FuncSlot,
 }
 
-impl NamedFunc {
+impl PluginFunc {
     /// Call the function in the plugin's current program; arguments go in r1-r5. Fails with
     /// [`VmError::FunctionNotFound`] if that program lacks it.
     pub fn call(&self, args: &[u64]) -> Result<u64> {
@@ -246,7 +237,7 @@ fn try_lock<'a>(program: &'a Mutex<Program>, name: &str) -> Result<MutexGuard<'a
         Err(TryLockError::Poisoned(e)) => {
             let mut guard = e.into_inner();
             for region in BORROW_FIRST_REGION..BORROW_FIRST_REGION + BORROW_REGIONS {
-                guard.memory_mut().unmap(region);
+                guard.memory_mut().unmap_any(region);
             }
             program.clear_poison();
             Ok(guard)

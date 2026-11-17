@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use ebpf_asm::{Assembler, R0, R1, R2};
 use rvm::{
-    instructions_from_bytes, region_base, ExecError, Executor, HelperRegistry, MapError, Perms, Program, Vm, VmError,
-    DATA_REGION, FIRST_FREE_REGION, RODATA_REGION,
+    region_base, ExecError, FunctionInfo, Image, Module, Perms, Program, Vm, VmError, DATA_REGION, FIRST_FREE_REGION,
+    RODATA_REGION,
 };
 
 use crate::common::object;
@@ -15,13 +15,25 @@ fn example() -> Program {
     Vm::new().load_elf(&object("examples/example.o")).unwrap()
 }
 
-/// Run `*(u64 *)r1 = r2; r0 = *(u64 *)r1` against the program's memory.
-fn store_load(program: &mut Program, addr: u64, value: u64) -> rvm::Result<u64> {
+/// A program whose `store_load` runs `*(u64 *)r1 = r2; r0 = *(u64 *)r1`, with 8 bytes of rodata, all 1s, and 8 of data.
+fn store_load() -> Program {
     let mut asm = Assembler::new();
     asm.stxdw(R1, 0, R2).ldxdw(R0, R1, 0).exit();
-    let code = instructions_from_bytes(&asm.assemble().unwrap());
-    let stack_top = program.stack_top();
-    Executor::new(&code, program.memory_mut(), &HelperRegistry::new(), stack_top).call(0, &[addr, value])
+    let code = asm.assemble().unwrap();
+    let info = FunctionInfo {
+        pc: 0,
+        size: code.len() as u64,
+        borrows: Vec::new(),
+    };
+    let image = Image {
+        code,
+        rodata: vec![1; 8],
+        rodata_len: 8,
+        data_len: 8,
+        functions: vec![("store_load".into(), info)],
+        ..Image::default()
+    };
+    Vm::new().load(image).unwrap()
 }
 
 fn is_mem_fault(r: rvm::Result<u64>) -> bool {
@@ -31,15 +43,17 @@ fn is_mem_fault(r: rvm::Result<u64>) -> bool {
 #[test]
 fn rodata_is_read_only_data_is_writable() {
     let vm = Vm::new();
-    let module = vm.parse_module("example", &object("examples/example.o")).unwrap();
+    let module = Module::from_elf("example", &object("examples/example.o")).unwrap();
     let magic = region_base(RODATA_REGION) + module.symbol("MAGIC_VALUE").unwrap().value;
-
-    let mut program = vm.link_one(&module).unwrap();
+    let mut program = vm.link(&[&module]).unwrap();
     assert_eq!(program.memory().read::<u64>(magic).unwrap(), 0xDEAD_BEEF_CAFE_BABE);
-    assert!(is_mem_fault(store_load(&mut program, magic, 0)));
     assert_eq!(program.call("return_magic", &[]).unwrap(), 0xDEAD_BEEF_CAFE_BABE);
 
-    assert_eq!(store_load(&mut program, region_base(DATA_REGION), 77).unwrap(), 77);
+    let mut program = store_load();
+    let rodata = region_base(RODATA_REGION);
+    assert!(is_mem_fault(program.call("store_load", &[rodata, 0])));
+    assert_eq!(program.memory().read::<u64>(rodata).unwrap(), 0x0101_0101_0101_0101);
+    assert_eq!(program.call("store_load", &[region_base(DATA_REGION), 77]).unwrap(), 77);
 }
 
 /// `bpf_main` writes through host-mapped structs; the writes must not land on other code.
@@ -72,14 +86,16 @@ fn bpf_main_globals_do_not_clobber_code() {
     // SAFETY: both structs outlive the mappings (unmapped below) and aren't touched meanwhile.
     let (ctx, out) = unsafe {
         (
-            mem.map_host(FIRST_FREE_REGION, NonNull::from(&input).cast(), size_of::<Input>(), Perms::R),
-            mem.map_host(FIRST_FREE_REGION + 1, NonNull::from(&mut output).cast(), size_of::<Output>(), Perms::RW),
+            mem.map_host(FIRST_FREE_REGION, NonNull::from(&input).cast(), size_of::<Input>(), Perms::R)
+                .unwrap(),
+            mem.map_host(FIRST_FREE_REGION + 1, NonNull::from(&mut output).cast(), size_of::<Output>(), Perms::RW)
+                .unwrap(),
         )
     };
 
     assert_eq!(program.call("bpf_main", &[ctx, out]).unwrap(), 0);
-    program.memory_mut().unmap(FIRST_FREE_REGION);
-    program.memory_mut().unmap(FIRST_FREE_REGION + 1);
+    program.memory_mut().unmap(FIRST_FREE_REGION).unwrap();
+    program.memory_mut().unmap(FIRST_FREE_REGION + 1).unwrap();
     assert_eq!((output.result, output.status), (35, 0));
     assert_eq!(program.call("simple_add", &[2, 3]).unwrap(), 5);
 }
@@ -114,9 +130,9 @@ fn helpers_cannot_read_write_only_memory() {
     assert_eq!(program.call("lookup", &[readable]).unwrap(), 7);
     assert_eq!(program.call("lookup", &[write_only]).unwrap(), u64::MAX);
     assert_eq!(program.call("store", &[write_only]).unwrap(), EINVAL);
-    assert_eq!(program.map("seen").unwrap().get_as::<u64, u64>(0), Err(MapError::NotFound));
+    assert_eq!(program.map("seen").unwrap().get_as::<u64, u64>(0), Ok(None));
     assert_eq!(program.call("store", &[readable]).unwrap(), 0);
-    assert_eq!(program.map("seen").unwrap().get_as::<u64, u64>(0), Ok(key));
+    assert_eq!(program.map("seen").unwrap().get_as::<u64, u64>(0), Ok(Some(key)));
 
     assert_eq!(program.call("print_fmt", &[readable]).unwrap(), 7);
     assert_eq!(program.call("print_fmt", &[write_only]).unwrap(), EINVAL);

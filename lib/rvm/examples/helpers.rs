@@ -3,19 +3,20 @@
 //! Run with: cargo run -p rvm --example helpers
 
 use ebpf_asm::{Assembler, R0, R1, R2};
-use rvm::{HelperRegistry, Perms, VmMemory};
+use rvm::{FunctionInfo, Image, Vm};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut helpers = HelperRegistry::new();
-    helpers.register(1, |x: u64| {
+    // these replace the map helpers, which also use IDs 1 to 3
+    let vm = Vm::new();
+    vm.register_helper(1, |x: u64| {
         println!("  helper_double({x}) called");
         x * 2
     });
-    helpers.register(2, |(a, b): (u64, u64)| {
+    vm.register_helper(2, |(a, b): (u64, u64)| {
         println!("  helper_add({a}, {b}) called");
         a + b
     });
-    helpers.register(3, |_: ()| {
+    vm.register_helper(3, |_: ()| {
         println!("  helper_magic() called");
         0xCAFEBABEu64
     });
@@ -28,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     asm.mov64_imm(R2, 8);
     asm.call(2);
     asm.exit();
-    let result = run(asm, &helpers)?;
+    let result = run(asm, &vm)?;
     println!("Result: {result}");
     if result != 50 {
         return Err(format!("expected 50, got {result}").into());
@@ -37,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut asm = Assembler::new();
     asm.call(3);
     asm.exit();
-    let result = run(asm, &helpers)?;
+    let result = run(asm, &vm)?;
     println!("Result: 0x{result:X}");
     if result != 0xCAFEBABE {
         return Err(format!("expected 0xCAFEBABE, got 0x{result:X}").into());
@@ -45,11 +46,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn run(mut asm: Assembler, helpers: &HelperRegistry) -> Result<u64, Box<dyn std::error::Error>> {
-    let bytes = asm.assemble()?;
-    let code = rvm::instructions_from_bytes(&bytes);
-    let mut memory = VmMemory::new();
-    let stack_top = memory.map(rvm::STACK_REGION, 512, Perms::RW) + 512;
-    let mut executor = rvm::Executor::new(&code, &mut memory, helpers, stack_top);
-    Ok(executor.call(0, &[])?)
+fn run(mut asm: Assembler, vm: &Vm) -> Result<u64, Box<dyn std::error::Error>> {
+    let code = asm.assemble()?;
+    let main = FunctionInfo {
+        pc: 0,
+        size: code.len() as u64,
+        borrows: Vec::new(),
+    };
+    let image = Image {
+        code,
+        functions: vec![("main".into(), main)],
+        ..Image::default()
+    };
+    Ok(vm.load(image)?.call("main", &[])?)
 }

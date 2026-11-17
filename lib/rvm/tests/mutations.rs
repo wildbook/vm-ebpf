@@ -56,7 +56,7 @@ fn mutated_elf_files_load_or_fail() {
     for (fixture, elf) in &fixtures() {
         let regions = elf_regions(elf);
         fuzz.run(fixture, elf, &regions, |bytes| {
-            let Ok(module) = vm.parse_module("main", bytes) else {
+            let Ok(module) = Module::from_elf("main", bytes) else {
                 return Outcome::Rejected;
             };
             if layout_size(&module) > REGION_CAP {
@@ -76,12 +76,14 @@ fn mutated_elf_files_load_or_fail() {
 fn host_vm() -> Vm {
     let vm = Vm::new();
     let host = Module::from_elf("host_event", &fixture("tests/host_event.o")).unwrap();
-    vm.types().append_btf(host.btf_data.as_ref().unwrap()).unwrap();
-    let u32_t = vm.types().int("unsigned int", 4, false);
-    let i32_t = vm.types().int("int", 4, true);
-    let bits = vm.types().add_struct("bits", 4);
-    vm.types().bitfield_member(bits, "reserved", 0, 20, u32_t);
-    vm.types().bitfield_member(bits, "b", 20, 12, i32_t);
+    vm.with_types(|types| {
+        types.append_btf(host.btf_data.as_ref().unwrap()).unwrap();
+        let u32_t = types.int("unsigned int", 4, false);
+        let i32_t = types.int("int", 4, true);
+        let bits = types.add_struct("bits", 4);
+        types.bitfield_member(bits, "reserved", 0, 20, u32_t);
+        types.bitfield_member(bits, "b", 20, 12, i32_t);
+    });
 
     vm.register_helper(100, |x: u64| x * 2);
     vm.register_fn("host_add", |(a, b): (u64, u64)| a + b);

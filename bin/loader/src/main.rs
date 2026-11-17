@@ -1,4 +1,4 @@
-//! Loads `bpf/examples/example.o`, prints what `Vm::parse_module` and `Vm::link_one` produce, and calls its exported
+//! Loads `bpf/examples/example.o`, prints what `Module::from_elf` and `Vm::link` produce, and calls its exported
 //! functions.
 //! Exits with an error when a call fails or returns the wrong value.
 
@@ -15,13 +15,13 @@ fn main() -> Result<()> {
     let vm = Vm::new();
 
     println!("\n=== Parsing ELF ===");
-    let module = vm.parse_module("example", &elf_bytes)?;
+    let module = Module::from_elf("example", &elf_bytes)?;
     print_module_info(&module);
 
     println!("\n=== Linking ===");
-    let mut program = vm.link_one(&module)?;
+    let mut program = vm.link(&[&module])?;
     println!("  Stack region: {} bytes", program.memory().region_len(rvm::STACK_REGION));
-    println!("  Stack top: 0x{:x}", program.stack_top());
+    println!("  Stack top: 0x{:x}", stack_top(&program));
     print_function_table(&program);
 
     println!("\n=== simple_add(100, 200) ===");
@@ -34,7 +34,7 @@ fn main() -> Result<()> {
 
     // `struct input_ctx` and `struct output_result` live in a host-mapped scratch region.
     println!("\n=== bpf_main (op=mul, 10 * 20) ===");
-    let ctx = program.memory_mut().map(rvm::FIRST_FREE_REGION, 4096, Perms::RW);
+    let ctx = program.memory_mut().map(rvm::FIRST_FREE_REGION, 4096, Perms::RW)?;
     let out = ctx + 64;
     let mem = program.memory_mut();
     mem.write(ctx, 10u64)?; // value_a
@@ -94,13 +94,18 @@ fn print_module_info(module: &Module) {
 /// Print the linked program's function table.
 fn print_function_table(program: &Program) {
     println!("\n=== Function table ===");
-    let mut functions: Vec<_> = program.functions().iter().collect();
+    let mut functions: Vec<_> = program.functions().collect();
     functions.sort_by_key(|(_, f)| f.pc);
     for (name, function) in functions {
         let pc = function.pc;
         let size = function.size;
         println!("  {name:20} pc={pc:<6} size={size} bytes");
     }
+}
+
+/// The initial r10: the end of the stack region.
+fn stack_top(program: &Program) -> u64 {
+    rvm::region_base(rvm::STACK_REGION) + program.memory().region_len(rvm::STACK_REGION) as u64
 }
 
 /// Call `name` with `args`, printing the entry point, arguments and result.
@@ -110,7 +115,7 @@ fn run_and_report(program: &mut Program, name: &str, args: &[u64]) -> Result<u64
         let byte_offset = pc * 8;
         println!("Entry PC: {pc} (byte offset: 0x{byte_offset:x})");
     }
-    println!("Stack pointer (r10): 0x{:x}", program.stack_top());
+    println!("Stack pointer (r10): 0x{:x}", stack_top(program));
     for (i, &arg) in args.iter().enumerate() {
         let reg = i + 1;
         println!("Argument r{reg}: 0x{arg:x} ({arg})");
