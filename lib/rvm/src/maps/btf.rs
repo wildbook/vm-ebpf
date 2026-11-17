@@ -90,5 +90,5 @@ fn resolve<'a, 'b>(btf: &'b Btf<'a>, id: u32) -> Option<&'b BtfTypeInfo<'a>> {
 }
 
 fn resolve_size(btf: &Btf<'_>, id: u32) -> Option<u32> {
-    btf.resolve_size(id).map(|s| s as u32)
+    btf.resolve_size(id).and_then(|s| u32::try_from(s).ok())
 }

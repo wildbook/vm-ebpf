@@ -6,7 +6,7 @@
 //! relocation's access string names a path through the local type that gets re-resolved
 //! against whichever matching type the target actually has.
 
-use crate::parse::{word, Btf};
+use crate::parse::{word, Btf, MAX_RESOLVE_DEPTH};
 use crate::raw::{BtfKind, BTF_INT_SIGNED};
 use crate::strings::BtfStrings;
 use crate::types::{BtfTypeInfo, Member};
@@ -212,17 +212,15 @@ impl<'a> BtfExt<'a> {
             offset += 8;
 
             let section_name = strings.get_or_empty(sec_name_off);
-            let mut relos = Vec::with_capacity(num_info as usize);
-
-            for _ in 0..num_info {
-                if offset + rec_size > relo_data.len() {
-                    return Err(BtfError::SectionOverflow);
-                }
-                if let Some(relo) = CoreRelo::parse(&relo_data[offset..]) {
-                    relos.push(relo);
-                }
-                offset += rec_size;
-            }
+            let records = (num_info as usize)
+                .checked_mul(rec_size)
+                .filter(|&len| len <= relo_data.len() - offset)
+                .ok_or(BtfError::SectionOverflow)?;
+            let relos = relo_data[offset..][..records]
+                .chunks_exact(rec_size)
+                .filter_map(CoreRelo::parse)
+                .collect();
+            offset += records;
 
             sections.push(SectionCoreRelos { section_name, relos });
         }
@@ -682,7 +680,7 @@ fn parse_spec(local: &Btf<'_>, relo: &CoreRelo, access_str: &str) -> Result<Spec
         idx: root_idx,
         name: None,
     }];
-    let mut bit_offset = u64::from(root_idx) * resolve_size(local, id)? * 8;
+    let mut bit_offset = elem_bits(root_idx, resolve_size(local, id)?).ok_or_else(|| invalid_access(access_str))?;
 
     for &idx in &raw[1..] {
         let (nid, t) = local.resolve_type(id).ok_or_else(|| invalid_access(access_str))?;
@@ -690,7 +688,9 @@ fn parse_spec(local: &Btf<'_>, relo: &CoreRelo, access_str: &str) -> Result<Spec
         match t {
             BtfTypeInfo::Struct { members, .. } | BtfTypeInfo::Union { members, .. } => {
                 let m = members.get(idx as usize).ok_or_else(|| invalid_access(access_str))?;
-                bit_offset += u64::from(m.bit_offset);
+                bit_offset = bit_offset
+                    .checked_add(u64::from(m.bit_offset))
+                    .ok_or_else(|| invalid_access(access_str))?;
                 if !m.name.is_empty() {
                     accessors.push(Accessor {
                         type_id: id,
@@ -714,7 +714,9 @@ fn parse_spec(local: &Btf<'_>, relo: &CoreRelo, access_str: &str) -> Result<Spec
                     name: None,
                 });
                 id = eid;
-                bit_offset += u64::from(idx) * resolve_size(local, eid)? * 8;
+                bit_offset = elem_bits(idx, resolve_size(local, eid)?)
+                    .and_then(|bits| bit_offset.checked_add(bits))
+                    .ok_or_else(|| invalid_access(access_str))?;
             }
             _ => return Err(invalid_access(access_str)),
         }
@@ -730,6 +732,11 @@ fn parse_spec(local: &Btf<'_>, relo: &CoreRelo, access_str: &str) -> Result<Spec
 
 fn invalid_access(access_str: &str) -> CoreReloError {
     CoreReloError::InvalidAccessString(access_str.to_string())
+}
+
+/// Bits spanned by `idx` elements of `size` bytes, or `None` past `u64::MAX`.
+fn elem_bits(idx: u32, size: u64) -> Option<u64> {
+    u64::from(idx).checked_mul(size)?.checked_mul(8)
 }
 
 /// A trailing, size-0 array that is the last member of its enclosing struct: clang's
@@ -834,7 +841,12 @@ fn spec_match(
             idx: local_acc.idx,
             name: None,
         });
-        spec.bit_offset += u64::from(local_acc.idx) * resolve_size(target, targ_id)? * 8;
+        // a local index can place the element past the end of the target's address space
+        let bits = elem_bits(local_acc.idx, resolve_size(target, targ_id)?);
+        let Some(bit_offset) = bits.and_then(|bits| spec.bit_offset.checked_add(bits)) else {
+            return Ok(None);
+        };
+        spec.bit_offset = bit_offset;
     }
 
     Ok(Some(spec))
@@ -900,7 +912,11 @@ fn match_member(
         if *depth > MAX_SPEC_DEPTH {
             return Err(CoreReloError::SpecTooDeep);
         }
-        spec.bit_offset += u64::from(m.bit_offset);
+        let Some(bit_offset) = spec.bit_offset.checked_add(u64::from(m.bit_offset)) else {
+            *depth -= 1;
+            continue;
+        };
+        spec.bit_offset = bit_offset;
 
         let found = if m.name.is_empty() {
             match_member(local, local_acc, local_name, target, m.type_id, spec, depth)?
@@ -990,9 +1006,10 @@ fn calc_field_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<Hal
     let bit_off = spec.bit_offset;
     let is_bitfield = m.bitfield_size > 0;
     let (byte_sz, byte_off, bit_sz) = if is_bitfield {
-        let mut byte_sz = u64::from(field_t.size().ok_or(CoreReloError::InvalidTypeId(field_type_id))?);
+        let size = field_t.size().filter(|&size| size != 0);
+        let mut byte_sz = u64::from(size.ok_or(CoreReloError::InvalidTypeId(field_type_id))?);
         let mut byte_off = bit_off / 8 / byte_sz * byte_sz;
-        while bit_off + u64::from(m.bitfield_size) - byte_off * 8 > byte_sz * 8 {
+        while bit_off - byte_off * 8 + u64::from(m.bitfield_size) > byte_sz * 8 {
             if byte_sz >= 8 {
                 return Err(CoreReloError::BitfieldTooWide);
             }
@@ -1036,13 +1053,14 @@ fn calc_field_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<Hal
                 mem: None,
             })
         }
+        // Unsigned wraparound for fields wider than 64 bits, as in libbpf.
         CoreReloKind::FieldLShiftU64 => Ok(Half {
-            val: 64 - (bit_off + bit_sz - byte_off * 8),
+            val: 64u64.wrapping_sub(bit_off - byte_off * 8 + bit_sz),
             validate,
             mem: None,
         }),
         CoreReloKind::FieldRShiftU64 => Ok(Half {
-            val: 64 - bit_sz,
+            val: 64u64.wrapping_sub(bit_sz),
             validate: true,
             mem: None,
         }),
@@ -1106,14 +1124,15 @@ fn calc_enumval_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<H
 /// access size CO-RE cares about for arrays is always the element's, never the array's.
 fn unwrap_arrays(btf: &Btf<'_>, id: u32) -> Result<u32, CoreReloError> {
     let (mut id, mut t) = btf.resolve_type(id).ok_or(CoreReloError::InvalidTypeId(id))?;
-    while let BtfTypeInfo::Array { elem_type, .. } = t {
-        let (eid, et) = btf
+    for _ in 0..=MAX_RESOLVE_DEPTH {
+        let BtfTypeInfo::Array { elem_type, .. } = t else {
+            return Ok(id);
+        };
+        (id, t) = btf
             .resolve_type(*elem_type)
             .ok_or(CoreReloError::InvalidTypeId(*elem_type))?;
-        id = eid;
-        t = et;
     }
-    Ok(id)
+    Err(CoreReloError::SpecTooDeep)
 }
 
 /// Byte size of a type, resolving through typedefs/modifiers/arrays, like libbpf's

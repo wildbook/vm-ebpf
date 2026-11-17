@@ -6,6 +6,7 @@
 
 use std::ffi::CStr;
 
+use constelf::err::ElfError;
 use constelf::file::ElfFile;
 use constelf::raw::{reloc, shf, sht, stb, stt};
 use hashbrown::HashMap;
@@ -134,7 +135,12 @@ impl Module {
         }
 
         // Second pass: collect symbols
-        if let Ok(symtab) = elf_sections.symtab() {
+        let symtab = match elf_sections.symtab() {
+            Ok(symtab) => Some(symtab),
+            Err(ElfError::SectionMissing) => None,
+            Err(e) => return Err(VmError::Elf(format!("failed to get symbols: {e:?}"))),
+        };
+        if let Some(symtab) = symtab {
             // Get symbol string table
             let strtab = elf_sections.sym_strtab().ok();
 

@@ -2,7 +2,10 @@ use crate::err::ElfError;
 use crate::{tryopt, ElfResult};
 
 pub const fn derva_slice(image: &[u8], beg: usize, len: usize) -> ElfResult<&[u8]> {
-    match slice(image, beg, beg + len) {
+    let Some(end) = beg.checked_add(len) else {
+        return Err(ElfError::DeRvaBounds);
+    };
+    match slice(image, beg, end) {
         Some(slice) => Ok(slice),
         None => Err(ElfError::DeRvaBounds),
     }

@@ -38,10 +38,12 @@ enum Addr {
 }
 
 impl Addr {
+    /// The address `by` bytes on. A symbol value or relocation offset past the end
+    /// of its section wraps here and fails where the address is used.
     fn offset(self, by: u64) -> Self {
         match self {
-            Self::Code(a) => Self::Code(a + by),
-            Self::Data(a) => Self::Data(a + by),
+            Self::Code(a) => Self::Code(a.wrapping_add(by)),
+            Self::Data(a) => Self::Data(a.wrapping_add(by)),
         }
     }
 
@@ -105,7 +107,7 @@ pub fn link<'m>(helpers: &HelperRegistry, types: &BtfBuilder, modules: &[&'m Mod
     let target_bytes = types.encode();
     let target = Btf::parse(&target_bytes)?;
 
-    let (mut image, layouts) = lay_out(modules);
+    let (mut image, layouts) = lay_out(modules)?;
     if [&image.code, &image.rodata, &image.data]
         .iter()
         .any(|b| b.len() > MAX_REGION_LEN)
@@ -148,13 +150,22 @@ fn trim_zeros(bytes: &mut Vec<u8>) -> usize {
 }
 
 /// Place every allocatable section and copy its contents into the image.
-fn lay_out(modules: &[&Module]) -> (Image, Vec<ModuleLayout>) {
-    fn place(buf: &mut Vec<u8>, section: &Section, align: usize) -> u64 {
-        let at = buf.len().next_multiple_of(section.align.max(align as u64) as usize);
-        buf.resize(at, 0);
+fn lay_out(modules: &[&Module]) -> Result<(Image, Vec<ModuleLayout>)> {
+    // Checks the size before growing `buf`, so a section header can't ask for more
+    // than a region holds.
+    fn place(buf: &mut Vec<u8>, section: &Section, align: usize) -> Result<u64> {
+        let align = section.align.max(align as u64);
+        let end = (buf.len() as u64)
+            .checked_next_multiple_of(align)
+            .and_then(|at| Some((at, at.checked_add(section.size)?)))
+            .filter(|&(_, end)| end <= MAX_REGION_LEN as u64);
+        let Some((at, end)) = end else {
+            return Err(VmError::InvalidArgument(format!("program exceeds {MAX_REGION_LEN} bytes")));
+        };
+        buf.resize(at as usize, 0);
         buf.extend_from_slice(&section.data);
-        buf.resize(at + section.size as usize, 0); // .bss has size but no data
-        at as u64
+        buf.resize(end as usize, 0); // .bss has size but no data
+        Ok(at)
     }
 
     let mut image = Image::default();
@@ -164,22 +175,22 @@ fn lay_out(modules: &[&Module]) -> (Image, Vec<ModuleLayout>) {
             let mut layout = ModuleLayout::default();
             for (idx, section) in module.sections.iter().enumerate() {
                 let addr = match section.kind {
-                    SectionKind::Code => Addr::Code(place(&mut image.code, section, 8)),
+                    SectionKind::Code => Addr::Code(place(&mut image.code, section, 8)?),
                     SectionKind::RoData => {
-                        Addr::Data(region_base(RODATA_REGION) + place(&mut image.rodata, section, 1))
+                        Addr::Data(region_base(RODATA_REGION) + place(&mut image.rodata, section, 1)?)
                     }
                     SectionKind::Data | SectionKind::Bss => {
-                        Addr::Data(region_base(DATA_REGION) + place(&mut image.data, section, 1))
+                        Addr::Data(region_base(DATA_REGION) + place(&mut image.data, section, 1)?)
                     }
                     _ => continue,
                 };
                 layout.sections.insert(idx, addr);
             }
             lay_out_jump_tables(module, &mut layout, &mut image.rodata);
-            layout
+            Ok(layout)
         })
-        .collect();
-    (image, layouts)
+        .collect::<Result<_>>()?;
+    Ok((image, layouts))
 }
 
 /// Copy each jump table section that `module`'s code loads into `rodata`, once per
@@ -334,7 +345,7 @@ fn apply_relocation(
         (reloc::bpf::BPF_64_32, Addr::Code(at), Addr::Code(target)) => {
             // BPF-to-BPF call: imm becomes the instruction offset from the next instruction.
             let target = target.wrapping_add_signed(reloc.addend);
-            let rel = ((target as i64 - (at + 8) as i64) / 8) as i32;
+            let rel = (target.wrapping_sub(at.wrapping_add(8)) as i64 / 8) as i32;
             image.insn_mut(at)?[4..8].copy_from_slice(&rel.to_le_bytes());
         }
         (reloc::bpf::BPF_64_ABS64, Addr::Data(at), target) => {

@@ -308,9 +308,10 @@ impl<'a> Btf<'a> {
 
     /// Resolve a type through modifiers (const, volatile, restrict, typedef).
     ///
-    /// Returns the underlying "real" type ID and info.
+    /// Returns the underlying "real" type ID and info, or `None` for a missing type
+    /// or a chain of over 32 modifiers, which a cycle makes endless.
     pub fn resolve_type(&self, mut type_id: u32) -> Option<(u32, &BtfTypeInfo<'a>)> {
-        loop {
+        for _ in 0..=MAX_RESOLVE_DEPTH {
             let ty = self.type_by_id(type_id)?;
             match ty {
                 BtfTypeInfo::Typedef { type_id: inner, .. }
@@ -323,14 +324,19 @@ impl<'a> Btf<'a> {
                 _ => return Some((type_id, ty)),
             }
         }
+        None
     }
 
     /// Byte size of a type, resolving through typedefs/modifiers/vars and, like libbpf's
     /// `btf__resolve_size`, multiplying an array's element size by its length.
+    ///
+    /// `None` for a missing type, a size that overflows `u64`, or a chain of over 32
+    /// modifiers and arrays.
     pub fn resolve_size(&self, mut id: u32) -> Option<u64> {
-        loop {
+        let mut count = 1u64;
+        for _ in 0..=MAX_RESOLVE_DEPTH {
             let ty = self.type_by_id(id)?;
-            return match ty {
+            let size = match ty {
                 BtfTypeInfo::Typedef { type_id, .. }
                 | BtfTypeInfo::Volatile { type_id }
                 | BtfTypeInfo::Const { type_id }
@@ -341,12 +347,19 @@ impl<'a> Btf<'a> {
                     continue;
                 }
                 BtfTypeInfo::Array { elem_type, nelems, .. } => {
-                    let elem_size = self.resolve_size(*elem_type)?;
-                    Some(elem_size * u64::from(*nelems))
+                    count = count.checked_mul(u64::from(*nelems))?;
+                    id = *elem_type;
+                    continue;
                 }
-                BtfTypeInfo::Ptr { .. } => Some(8),
-                _ => ty.size().map(u64::from),
+                BtfTypeInfo::Ptr { .. } => 8,
+                _ => u64::from(ty.size()?),
             };
+            return size.checked_mul(count);
         }
+        None
     }
 }
+
+/// Longest chain of modifiers, typedefs and arrays that resolution follows, as in
+/// libbpf.
+pub const MAX_RESOLVE_DEPTH: usize = 32;

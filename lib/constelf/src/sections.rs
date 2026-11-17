@@ -102,7 +102,7 @@ impl<'a> ElfSections<'a> {
 
             if header.sh_type == raw::sht::SYMTAB {
                 let bytes = tryres!(self.bytes(header));
-                assert!(bytes.len() % mem::size_of::<Elf64Sym>() == 0);
+                ensure!(ElfError::InvalidData, bytes.len() % mem::size_of::<Elf64Sym>() == 0);
                 // assert!(bytes.as_ptr().is_aligned_to(align_of::<Elf64Sym>()));
 
                 let ptr = bytes.as_ptr().cast::<Elf64Sym>();
