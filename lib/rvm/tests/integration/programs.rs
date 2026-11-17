@@ -79,7 +79,7 @@ fn function_pointers_and_jump_tables() {
 /// takes the fallback, and an unguarded access to the missing field fails when run.
 #[test]
 fn core_relocations_follow_host_layout() {
-    let mut vm = Vm::new();
+    let vm = Vm::new();
     let u64_t = vm.types().int("u64", 8, false);
     let u32_t = vm.types().int("u32", 4, false);
     let event_ty = vm.types().add_struct("event", 16);
@@ -102,7 +102,7 @@ fn core_relocations_follow_host_layout() {
 #[test]
 fn core_relocations_follow_appended_host_btf() {
     let host_module = rvm::Module::from_elf("host_event", &object("host_event.o")).unwrap();
-    let mut vm = Vm::new();
+    let vm = Vm::new();
     vm.types().append_btf(host_module.btf_data.as_ref().unwrap()).unwrap();
     let mut program = vm.load_elf(&object("core_guard.o")).unwrap();
 
@@ -122,7 +122,7 @@ fn core_relocations_follow_appended_host_btf() {
 /// the one the program was compiled against, and is signed.
 #[test]
 fn core_relocations_read_signed_bitfield() {
-    let mut vm = Vm::new();
+    let vm = Vm::new();
     let u32_t = vm.types().int("unsigned int", 4, false);
     let i32_t = vm.types().int("int", 4, true);
     let bits = vm.types().add_struct("bits", 4);

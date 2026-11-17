@@ -629,6 +629,48 @@ macro_rules! scalar {
 
 scalar!(u8, u16, u32, u64, i8, i16, i32, i64);
 
+/// Plain data: a type whose value is exactly its bytes, for reading and writing map
+/// keys and values as Rust types.
+///
+/// The bytes are copied as they are, in host byte order. Guests are little endian, so
+/// fields wider than a byte only read back right on a little-endian host.
+///
+/// # Safety
+///
+/// The type must have no padding bytes, and every bit pattern must be a valid value:
+/// integers, floats, arrays of them, and `#[repr(C)]` structs of such fields laid out
+/// without gaps.
+pub unsafe trait Pod: Copy + 'static {
+    /// The value's bytes.
+    fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `Pod` types have no padding, so all `size_of::<Self>()` bytes are
+        // initialized.
+        unsafe { std::slice::from_raw_parts((self as *const Self).cast(), size_of::<Self>()) }
+    }
+
+    /// The value made of `bytes`, or `None` unless there are exactly
+    /// `size_of::<Self>()` of them.
+    fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        // SAFETY: the length matches and `Pod` types accept every bit pattern.
+        (bytes.len() == size_of::<Self>()).then(|| unsafe { bytes.as_ptr().cast::<Self>().read_unaligned() })
+    }
+}
+
+// SAFETY: primitives without padding or invalid bit patterns, and arrays of `Pod`.
+unsafe impl Pod for u8 {}
+unsafe impl Pod for u16 {}
+unsafe impl Pod for u32 {}
+unsafe impl Pod for u64 {}
+unsafe impl Pod for u128 {}
+unsafe impl Pod for i8 {}
+unsafe impl Pod for i16 {}
+unsafe impl Pod for i32 {}
+unsafe impl Pod for i64 {}
+unsafe impl Pod for i128 {}
+unsafe impl Pod for f32 {}
+unsafe impl Pod for f64 {}
+unsafe impl<T: Pod, const N: usize> Pod for [T; N] {}
+
 impl std::fmt::Debug for VmMemory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mapped = (0..MAX_REGIONS)

@@ -20,7 +20,7 @@
 
 use std::error::Error;
 
-use rvm::{Perms, Program, Vm};
+use rvm::{Perms, Pod, Program, Vm};
 
 const PARSER: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/msgpack_logs.o"));
 
@@ -63,16 +63,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn read_stats(parser: &mut Program) -> Result<Stats, Box<dyn Error>> {
     let totals = parser.map("totals").ok_or("no totals map")?;
-    let totals = totals.get(&0u32.to_le_bytes()).ok_or("no totals")?;
-    let [events, services, skipped_fields, other_records] = [0, 1, 2, 3].map(|i| u64_at(totals, i * 8));
+    let [events, services, skipped_fields, other_records]: [u64; 4] = totals.get_as(0u32)?;
 
     let map = parser.map("services").ok_or("no services map")?;
-    let service = |i: u32| {
-        map.get(&i.to_le_bytes())
-            .map(Service::from_bytes)
-            .ok_or("missing service")
-    };
-    let services = (0..services as u32).map(service).collect::<Result<_, _>>()?;
+    let entries = map.entries();
+    let services = entries.iter_as::<u32, SvcStats>()?.take(services as usize);
+    let services = services.map(|(_, s)| s.into()).collect();
 
     Ok(Stats {
         events,
@@ -103,10 +99,6 @@ fn print_stats(stats: &Stats, bytes: usize) {
     }
 }
 
-fn u64_at(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(bytes[offset..][..8].try_into().unwrap())
-}
-
 /// The stats as the plugin keeps them in its `totals` and `services` maps.
 #[derive(Debug, Default, PartialEq)]
 struct Stats {
@@ -116,7 +108,7 @@ struct Stats {
     services: Vec<Service>,
 }
 
-/// `struct svc_stats`.
+/// One service's stats.
 #[derive(Debug, Default, PartialEq)]
 struct Service {
     name: String,
@@ -127,18 +119,16 @@ struct Service {
     bytes: u64,
 }
 
-impl Service {
-    fn from_bytes(bytes: &[u8]) -> Self {
-        let name = &bytes[..NAME_LEN];
-        let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(NAME_LEN)];
-        let word = |i: usize| u64_at(bytes, NAME_LEN + i * 8);
+impl From<SvcStats> for Service {
+    fn from(s: SvcStats) -> Self {
+        let name = &s.name[..s.name.iter().position(|&b| b == 0).unwrap_or(NAME_LEN)];
         Self {
             name: String::from_utf8_lossy(name).into_owned(),
-            events: word(0),
-            by_level: [word(1), word(2), word(3), word(4)],
-            ms_total: word(5),
-            ms_max: word(6),
-            bytes: word(7),
+            events: s.events,
+            by_level: s.by_level,
+            ms_total: s.ms_total,
+            ms_max: s.ms_max,
+            bytes: s.bytes,
         }
     }
 }
@@ -158,6 +148,22 @@ impl Stats {
         }
     }
 }
+
+/// `struct svc_stats`, a value of the `services` map.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SvcStats {
+    name: [u8; NAME_LEN],
+    events: u64,
+    by_level: [u64; 4],
+    ms_total: u64,
+    ms_max: u64,
+    bytes: u64,
+}
+
+// SAFETY: integer fields only, and the `u64`s start at an 8 byte offset, so there is
+// no padding.
+unsafe impl Pod for SvcStats {}
 
 /// Encodes `records` log records and tallies what the parser should make of them.
 /// Every 40th record is a heartbeat and every 57th a map without a service name;

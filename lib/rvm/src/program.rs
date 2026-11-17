@@ -208,4 +208,35 @@ impl Program {
     }
 }
 
+/// A [`Func`] that follows its function into whichever program it is called with, for
+/// handles that outlive the program they were looked up in. Callers serialize access
+/// per slot, e.g. under a plugin's lock.
+#[derive(Debug)]
+pub struct FuncSlot {
+    program: AtomicU64,
+    pc: AtomicU64,
+}
+
+impl FuncSlot {
+    pub fn new(func: Func) -> Self {
+        Self {
+            program: AtomicU64::new(func.program),
+            pc: AtomicU64::new(func.pc),
+        }
+    }
+
+    /// Call the function in `program`, looking `name` up again if the slot holds a
+    /// function of another program.
+    #[inline]
+    pub fn call(&self, program: &mut Program, name: &str, args: &[u64]) -> Result<u64> {
+        let mut pc = self.pc.load(Ordering::Relaxed);
+        if self.program.load(Ordering::Relaxed) != program.id {
+            pc = program.func(name)?.pc;
+            self.pc.store(pc, Ordering::Relaxed);
+            self.program.store(program.id, Ordering::Relaxed);
+        }
+        program.call_pc(pc, args)
+    }
+}
+
 static NEXT_PROGRAM_ID: AtomicU64 = AtomicU64::new(0);

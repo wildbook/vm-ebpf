@@ -9,13 +9,14 @@
 //! Both log through the host function `print`, which reads the line from the
 //! calling plugin's memory. The entities live in a region that the host shares
 //! with every plugin and reads and writes field by field. The host describes its
-//! `Entity` layout with `Vm::types`, and CO-RE patches the plugins' field offsets
-//! and array stride to match it: `bpf/game_sdk.h` declares the struct with other
-//! field order and size. `scores` and the rules plugin's `waves` are maps that the
-//! VM shares, so they belong to the VM and keep their contents when the host
-//! replaces the rules with `game_rules_v2.o` halfway through. The host links the
-//! combat plugin ahead of time into an image and loads it from bytes, and calls
-//! both plugins every tick through function handles it looks up once.
+//! `Entity` layout with `host_struct!`, and CO-RE patches the plugins' field
+//! offsets and array stride to match it: `bpf/game_sdk.h` declares the struct with
+//! other field order and size. `scores` and the rules plugin's `waves` are maps
+//! that the VM shares, so they belong to the VM and keep their contents when the
+//! host replaces the rules with `game_rules_v2.o` halfway through. The host links
+//! the combat plugin ahead of time into an image and loads it from bytes, and calls
+//! both plugins every tick through function handles it looks up once; the rules
+//! handle follows the reload.
 //!
 //! Rebuild the plugins with:
 //!   clang -target bpf -mcpu=v4 -O2 -g -c bpf/game_rules.c -o bpf/game_rules.o
@@ -28,7 +29,7 @@ use std::error::Error;
 use std::mem::{offset_of, size_of};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use rvm::{BtfBuilder, MemoryError, Perms, Plugin, Scalar, SharedRegion, Vm};
+use rvm::{MapError, MemoryError, Perms, Plugin, Scalar, SharedRegion, Vm};
 
 const RULES: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/game_rules.o"));
 const RULES_V2: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/game_rules_v2.o"));
@@ -64,8 +65,9 @@ const HEROES: [(&str, Stats); 2] = [
 ];
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let mut vm = Vm::new();
-    describe_entity(vm.types());
+    let vm = Vm::new();
+    // CO-RE patches the plugins' accesses to `struct entity` to match `Entity`
+    rvm::host_struct!(vm.types(), Entity as "entity" { id, hp, armor, kind, x, y, attack });
     // SAFETY: plugins only run on this thread.
     unsafe {
         vm.share_map("scores", false);
@@ -87,25 +89,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     run(&vm, &world, &rules, &combat)?;
     print_summary(&world, &rules)
-}
-
-/// Tells CO-RE where the host keeps each field of `struct entity`.
-fn describe_entity(types: &mut BtfBuilder) {
-    let int = types.int("int", 4, true);
-    let uint = types.int("unsigned int", 4, false);
-    let entity = types.add_struct("entity", size_of::<Entity>() as u32);
-    let fields = [
-        ("id", offset_of!(Entity, id), uint),
-        ("hp", offset_of!(Entity, hp), int),
-        ("armor", offset_of!(Entity, armor), int),
-        ("kind", offset_of!(Entity, kind), uint),
-        ("x", offset_of!(Entity, x), int),
-        ("y", offset_of!(Entity, y), int),
-        ("attack", offset_of!(Entity, attack), int),
-    ];
-    for (name, offset, ty) in fields {
-        types.member(entity, name, offset as u32, ty);
-    }
 }
 
 fn register_host_fns(vm: &Vm, world: &Arc<World>) {
@@ -145,19 +128,18 @@ fn register_host_fns(vm: &Vm, world: &Arc<World>) {
 
 /// Runs the game, swapping in the second version of the rules at `RELOAD_AT`.
 fn run(vm: &Vm, world: &World, rules: &Plugin, combat: &Plugin) -> rvm::Result<()> {
-    let mut rules_tick = rules.func("on_tick")?;
+    // a named function follows the rules into the program that replaces them
+    let rules_tick = rules.named_func("on_tick")?;
     let combat_tick = combat.func("on_tick")?;
 
     for tick in 0..TICKS {
         world.set_tick(tick);
         if tick == RELOAD_AT {
             rules.replace(vm.load_elf(RULES_V2)?);
-            // handles into the replaced program fail, so look the function up again
-            rules_tick = rules.func("on_tick")?;
             println!("tick {tick:>2}  host: reloaded rules");
         }
 
-        rules.call_func(rules_tick, &[tick.into()])?;
+        rules_tick.call(&[tick.into()])?;
         combat.call_func(combat_tick, &[world.base(), world.len() as u64])?;
         world.remove_dead();
     }
@@ -168,8 +150,9 @@ fn print_summary(world: &World, rules: &Plugin) -> Result<(), Box<dyn Error>> {
     let mut rules = rules.lock()?;
     let alive = world.entities();
 
+    // `struct wave_state` and `struct score` are two `u64`s each
     let waves = rules.map("waves").ok_or("rules has no waves map")?;
-    let [wave, spawned] = u64s(waves.get(&0u32.to_le_bytes()).ok_or("no wave state")?);
+    let [wave, spawned]: [u64; 2] = waves.get_as(0u32)?;
     let monsters: Vec<_> = alive.iter().filter(|e| e.kind != HERO).collect();
     let oldest = monsters.iter().map(|e| e.spawned_at).min().unwrap_or(TICKS);
     let left = monsters.len();
@@ -179,16 +162,13 @@ fn print_summary(world: &World, rules: &Plugin) -> Result<(), Box<dyn Error>> {
     for (i, (name, _)) in HEROES.iter().enumerate() {
         let id = i as u32 + 1;
         let hp = alive.iter().find(|e| e.id == id).map_or(0, |e| e.hp);
-        let [points, kills] = scores.get(&id.to_le_bytes()).map_or([0, 0], u64s);
+        let [points, kills]: [u64; 2] = match scores.get_as(id) {
+            Err(MapError::NotFound) => [0, 0],
+            score => score?,
+        };
         println!("{name}: {hp} hp, {points} points, {kills} kills");
     }
     Ok(())
-}
-
-/// Reads `struct score` and `struct wave_state`, which are two `u64`s each.
-fn u64s(bytes: &[u8]) -> [u64; 2] {
-    let word = |i: usize| u64::from_le_bytes(bytes[i * 8..][..8].try_into().unwrap());
-    [word(0), word(1)]
 }
 
 /// The host's entity. Its field order and size differ from `struct entity` in

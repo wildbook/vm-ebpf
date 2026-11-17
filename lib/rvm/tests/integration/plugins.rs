@@ -32,6 +32,24 @@ fn plugin_calls_export_and_survives_reload() {
 }
 
 #[test]
+fn named_func_follows_replace() {
+    let vm = Vm::new();
+    let a = vm.load_plugin("a", &object("plugin_a.o")).unwrap();
+    let scale = a.named_func("a_scale").unwrap();
+    assert_eq!(scale.call(&[5]).unwrap(), 10);
+
+    a.replace(vm.load_elf(&object("plugin_a3.o")).unwrap());
+    assert_eq!(scale.call(&[5]).unwrap(), 15);
+
+    // A program without the function fails the call, and the handle recovers when a
+    // later program has it again.
+    a.replace(vm.load_elf(&object("maps.o")).unwrap());
+    assert!(matches!(scale.call(&[5]), Err(VmError::FunctionNotFound(name)) if name == "a_scale"));
+    a.replace(vm.load_elf(&object("plugin_a.o")).unwrap());
+    assert_eq!(scale.call(&[5]).unwrap(), 10);
+}
+
+#[test]
 fn reentrant_call_fails_instead_of_deadlocking() {
     let vm = Vm::new();
     let a = vm.load_plugin("a", &object("plugin_a.o")).unwrap();

@@ -49,7 +49,9 @@ cargo run -p rvm --example msgpack_logs  # streams MessagePack logs through a pa
   Everywhere) relocations. The host describes its actual struct layouts as BTF,
   with `BtfBuilder`; relocations patch field-access instructions compiled
   against a different layout to match, exactly as kernel CO-RE matches a BPF
-  program's BTF against the kernel's.
+  program's BTF against the kernel's. `rvm::host_struct!` describes a
+  `#[repr(C)]` Rust struct from its definition:
+  `host_struct!(vm.types(), Entity as "entity" { id, hp, pos as "position" })`.
 - `lib/ebpf-asm`: an assembler used by `bin/demo`, `lib/rvm`'s tests, benches and
   examples to build eBPF bytecode without a C toolchain. Also has a disassembler,
   used by its own examples and tests for debugging.
@@ -100,7 +102,9 @@ lock.
 publishes its function `f` as a named extern that programs linked afterwards can
 import. The call runs in the exporting plugin with its own memory and maps, so
 plain pointers mean nothing on the other side. `Plugin::replace` swaps in a new
-build, and importers use it from their next call. A call into a plugin that is
+build, and importers use it from their next call. A `Func` from `Plugin::func`
+fails after a replace; `Plugin::named_func` returns a handle that looks the
+function up again in the new build on its next call. A call into a plugin that is
 already running fails with `VmError::PluginBusy` instead of deadlocking.
 
 An exported function can borrow a buffer from its caller for one call by
@@ -223,7 +227,11 @@ Maps: array and hash maps declared libbpf style in `.maps` (`__uint(type, ...)`,
 (`map_lookup_elem`, `map_update_elem`, `map_delete_elem`) are built in unless the
 host registers its own under those IDs. Values live in `MAPS_REGION`, so a looked
 up pointer is an ordinary guest address. The host reads and writes maps through
-`Program::map(name)`.
+`Program::map(name)`, as bytes (`get`, `update`, `delete`) or as `Pod` types
+(`get_as`, `update_as`), such as integers, arrays and `#[repr(C)]` structs without
+padding. `MapRef::entries` iterates a map without allocating: every element of an
+array map with its index, or the keys present in a hash map with their values.
+For a shared hash map it holds the key index locked for reading until dropped.
 
 `Vm::share_map(name, pad_values)` makes maps of that name one instance across
 every program the VM links afterwards, at the same guest address in each. The

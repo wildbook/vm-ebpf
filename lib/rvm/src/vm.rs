@@ -61,7 +61,7 @@ pub struct Vm {
     shared_regions: Mutex<Vec<SharedRegion>>,
     /// Host BTF the program's own BTF resolves CO-RE relocations against.
     #[cfg(feature = "link")]
-    types: BtfBuilder,
+    types: Mutex<BtfBuilder>,
     /// VM configuration.
     config: VmConfig,
 }
@@ -89,7 +89,7 @@ impl Vm {
             shared_maps: SharedMaps::default(),
             shared_regions: Mutex::default(),
             #[cfg(feature = "link")]
-            types: BtfBuilder::new(),
+            types: Mutex::default(),
             config,
         }
     }
@@ -254,19 +254,22 @@ impl Vm {
 /// ELF parsing, CO-RE and linking.
 #[cfg(feature = "link")]
 impl Vm {
-    /// Get the host's BTF builder, for describing its types to CO-RE.
+    /// The host's types, as BTF, for CO-RE. Linking takes the same lock, so drop the
+    /// guard before linking.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let event = vm.types().add_struct("event", 12);
-    /// let u64_t = vm.types().int("u64", 8, false);
-    /// let u32_t = vm.types().int("u32", 4, false);
-    /// vm.types().member(event, "timestamp", 0, u64_t);
-    /// vm.types().member(event, "pid", 8, u32_t);
+    /// #[repr(C)]
+    /// struct Event {
+    ///     timestamp: u64,
+    ///     pid: u32,
+    /// }
+    ///
+    /// rvm::host_struct!(vm.types(), Event as "event" { timestamp, pid });
     /// ```
-    pub fn types(&mut self) -> &mut BtfBuilder {
-        &mut self.types
+    pub fn types(&self) -> std::sync::MutexGuard<'_, BtfBuilder> {
+        self.types.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Parse a module from ELF bytes, for [`Vm::link`] or [`Vm::prepare_modules`].
@@ -286,7 +289,7 @@ impl Vm {
 
     /// Link modules into one image, resolving symbols between them.
     pub fn prepare_modules(&self, modules: &[&Module]) -> Result<Image> {
-        linker::link(&self.helpers.read(), &self.types, modules)
+        linker::link(&self.helpers.read(), &self.types(), modules)
     }
 
     /// Link modules into an executable program: [`Vm::prepare_modules`], then load.

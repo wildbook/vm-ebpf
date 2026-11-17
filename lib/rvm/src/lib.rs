@@ -15,7 +15,7 @@
 //! use rvm::Vm;
 //!
 //! // Create a VM and register helpers
-//! let mut vm = Vm::new();
+//! let vm = Vm::new();
 //!
 //! // Register a helper function (type-safe)
 //! vm.register_helper(1, |x: u64| {
@@ -24,11 +24,12 @@
 //! });
 //!
 //! // Describe the host's types, as BTF, for CO-RE
-//! let event = vm.types().add_struct("event", 12);
-//! let u64_t = vm.types().int("u64", 8, false);
-//! let u32_t = vm.types().int("u32", 4, false);
-//! vm.types().member(event, "timestamp", 0, u64_t);
-//! vm.types().member(event, "pid", 8, u32_t);
+//! #[repr(C)]
+//! struct Event {
+//!     timestamp: u64,
+//!     pid: u32,
+//! }
+//! rvm::host_struct!(vm.types(), Event as "event" { timestamp, pid });
 //!
 //! // Load and execute an eBPF program
 //! let program = vm.load_elf(&elf_bytes)?;
@@ -49,7 +50,8 @@
 //!   function table.
 //! - [`Plugin`]: a loaded program that other programs can call into.
 //! - [`HelperRegistry`]: the extern table of host functions callable from eBPF.
-//! - [`BtfBuilder`]: the host's types, as BTF, for CO-RE relocations.
+//! - [`BtfBuilder`]: the host's types, as BTF, for CO-RE relocations;
+//!   [`host_struct!`] fills it from Rust struct definitions.
 //!
 //! ## Cargo features
 //!
@@ -62,6 +64,8 @@
 mod error;
 mod executor;
 mod helper;
+#[cfg(feature = "link")]
+mod host_type;
 mod image;
 mod layout;
 #[cfg(feature = "link")]
@@ -86,22 +90,27 @@ pub use btf::BtfBuilder;
 pub use error::{ExecError, HelperError, LinkError, MemoryError, Result, VmError};
 pub use executor::{Executor, DEFAULT_FRAME_SIZE};
 pub use helper::{FromArgs, HelperArgs, HelperContext, HelperRegistry, IntoReturn, SharedHelpers};
+#[cfg(feature = "link")]
+#[doc(hidden)]
+pub use host_type::__host_field_type;
+#[cfg(feature = "link")]
+pub use host_type::HostType;
 pub use image::{Image, Import};
 pub use layout::{
     BORROW_FIRST_REGION, CODE_REGION, DATA_REGION, FIRST_FREE_REGION, MAPS_REGION, RODATA_REGION,
     SHARED_MAPS_FIRST_REGION, STACK_REGION,
 };
 pub use maps::{
-    MapDef, MapError, MapKind, MapRef, Maps, BPF_ANY, BPF_EXIST, BPF_FUNC_MAP_DELETE_ELEM, BPF_FUNC_MAP_LOOKUP_ELEM,
-    BPF_FUNC_MAP_UPDATE_ELEM, BPF_NOEXIST,
+    Entries, MapDef, MapError, MapIter, MapKey, MapKind, MapRef, Maps, BPF_ANY, BPF_EXIST, BPF_FUNC_MAP_DELETE_ELEM,
+    BPF_FUNC_MAP_LOOKUP_ELEM, BPF_FUNC_MAP_UPDATE_ELEM, BPF_NOEXIST,
 };
 pub use memory::{
-    region_base, GuestMemory, Memory, Perms, Scalar, SharedBuffer, SharedRegion, VmMemory, MAX_REGIONS, MAX_REGION_LEN,
-    REGION_SHIFT,
+    region_base, GuestMemory, Memory, Perms, Pod, Scalar, SharedBuffer, SharedRegion, VmMemory, MAX_REGIONS,
+    MAX_REGION_LEN, REGION_SHIFT,
 };
 #[cfg(feature = "link")]
 pub use module::Module;
-pub use plugin::{Plugin, WeakPlugin};
+pub use plugin::{NamedFunc, Plugin, WeakPlugin};
 pub use program::{Borrow, Func, FunctionInfo, Program};
 pub use rvm_core::{instructions_from_bytes, AtomicOp, Code, Instruction, MAX_CALL_DEPTH};
 #[cfg(feature = "link")]

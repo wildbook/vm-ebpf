@@ -77,7 +77,7 @@ fn mutated_elf_files_load_or_fail() {
 /// A VM with every extern, helper and host type the fixtures use, so most of them
 /// link and their CO-RE relocations have candidates to match.
 fn host_vm() -> Vm {
-    let mut vm = Vm::new();
+    let vm = Vm::new();
     let host = Module::from_elf("host_event", &fixture("host_event.o")).unwrap();
     vm.types().append_btf(host.btf_data.as_ref().unwrap()).unwrap();
     let u32_t = vm.types().int("unsigned int", 4, false);

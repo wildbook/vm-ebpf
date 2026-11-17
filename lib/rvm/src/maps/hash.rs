@@ -2,7 +2,7 @@
 
 use std::hash::BuildHasher;
 
-use hashbrown::hash_table::Entry;
+use hashbrown::hash_table::{self, Entry};
 use hashbrown::HashTable;
 
 use super::{MapError, BPF_EXIST, BPF_NOEXIST};
@@ -41,6 +41,16 @@ impl HashIndex {
 
     fn key_at(keys: &[u8], key_size: usize, slot: u32) -> &[u8] {
         &keys[slot as usize * key_size..][..key_size]
+    }
+
+    /// Occupied slots, in table order.
+    pub fn slots(&self) -> hash_table::Iter<'_, u32> {
+        self.table.iter()
+    }
+
+    /// The key stored at `slot`.
+    pub fn key(&self, slot: u32) -> &[u8] {
+        Self::key_at(&self.keys, self.key_size, slot)
     }
 
     #[inline]

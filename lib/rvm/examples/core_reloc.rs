@@ -139,7 +139,7 @@ fn test_without_core(elf_bytes: &[u8]) {
 
 fn test_with_core(elf_bytes: &[u8]) {
     // Create VM and register the RUNTIME struct layout
-    let mut vm = Vm::new();
+    let vm = Vm::new();
 
     // Describe the runtime layout as BTF - fields are in different positions!
     let u32_t = vm.types().int("u32", 4, false);

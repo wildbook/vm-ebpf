@@ -17,13 +17,14 @@
 //! The guest refers to a map by its handle: the `lddw` the program uses to load a map
 //! gets the map's index in this program.
 
-use std::sync::Arc;
+use std::ops::Range;
+use std::sync::{Arc, RwLockReadGuard};
 
-use hashbrown::HashMap;
+use hashbrown::{hash_table, HashMap};
 
 use crate::error::{LinkError, Result, VmError};
 use crate::layout::MAPS_REGION;
-use crate::memory::{region_base, VmMemory, MAX_REGION_LEN};
+use crate::memory::{region_base, Pod, VmMemory, MAX_REGION_LEN};
 
 #[cfg(feature = "link")]
 mod btf;
@@ -62,7 +63,7 @@ pub struct MapDef {
     pub max_entries: u32,
 }
 
-/// Why a map update or delete failed. Guest helpers return these as negative errno.
+/// Why a map access failed. Guest helpers return these as negative errno.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MapError {
     /// Key not present (`ENOENT`).
@@ -85,6 +86,19 @@ impl MapError {
         }
     }
 }
+
+impl std::fmt::Display for MapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotFound => "key not found",
+            Self::Exists => "key already present",
+            Self::Full => "map full, or array index out of range",
+            Self::Invalid => "wrong key or value size, unknown flags, or delete on an array map",
+        })
+    }
+}
+
+impl std::error::Error for MapError {}
 
 /// The maps of a linked program.
 #[derive(Debug, Default, Clone)]
@@ -238,7 +252,149 @@ impl<'a> MapRef<'a> {
         self.memory.bytes_mut(addr, len).expect("map slots are mapped").fill(0);
         Ok(())
     }
+
+    /// The value for `key`, copied out as a `V`. Fails with [`MapError::NotFound`] if
+    /// the key is absent, and with [`MapError::Invalid`] if `K` or `V` differs in size
+    /// from the map's keys or values.
+    pub fn get_as<K: Pod, V: Pod>(&self, key: K) -> std::result::Result<V, MapError> {
+        check_sizes::<K, V>(self.def())?;
+        let value = self.get(key.as_bytes()).ok_or(MapError::NotFound)?;
+        Ok(V::from_bytes(value).expect("value size checked"))
+    }
+
+    /// [`MapRef::update`] with the bytes of `key` and `value`.
+    pub fn update_as<K: Pod, V: Pod>(&mut self, key: K, value: V, flags: u64) -> std::result::Result<(), MapError> {
+        self.update(key.as_bytes(), value.as_bytes(), flags)
+    }
+
+    /// The map's entries, for [`Entries::iter`] or [`Entries::iter_as`].
+    pub fn entries(&self) -> Entries<'_> {
+        let map = &self.maps.maps[self.handle as usize];
+        let index = match &map.index {
+            Index::Array => EntriesIndex::Array,
+            Index::Hash(index) => EntriesIndex::Hash(index),
+            Index::Shared(shared) => match &shared.index {
+                None => EntriesIndex::Array,
+                Some(index) => EntriesIndex::Shared(read(index)),
+            },
+        };
+        Entries {
+            map,
+            memory: self.memory,
+            index,
+        }
+    }
 }
+
+/// The entries of one map, from [`MapRef::entries`].
+///
+/// For a shared hash map, this holds the map's key index locked for reading until it
+/// is dropped. Guests that insert or delete keys meanwhile wait, and one that runs on
+/// this thread deadlocks.
+pub struct Entries<'a> {
+    map: &'a Map,
+    memory: &'a VmMemory,
+    index: EntriesIndex<'a>,
+}
+
+enum EntriesIndex<'a> {
+    Array,
+    Hash(&'a HashIndex),
+    Shared(RwLockReadGuard<'a, HashIndex>),
+}
+
+impl Entries<'_> {
+    /// Every element of an array map with its index, in index order, or the keys
+    /// present in a hash map with their values, in no particular order.
+    pub fn iter(&self) -> MapIter<'_> {
+        let slots = match &self.index {
+            EntriesIndex::Array => Slots::Array(0..self.map.def.max_entries),
+            EntriesIndex::Hash(index) => Slots::Hash(index, index.slots()),
+            EntriesIndex::Shared(index) => Slots::Hash(index, index.slots()),
+        };
+        MapIter {
+            map: self.map,
+            memory: self.memory,
+            slots,
+        }
+    }
+
+    /// [`Entries::iter`] with keys and values copied out as `K` and `V`; an array
+    /// index is a 4 byte key. Fails with [`MapError::Invalid`] if `K` or `V` differs in
+    /// size from the map's keys or values.
+    pub fn iter_as<K: Pod, V: Pod>(&self) -> std::result::Result<impl Iterator<Item = (K, V)> + '_, MapError> {
+        check_sizes::<K, V>(&self.map.def)?;
+        Ok(self.iter().map(|(key, value)| {
+            let key = match key {
+                MapKey::Index(index) => K::from_bytes(&index.to_le_bytes()),
+                MapKey::Bytes(bytes) => K::from_bytes(bytes),
+            };
+            let value = V::from_bytes(value);
+            (key.expect("key size checked"), value.expect("value size checked"))
+        }))
+    }
+}
+
+impl<'a> IntoIterator for &'a Entries<'_> {
+    type Item = (MapKey<'a>, &'a [u8]);
+    type IntoIter = MapIter<'a>;
+
+    fn into_iter(self) -> MapIter<'a> {
+        self.iter()
+    }
+}
+
+/// A key from [`MapIter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapKey<'a> {
+    /// An array map's index.
+    Index(u32),
+    /// A hash map's key.
+    Bytes(&'a [u8]),
+}
+
+/// The keys and values of a map, read in place from guest memory; see
+/// [`Entries::iter`].
+pub struct MapIter<'a> {
+    map: &'a Map,
+    memory: &'a VmMemory,
+    slots: Slots<'a>,
+}
+
+enum Slots<'a> {
+    Array(Range<u32>),
+    Hash(&'a HashIndex, hash_table::Iter<'a, u32>),
+}
+
+impl<'a> Iterator for MapIter<'a> {
+    type Item = (MapKey<'a>, &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (key, slot) = match &mut self.slots {
+            Slots::Array(indices) => {
+                let index = indices.next()?;
+                (MapKey::Index(index), index)
+            }
+            Slots::Hash(index, slots) => {
+                let index: &'a HashIndex = index;
+                let slot = *slots.next()?;
+                (MapKey::Bytes(index.key(slot)), slot)
+            }
+        };
+        let (addr, len) = (self.map.addr(slot), self.map.def.value_size as usize);
+        let value = self.memory.bytes(addr, len).expect("map slots are mapped");
+        Some((key, value))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match &self.slots {
+            Slots::Array(indices) => indices.size_hint(),
+            Slots::Hash(_, slots) => slots.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for MapIter<'_> {}
 
 impl Map {
     #[inline]
@@ -309,6 +465,64 @@ pub fn check_def(def: &MapDef) -> Result<()> {
     Ok(())
 }
 
+fn check_sizes<K: Pod, V: Pod>(def: &MapDef) -> std::result::Result<(), MapError> {
+    if size_of::<K>() != def.key_size as usize || size_of::<V>() != def.value_size as usize {
+        return Err(MapError::Invalid);
+    }
+    Ok(())
+}
+
 fn invalid(msg: String) -> VmError {
     LinkError::InvalidReference(msg).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::Perms;
+
+    #[test]
+    fn typed_access_and_iteration() {
+        let def = |name: &str, kind, key_size, value_size| MapDef {
+            name: name.into(),
+            kind,
+            key_size,
+            value_size,
+            max_entries: 3,
+        };
+        let defs = vec![def("hash", MapKind::Hash, 8, 8), def("array", MapKind::Array, 4, 16)];
+        let (mut maps, len) = Maps::new(defs, &SharedMaps::default()).unwrap();
+        let mut memory = VmMemory::new();
+        memory.map(MAPS_REGION, len, Perms::RW);
+
+        let mut hash = MapRef::new(&mut maps, &mut memory, 0);
+        assert_eq!(hash.entries().iter().len(), 0);
+        assert_eq!(hash.get_as::<u64, u64>(1), Err(MapError::NotFound));
+        assert_eq!(hash.get_as::<u64, u32>(1), Err(MapError::Invalid));
+        assert_eq!(hash.get_as::<u32, u64>(1), Err(MapError::Invalid));
+        assert_eq!(hash.update_as(1u64, 10u32, BPF_ANY), Err(MapError::Invalid));
+        assert!(hash.entries().iter_as::<u64, u32>().is_err());
+
+        // a deleted key leaves the iteration, and its slot goes to the next insert
+        for key in 1..=3u64 {
+            hash.update_as(key, key * 10, BPF_ANY).unwrap();
+        }
+        hash.delete(&2u64.to_le_bytes()).unwrap();
+        let mut entries: Vec<(u64, u64)> = hash.entries().iter_as().unwrap().collect();
+        entries.sort();
+        assert_eq!(entries, [(1, 10), (3, 30)]);
+        hash.update_as(4u64, 40u64, BPF_NOEXIST).unwrap();
+        let mut entries: Vec<(u64, u64)> = hash.entries().iter_as().unwrap().collect();
+        entries.sort();
+        assert_eq!(entries, [(1, 10), (3, 30), (4, 40)]);
+        assert_eq!(hash.get_as::<u64, u64>(2), Err(MapError::NotFound));
+
+        // every array index exists, zeroed until written
+        let mut array = MapRef::new(&mut maps, &mut memory, 1);
+        array.update_as(1u32, [7u64, 8], BPF_ANY).unwrap();
+        let values: Vec<(u32, [u64; 2])> = array.entries().iter_as().unwrap().collect();
+        assert_eq!(values, [(0, [0, 0]), (1, [7, 8]), (2, [0, 0])]);
+        assert_eq!(array.entries().iter().nth(1).unwrap().0, MapKey::Index(1));
+        assert_eq!(array.get_as::<u32, [u64; 2]>(3), Err(MapError::NotFound));
+    }
 }

@@ -19,7 +19,7 @@ use crate::error::{HelperError, Result, VmError};
 use crate::helper::HelperContext;
 use crate::layout::BORROW_FIRST_REGION;
 use crate::memory::{region_base, Perms};
-use crate::program::{Borrow, Func, Program};
+use crate::program::{Borrow, Func, FuncSlot, Program};
 
 /// A linked program that other programs can call into.
 #[derive(Clone)]
@@ -46,7 +46,7 @@ impl Plugin {
     }
 
     /// Look up `func` for [`Plugin::call_func`]. [`Plugin::replace`] invalidates the
-    /// handle.
+    /// handle; [`Plugin::named_func`] gives one that follows the replacement.
     pub fn func(&self, func: &str) -> Result<Func> {
         self.lock()?.func(func)
     }
@@ -54,6 +54,18 @@ impl Plugin {
     /// Call a function looked up with [`Plugin::func`]; arguments go in r1-r5.
     pub fn call_func(&self, func: Func, args: &[u64]) -> Result<u64> {
         self.lock()?.call_func(func, args)
+    }
+
+    /// Look up `func` for repeated calls through [`NamedFunc::call`]. After
+    /// [`Plugin::replace`], the next call looks `func` up again in the new program. The
+    /// handle keeps the plugin alive.
+    pub fn named_func(&self, func: &str) -> Result<NamedFunc> {
+        let slot = FuncSlot::new(self.func(func)?);
+        Ok(NamedFunc {
+            plugin: self.clone(),
+            name: func.into(),
+            func: slot,
+        })
     }
 
     /// Exclusive access to the program, e.g. for its maps or memory.
@@ -144,6 +156,23 @@ impl WeakPlugin {
             name: self.name.clone(),
             program: self.program.upgrade()?,
         })
+    }
+}
+
+/// A function of a [`Plugin`] that follows [`Plugin::replace`]; see
+/// [`Plugin::named_func`].
+#[derive(Debug)]
+pub struct NamedFunc {
+    plugin: Plugin,
+    name: Arc<str>,
+    func: FuncSlot,
+}
+
+impl NamedFunc {
+    /// Call the function in the plugin's current program; arguments go in r1-r5. Fails
+    /// with [`VmError::FunctionNotFound`] if that program lacks it.
+    pub fn call(&self, args: &[u64]) -> Result<u64> {
+        self.func.call(&mut *self.plugin.lock()?, &self.name, args)
     }
 }
 
