@@ -2,8 +2,7 @@
  * A host's actual `struct event` layout, shipped as plain BTF (no CO-RE access
  * indexes: this is the real layout, not a program reading someone else's).
  */
-#include "../rvm_bpf.h"
-
+#include "rvm_bpf.h"
 struct event {
     u32 flags;
     u32 pid;

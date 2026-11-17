@@ -1,7 +1,7 @@
 /*
  * Helpers that read through pointers the caller passes in, which need the guest's read permission.
  */
-#include "../rvm_bpf.h"
+#include "rvm_bpf.h"
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);

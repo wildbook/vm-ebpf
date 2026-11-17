@@ -1,7 +1,7 @@
 /*
  * Library module for cross-module link tests (see link_main.c).
  */
-#include "../rvm_bpf.h"
+#include "rvm_bpf.h"
 
 /* Library-private state: each program that links this module gets its own copy. */
 u64 lib_calls = 0;

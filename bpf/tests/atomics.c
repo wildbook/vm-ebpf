@@ -1,8 +1,7 @@
 /*
  * BPF atomics as clang emits them.
  */
-#include "../rvm_bpf.h"
-
+#include "rvm_bpf.h"
 u64 counter64 = 0;
 u32 counter32 = 0;
 

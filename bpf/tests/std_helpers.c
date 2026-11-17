@@ -1,8 +1,7 @@
 /*
  * Uses the opt-in standard helpers: ktime_get_ns, trace_printk, get_prandom_u32.
  */
-#include "../rvm_bpf.h"
-
+#include "rvm_bpf.h"
 /* Prints one line and returns nanoseconds elapsed across the print. */
 u64 report(u64 x) {
     static const char fmt[] = "x=%llu neg=%d hex=%x\n";

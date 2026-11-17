@@ -1,3 +1,25 @@
-bpf_objects()
-bpf_object(plugin_a.c plugin_a3.o -DFACTOR=3)                # replaces plugin_a in the reload tests
-bpf_object(shared_counter.c shared_counter_u32.o -DVALUE=u32) # mismatched shared map definition
+bpf_objects(rvm_bpf
+    acq_rel.c
+    atomics.c
+    borrow_callee.c
+    borrow_caller.c
+    core_bitfield.c
+    core_guard.c
+    data_ptrs.c
+    func_ptr.c
+    global_hits.c
+    guest_ptrs.c
+    host_event.c
+    link_lib.c
+    link_main.c
+    maps.c
+    plugin_a.c
+    plugin_b.c
+    shared_counter.c
+    shared_region.c
+    std_helpers.c)
+
+# replaces plugin_a in the reload tests
+bpf_object(plugin_a3 SOURCE plugin_a.c LINK rvm_bpf DEFINITIONS FACTOR=3)
+# mismatched shared map definition
+bpf_object(shared_counter_u32 SOURCE shared_counter.c LINK rvm_bpf DEFINITIONS VALUE=u32)

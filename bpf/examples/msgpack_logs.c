@@ -4,7 +4,7 @@
  *   {"svc": "api", "lvl": "warn", "ms": 120, "bytes": 5120}
  * Other keys, and records that aren't maps, are skipped whatever they hold.
  */
-#include "../rvm_bpf.h"
+#include "rvm_bpf.h"
 
 #define NAME_LEN 16
 #define MAX_SERVICES 16

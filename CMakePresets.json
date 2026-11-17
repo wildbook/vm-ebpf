@@ -1,0 +1,26 @@
+{
+    "version": 3,
+    "configurePresets": [
+        {
+            "name": "bpf",
+            "displayName": "BPF objects",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build",
+            "toolchainFile": "${sourceDir}/cmake/bpf-toolchain.cmake",
+            "cacheVariables": {
+                "CMAKE_EXPORT_COMPILE_COMMANDS": true
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "bpf",
+            "configurePreset": "bpf"
+        },
+        {
+            "name": "update-prebuilt",
+            "configurePreset": "bpf",
+            "targets": ["update-prebuilt"]
+        }
+    ]
+}

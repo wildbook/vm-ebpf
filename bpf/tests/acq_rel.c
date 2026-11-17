@@ -1,8 +1,7 @@
 /*
  * Message passing through a host-shared region with load-acquire and store-release.
  */
-#include "../rvm_bpf.h"
-
+#include "rvm_bpf.h"
 #define WORDS 6
 
 struct mailbox {

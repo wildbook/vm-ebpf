@@ -2,7 +2,7 @@
  * Modding SDK for the game host in lib/rvm/examples/modding.rs: the types, host
  * functions and shared maps that plugins see.
  */
-#include "../rvm_bpf.h"
+#include "rvm_bpf.h"
 
 enum kind { HERO, GOBLIN, ORC, TROLL };
 

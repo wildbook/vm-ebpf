@@ -1,8 +1,7 @@
 /*
  * Plugin exporting a_scale; a second build with FACTOR=3 tests hot reload.
  */
-#include "../rvm_bpf.h"
-
+#include "rvm_bpf.h"
 #ifndef FACTOR
 #define FACTOR 2
 #endif

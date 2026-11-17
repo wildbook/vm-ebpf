@@ -2,7 +2,7 @@
  * Function pointers: callback tables in .rodata and .data, a callback passed as an
  * argument, and a dense switch that clang lowers to a jump table (gotox).
  */
-#include "../rvm_bpf.h"
+#include "rvm_bpf.h"
 
 typedef u64 (*op_fn)(u64, u64);
 

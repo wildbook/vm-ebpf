@@ -2,7 +2,7 @@
  * Calculator used by bin/loader and the integration tests: globals in .rodata
  * and .data, BPF-to-BPF calls, and struct pointer arguments.
  */
-#include "../rvm_bpf.h"
+#include "rvm_bpf.h"
 
 struct input_ctx {
     u64 value_a;

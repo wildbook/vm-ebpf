@@ -2,8 +2,7 @@
  * Plugin importing a_scale from plugin_a and a host function that calls back into
  * this plugin.
  */
-#include "../rvm_bpf.h"
-
+#include "rvm_bpf.h"
 extern u64 a_scale(u64 x);
 extern u64 host_reenter(u64 x);
 

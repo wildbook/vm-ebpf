@@ -1,7 +1,7 @@
 /*
  * Benchmark workloads for lib/rvm/benches.
  */
-#include "../rvm_bpf.h"
+#include "rvm_bpf.h"
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);

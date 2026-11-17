@@ -1,8 +1,7 @@
 /*
  * Pointers stored in global data, which need data relocations at link time.
  */
-#include "../rvm_bpf.h"
-
+#include "rvm_bpf.h"
 u64 target = 41;
 const u64 table[3] = {10, 20, 30};
 

@@ -3,7 +3,7 @@
  * `borrow:N` / `borrow_ro:N` on a pointer parameter names the parameter holding
  * its length in bytes.
  */
-#include "../rvm_bpf.h"
+#include "rvm_bpf.h"
 
 u64 sum(const u64 *buf BORROW_RO(1), u64 len) {
     u64 total = 0;

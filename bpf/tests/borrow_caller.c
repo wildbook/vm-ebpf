@@ -1,8 +1,7 @@
 /*
  * Passes stack buffers to borrow_callee.c's exports.
  */
-#include "../rvm_bpf.h"
-
+#include "rvm_bpf.h"
 extern u64 sum(const u64 *buf, u64 len);
 extern u64 fill(u64 *buf, u64 len, u64 value);
 extern u64 poke(u64 *buf, u64 len);

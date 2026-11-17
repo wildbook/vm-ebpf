@@ -2,8 +2,7 @@
  * CO-RE bitfield read, written out in the style of libbpf's bpf_core_read.h
  * BPF_CORE_READ_BITFIELD macro (no libbpf headers available to this fixture).
  */
-#include "../rvm_bpf.h"
-
+#include "rvm_bpf.h"
 struct bits {
     unsigned reserved : 20;
     int b : 12;

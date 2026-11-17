@@ -2,7 +2,7 @@
  * One array map, `hits`, for sharing between plugins; a second build with
  * VALUE=u32 gives it 32-bit values.
  */
-#include "../rvm_bpf.h"
+#include "rvm_bpf.h"
 
 #ifndef VALUE
 #define VALUE u64

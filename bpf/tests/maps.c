@@ -1,7 +1,7 @@
 /*
  * Array and hash maps declared libbpf style, used through the standard helpers.
  */
-#include "../rvm_bpf.h"
+#include "rvm_bpf.h"
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);

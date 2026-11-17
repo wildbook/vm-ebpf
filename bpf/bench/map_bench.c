@@ -1,7 +1,7 @@
 /*
  * Map helper throughput, for lib/rvm/benches/exec.rs.
  */
-#include "../rvm_bpf.h"
+#include "rvm_bpf.h"
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);

@@ -2,8 +2,7 @@
  * CO-RE against a host that may lack a field: `read_flags` checks for it first,
  * `read_flags_unguarded` doesn't.
  */
-#include "../rvm_bpf.h"
-
+#include "rvm_bpf.h"
 struct event {
     u64 timestamp;
     u32 pid;
