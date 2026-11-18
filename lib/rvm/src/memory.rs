@@ -579,11 +579,6 @@ impl SharedRegion {
         self.perms
     }
 
-    /// The host memory behind the region.
-    pub(crate) fn buffer(&self) -> &Arc<SharedBuffer> {
-        &self.buffer
-    }
-
     /// Copy `buf.len()` bytes at `offset` into `buf`.
     pub fn read_bytes(&self, offset: usize, buf: &mut [u8]) -> Result<(), MemoryError> {
         let src = self.ptr(offset, buf.len())?;

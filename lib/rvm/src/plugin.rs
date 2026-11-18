@@ -10,20 +10,22 @@
 //! call into a plugin that is already running, from the host or through a chain of plugin calls, fails with
 //! [`VmError::PluginBusy`] instead of deadlocking. So does [`Plugin::replace`] while the plugin runs.
 
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::{Arc, Weak};
 
 use crate::error::{HelperError, Result, VmError};
 use crate::helper::HelperContext;
 use crate::layout::{BORROW_FIRST_REGION, BORROW_REGIONS};
 use crate::memory::{region_base, Perms};
-use crate::program::{Borrow, Func, FuncSlot, Program};
-use crate::sync::lock;
+use crate::program::{AtomicFunc, Borrow, Func, FuncSlot, Program};
+use crate::sync::{TryLock, TryLockGuard};
 
 /// A linked program that other programs can call into.
 #[derive(Clone)]
 pub struct Plugin {
     name: Arc<str>,
-    program: Arc<Mutex<Program>>,
+    program: Arc<TryLock<Program>>,
 }
 
 impl Plugin {
@@ -31,7 +33,7 @@ impl Plugin {
     pub fn new(name: impl Into<Arc<str>>, program: Program) -> Self {
         Self {
             name: name.into(),
-            program: Arc::new(Mutex::new(program)),
+            program: Arc::new(TryLock::new(program)),
         }
     }
 
@@ -55,8 +57,9 @@ impl Plugin {
         })
     }
 
-    /// Exclusive access to the program, e.g. for its maps or memory.
-    pub fn lock(&self) -> Result<MutexGuard<'_, Program>> {
+    /// Exclusive access to the program, e.g. for its maps or memory. Fails with [`VmError::PluginBusy`] while a call
+    /// into the plugin runs or another guard is alive.
+    pub fn lock(&self) -> Result<TryLockGuard<'_, Program>> {
         try_lock(&self.program, &self.name)
     }
 
@@ -81,9 +84,8 @@ impl Plugin {
         &self,
         func: &str,
     ) -> Result<impl Fn(&mut HelperContext) -> std::result::Result<u64, HelperError> + Send + Sync + 'static> {
-        let target = ExportTarget::find(&*self.lock()?, func).ok_or_else(|| not_found(&self.name, func))?;
-        let target = Mutex::new(target);
-        let program: Weak<Mutex<Program>> = Arc::downgrade(&self.program);
+        let slot = ExportSlot::find(&*self.lock()?, func).ok_or_else(|| not_found(&self.name, func))?;
+        let program: Weak<TryLock<Program>> = Arc::downgrade(&self.program);
         let name = self.name.clone();
         let func: Arc<str> = func.into();
 
@@ -97,81 +99,129 @@ impl Plugin {
                 .upgrade()
                 .ok_or_else(|| failed(VmError::PluginUnloaded(name.to_string())))?;
             let mut program = try_lock(&program, &name).map_err(failed)?;
-
-            // only touched under the plugin lock, so this never waits
-            let target = {
-                let mut target = lock(&target);
-                if !program.owns(target.entry) {
-                    *target = ExportTarget::find(&program, &func).ok_or_else(|| failed(not_found(&name, &func)))?;
-                }
-                *target
-            };
+            let (entry, borrows) = slot
+                .get(&program, &func)
+                .ok_or_else(|| failed(not_found(&name, &func)))?;
 
             let a = ctx.args;
             let mut args = [a.r1, a.r2, a.r3, a.r4, a.r5];
-            if target.borrow_count == 0 {
-                return program.call_func(target.entry, &args).map_err(failed);
+            if borrows.is_empty() {
+                return program.call_func(entry, &args).map_err(failed);
             }
 
             let caller = &*ctx.memory;
-            let mut mapped = Ok(());
-            for &Borrow { arg, len_arg, writable } in target.borrows() {
+            let callee = UnmapBorrows {
+                program: &mut program,
+                borrows,
+            };
+            for Borrow { arg, len_arg, writable } in borrows {
                 let (addr, len) = (args[arg as usize], args[len_arg as usize] as usize);
                 // the caller must itself be allowed what the callee gets
                 let perms = if writable { Perms::RW } else { Perms::R };
-                let ptr = match caller.host_ptr(addr, len, perms) {
-                    Ok(ptr) => ptr,
-                    Err(e) => {
-                        mapped = Err(failed(e.into()));
-                        break;
-                    }
-                };
+                let ptr = caller.host_ptr(addr, len, perms).map_err(|e| failed(e.into()))?;
                 let region = BORROW_FIRST_REGION + arg as usize;
-                // SAFETY: the caller is blocked in this call; the regions are unmapped before it returns, or on the
-                // next lock after a panic.
-                unsafe { program.memory_mut().map_host_any(region, ptr, len, perms) };
+                // SAFETY: the caller is blocked in this call, and `callee` unmaps the region before the call returns
+                // or unwinds.
+                unsafe { callee.program.memory_mut().map_host_any(region, ptr, len, perms) };
                 args[arg as usize] = region_base(region);
             }
-
-            let result = mapped.and_then(|()| program.call_func(target.entry, &args).map_err(failed));
-            for borrow in target.borrows() {
-                program
-                    .memory_mut()
-                    .unmap_any(BORROW_FIRST_REGION + borrow.arg as usize);
-            }
-            result
+            callee.program.call_func(entry, &args).map_err(failed)
         })
     }
 }
 
-/// An exported function as found in one program, kept until [`Plugin::replace`] swaps the program.
-#[derive(Clone, Copy)]
-struct ExportTarget {
-    entry: Func,
-    /// Image loading checks that borrowed parameters are distinct argument registers, so there are at most 5.
-    borrows: [Borrow; BORROW_REGIONS],
-    borrow_count: usize,
+/// The callee of a call with borrowed buffers. Unmaps the borrow regions when it goes out of scope, also when a host
+/// function panics during the call.
+struct UnmapBorrows<'a> {
+    program: &'a mut Program,
+    borrows: Borrows,
 }
 
-impl ExportTarget {
+impl Drop for UnmapBorrows<'_> {
+    fn drop(&mut self) {
+        for borrow in self.borrows {
+            let region = BORROW_FIRST_REGION + borrow.arg as usize;
+            self.program.memory_mut().unmap_any(region);
+        }
+    }
+}
+
+/// An exported function as last found in the plugin's program; [`Plugin::replace`] makes the next call look it up again.
+/// Only used under the plugin lock, which orders its relaxed accesses.
+struct ExportSlot {
+    func: AtomicFunc,
+    borrows: AtomicU64,
+}
+
+impl ExportSlot {
     fn find(program: &Program, func: &str) -> Option<Self> {
         let (entry, info) = program.func_with_info(func)?;
-        let unused = Borrow {
-            arg: 0,
-            len_arg: 0,
-            writable: false,
-        };
-        let mut borrows = [unused; BORROW_REGIONS];
-        borrows[..info.borrows.len()].copy_from_slice(&info.borrows);
         Some(Self {
-            entry,
-            borrows,
-            borrow_count: info.borrows.len(),
+            func: AtomicFunc::new(entry),
+            borrows: AtomicU64::new(Borrows::new(&info.borrows).0),
         })
     }
 
-    fn borrows(&self) -> &[Borrow] {
-        &self.borrows[..self.borrow_count]
+    /// The function called `func` in `program`, which the slot holds unless the program was replaced.
+    #[inline]
+    fn get(&self, program: &Program, func: &str) -> Option<(Func, Borrows)> {
+        let entry = self.func.load();
+        if program.owns(entry) {
+            Some((entry, Borrows(self.borrows.load(Relaxed))))
+        } else {
+            self.follow(program, func)
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn follow(&self, program: &Program, func: &str) -> Option<(Func, Borrows)> {
+        let (entry, info) = program.func_with_info(func)?;
+        let borrows = Borrows::new(&info.borrows);
+        self.func.store(entry);
+        self.borrows.store(borrows.0, Relaxed);
+        Some((entry, borrows))
+    }
+}
+
+/// The borrowed parameters of a function, packed for [`ExportSlot`]: one byte per borrow from the low byte up, as
+/// `0x80 | arg | len_arg << 3 | writable << 6`, then zero bytes.
+#[derive(Clone, Copy)]
+struct Borrows(u64);
+
+impl Borrows {
+    fn new(borrows: &[Borrow]) -> Self {
+        // image loading checks that borrowed parameters are distinct argument registers
+        assert!(borrows.len() <= BORROW_REGIONS);
+        let mut packed = 0;
+        for b in borrows.iter().rev() {
+            let byte = 0x80 | b.arg | b.len_arg << 3 | u8::from(b.writable) << 6;
+            packed = packed << 8 | u64::from(byte);
+        }
+        Self(packed)
+    }
+
+    #[inline]
+    fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl Iterator for Borrows {
+    type Item = Borrow;
+
+    #[inline]
+    fn next(&mut self) -> Option<Borrow> {
+        let b = self.0 as u8;
+        if b == 0 {
+            return None;
+        }
+        self.0 >>= 8;
+        Some(Borrow {
+            arg: b & 7,
+            len_arg: b >> 3 & 7,
+            writable: b & 0x40 != 0,
+        })
     }
 }
 
@@ -179,7 +229,7 @@ impl ExportTarget {
 #[derive(Clone)]
 pub struct WeakPlugin {
     name: Arc<str>,
-    program: Weak<Mutex<Program>>,
+    program: Weak<TryLock<Program>>,
 }
 
 impl WeakPlugin {
@@ -226,33 +276,14 @@ fn in_plugin(error: VmError, plugin: &str) -> VmError {
 
 // `name` by reference to the `Arc`: the call path then passes an address instead of loading the name
 #[inline]
-fn try_lock<'a>(program: &'a Mutex<Program>, name: &Arc<str>) -> Result<MutexGuard<'a, Program>> {
-    match program.try_lock() {
-        Ok(guard) => Ok(guard),
-        Err(e) => lock_failed(program, name, e),
-    }
+fn try_lock<'a>(program: &'a TryLock<Program>, name: &Arc<str>) -> Result<TryLockGuard<'a, Program>> {
+    program.try_lock().ok_or_else(|| busy(name))
 }
 
 #[cold]
 #[inline(never)]
-fn lock_failed<'a>(
-    program: &'a Mutex<Program>,
-    name: &Arc<str>,
-    error: TryLockError<MutexGuard<'a, Program>>,
-) -> Result<MutexGuard<'a, Program>> {
-    match error {
-        TryLockError::WouldBlock => Err(VmError::PluginBusy(name.to_string())),
-        // a panic during a call poisons the lock and may have skipped unmapping borrowed caller memory, which may be
-        // gone by now
-        TryLockError::Poisoned(e) => {
-            let mut guard = e.into_inner();
-            for region in BORROW_FIRST_REGION..BORROW_FIRST_REGION + BORROW_REGIONS {
-                guard.memory_mut().unmap_any(region);
-            }
-            program.clear_poison();
-            Ok(guard)
-        }
-    }
+fn busy(name: &Arc<str>) -> VmError {
+    VmError::PluginBusy(name.to_string())
 }
 
 impl std::fmt::Debug for Plugin {

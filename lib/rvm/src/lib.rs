@@ -73,6 +73,7 @@ mod memory;
 mod module;
 mod plugin;
 mod program;
+mod published;
 #[cfg(feature = "link")]
 mod section;
 mod std_helpers;
@@ -115,4 +116,5 @@ pub use std_helpers::{
 };
 #[cfg(feature = "link")]
 pub use symbol::{Export, Symbol};
+pub use sync::TryLockGuard;
 pub use vm::{Vm, VmConfig};

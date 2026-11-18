@@ -13,9 +13,8 @@
 
 use std::sync::Arc;
 
-use hashbrown::HashMap;
 use rvm_core::opcode::{JmpOpc, OpCode, Source};
-use rvm_core::{instructions_from_bytes, BPF_PSEUDO_KFUNC_CALL, MAX_CALL_DEPTH};
+use rvm_core::{Code, Instruction, BPF_PSEUDO_KFUNC_CALL, MAX_CALL_DEPTH};
 
 use crate::error::{LinkError, Result, VmError};
 use crate::helper::SharedHelpers;
@@ -26,8 +25,7 @@ use crate::map_def::{MapDef, MapKind};
 #[cfg(feature = "maps")]
 use crate::maps::Maps;
 use crate::memory::{Perms, VmMemory, MAX_REGION_LEN};
-use crate::program::{Borrow, FunctionInfo, Program};
-use crate::sync::lock;
+use crate::program::{Borrow, FunctionInfo, Functions, Program};
 use crate::vm::{Shared, VmConfig};
 
 const MAGIC: &[u8; 4] = b"RVMI";
@@ -130,6 +128,35 @@ impl Image {
 
     /// Parse an image written by [`Image::to_bytes`]. Contents are checked when the image is loaded.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let s = Sections::parse(bytes)?;
+        Ok(Self {
+            code: s.code.to_vec(),
+            rodata: s.rodata.to_vec(),
+            rodata_len: s.rodata_len,
+            data: s.data.to_vec(),
+            data_len: s.data_len,
+            maps: s.maps,
+            functions: s.functions,
+            externs: s.externs,
+        })
+    }
+}
+
+/// An [`Image`] whose code and initial data borrow from the image or from its serialized bytes, so loading copies them
+/// once, into the program.
+struct Sections<'a> {
+    code: &'a [u8],
+    rodata: &'a [u8],
+    rodata_len: usize,
+    data: &'a [u8],
+    data_len: usize,
+    maps: Vec<MapDef>,
+    functions: Vec<(String, FunctionInfo)>,
+    externs: Vec<(u32, Import)>,
+}
+
+impl<'a> Sections<'a> {
+    fn parse(bytes: &'a [u8]) -> Result<Self> {
         let mut r = Reader(bytes);
         if r.take(MAGIC.len())? != MAGIC {
             return Err(invalid("not an rvm image"));
@@ -142,7 +169,7 @@ impl Image {
             )));
         }
 
-        let code = r.section()?.0.to_vec();
+        let code = r.section()?.0;
         let (rodata, rodata_len) = r.section()?.segment()?;
         let (data, data_len) = r.section()?.segment()?;
 
@@ -210,7 +237,7 @@ impl Image {
 /// Check `image`, bind its extern calls to `helpers`, and allocate its memory and maps.
 pub fn load(image: Image, helpers: &Arc<SharedHelpers>, shared: &Shared, config: &VmConfig) -> Result<Program> {
     let Image {
-        mut code,
+        code,
         rodata,
         rodata_len,
         data,
@@ -219,21 +246,39 @@ pub fn load(image: Image, helpers: &Arc<SharedHelpers>, shared: &Shared, config:
         functions,
         externs,
     } = image;
+    let sections = Sections {
+        code: &code,
+        rodata: &rodata,
+        rodata_len,
+        data: &data,
+        data_len,
+        maps,
+        functions,
+        externs,
+    };
+    load_sections(sections, helpers, shared, config)
+}
 
+/// [`load`] the image that [`Image::to_bytes`] wrote to `bytes`.
+pub fn load_bytes(bytes: &[u8], helpers: &Arc<SharedHelpers>, shared: &Shared, config: &VmConfig) -> Result<Program> {
+    load_sections(Sections::parse(bytes)?, helpers, shared, config)
+}
+
+fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared, config: &VmConfig) -> Result<Program> {
     #[cfg(not(feature = "maps"))]
-    if let Some(def) = maps.first() {
+    if let Some(def) = s.maps.first() {
         let msg = format!("map {}: rvm is built without the `maps` feature", def.name);
         return Err(LinkError::InvalidMap(msg).into());
     }
-    let shared_regions = lock(&shared.regions);
 
-    if code.len() % 8 != 0 {
-        return Err(invalid(format!("code is {} bytes", code.len())));
+    let (words, rest) = s.code.as_chunks::<8>();
+    if !rest.is_empty() {
+        return Err(invalid(format!("code is {} bytes", s.code.len())));
     }
     for (region, init, len) in [
-        ("code", &code, code.len()),
-        ("rodata", &rodata, rodata_len),
-        ("data", &data, data_len),
+        ("code", s.code, s.code.len()),
+        ("rodata", s.rodata, s.rodata_len),
+        ("data", s.data, s.data_len),
     ] {
         if len > MAX_REGION_LEN {
             return Err(VmError::ProgramTooLarge(region));
@@ -243,13 +288,13 @@ pub fn load(image: Image, helpers: &Arc<SharedHelpers>, shared: &Shared, config:
         }
     }
 
+    let mut insns: Box<[Instruction]> = words.iter().map(|w| Instruction(u64::from_le_bytes(*w))).collect();
     // Bind against one version of the table; the program refreshes from there.
     let (table, version) = helpers.snapshot();
-    let (insns, _) = code.as_chunks_mut::<8>();
-    for (at, import) in &externs {
+    for (at, import) in &s.externs {
         let insn = insns
             .get_mut(*at as usize)
-            .filter(|insn| insn[0] == CALL)
+            .filter(|insn| insn.opcode().0 == CALL)
             .ok_or_else(|| invalid(format!("extern at instruction {at} is not a call")))?;
         let slot = match import {
             Import::Name(name) => table
@@ -257,25 +302,24 @@ pub fn load(image: Image, helpers: &Arc<SharedHelpers>, shared: &Shared, config:
                 .ok_or_else(|| LinkError::UnresolvedSymbol(name.clone()))?,
             Import::Helper(id) => table.slot_of_id(*id).ok_or(LinkError::UnknownHelper(*id))?,
         };
-        set_slot_call(insn, slot);
+        let mut bytes = insn.0.to_le_bytes();
+        set_slot_call(&mut bytes, slot);
+        insn.0 = u64::from_le_bytes(bytes);
     }
 
     let insn_count = insns.len() as u64;
-    let functions = functions
-        .into_iter()
-        .map(|(name, info)| {
-            // each borrow maps its own region, so the pointer parameters must differ
-            let borrows = &info.borrows;
-            let distinct = borrows
-                .iter()
-                .enumerate()
-                .all(|(i, b)| borrows[..i].iter().all(|o| o.arg != b.arg));
-            if info.pc >= insn_count || !borrows.iter().all(Borrow::in_range) || !distinct {
-                return Err(invalid(format!("function {name}: entry or borrows out of range")));
-            }
-            Ok((name, info))
-        })
-        .collect::<Result<HashMap<_, _>>>()?;
+    for (name, info) in &s.functions {
+        // each borrow maps its own region, so the pointer parameters must differ
+        let borrows = &info.borrows;
+        let distinct = borrows
+            .iter()
+            .enumerate()
+            .all(|(i, b)| borrows[..i].iter().all(|o| o.arg != b.arg));
+        if info.pc >= insn_count || !borrows.iter().all(Borrow::in_range) || !distinct {
+            return Err(invalid(format!("function {name}: entry or borrows out of range")));
+        }
+    }
+    let functions = Functions::new(s.functions).ok_or_else(|| invalid("functions are not sorted by unique name"))?;
 
     let stack_len = config
         .frame_size
@@ -288,12 +332,12 @@ pub fn load(image: Image, helpers: &Arc<SharedHelpers>, shared: &Shared, config:
         })?;
 
     #[cfg(feature = "maps")]
-    let (maps, maps_len) = Maps::new(maps, &shared.maps)?;
+    let (maps, maps_len) = Maps::new(s.maps, &shared.maps)?;
 
     let mut memory = VmMemory::new();
     let stack_top = memory.map_any(STACK_REGION, stack_len as usize, Perms::RW) + stack_len;
-    memory.map_bytes_any(RODATA_REGION, &rodata, rodata_len, Perms::R);
-    memory.map_bytes_any(DATA_REGION, &data, data_len, Perms::RW);
+    memory.map_bytes_any(RODATA_REGION, s.rodata, s.rodata_len, Perms::R);
+    memory.map_bytes_any(DATA_REGION, s.data, s.data_len, Perms::RW);
     #[cfg(feature = "maps")]
     if maps_len != 0 {
         memory.map_any(MAPS_REGION, maps_len, Perms::RW);
@@ -304,14 +348,11 @@ pub fn load(image: Image, helpers: &Arc<SharedHelpers>, shared: &Shared, config:
         for map in maps.shared() {
             memory.map_shared(map.region, map.storage.clone(), Perms::RW);
         }
-        for region in shared_regions.iter() {
-            memory.map_shared(region.region(), region.buffer().clone(), region.perms());
-        }
+        shared.regions.map_into(&mut memory);
     }
 
-    let code = instructions_from_bytes(&code);
     let helpers = (helpers.clone(), table, version);
-    let program = Program::new(code, memory, stack_top, functions, helpers, config);
+    let program = Program::new(Code::new(insns), memory, stack_top, functions, helpers, config);
     #[cfg(feature = "maps")]
     let program = program.with_maps(maps);
     Ok(program)
@@ -406,9 +447,9 @@ impl<'a> Reader<'a> {
     }
 
     /// A region's length followed by its initial bytes, filling the section.
-    fn segment(mut self) -> Result<(Vec<u8>, usize)> {
+    fn segment(mut self) -> Result<(&'a [u8], usize)> {
         let len = self.len()?;
-        Ok((self.0.to_vec(), len))
+        Ok((self.0, len))
     }
 
     fn end(&self) -> Result<()> {

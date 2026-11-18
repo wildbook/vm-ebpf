@@ -104,6 +104,86 @@ pub unsafe extern "C" fn rvm_call(
     unsafe { finish(program.call(name, args), ret) }
 }
 
+/// Stores the index of the function `name` in `*index`, for [`rvm_call_func`].
+///
+/// # Safety
+///
+/// `program` must be a live program from [`rvm_load`], `name` must point to `name_len` readable bytes, and `index`
+/// must be valid for writes. `name` may be null when `name_len` is 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rvm_func(
+    program: *const Program,
+    name: *const u8,
+    name_len: usize,
+    index: *mut usize,
+) -> Status {
+    let program = unsafe { &*program };
+    let Ok(name) = std::str::from_utf8(unsafe { slice_or_empty(name, name_len) }) else {
+        return Status::Argument;
+    };
+    let Some(found) = program.function_index(name) else {
+        return Status::NotFound;
+    };
+    unsafe { index.write(found) };
+    Status::Ok
+}
+
+/// Calls the function at `index` with `args` in r1 to r5 and stores its r0 in `*ret`.
+///
+/// # Safety
+///
+/// `program` must be a live program from [`rvm_load`], `args` must point to `nargs` values, and `ret` must be valid
+/// for writes. `args` may be null when `nargs` is 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rvm_call_func(
+    program: *mut Program,
+    index: usize,
+    args: *const u64,
+    nargs: usize,
+    ret: *mut u64,
+) -> Status {
+    let program = unsafe { &mut *program };
+    let Some(func) = program.func_at(index) else {
+        return Status::NotFound;
+    };
+    let args = unsafe { slice_or_empty(args, nargs) };
+    unsafe { finish(program.call_func(func, args), ret) }
+}
+
+/// The number of functions. Indices go from 0 to this count minus 1, in name order.
+///
+/// # Safety
+///
+/// `program` must be a live program from [`rvm_load`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rvm_function_count(program: *const Program) -> usize {
+    unsafe { &*program }.functions().len()
+}
+
+/// Stores the name of the function at `index`, which stays valid until the program is freed, in `*name` and
+/// `*name_len`. The name is UTF-8 and not NUL-terminated.
+///
+/// # Safety
+///
+/// `program` must be a live program from [`rvm_load`], and `name` and `name_len` must be valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rvm_function_name(
+    program: *const Program,
+    index: usize,
+    name: *mut *const u8,
+    name_len: *mut usize,
+) -> Status {
+    let program = unsafe { &*program };
+    let Some((found, _)) = program.functions().nth(index) else {
+        return Status::NotFound;
+    };
+    unsafe {
+        name.write(found.as_ptr());
+        name_len.write(found.len());
+    }
+    Status::Ok
+}
+
 /// Stores the value of `result` in `*out`, or returns the error's status.
 ///
 /// # Safety

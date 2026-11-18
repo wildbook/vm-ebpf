@@ -84,8 +84,7 @@ pub struct Program {
     memory: VmMemory,
     #[cfg(feature = "maps")]
     maps: Maps,
-    /// Function table: name -> function info.
-    functions: HashMap<String, FunctionInfo>,
+    functions: Functions,
     /// Stack top address (r10 initial value).
     stack_top: u64,
     /// The VM's extern table, and this program's copy of it at `helpers_version`.
@@ -105,7 +104,7 @@ impl Program {
         code: Code,
         memory: VmMemory,
         stack_top: u64,
-        functions: HashMap<String, FunctionInfo>,
+        functions: Functions,
         helpers: (Arc<SharedHelpers>, HelperRegistry, u64),
         config: &VmConfig,
     ) -> Self {
@@ -157,14 +156,21 @@ impl Program {
         Ok(MapRef::new(&mut self.maps, &mut self.memory, handle))
     }
 
-    /// The exported functions, in no particular order.
+    /// The exported functions, sorted by name. A function's position here is its index for [`Program::func_at`].
     pub fn functions(&self) -> impl ExactSizeIterator<Item = (&str, &FunctionInfo)> {
-        self.functions.iter().map(|(name, info)| (name.as_str(), info))
+        self.functions.list.iter().map(|(name, info)| (name.as_str(), info))
     }
 
     /// Get information about a function by name.
     pub fn function(&self, name: &str) -> Option<&FunctionInfo> {
-        self.functions.get(name)
+        let (index, _) = self.functions.find(name)?;
+        Some(&self.functions.list.get(index)?.1)
+    }
+
+    /// The index of the function called `name` in [`Program::functions`].
+    #[inline]
+    pub fn function_index(&self, name: &str) -> Option<usize> {
+        Some(self.functions.find(name)?.0)
     }
 
     /// Call a function by name; arguments go in r1-r5.
@@ -177,22 +183,32 @@ impl Program {
     /// The function called `name`, for [`Program::call_func`].
     #[inline]
     pub fn func(&self, name: &str) -> Result<Func> {
-        let (func, _) = self.func_with_info(name).ok_or_else(|| VmError::FunctionNotFound {
-            plugin: None,
-            func: name.to_string(),
-        })?;
-        Ok(func)
+        let Some((_, pc)) = self.functions.find(name) else {
+            return Err(VmError::FunctionNotFound {
+                plugin: None,
+                func: name.to_string(),
+            });
+        };
+        Ok(Func { program: self.id, pc })
+    }
+
+    /// The function at `index` in [`Program::functions`], for [`Program::call_func`]; `None` if `index` is out of
+    /// range.
+    #[inline]
+    pub fn func_at(&self, index: usize) -> Option<Func> {
+        let (_, info) = self.functions.list.get(index)?;
+        Some(Func {
+            program: self.id,
+            pc: info.pc,
+        })
     }
 
     /// The function called `name` and its table entry.
     #[inline]
     pub(crate) fn func_with_info(&self, name: &str) -> Option<(Func, &FunctionInfo)> {
-        let info = self.functions.get(name)?;
-        let func = Func {
-            program: self.id,
-            pc: info.pc,
-        };
-        Some((func, info))
+        let (index, pc) = self.functions.find(name)?;
+        let (_, info) = self.functions.list.get(index)?;
+        Some((Func { program: self.id, pc }, info))
     }
 
     /// Whether `func` was looked up in this program.
@@ -240,20 +256,48 @@ impl Program {
     }
 }
 
+/// A [`Func`] in two atomics. Callers serialize access, e.g. under a plugin's lock.
+#[derive(Debug)]
+pub struct AtomicFunc {
+    program: AtomicU64,
+    pc: AtomicU64,
+}
+
+impl AtomicFunc {
+    pub fn new(func: Func) -> Self {
+        Self {
+            program: AtomicU64::new(func.program),
+            pc: AtomicU64::new(func.pc),
+        }
+    }
+
+    #[inline]
+    pub fn load(&self) -> Func {
+        Func {
+            program: self.program.load(Ordering::Relaxed),
+            pc: self.pc.load(Ordering::Relaxed),
+        }
+    }
+
+    #[inline]
+    pub fn store(&self, func: Func) {
+        self.program.store(func.program, Ordering::Relaxed);
+        self.pc.store(func.pc, Ordering::Relaxed);
+    }
+}
+
 /// A [`Func`] that follows its function by name into whichever program it is called with, for handles that outlive the
 /// program they were looked up in. Callers serialize access per slot, e.g. under a plugin's lock.
 #[derive(Debug)]
 pub struct FuncSlot {
-    program: AtomicU64,
-    pc: AtomicU64,
+    func: AtomicFunc,
     name: Arc<str>,
 }
 
 impl FuncSlot {
     pub fn new(func: Func, name: Arc<str>) -> Self {
         Self {
-            program: AtomicU64::new(func.program),
-            pc: AtomicU64::new(func.pc),
+            func: AtomicFunc::new(func),
             name,
         }
     }
@@ -262,8 +306,9 @@ impl FuncSlot {
     /// with [`VmError::FunctionNotFound`] naming `plugin` if `program` lacks it.
     #[inline]
     pub fn call(&self, program: &mut Program, plugin: &Arc<str>, args: &[u64]) -> Result<u64> {
-        let pc = if self.program.load(Ordering::Relaxed) == program.id {
-            self.pc.load(Ordering::Relaxed)
+        let func = self.func.load();
+        let pc = if program.owns(func) {
+            func.pc
         } else {
             self.follow(program, plugin)?
         };
@@ -277,9 +322,37 @@ impl FuncSlot {
         let Some((func, _)) = program.func_with_info(&self.name) else {
             return Err(not_found(plugin, &self.name));
         };
-        self.pc.store(func.pc, Ordering::Relaxed);
-        self.program.store(func.program, Ordering::Relaxed);
+        self.func.store(func);
         Ok(func.pc)
+    }
+}
+
+/// A program's exported functions: sorted by name, which gives each its index, and hashed for calls by name.
+#[derive(Debug)]
+pub(crate) struct Functions {
+    list: Vec<(String, FunctionInfo)>,
+    // name -> (index, pc); the pc sits in the map, which measured faster for calls by name than reading it from `list`
+    by_name: HashMap<String, (usize, u64)>,
+}
+
+impl Functions {
+    /// The table of `list`; `None` unless `list` is sorted by name with every name once.
+    pub(crate) fn new(list: Vec<(String, FunctionInfo)>) -> Option<Self> {
+        if !list.is_sorted_by(|(a, _), (b, _)| a < b) {
+            return None;
+        }
+        let by_name = list
+            .iter()
+            .enumerate()
+            .map(|(index, (name, info))| (name.clone(), (index, info.pc)))
+            .collect();
+        Some(Self { list, by_name })
+    }
+
+    /// The index and pc of the function called `name`.
+    #[inline(always)]
+    fn find(&self, name: &str) -> Option<(usize, u64)> {
+        self.by_name.get(name).copied()
     }
 }
 

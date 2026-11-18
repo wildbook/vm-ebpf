@@ -1,5 +1,7 @@
 //! Plugins: exports, reloads, re-entrancy, and sharing maps/regions/borrows.
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rvm::{HelperError, LinkError, Program, Vm, VmError, WeakPlugin};
@@ -214,4 +216,27 @@ fn borrowed_buffers() {
     assert!(err.contains("callee::poke") && err.contains("memory fault"), "{err}");
     let slot = rvm::region_base(rvm::BORROW_FIRST_REGION);
     assert!(callee.lock().unwrap().memory().bytes(slot, 1).is_err());
+}
+
+/// A host function that panics during a call with a borrowed buffer leaves the buffer unmapped and both plugins
+/// unlocked.
+#[test]
+fn panic_during_borrowed_call() {
+    let vm = Vm::new();
+    let fail = Arc::new(AtomicBool::new(true));
+    let failing = fail.clone();
+    vm.register_fn("host_peek", move |first: u64| {
+        assert!(!failing.load(Ordering::Relaxed), "host_peek failed");
+        first
+    });
+    let callee = vm.load_plugin("callee", &object("tests/borrow_host.o")).unwrap();
+    vm.export(&callee, "peek").unwrap();
+    let caller = vm.load_plugin("caller", &object("tests/borrow_host_caller.o")).unwrap();
+
+    assert!(catch_unwind(AssertUnwindSafe(|| caller.call("run", &[]))).is_err());
+    let slot = rvm::region_base(rvm::BORROW_FIRST_REGION);
+    assert!(callee.lock().unwrap().memory().bytes(slot, 1).is_err());
+
+    fail.store(false, Ordering::Relaxed);
+    assert_eq!(caller.call("run", &[]).unwrap(), 42);
 }

@@ -3,6 +3,8 @@ bpf_objects(rvm_bpf
     atomics.c
     borrow_callee.c
     borrow_caller.c
+    borrow_host.c
+    borrow_host_caller.c
     core_bitfield.c
     core_guard.c
     data_ptrs.c

@@ -49,6 +49,20 @@ rvm_status rvm_map(rvm_program *program, size_t region, size_t len, uint64_t *ad
 rvm_status rvm_call(rvm_program *program, const char *name, size_t name_len, const uint64_t *args, size_t nargs,
                     uint64_t *ret);
 
+// Functions have indices from 0 to rvm_function_count - 1, in name order. A call by index skips the name lookup.
+
+// Stores the index of the function `name` in *index. name may be NULL when name_len is 0.
+rvm_status rvm_func(const rvm_program *program, const char *name, size_t name_len, size_t *index);
+
+// Calls the function at `index` like rvm_call; RVM_ERR_NOT_FOUND if index is out of range.
+rvm_status rvm_call_func(rvm_program *program, size_t index, const uint64_t *args, size_t nargs, uint64_t *ret);
+
+size_t rvm_function_count(const rvm_program *program);
+
+// Stores the name of the function at `index` in *name and *name_len; RVM_ERR_NOT_FOUND if index is out of range. The
+// name is UTF-8, not NUL-terminated, and valid until the program is freed.
+rvm_status rvm_function_name(const rvm_program *program, size_t index, const char **name, size_t *name_len);
+
 #ifdef __cplusplus
 }
 #endif

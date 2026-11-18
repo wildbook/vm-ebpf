@@ -1,7 +1,7 @@
 //! Host functions callable from eBPF: typed registration and slot dispatch.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex};
 
 use hashbrown::HashMap;
 
@@ -9,7 +9,8 @@ use crate::error::HelperError;
 #[cfg(feature = "maps")]
 use crate::maps::Maps;
 use crate::memory::{GuestMemory, VmMemory};
-use crate::sync::{read, write};
+use crate::published::Published;
+use crate::sync::lock;
 
 /// Registers r1-r5 at the time of a helper call.
 #[derive(Debug, Clone, Copy)]
@@ -325,19 +326,24 @@ impl std::fmt::Debug for HelperRegistry {
 
 /// The extern table a [`crate::Vm`] shares with the programs it links.
 ///
-/// Every change bumps a version. A program keeps its own copy of the table and re-copies it on entry when the version
-/// moved, so helper calls never touch a lock and a change takes effect at each program's next call.
+/// Every change publishes a new table and bumps a version. A program keeps its own copy of the table and re-copies it
+/// on entry when the version moved, so helper calls never touch a lock and a change takes effect at each program's
+/// next call.
 #[derive(Debug, Default)]
 pub struct SharedHelpers {
-    registry: RwLock<HelperRegistry>,
+    current: Published<HelperRegistry>,
+    // serializes updates, so none is lost; readers never take it
+    writer: Mutex<()>,
     version: AtomicU64,
 }
 
 impl SharedHelpers {
-    /// Apply `f` to the table and publish the result.
+    /// Apply `f` to a copy of the table and publish the result.
     pub fn update<R>(&self, f: impl FnOnce(&mut HelperRegistry) -> R) -> R {
-        let mut registry = write(&self.registry);
+        let _writer = lock(&self.writer);
+        let mut registry = HelperRegistry::clone(&self.current.get());
         let result = f(&mut registry);
+        drop(self.current.replace(Arc::new(registry)));
         self.version.fetch_add(1, Ordering::Release);
         result
     }
@@ -348,14 +354,17 @@ impl SharedHelpers {
         self.version.load(Ordering::Acquire)
     }
 
-    /// Read access to the current table.
-    pub fn read(&self) -> RwLockReadGuard<'_, HelperRegistry> {
-        read(&self.registry)
+    /// The current table.
+    #[cfg(feature = "link")]
+    pub fn read(&self) -> Arc<HelperRegistry> {
+        self.current.get()
     }
 
-    /// A copy of the table and the version it belongs to.
+    /// A copy of the current table and a version no newer than it.
     pub fn snapshot(&self) -> (HelperRegistry, u64) {
-        let registry = self.read();
-        (registry.clone(), self.version())
+        // the table is published before the version moves, so reading the version first never pairs it with an older
+        // table
+        let version = self.version();
+        (HelperRegistry::clone(&self.current.get()), version)
     }
 }

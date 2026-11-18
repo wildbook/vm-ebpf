@@ -144,8 +144,11 @@ images declare none, as `bin/emu` does.
 `rvmrt.dll` and a static `rvmrt.lib`. `lib/rvmrt/include/rvmrt.h` declares its
 functions: `rvm_load` loads a prepared image, `rvm_map` maps zeroed guest
 memory, `rvm_call` calls a function by name, and `rvm_free` frees the program.
-Errors come back as `rvm_status` codes. The runtime has no helpers and the
-default instruction limit; an image that declares maps fails with
+Functions also have indices, in name order: `rvm_function_count` and
+`rvm_function_name` list them, `rvm_func` finds a name's index once, and
+`rvm_call_func` calls by index without the name lookup, which saves about 15 ns
+per call. Errors come back as `rvm_status` codes. The runtime has no helpers and
+the default instruction limit; an image that declares maps fails with
 `RVM_ERR_LINK`.
 
 ```bash
@@ -166,12 +169,11 @@ rvmrt it is 9,216 bytes with 44 imports.
 
 | build | `rvmrt.dll` | added to the C host by `rvmrt.lib` |
 |---|---|---|
-| in `lib/rvmrt` | 72,704 B, 35 imports from 4 DLLs | 64,512 B, 12 imports |
-| at the root | 156,672 B, 58 imports from 6 DLLs | 147,968 B, 33 imports |
+| in `lib/rvmrt` | 71,680 B, 31 imports from 3 DLLs | 61,952 B, 8 imports |
+| at the root | 155,648 B, 58 imports from 6 DLLs | 146,944 B, 33 imports |
 
-The 12 imports are the process heap (`GetProcessHeap`, `HeapAlloc`, `HeapFree`,
-`HeapReAlloc`), `WaitOnAddress`, `WakeByAddressAll`, `WakeByAddressSingle`,
-`GetLastError`, `memcmp`, `memmove`, and `GetCurrentProcess` with
+The 8 imports are the process heap (`GetProcessHeap`, `HeapAlloc`, `HeapFree`,
+`HeapReAlloc`), `memcmp`, `memmove`, and `GetCurrentProcess` with
 `TerminateProcess` for aborts.
 
 ## Plugins
