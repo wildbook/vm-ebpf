@@ -14,6 +14,25 @@ pub const BTF_INT_SIGNED: u8 = 1 << 0;
 /// Size in bytes of the `btf_type` header that starts every type record.
 pub const TYPE_HEADER_LEN: usize = 12;
 
+// Sizes in bytes of the records that follow a type header, named after the kernel structs they hold. `BTF_INT_SIZE`
+// is the `u32` that packs an integer's encoding, bit offset and bit count.
+pub const BTF_INT_SIZE: usize = 4;
+pub const BTF_ARRAY_SIZE: usize = 12;
+pub const BTF_MEMBER_SIZE: usize = 12;
+pub const BTF_ENUM_SIZE: usize = 8;
+pub const BTF_PARAM_SIZE: usize = 8;
+pub const BTF_VAR_SIZE: usize = 4;
+pub const BTF_VAR_SECINFO_SIZE: usize = 12;
+pub const BTF_DECL_TAG_SIZE: usize = 4;
+pub const BTF_ENUM64_SIZE: usize = 12;
+
+/// `Func` linkage (`enum btf_func_linkage`): visible only inside its object.
+pub const BTF_FUNC_STATIC: u16 = 0;
+/// `Func` linkage: defined here and visible to other objects.
+pub const BTF_FUNC_GLOBAL: u16 = 1;
+/// `Func` linkage: declared here and defined elsewhere.
+pub const BTF_FUNC_EXTERN: u16 = 2;
+
 /// BTF type kind values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -54,26 +73,27 @@ impl BtfKind {
 
     /// Size in bytes of additional data following the type header for this kind.
     pub fn extra_size(self, vlen: u16) -> usize {
+        let vlen = usize::from(vlen);
         match self {
             Self::Void => 0,
-            Self::Int => 4,
+            Self::Int => BTF_INT_SIZE,
             Self::Ptr => 0,
-            Self::Array => 12,                                // btf_array
-            Self::Struct | Self::Union => vlen as usize * 12, // btf_member
-            Self::Enum => vlen as usize * 8,                  // btf_enum
+            Self::Array => BTF_ARRAY_SIZE,
+            Self::Struct | Self::Union => vlen * BTF_MEMBER_SIZE,
+            Self::Enum => vlen * BTF_ENUM_SIZE,
             Self::Fwd => 0,
             Self::Typedef => 0,
             Self::Volatile => 0,
             Self::Const => 0,
             Self::Restrict => 0,
             Self::Func => 0,
-            Self::FuncProto => vlen as usize * 8, // btf_param
-            Self::Var => 4,                       // btf_var
-            Self::DataSec => vlen as usize * 12,  // btf_var_secinfo
+            Self::FuncProto => vlen * BTF_PARAM_SIZE,
+            Self::Var => BTF_VAR_SIZE,
+            Self::DataSec => vlen * BTF_VAR_SECINFO_SIZE,
             Self::Float => 0,
-            Self::DeclTag => 4, // btf_decl_tag
+            Self::DeclTag => BTF_DECL_TAG_SIZE,
             Self::TypeTag => 0,
-            Self::Enum64 => vlen as usize * 12, // btf_enum64
+            Self::Enum64 => vlen * BTF_ENUM64_SIZE,
         }
     }
 }

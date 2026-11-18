@@ -63,7 +63,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn read_stats(parser: &mut Program) -> Result<Stats, Box<dyn Error>> {
     let totals = parser.map("totals")?;
-    let [events, services, skipped_fields, other_records]: [u64; 4] = totals.get_as(0u32)?.ok_or("no totals")?;
+    let Totals {
+        events,
+        services,
+        skipped_fields,
+        other_records,
+    } = totals.get_as(0u32)?.ok_or("no totals")?;
 
     let map = parser.map("services")?;
     let entries = map.entries();
@@ -163,6 +168,19 @@ struct SvcStats {
 
 // SAFETY: integer fields only, and the `u64`s start at an 8 byte offset, so there is no padding.
 unsafe impl Pod for SvcStats {}
+
+/// `struct totals`, the value of the `totals` map.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Totals {
+    events: u64,
+    services: u64,
+    skipped_fields: u64,
+    other_records: u64,
+}
+
+// SAFETY: `u64` fields only, so there is no padding.
+unsafe impl Pod for Totals {}
 
 /// Encodes `records` log records and tallies what the parser should make of them. Every 40th record is a heartbeat and
 /// every 57th a map without a service name; the rest are events, some with fields the parser doesn't know.
@@ -349,5 +367,39 @@ impl Rng {
 
     fn below(&mut self, n: u64) -> u64 {
         self.next() % n
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::mem::{offset_of, size_of};
+
+    use btf::Btf;
+    use rvm::Module;
+
+    use super::*;
+
+    /// The host reads the parser's map values as `SvcStats` and `Totals`, so their layouts must match the C structs.
+    #[test]
+    fn map_values_match_the_plugin() {
+        let module = Module::from_elf("parser", PARSER).unwrap();
+        let btf = Btf::parse(module.btf_data.as_deref().unwrap()).unwrap();
+
+        let svc_stats = vec![
+            ("name", offset_of!(SvcStats, name)),
+            ("events", offset_of!(SvcStats, events)),
+            ("by_level", offset_of!(SvcStats, by_level)),
+            ("ms_total", offset_of!(SvcStats, ms_total)),
+            ("ms_max", offset_of!(SvcStats, ms_max)),
+            ("bytes", offset_of!(SvcStats, bytes)),
+        ];
+        assert_eq!(btf.struct_layout("svc_stats"), Some((size_of::<SvcStats>(), svc_stats)));
+        let totals = vec![
+            ("events", offset_of!(Totals, events)),
+            ("services", offset_of!(Totals, services)),
+            ("skipped_fields", offset_of!(Totals, skipped_fields)),
+            ("other_records", offset_of!(Totals, other_records)),
+        ];
+        assert_eq!(btf.struct_layout("totals"), Some((size_of::<Totals>(), totals)));
     }
 }

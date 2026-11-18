@@ -25,12 +25,28 @@ typedef signed long long   s64;
 #define BORROW(len_arg)    __attribute__((btf_decl_tag("borrow:" #len_arg)))
 #define BORROW_RO(len_arg) __attribute__((btf_decl_tag("borrow_ro:" #len_arg)))
 
-/* Map types and update flags, as in lib/rvm/src/maps/btf.rs and maps/mod.rs. */
+/* Map types and update flags, as in lib/rvm/src/map_def/btf.rs and lib/rvm/src/maps/mod.rs. */
 #define BPF_MAP_TYPE_HASH  1
 #define BPF_MAP_TYPE_ARRAY 2
 #define BPF_ANY     0
 #define BPF_NOEXIST 1
 #define BPF_EXIST   2
+
+/* The info kinds of clang's __builtin_preserve_field_info and __builtin_preserve_type_info, as libbpf names them. */
+enum bpf_field_info_kind {
+    BPF_FIELD_BYTE_OFFSET = 0,
+    BPF_FIELD_BYTE_SIZE = 1,
+    BPF_FIELD_EXISTS = 2,
+    BPF_FIELD_SIGNED = 3,
+    BPF_FIELD_LSHIFT_U64 = 4,
+    BPF_FIELD_RSHIFT_U64 = 5,
+};
+
+enum bpf_type_info_kind {
+    BPF_TYPE_EXISTS = 0,
+    BPF_TYPE_SIZE = 1,
+    BPF_TYPE_MATCHES = 2,
+};
 
 /* Map helpers, always available; see lib/rvm/src/maps/helpers.rs. */
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;

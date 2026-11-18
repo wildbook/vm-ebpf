@@ -2,15 +2,21 @@
 //! exported functions.
 //! Exits with an error when a call fails or returns the wrong value.
 
+use std::mem::offset_of;
+
 use anyhow::{ensure, Context, Result};
-use rvm::{Module, Perms, Program, Vm};
+use rvm::{Module, Perms, Pod, Program, Vm};
+
+const ELF_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/prebuilt/examples/example.o");
+
+/// `operation` of `struct input_ctx` that multiplies.
+const OP_MUL: u32 = 2;
 
 fn main() -> Result<()> {
-    let elf_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/prebuilt/examples/example.o");
-    let elf_bytes = std::fs::read(elf_path)
-        .with_context(|| format!("reading {elf_path}; `cmake --build --preset update-prebuilt` rebuilds it"))?;
+    let elf_bytes = std::fs::read(ELF_PATH)
+        .with_context(|| format!("reading {ELF_PATH}; `cmake --build --preset update-prebuilt` rebuilds it"))?;
     let len = elf_bytes.len();
-    println!("Loaded {elf_path}: {len} bytes");
+    println!("Loaded {ELF_PATH}: {len} bytes");
 
     let vm = Vm::new();
 
@@ -36,12 +42,15 @@ fn main() -> Result<()> {
     println!("\n=== bpf_main (op=mul, 10 * 20) ===");
     let ctx = program.memory_mut().map(rvm::FIRST_FREE_REGION, 4096, Perms::RW)?;
     let out = ctx + 64;
-    let mem = program.memory_mut();
-    mem.write(ctx, 10u64)?; // value_a
-    mem.write(ctx + 8, 20u64)?; // value_b
-    mem.write(ctx + 16, 2u32)?; // operation = mul
+    let input = InputCtx {
+        value_a: 10,
+        value_b: 20,
+        operation: OP_MUL,
+        flags: 0,
+    };
+    program.memory_mut().write_bytes(ctx, input.as_bytes())?;
     let status = program.call("bpf_main", &[ctx, out])?;
-    let product: u64 = program.memory().read(out)?;
+    let product: u64 = program.memory().read(out + offset_of!(OutputResult, result) as u64)?;
     println!("bpf_main returned {status}, out->result = {product}");
     ensure!(status == 0 && product == 200, "bpf_main returned {status}, result {product}; expected 0, 200");
 
@@ -124,4 +133,55 @@ fn run_and_report(program: &mut Program, name: &str, args: &[u64]) -> Result<u64
     let result = program.call(name, args).with_context(|| format!("calling {name}"))?;
     println!("Return value (r0): {result} (0x{result:x})");
     Ok(result)
+}
+
+/// `struct input_ctx` in `bpf/examples/example.c`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct InputCtx {
+    value_a: u64,
+    value_b: u64,
+    operation: u32,
+    flags: u32,
+}
+
+// SAFETY: integer fields only, and the `u32`s fill the struct's last 8 bytes, so there is no padding.
+unsafe impl Pod for InputCtx {}
+
+/// `struct output_result` in `bpf/examples/example.c`.
+#[repr(C)]
+struct OutputResult {
+    result: u64,
+    status: u32,
+    reserved: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::mem::size_of;
+
+    use btf::Btf;
+
+    use super::*;
+
+    /// `bpf_main` reads and writes these structs in host memory, so their layouts must match the C structs.
+    #[test]
+    fn context_structs_match_the_program() {
+        let module = Module::from_elf("example", &std::fs::read(ELF_PATH).unwrap()).unwrap();
+        let btf = Btf::parse(module.btf_data.as_deref().unwrap()).unwrap();
+
+        let input_ctx = vec![
+            ("value_a", offset_of!(InputCtx, value_a)),
+            ("value_b", offset_of!(InputCtx, value_b)),
+            ("operation", offset_of!(InputCtx, operation)),
+            ("flags", offset_of!(InputCtx, flags)),
+        ];
+        assert_eq!(btf.struct_layout("input_ctx"), Some((size_of::<InputCtx>(), input_ctx)));
+        let output_result = vec![
+            ("result", offset_of!(OutputResult, result)),
+            ("status", offset_of!(OutputResult, status)),
+            ("reserved", offset_of!(OutputResult, reserved)),
+        ];
+        assert_eq!(btf.struct_layout("output_result"), Some((size_of::<OutputResult>(), output_result)));
+    }
 }

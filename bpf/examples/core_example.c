@@ -1,6 +1,7 @@
 /*
  * Reads `struct event` fields through CO-RE relocations, which the linker
- * patches to the host's layout of the struct.
+ * patches to the host's layout of the struct. Written like a kernel program,
+ * with its own declarations instead of rvm_bpf.h.
  */
 
 #define NULL ((void *)0)

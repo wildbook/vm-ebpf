@@ -29,21 +29,21 @@ struct totals {
 
 /* Service name to its index in `services`, in order of first appearance. */
 struct {
-    __uint(type, 1 /* BPF_MAP_TYPE_HASH */);
+    __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, MAX_SERVICES);
     __type(key, char[NAME_LEN]);
     __type(value, u32);
 } svc_ids SEC(".maps");
 
 struct {
-    __uint(type, 2 /* BPF_MAP_TYPE_ARRAY */);
+    __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, MAX_SERVICES);
     __type(key, u32);
     __type(value, struct svc_stats);
 } services SEC(".maps");
 
 struct {
-    __uint(type, 2 /* BPF_MAP_TYPE_ARRAY */);
+    __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
     __type(key, u32);
     __type(value, struct totals);
@@ -318,7 +318,7 @@ static noinline struct svc_stats *service(const char *name, struct totals *t) {
         return bpf_map_lookup_elem(&services, id);
 
     u32 next = t->services;
-    if (next >= MAX_SERVICES || bpf_map_update_elem(&svc_ids, name, &next, 1 /* BPF_NOEXIST */))
+    if (next >= MAX_SERVICES || bpf_map_update_elem(&svc_ids, name, &next, BPF_NOEXIST))
         return 0;
     struct svc_stats *s = bpf_map_lookup_elem(&services, &next);
     if (!s)

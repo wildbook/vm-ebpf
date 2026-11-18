@@ -22,7 +22,7 @@ use std::error::Error;
 use std::mem::{offset_of, size_of};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use rvm::{MemoryError, Perms, Plugin, Scalar, SharedRegion, Vm};
+use rvm::{MemoryError, Perms, Plugin, Pod, Scalar, SharedRegion, Vm};
 
 const RULES: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/prebuilt/examples/game_rules.o"));
 const RULES_V2: &[u8] =
@@ -144,9 +144,8 @@ fn print_summary(world: &World, rules: &Plugin) -> Result<(), Box<dyn Error>> {
     let mut rules = rules.lock()?;
     let alive = world.entities();
 
-    // `struct wave_state` and `struct score` are two `u64`s each
     let waves = rules.map("waves")?;
-    let [wave, spawned]: [u64; 2] = waves.get_as(0u32)?.ok_or("no wave state")?;
+    let WaveState { wave, spawned } = waves.get_as(0u32)?.ok_or("no wave state")?;
     let monsters: Vec<_> = alive.iter().filter(|e| e.kind != HERO).collect();
     let oldest = monsters.iter().map(|e| e.spawned_at).min().unwrap_or(TICKS);
     let left = monsters.len();
@@ -156,7 +155,7 @@ fn print_summary(world: &World, rules: &Plugin) -> Result<(), Box<dyn Error>> {
     for (i, (name, _)) in HEROES.iter().enumerate() {
         let id = i as u32 + 1;
         let hp = alive.iter().find(|e| e.id == id).map_or(0, |e| e.hp);
-        let [points, kills]: [u64; 2] = scores.get_as(id)?.unwrap_or_default();
+        let Score { points, kills } = scores.get_as(id)?.unwrap_or_default();
         println!("{name}: {hp} hp, {points} points, {kills} kills");
     }
     Ok(())
@@ -182,6 +181,28 @@ struct Stats {
     attack: i32,
     armor: i32,
 }
+
+/// `struct wave_state` in `bpf/examples/game_rules.c`, the value of the `waves` map.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WaveState {
+    wave: u64,
+    spawned: u64,
+}
+
+// SAFETY: `u64` fields only, so there is no padding.
+unsafe impl Pod for WaveState {}
+
+/// `struct score` in `bpf/examples/game_sdk.h`, the value of the `scores` map.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Score {
+    points: u64,
+    kills: u64,
+}
+
+// SAFETY: `u64` fields only, so there is no padding.
+unsafe impl Pod for Score {}
 
 /// Entities in a region shared with every plugin, as an array the host appends to and compacts.
 struct World {
@@ -322,5 +343,32 @@ impl WorldState {
         self.set(slot, offset_of!(Entity, y), entity.y);
         self.set(slot, offset_of!(Entity, attack), entity.attack);
         self.set(slot, offset_of!(Entity, spawned_at), entity.spawned_at);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use btf::Btf;
+    use rvm::Module;
+
+    use super::*;
+
+    /// The host reads the rules plugin's map values as `WaveState` and `Score`, so their layouts must match the C
+    /// structs.
+    #[test]
+    fn map_values_match_the_plugin() {
+        let module = Module::from_elf("rules", RULES).unwrap();
+        let btf = Btf::parse(module.btf_data.as_deref().unwrap()).unwrap();
+
+        let wave_state = vec![
+            ("wave", offset_of!(WaveState, wave)),
+            ("spawned", offset_of!(WaveState, spawned)),
+        ];
+        assert_eq!(btf.struct_layout("wave_state"), Some((size_of::<WaveState>(), wave_state)));
+        let score = vec![
+            ("points", offset_of!(Score, points)),
+            ("kills", offset_of!(Score, kills)),
+        ];
+        assert_eq!(btf.struct_layout("score"), Some((size_of::<Score>(), score)));
     }
 }

@@ -113,10 +113,6 @@ fn resolve_target(token: &str, slot: usize, label_slot: &HashMap<String, usize>)
     }
 }
 
-fn is_jmp_base(base: &str) -> bool {
-    matches!(base, "jeq" | "jne" | "jgt" | "jge" | "jlt" | "jle" | "jset" | "jsgt" | "jsge" | "jslt" | "jsle")
-}
-
 /// Splits a trailing `32` width suffix off a mnemonic, e.g. `"jeq32"` -> `("jeq", true)`.
 fn strip32(mnemonic: &str) -> (&str, bool) {
     match mnemonic.strip_suffix("32") {
@@ -189,20 +185,39 @@ macro_rules! alu_dispatch {
     };
 }
 
-/// Emits one register/immediate conditional jump method pair per base name.
-macro_rules! jmp_dispatch {
-    ($base:expr, $is32:expr, $asm:expr, $dst:expr, $src:expr, $label:expr;
-     $( $name:literal: $m64:ident, $m64i:ident, $m32:ident, $m32i:ident );+ $(;)?) => {
-        match ($base, $is32, $src) {
-            $(
-                ($name, false, Operand::Reg(r)) => { $asm.$m64($dst, r, $label); }
-                ($name, false, Operand::Imm(i)) => { $asm.$m64i($dst, i, $label); }
-                ($name, true, Operand::Reg(r)) => { $asm.$m32($dst, r, $label); }
-                ($name, true, Operand::Imm(i)) => { $asm.$m32i($dst, i, $label); }
-            )+
-            _ => return Err(format!("unknown jump mnemonic: {}{}", $base, if $is32 { "32" } else { "" })),
+/// Defines `is_jmp_base` and `emit_jmp` from one table of conditional jump base names and their methods.
+macro_rules! jmp_table {
+    ($( $name:literal: $m64:ident, $m64i:ident, $m32:ident, $m32i:ident );+ $(;)?) => {
+        fn is_jmp_base(base: &str) -> bool {
+            matches!(base, $( $name )|+)
+        }
+
+        fn emit_jmp(asm: &mut Assembler, base: &str, is32: bool, dst: Register, src: Operand, label: &Label) {
+            match (base, is32, src) {
+                $(
+                    ($name, false, Operand::Reg(r)) => { asm.$m64(dst, r, label); }
+                    ($name, false, Operand::Imm(i)) => { asm.$m64i(dst, i, label); }
+                    ($name, true, Operand::Reg(r)) => { asm.$m32(dst, r, label); }
+                    ($name, true, Operand::Imm(i)) => { asm.$m32i(dst, i, label); }
+                )+
+                _ => unreachable!("{base} is not a jump base"),
+            }
         }
     };
+}
+
+jmp_table! {
+    "jeq": jeq, jeq_imm, jeq32, jeq32_imm;
+    "jne": jne, jne_imm, jne32, jne32_imm;
+    "jgt": jgt, jgt_imm, jgt32, jgt32_imm;
+    "jge": jge, jge_imm, jge32, jge32_imm;
+    "jlt": jlt, jlt_imm, jlt32, jlt32_imm;
+    "jle": jle, jle_imm, jle32, jle32_imm;
+    "jset": jset, jset_imm, jset32, jset32_imm;
+    "jsgt": jsgt, jsgt_imm, jsgt32, jsgt32_imm;
+    "jsge": jsge, jsge_imm, jsge32, jsge32_imm;
+    "jslt": jslt, jslt_imm, jslt32, jslt32_imm;
+    "jsle": jsle, jsle_imm, jsle32, jsle32_imm;
 }
 
 /// Emits the non-fetch/fetch method pair per atomic op name, keyed by `(base, is32, fetch)`.
@@ -246,8 +261,9 @@ fn emit(
     label_by_slot: &HashMap<usize, Label>,
 ) -> Result<(), String> {
     let ops = &insn.operands;
-    let label_operand = |token: &str| -> Result<&Label, String> {
-        let target = resolve_target(token, insn.slot, label_slot)?;
+    // `label_operand` alone knows which operand holds the target.
+    let label = || -> Result<&Label, String> {
+        let target = label_operand(insn, label_slot)?.ok_or_else(|| format!("{} takes no label", insn.mnemonic))?;
         label_by_slot
             .get(&target)
             .ok_or_else(|| format!("no label created for slot {target}"))
@@ -369,13 +385,13 @@ fn emit(
             asm.stxb(dst, off, reg(&ops[1])?);
         }
         "ja" => {
-            asm.ja(label_operand(&ops[0])?);
+            asm.ja(label()?);
         }
         "ja32" => {
-            asm.ja32(label_operand(&ops[0])?);
+            asm.ja32(label()?);
         }
         "call" if ops[0] == "local" => {
-            asm.call_local(label_operand(&ops[1])?);
+            asm.call_local(label()?);
         }
         "call" if ops[0] == "helper" && ops[1].starts_with('%') => {
             asm.callx(reg(&ops[1])?);
@@ -404,22 +420,7 @@ fn emit(
         mnemonic => {
             let (base, is32) = strip32(mnemonic);
             if is_jmp_base(base) {
-                let dst = reg(&ops[0])?;
-                let src = operand(&ops[1])?;
-                let label = label_operand(&ops[2])?;
-                jmp_dispatch!(base, is32, asm, dst, src, label;
-                    "jeq": jeq, jeq_imm, jeq32, jeq32_imm;
-                    "jne": jne, jne_imm, jne32, jne32_imm;
-                    "jgt": jgt, jgt_imm, jgt32, jgt32_imm;
-                    "jge": jge, jge_imm, jge32, jge32_imm;
-                    "jlt": jlt, jlt_imm, jlt32, jlt32_imm;
-                    "jle": jle, jle_imm, jle32, jle32_imm;
-                    "jset": jset, jset_imm, jset32, jset32_imm;
-                    "jsgt": jsgt, jsgt_imm, jsgt32, jsgt32_imm;
-                    "jsge": jsge, jsge_imm, jsge32, jsge32_imm;
-                    "jslt": jslt, jslt_imm, jslt32, jslt32_imm;
-                    "jsle": jsle, jsle_imm, jsle32, jsle32_imm;
-                );
+                emit_jmp(asm, base, is32, reg(&ops[0])?, operand(&ops[1])?, label()?);
                 return Ok(());
             }
             let dst = reg(&ops[0])?;

@@ -20,28 +20,30 @@ target_compile_options(bpf_options INTERFACE
     -mcpu=v4 -O2 -g
     "-ffile-prefix-map=${PROJECT_SOURCE_DIR}=."
     "-ffile-prefix-map=${PROJECT_BINARY_DIR}=.")
+target_include_directories(bpf_options INTERFACE "${PROJECT_SOURCE_DIR}/bpf")
 
-# Compiles <name>.c, or the SOURCE file, from the current directory into the object library <name>, using the header
-# library LINK and the DEFINITIONS.
+# Compiles <name>.c, or the SOURCE file, from the current directory into the object library <name>, with the
+# DEFINITIONS.
 function(bpf_object name)
-    cmake_parse_arguments(PARSE_ARGV 1 arg "" "SOURCE;LINK" "DEFINITIONS")
+    cmake_parse_arguments(PARSE_ARGV 1 arg "" "SOURCE" "DEFINITIONS")
     if(NOT arg_SOURCE)
         set(arg_SOURCE "${name}.c")
     endif()
 
     add_library("${name}" OBJECT "${arg_SOURCE}")
-    target_link_libraries("${name}" PRIVATE bpf_options "${arg_LINK}")
+    target_link_libraries("${name}" PRIVATE bpf_options)
     target_compile_definitions("${name}" PRIVATE ${arg_DEFINITIONS})
 
     file(RELATIVE_PATH dir "${PROJECT_SOURCE_DIR}/bpf" "${CMAKE_CURRENT_SOURCE_DIR}")
     set_property(GLOBAL APPEND PROPERTY BPF_OBJECTS "${dir}/${name}")
 endfunction()
 
-# Calls bpf_object for each source, named after the file.
-function(bpf_objects link)
-    foreach(source IN LISTS ARGN)
+# Calls bpf_object for each .c file in the current directory, named after the file.
+function(bpf_objects)
+    file(GLOB sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.c")
+    foreach(source IN LISTS sources)
         cmake_path(GET source STEM name)
-        bpf_object("${name}" SOURCE "${source}" LINK "${link}")
+        bpf_object("${name}" SOURCE "${source}")
     endforeach()
 endfunction()
 
@@ -68,8 +70,11 @@ endforeach()
 add_custom_target(bpf-objects ALL DEPENDS ${built_objects})
 
 list(REMOVE_DUPLICATES prebuilt_dirs)
+# inputs.sha256 lets `cargo test` notice sources that changed after the last update.
 add_custom_target(update-prebuilt
     COMMAND "${CMAKE_COMMAND}" -E make_directory ${prebuilt_dirs}
     ${copy_commands}
+    COMMAND "${CMAKE_COMMAND}" "-DSOURCE_DIR=${PROJECT_SOURCE_DIR}" "-DOUTPUT=${BPF_PREBUILT_DIR}/inputs.sha256"
+        -P "${PROJECT_SOURCE_DIR}/cmake/hash-inputs.cmake"
     DEPENDS ${built_objects}
     VERBATIM)

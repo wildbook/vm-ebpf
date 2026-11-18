@@ -1,6 +1,9 @@
 //! BTF parsing from raw bytes.
 
-use crate::raw::{BtfKind, TypeHeader, BTF_MAGIC, BTF_VERSION, TYPE_HEADER_LEN};
+use crate::raw::{
+    BtfKind, TypeHeader, BTF_ENUM64_SIZE, BTF_ENUM_SIZE, BTF_MAGIC, BTF_MEMBER_SIZE, BTF_PARAM_SIZE,
+    BTF_VAR_SECINFO_SIZE, BTF_VERSION, TYPE_HEADER_LEN,
+};
 use crate::strings::BtfStrings;
 use crate::types::*;
 
@@ -141,6 +144,18 @@ impl<'a> Btf<'a> {
         self.types.iter().enumerate().map(|(i, t)| (i as u32, t))
     }
 
+    /// The struct named `name`: its size and each member's name and offset, in bytes and declaration order. `None` if
+    /// no struct has that name or one of its members is a bitfield.
+    pub fn struct_layout(&self, name: &str) -> Option<(usize, Vec<(&'a str, usize)>)> {
+        let (size, members) = self.types.iter().find_map(|ty| match ty {
+            BtfTypeInfo::Struct { name: n, size, members } if *n == name => Some((*size as usize, members)),
+            _ => None,
+        })?;
+        let byte_offset = |m: &Member<'a>| (m.bitfield_size == 0 && m.bit_offset % 8 == 0).then_some(m.bit_offset / 8);
+        let offsets = members.iter().map(|m| Some((m.name, byte_offset(m)? as usize)));
+        Some((size, offsets.collect::<Option<_>>()?))
+    }
+
     /// Resolve a type through modifiers (const, volatile, restrict, typedef).
     ///
     /// Returns the underlying "real" type ID and info, or `None` for a missing type or a chain of over 32 modifiers,
@@ -201,7 +216,7 @@ fn parse_type<'a>(header: &TypeHeader, extra: &'a [u8], strings: &BtfStrings<'a>
     let size_or_type = header.size_or_type;
     let kind_flag = header.kind_flag;
     let members = || {
-        records(extra, |c: &[u8; 12]| {
+        records(extra, |c: &[u8; BTF_MEMBER_SIZE]| {
             let raw_offset = word(c, 2);
             Member {
                 name: strings.get_or_empty(word(c, 0)),
@@ -247,7 +262,7 @@ fn parse_type<'a>(header: &TypeHeader, extra: &'a [u8], strings: &BtfStrings<'a>
             size: size_or_type,
             is_signed: kind_flag,
             is_64: false,
-            variants: records(extra, |c: &[u8; 8]| EnumValue {
+            variants: records(extra, |c: &[u8; BTF_ENUM_SIZE]| EnumValue {
                 name: strings.get_or_empty(word(c, 0)),
                 value: i64::from(word(c, 1) as i32),
             }),
@@ -270,7 +285,7 @@ fn parse_type<'a>(header: &TypeHeader, extra: &'a [u8], strings: &BtfStrings<'a>
         },
         BtfKind::FuncProto => BtfTypeInfo::FuncProto {
             return_type: size_or_type,
-            params: records(extra, |c: &[u8; 8]| Param {
+            params: records(extra, |c: &[u8; BTF_PARAM_SIZE]| Param {
                 name: strings.get_or_empty(word(c, 0)),
                 type_id: word(c, 1),
             }),
@@ -283,7 +298,7 @@ fn parse_type<'a>(header: &TypeHeader, extra: &'a [u8], strings: &BtfStrings<'a>
         BtfKind::DataSec => BtfTypeInfo::DataSec {
             name,
             size: size_or_type,
-            vars: records(extra, |c: &[u8; 12]| VarSecInfo {
+            vars: records(extra, |c: &[u8; BTF_VAR_SECINFO_SIZE]| VarSecInfo {
                 type_id: word(c, 0),
                 offset: word(c, 1),
                 size: word(c, 2),
@@ -307,7 +322,7 @@ fn parse_type<'a>(header: &TypeHeader, extra: &'a [u8], strings: &BtfStrings<'a>
             size: size_or_type,
             is_signed: kind_flag,
             is_64: true,
-            variants: records(extra, |c: &[u8; 12]| EnumValue {
+            variants: records(extra, |c: &[u8; BTF_ENUM64_SIZE]| EnumValue {
                 name: strings.get_or_empty(word(c, 0)),
                 value: ((word(c, 2) as u64) << 32 | word(c, 1) as u64) as i64,
             }),

@@ -36,24 +36,9 @@ pub enum CoreReloKind {
 }
 
 impl CoreReloKind {
-    /// Parse from raw value.
+    /// The kind with discriminant `val`, or `None` if BTF defines no such kind.
     pub fn from_u32(val: u32) -> Option<Self> {
-        match val {
-            0 => Some(Self::FieldByteOffset),
-            1 => Some(Self::FieldByteSize),
-            2 => Some(Self::FieldExists),
-            3 => Some(Self::FieldSigned),
-            4 => Some(Self::FieldLShiftU64),
-            5 => Some(Self::FieldRShiftU64),
-            6 => Some(Self::TypeIdLocal),
-            7 => Some(Self::TypeIdTarget),
-            8 => Some(Self::TypeExists),
-            9 => Some(Self::TypeSize),
-            10 => Some(Self::EnumvalExists),
-            11 => Some(Self::EnumvalValue),
-            12 => Some(Self::TypeMatches),
-            _ => None,
-        }
+        KINDS.get(usize::try_from(val).ok()?).copied()
     }
 
     /// Check if this is a field-based relocation.
@@ -79,6 +64,34 @@ impl CoreReloKind {
         matches!(self, Self::EnumvalExists | Self::EnumvalValue)
     }
 }
+
+/// Every kind, indexed by its discriminant.
+const KINDS: [CoreReloKind; 13] = {
+    use CoreReloKind::*;
+    [
+        FieldByteOffset,
+        FieldByteSize,
+        FieldExists,
+        FieldSigned,
+        FieldLShiftU64,
+        FieldRShiftU64,
+        TypeIdLocal,
+        TypeIdTarget,
+        TypeExists,
+        TypeSize,
+        EnumvalExists,
+        EnumvalValue,
+        TypeMatches,
+    ]
+};
+
+const _: () = {
+    let mut i = 0;
+    while i < KINDS.len() {
+        assert!(KINDS[i] as usize == i);
+        i += 1;
+    }
+};
 
 /// A single CO-RE relocation entry.
 #[derive(Debug, Clone)]

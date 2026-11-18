@@ -10,34 +10,43 @@ use std::time::Instant;
 use crate::helper::{HelperContext, HelperRegistry};
 use crate::memory::GuestMemory;
 
-/// `void *map_lookup_elem(void *map, const void *key)`
-pub const BPF_FUNC_MAP_LOOKUP_ELEM: u32 = 1;
-/// `long map_update_elem(void *map, const void *key, const void *value, u64 flags)`
-pub const BPF_FUNC_MAP_UPDATE_ELEM: u32 = 2;
-/// `long map_delete_elem(void *map, const void *key)`
-pub const BPF_FUNC_MAP_DELETE_ELEM: u32 = 3;
-/// `u64 bpf_ktime_get_ns(void)`
-pub const BPF_FUNC_KTIME_GET_NS: u32 = 5;
-/// `long bpf_trace_printk(const char *fmt, u32 fmt_size, ...)`
-pub const BPF_FUNC_TRACE_PRINTK: u32 = 6;
-/// `u32 bpf_get_prandom_u32(void)`
-pub const BPF_FUNC_GET_PRANDOM_U32: u32 = 7;
+/// Declares the standard helpers: an ID constant for each, [`helper_name`] and, for tests, `STD_HELPERS`.
+macro_rules! std_helpers {
+    ($($(#[$doc:meta])* $id_const:ident = $id:literal, $name:literal;)*) => {
+        $($(#[$doc])* pub const $id_const: u32 = $id;)*
+
+        /// Name of a standard helper ID, for error messages.
+        pub fn helper_name(id: u32) -> Option<&'static str> {
+            match id {
+                $($id_const => Some($name),)*
+                _ => None,
+            }
+        }
+
+        /// Every standard helper's ID and name.
+        #[cfg(test)]
+        pub const STD_HELPERS: &[(u32, &str)] = &[$(($id, $name)),*];
+    };
+}
+
+// bpf/rvm_bpf.h declares these for C as `bpf_<name>`
+std_helpers! {
+    /// `void *map_lookup_elem(void *map, const void *key)`
+    BPF_FUNC_MAP_LOOKUP_ELEM = 1, "map_lookup_elem";
+    /// `long map_update_elem(void *map, const void *key, const void *value, u64 flags)`
+    BPF_FUNC_MAP_UPDATE_ELEM = 2, "map_update_elem";
+    /// `long map_delete_elem(void *map, const void *key)`
+    BPF_FUNC_MAP_DELETE_ELEM = 3, "map_delete_elem";
+    /// `u64 bpf_ktime_get_ns(void)`
+    BPF_FUNC_KTIME_GET_NS = 5, "ktime_get_ns";
+    /// `long bpf_trace_printk(const char *fmt, u32 fmt_size, ...)`
+    BPF_FUNC_TRACE_PRINTK = 6, "trace_printk";
+    /// `u32 bpf_get_prandom_u32(void)`
+    BPF_FUNC_GET_PRANDOM_U32 = 7, "get_prandom_u32";
+}
 
 /// `EINVAL`, which helpers return negated when an argument is invalid.
 pub const EINVAL: i64 = 22;
-
-/// Name of a standard helper ID, for error messages.
-pub fn helper_name(id: u32) -> Option<&'static str> {
-    Some(match id {
-        BPF_FUNC_MAP_LOOKUP_ELEM => "map_lookup_elem",
-        BPF_FUNC_MAP_UPDATE_ELEM => "map_update_elem",
-        BPF_FUNC_MAP_DELETE_ELEM => "map_delete_elem",
-        BPF_FUNC_KTIME_GET_NS => "ktime_get_ns",
-        BPF_FUNC_TRACE_PRINTK => "trace_printk",
-        BPF_FUNC_GET_PRANDOM_U32 => "get_prandom_u32",
-        _ => return None,
-    })
-}
 
 /// Register `ktime_get_ns`: monotonic nanoseconds since the first time any VM in this process registered it.
 pub fn register_time(helpers: &mut HelperRegistry) {

@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use rvm_core::opcode::CALL;
+use rvm_core::opcode::{CALL, LD_IMM64};
 use rvm_core::{decode_instructions, Code, Instruction, BPF_PSEUDO_KFUNC_CALL, MAX_CALL_DEPTH};
 
 use crate::error::{LinkError, Result, VmError};
@@ -72,6 +72,38 @@ pub enum Import {
 }
 
 impl Image {
+    /// An image of raw bytecode whose only function, `main`, spans all of `code` from its first instruction.
+    pub fn from_code(code: Vec<u8>) -> Image {
+        let main = FunctionInfo {
+            pc: 0,
+            size: code.len() as u64,
+            borrows: Vec::new(),
+        };
+        Image {
+            code,
+            functions: vec![("main".into(), main)],
+            ..Image::default()
+        }
+    }
+
+    /// Each `call <helper id>` in the code, as its instruction index and the helper ID. Linking records these as
+    /// [`Import::Helper`] externs.
+    pub fn helper_calls(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        let insns = self.code.as_chunks::<8>().0;
+        let mut i = 0;
+        std::iter::from_fn(move || {
+            while let Some(insn) = insns.get(i) {
+                let at = i as u32;
+                // the second slot of an `lddw` holds immediate bits, not an instruction
+                i += if insn[0] == LD_IMM64 { 2 } else { 1 };
+                if insn[0] == CALL && Instruction(u64::from_le_bytes(*insn)).src_reg() == 0 {
+                    return Some((at, imm(insn)));
+                }
+            }
+            None
+        })
+    }
+
     /// Serialize the image for [`crate::Vm::load_image`].
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut w = Writer(Vec::new());
@@ -388,7 +420,6 @@ pub fn set_slot_call(insn: &mut [u8; 8], slot: u32) {
 }
 
 /// The `imm` field of `insn`.
-#[cfg(feature = "link")]
 pub fn imm(insn: &[u8; 8]) -> u32 {
     let [.., a, b, c, d] = *insn;
     u32::from_le_bytes([a, b, c, d])

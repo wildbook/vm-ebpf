@@ -42,7 +42,11 @@ use std::fmt;
 use btf::{CoreRelo, CoreReloKind};
 
 use crate::instruction::{alu, atomic, class, jmp, mode, size, RawInstruction, SRC_IMM, SRC_REG};
+#[cfg(test)]
+use crate::mnemonic::Mnemonic;
 use crate::register::Register;
+#[cfg(test)]
+use crate::register::{R0, R1};
 
 /// Assembler error type.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,10 +130,27 @@ struct AsmInsn {
     raw2: Option<RawInstruction>,
 }
 
+// Each `*_family!` row names the mnemonic its methods decode to. The macro also emits `$cases`, a test-only table of
+// every method it defines, which `tests::every_method_decodes_to_its_mnemonic` runs through the decoder.
+
+/// An assembler method called with fixed operands, and the mnemonic its output must decode to.
+#[cfg(test)]
+type Case = (&'static str, fn(&mut Assembler) -> &mut Assembler, Mnemonic);
+
+/// Emits a jump through `emit` that targets the instruction after it.
+#[cfg(test)]
+fn jump_to_next(
+    asm: &mut Assembler,
+    emit: for<'a> fn(&'a mut Assembler, &Label) -> &'a mut Assembler,
+) -> &mut Assembler {
+    let next = asm.create_label();
+    emit(asm, &next).set_label(&next).unwrap()
+}
+
 /// Emits a register/immediate pair of ALU instruction methods for one opcode. `$off` is the ALU `offset` nibble eBPF
 /// uses to pick the signed variant of DIV/MOD.
 macro_rules! alu_family {
-    ($class:ident; $( $name:ident, $name_imm:ident = $op:ident, $off:expr; )+) => {
+    ($cases:ident, $class:ident; $( $name:ident, $name_imm:ident = $op:ident, $off:expr => $mnem:ident; )+) => {
         $(
             #[doc = concat!("`", stringify!($name), " dst, src`")]
             pub fn $name(&mut self, dst: Register, src: Register) -> &mut Self {
@@ -145,13 +166,19 @@ macro_rules! alu_family {
                 self
             }
         )+
+
+        #[cfg(test)]
+        const $cases: &[Case] = &[$(
+            (stringify!($name), |a| a.$name(R0, R1), Mnemonic::$mnem),
+            (stringify!($name_imm), |a| a.$name_imm(R0, 1), Mnemonic::$mnem),
+        )+];
     };
 }
 
 /// Emits one sign-extending move method per (source width, class) row. `$off` is the ALU `offset` nibble that selects
 /// the source width to sign-extend from.
 macro_rules! movsx_family {
-    ($( $name:ident = $class:ident, $off:expr );+ $(;)?) => {
+    ($cases:ident; $( $name:ident = $class:ident, $off:expr => $mnem:ident; )+) => {
         $(
             #[doc = concat!("`", stringify!($name), " dst, src`")]
             pub fn $name(&mut self, dst: Register, src: Register) -> &mut Self {
@@ -160,12 +187,17 @@ macro_rules! movsx_family {
                 self
             }
         )+
+
+        #[cfg(test)]
+        const $cases: &[Case] = &[$(
+            (stringify!($name), |a| a.$name(R0, R1), Mnemonic::$mnem),
+        )+];
     };
 }
 
 /// Emits a register/immediate pair of conditional jump methods for one opcode.
 macro_rules! jmp_family {
-    ($class:ident; $( $name:ident, $name_imm:ident = $op:ident; )+) => {
+    ($cases:ident, $class:ident; $( $name:ident, $name_imm:ident = $op:ident => $mnem:ident; )+) => {
         $(
             #[doc = concat!("`", stringify!($name), " dst, src, label`")]
             pub fn $name(&mut self, dst: Register, src: Register, label: &Label) -> &mut Self {
@@ -183,12 +215,18 @@ macro_rules! jmp_family {
                 self
             }
         )+
+
+        #[cfg(test)]
+        const $cases: &[Case] = &[$(
+            (stringify!($name), |a| jump_to_next(a, |a, l| a.$name(R0, R1, l)), Mnemonic::$mnem),
+            (stringify!($name_imm), |a| jump_to_next(a, |a, l| a.$name_imm(R0, 1, l)), Mnemonic::$mnem),
+        )+];
     };
 }
 
 /// Emits one load-from-memory method per (mnemonic, size, mode) row.
 macro_rules! ldx_family {
-    ($( $name:ident = $size:ident, $mode:ident; )+) => {
+    ($cases:ident; $( $name:ident = $size:ident, $mode:ident => $mnem:ident; )+) => {
         $(
             #[doc = concat!("`", stringify!($name), " dst, [src+off]`")]
             pub fn $name(&mut self, dst: Register, src: Register, offset: i16) -> &mut Self {
@@ -197,12 +235,17 @@ macro_rules! ldx_family {
                 self
             }
         )+
+
+        #[cfg(test)]
+        const $cases: &[Case] = &[$(
+            (stringify!($name), |a| a.$name(R0, R1, 0), Mnemonic::$mnem),
+        )+];
     };
 }
 
 /// Emits one store-to-memory-from-register method per size.
 macro_rules! stx_family {
-    ($( $name:ident = $size:ident );+) => {
+    ($cases:ident; $( $name:ident = $size:ident => $mnem:ident );+ $(;)?) => {
         $(
             #[doc = concat!("`", stringify!($name), " [dst+off], src`")]
             pub fn $name(&mut self, dst: Register, offset: i16, src: Register) -> &mut Self {
@@ -211,12 +254,17 @@ macro_rules! stx_family {
                 self
             }
         )+
+
+        #[cfg(test)]
+        const $cases: &[Case] = &[$(
+            (stringify!($name), |a| a.$name(R1, 0, R0), Mnemonic::$mnem),
+        )+];
     };
 }
 
 /// Emits one store-immediate-to-memory method per size.
 macro_rules! st_family {
-    ($( $name:ident = $size:ident );+) => {
+    ($cases:ident; $( $name:ident = $size:ident => $mnem:ident );+ $(;)?) => {
         $(
             #[doc = concat!("`", stringify!($name), " [dst+off], imm`")]
             pub fn $name(&mut self, dst: Register, offset: i16, imm: i32) -> &mut Self {
@@ -225,22 +273,27 @@ macro_rules! st_family {
                 self
             }
         )+
+
+        #[cfg(test)]
+        const $cases: &[Case] = &[$(
+            (stringify!($name), |a| a.$name(R1, 0, 1), Mnemonic::$mnem),
+        )+];
     };
 }
 
 /// Emits a non-fetch/fetch pair of atomic read-modify-write methods per op, for one memory size. `xchg` and `cmpxchg`
 /// always report the prior value, so they are defined separately instead of through this macro.
 macro_rules! atomic_family {
-    ($size:ident; $( $name:ident, $name_fetch:ident = $op:ident, $mnem:literal, $mnem_fetch:literal );+ $(;)?) => {
+    ($cases:ident, $size:ident; $( $name:ident, $name_fetch:ident = $op:ident => $mnem:ident, $mnem_fetch:ident; )+) => {
         $(
-            #[doc = concat!("`lock ", $mnem, " [dst+off], src`")]
+            #[doc = concat!("`", stringify!($name), " [dst+off], src`")]
             pub fn $name(&mut self, dst: Register, offset: i16, src: Register) -> &mut Self {
                 let opcode = class::STX | size::$size | mode::ATOMIC;
                 self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), offset, atomic::$op));
                 self
             }
 
-            #[doc = concat!("`lock ", $mnem_fetch, " [dst+off], src`")]
+            #[doc = concat!("`", stringify!($name_fetch), " [dst+off], src`")]
             pub fn $name_fetch(&mut self, dst: Register, offset: i16, src: Register) -> &mut Self {
                 let opcode = class::STX | size::$size | mode::ATOMIC;
                 let imm = atomic::$op | atomic::FETCH;
@@ -248,12 +301,18 @@ macro_rules! atomic_family {
                 self
             }
         )+
+
+        #[cfg(test)]
+        const $cases: &[Case] = &[$(
+            (stringify!($name), |a| a.$name(R1, 0, R0), Mnemonic::$mnem),
+            (stringify!($name_fetch), |a| a.$name_fetch(R1, 0, R0), Mnemonic::$mnem_fetch),
+        )+];
     };
 }
 
 /// Emits a load-acquire and a store-release method per memory size, with the operand order of `ldx*` and `stx*`.
 macro_rules! acquire_release_family {
-    ($( $load:ident, $store:ident = $size:ident );+ $(;)?) => {
+    ($cases:ident; $( $load:ident, $store:ident = $size:ident => $mnem_load:ident, $mnem_store:ident; )+) => {
         $(
             #[doc = concat!("`", stringify!($load), " dst, [src+off]`")]
             pub fn $load(&mut self, dst: Register, src: Register, offset: i16) -> &mut Self {
@@ -269,13 +328,19 @@ macro_rules! acquire_release_family {
                 self
             }
         )+
+
+        #[cfg(test)]
+        const $cases: &[Case] = &[$(
+            (stringify!($load), |a| a.$load(R0, R1, 0), Mnemonic::$mnem_load),
+            (stringify!($store), |a| a.$store(R1, 0, R0), Mnemonic::$mnem_store),
+        )+];
     };
 }
 
 /// Emits one byte-swap method per bit width, for a fixed class and source type (`le*`/`be*` are ALU32 and truncate;
 /// `bswap*` is ALU64 and always swaps the full width regardless of host endianness).
 macro_rules! endian_family {
-    ($class:ident, $src:ident; $( $name:ident = $bits:expr ),+) => {
+    ($cases:ident, $class:ident, $src:ident; $( $name:ident = $bits:expr => $mnem:ident ),+) => {
         $(
             #[doc = concat!("`", stringify!($name), " dst`")]
             pub fn $name(&mut self, dst: Register) -> &mut Self {
@@ -284,6 +349,11 @@ macro_rules! endian_family {
                 self
             }
         )+
+
+        #[cfg(test)]
+        const $cases: &[Case] = &[$(
+            (stringify!($name), |a| a.$name(R0), Mnemonic::$mnem),
+        )+];
     };
 }
 
@@ -470,60 +540,60 @@ impl Assembler {
         self
     }
 
-    alu_family!(ALU64;
-        add64, add64_imm = ADD, 0;
-        sub64, sub64_imm = SUB, 0;
-        mul64, mul64_imm = MUL, 0;
-        div64, div64_imm = DIV, 0;
-        sdiv64, sdiv64_imm = DIV, 1;
-        or64, or64_imm = OR, 0;
-        and64, and64_imm = AND, 0;
-        lsh64, lsh64_imm = LSH, 0;
-        rsh64, rsh64_imm = RSH, 0;
-        mod64, mod64_imm = MOD, 0;
-        smod64, smod64_imm = MOD, 1;
-        xor64, xor64_imm = XOR, 0;
-        mov64, mov64_imm = MOV, 0;
-        arsh64, arsh64_imm = ARSH, 0;
+    alu_family!(ALU64_CASES, ALU64;
+        add64, add64_imm = ADD, 0 => Add64;
+        sub64, sub64_imm = SUB, 0 => Sub64;
+        mul64, mul64_imm = MUL, 0 => Mul64;
+        div64, div64_imm = DIV, 0 => Div64;
+        sdiv64, sdiv64_imm = DIV, 1 => SDiv64;
+        or64, or64_imm = OR, 0 => Or64;
+        and64, and64_imm = AND, 0 => And64;
+        lsh64, lsh64_imm = LSH, 0 => Lsh64;
+        rsh64, rsh64_imm = RSH, 0 => Rsh64;
+        mod64, mod64_imm = MOD, 0 => Mod64;
+        smod64, smod64_imm = MOD, 1 => SMod64;
+        xor64, xor64_imm = XOR, 0 => Xor64;
+        mov64, mov64_imm = MOV, 0 => Mov64;
+        arsh64, arsh64_imm = ARSH, 0 => Arsh64;
     );
 
-    alu_family!(ALU32;
-        add32, add32_imm = ADD, 0;
-        sub32, sub32_imm = SUB, 0;
-        mul32, mul32_imm = MUL, 0;
-        div32, div32_imm = DIV, 0;
-        sdiv32, sdiv32_imm = DIV, 1;
-        or32, or32_imm = OR, 0;
-        and32, and32_imm = AND, 0;
-        lsh32, lsh32_imm = LSH, 0;
-        rsh32, rsh32_imm = RSH, 0;
-        mod32, mod32_imm = MOD, 0;
-        smod32, smod32_imm = MOD, 1;
-        xor32, xor32_imm = XOR, 0;
-        mov32, mov32_imm = MOV, 0;
-        arsh32, arsh32_imm = ARSH, 0;
+    alu_family!(ALU32_CASES, ALU32;
+        add32, add32_imm = ADD, 0 => Add32;
+        sub32, sub32_imm = SUB, 0 => Sub32;
+        mul32, mul32_imm = MUL, 0 => Mul32;
+        div32, div32_imm = DIV, 0 => Div32;
+        sdiv32, sdiv32_imm = DIV, 1 => SDiv32;
+        or32, or32_imm = OR, 0 => Or32;
+        and32, and32_imm = AND, 0 => And32;
+        lsh32, lsh32_imm = LSH, 0 => Lsh32;
+        rsh32, rsh32_imm = RSH, 0 => Rsh32;
+        mod32, mod32_imm = MOD, 0 => Mod32;
+        smod32, smod32_imm = MOD, 1 => SMod32;
+        xor32, xor32_imm = XOR, 0 => Xor32;
+        mov32, mov32_imm = MOV, 0 => Mov32;
+        arsh32, arsh32_imm = ARSH, 0 => Arsh32;
     );
 
-    movsx_family!(
-        movsx832 = ALU32, 8;
-        movsx1632 = ALU32, 16;
-        movsx864 = ALU64, 8;
-        movsx1664 = ALU64, 16;
-        movsx3264 = ALU64, 32;
+    movsx_family!(MOVSX_CASES;
+        movsx832 = ALU32, 8 => Movsx832;
+        movsx1632 = ALU32, 16 => Movsx1632;
+        movsx864 = ALU64, 8 => Movsx864;
+        movsx1664 = ALU64, 16 => Movsx1664;
+        movsx3264 = ALU64, 32 => Movsx3264;
     );
 
-    endian_family!(ALU32, SRC_IMM; le16 = 16, le32 = 32, le64 = 64);
-    endian_family!(ALU32, SRC_REG; be16 = 16, be32 = 32, be64 = 64);
-    endian_family!(ALU64, SRC_IMM; bswap16 = 16, bswap32 = 32, bswap64 = 64);
+    endian_family!(LE_CASES, ALU32, SRC_IMM; le16 = 16 => Le16, le32 = 32 => Le32, le64 = 64 => Le64);
+    endian_family!(BE_CASES, ALU32, SRC_REG; be16 = 16 => Be16, be32 = 32 => Be32, be64 = 64 => Be64);
+    endian_family!(BSWAP_CASES, ALU64, SRC_IMM; bswap16 = 16 => Bswap16, bswap32 = 32 => Bswap32, bswap64 = 64 => Bswap64);
 
-    ldx_family!(
-        ldxdw = DW, MEM;
-        ldxw = W, MEM;
-        ldxh = H, MEM;
-        ldxb = B, MEM;
-        ldxsw = W, MEMSX;
-        ldxsh = H, MEMSX;
-        ldxsb = B, MEMSX;
+    ldx_family!(LDX_CASES;
+        ldxdw = DW, MEM => Ldxdw;
+        ldxw = W, MEM => Ldxw;
+        ldxh = H, MEM => Ldxh;
+        ldxb = B, MEM => Ldxb;
+        ldxsw = W, MEMSX => Ldxsw;
+        ldxsh = H, MEMSX => Ldxsh;
+        ldxsb = B, MEMSX => Ldxsb;
     );
 
     /// `lddw dst, imm64`: load a 64-bit immediate.
@@ -537,20 +607,20 @@ impl Assembler {
         self
     }
 
-    stx_family!(stxdw = DW; stxw = W; stxh = H; stxb = B);
-    st_family!(stdw = DW; stw = W; sth = H; stb = B);
+    stx_family!(STX_CASES; stxdw = DW => Stxdw; stxw = W => Stxw; stxh = H => Stxh; stxb = B => Stxb);
+    st_family!(ST_CASES; stdw = DW => Stdw; stw = W => Stw; sth = H => Sth; stb = B => Stb);
 
-    atomic_family!(DW;
-        atomic_add64, atomic_fetch_add64 = ADD, "add64", "fadd64";
-        atomic_or64, atomic_fetch_or64 = OR, "or64", "for64";
-        atomic_and64, atomic_fetch_and64 = AND, "and64", "fand64";
-        atomic_xor64, atomic_fetch_xor64 = XOR, "xor64", "fxor64";
+    atomic_family!(ATOMIC64_CASES, DW;
+        atomic_add64, atomic_fetch_add64 = ADD => AtomicAdd64, AtomicFetchAdd64;
+        atomic_or64, atomic_fetch_or64 = OR => AtomicOr64, AtomicFetchOr64;
+        atomic_and64, atomic_fetch_and64 = AND => AtomicAnd64, AtomicFetchAnd64;
+        atomic_xor64, atomic_fetch_xor64 = XOR => AtomicXor64, AtomicFetchXor64;
     );
-    atomic_family!(W;
-        atomic_add32, atomic_fetch_add32 = ADD, "add32", "fadd32";
-        atomic_or32, atomic_fetch_or32 = OR, "or32", "for32";
-        atomic_and32, atomic_fetch_and32 = AND, "and32", "fand32";
-        atomic_xor32, atomic_fetch_xor32 = XOR, "xor32", "fxor32";
+    atomic_family!(ATOMIC32_CASES, W;
+        atomic_add32, atomic_fetch_add32 = ADD => AtomicAdd32, AtomicFetchAdd32;
+        atomic_or32, atomic_fetch_or32 = OR => AtomicOr32, AtomicFetchOr32;
+        atomic_and32, atomic_fetch_and32 = AND => AtomicAnd32, AtomicFetchAnd32;
+        atomic_xor32, atomic_fetch_xor32 = XOR => AtomicXor32, AtomicFetchXor32;
     );
 
     /// `lock xchg64 [dst+off], src`: 64-bit atomic exchange; always reports the prior value.
@@ -583,11 +653,11 @@ impl Assembler {
         self
     }
 
-    acquire_release_family!(
-        load_acquire64, store_release64 = DW;
-        load_acquire32, store_release32 = W;
-        load_acquire16, store_release16 = H;
-        load_acquire8, store_release8 = B;
+    acquire_release_family!(ACQUIRE_RELEASE_CASES;
+        load_acquire64, store_release64 = DW => LoadAcquire64, StoreRelease64;
+        load_acquire32, store_release32 = W => LoadAcquire32, StoreRelease32;
+        load_acquire16, store_release16 = H => LoadAcquire16, StoreRelease16;
+        load_acquire8, store_release8 = B => LoadAcquire8, StoreRelease8;
     );
 
     /// `ja label`: unconditional jump to a label.
@@ -629,32 +699,32 @@ impl Assembler {
         self
     }
 
-    jmp_family!(JMP64;
-        jeq, jeq_imm = JEQ;
-        jne, jne_imm = JNE;
-        jgt, jgt_imm = JGT;
-        jge, jge_imm = JGE;
-        jlt, jlt_imm = JLT;
-        jle, jle_imm = JLE;
-        jset, jset_imm = JSET;
-        jsgt, jsgt_imm = JSGT;
-        jsge, jsge_imm = JSGE;
-        jslt, jslt_imm = JSLT;
-        jsle, jsle_imm = JSLE;
+    jmp_family!(JMP64_CASES, JMP64;
+        jeq, jeq_imm = JEQ => Jeq;
+        jne, jne_imm = JNE => Jne;
+        jgt, jgt_imm = JGT => Jgt;
+        jge, jge_imm = JGE => Jge;
+        jlt, jlt_imm = JLT => Jlt;
+        jle, jle_imm = JLE => Jle;
+        jset, jset_imm = JSET => Jset;
+        jsgt, jsgt_imm = JSGT => Jsgt;
+        jsge, jsge_imm = JSGE => Jsge;
+        jslt, jslt_imm = JSLT => Jslt;
+        jsle, jsle_imm = JSLE => Jsle;
     );
 
-    jmp_family!(JMP32;
-        jeq32, jeq32_imm = JEQ;
-        jne32, jne32_imm = JNE;
-        jgt32, jgt32_imm = JGT;
-        jge32, jge32_imm = JGE;
-        jlt32, jlt32_imm = JLT;
-        jle32, jle32_imm = JLE;
-        jset32, jset32_imm = JSET;
-        jsgt32, jsgt32_imm = JSGT;
-        jsge32, jsge32_imm = JSGE;
-        jslt32, jslt32_imm = JSLT;
-        jsle32, jsle32_imm = JSLE;
+    jmp_family!(JMP32_CASES, JMP32;
+        jeq32, jeq32_imm = JEQ => Jeq32;
+        jne32, jne32_imm = JNE => Jne32;
+        jgt32, jgt32_imm = JGT => Jgt32;
+        jge32, jge32_imm = JGE => Jge32;
+        jlt32, jlt32_imm = JLT => Jlt32;
+        jle32, jle32_imm = JLE => Jle32;
+        jset32, jset32_imm = JSET => Jset32;
+        jsgt32, jsgt32_imm = JSGT => Jsgt32;
+        jsge32, jsge32_imm = JSGE => Jsge32;
+        jslt32, jslt32_imm = JSLT => Jslt32;
+        jsle32, jsle32_imm = JSLE => Jsle32;
     );
 
     /// `call imm`: call a helper function by ID.
@@ -696,7 +766,59 @@ impl Default for Assembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::register::*;
+    use crate::decoder::decode_all;
+
+    /// The methods not defined through a `*_family!`.
+    const OTHER_CASES: &[Case] = &[
+        ("neg64", |a| a.neg64(R0), Mnemonic::Neg64),
+        ("neg32", |a| a.neg32(R0), Mnemonic::Neg32),
+        ("lddw", |a| a.lddw(R0, 0x1234), Mnemonic::Lddw),
+        ("atomic_xchg64", |a| a.atomic_xchg64(R1, 0, R0), Mnemonic::AtomicXchg64),
+        ("atomic_xchg32", |a| a.atomic_xchg32(R1, 0, R0), Mnemonic::AtomicXchg32),
+        ("atomic_cmpxchg64", |a| a.atomic_cmpxchg64(R1, 0, R0), Mnemonic::AtomicCmpxchg64),
+        ("atomic_cmpxchg32", |a| a.atomic_cmpxchg32(R1, 0, R0), Mnemonic::AtomicCmpxchg32),
+        ("ja", |a| jump_to_next(a, |a, l| a.ja(l)), Mnemonic::Ja),
+        ("ja_off", |a| a.ja_off(0), Mnemonic::Ja),
+        ("ja32", |a| jump_to_next(a, |a, l| a.ja32(l)), Mnemonic::Ja32),
+        ("gotox", |a| a.gotox(R1), Mnemonic::Gotox),
+        ("may_goto", |a| jump_to_next(a, |a, l| a.may_goto(l)), Mnemonic::MayGoto),
+        ("call", |a| a.call(1), Mnemonic::Call),
+        ("call_local", |a| jump_to_next(a, |a, l| a.call_local(l)), Mnemonic::CallLocal),
+        ("callx", |a| a.callx(R1), Mnemonic::Callx),
+        ("exit", |a| a.exit(), Mnemonic::Exit),
+    ];
+
+    /// Each method emits exactly one instruction, which decodes to the mnemonic its table names.
+    #[test]
+    fn every_method_decodes_to_its_mnemonic() {
+        let tables = [
+            Assembler::ALU64_CASES,
+            Assembler::ALU32_CASES,
+            Assembler::MOVSX_CASES,
+            Assembler::LE_CASES,
+            Assembler::BE_CASES,
+            Assembler::BSWAP_CASES,
+            Assembler::LDX_CASES,
+            Assembler::STX_CASES,
+            Assembler::ST_CASES,
+            Assembler::ATOMIC64_CASES,
+            Assembler::ATOMIC32_CASES,
+            Assembler::ACQUIRE_RELEASE_CASES,
+            Assembler::JMP64_CASES,
+            Assembler::JMP32_CASES,
+            OTHER_CASES,
+        ];
+
+        for &(name, emit, mnemonic) in tables.iter().copied().flatten() {
+            let mut asm = Assembler::new();
+            emit(&mut asm);
+            let code = asm.assemble().unwrap();
+            let insns = decode_all(&code);
+            assert_eq!(insns.len(), 1, "{name}");
+            assert_eq!(insns[0].mnemonic, mnemonic, "{name}");
+            assert_eq!(insns[0].size as usize, code.len(), "{name}");
+        }
+    }
 
     #[test]
     fn undefined_label() {

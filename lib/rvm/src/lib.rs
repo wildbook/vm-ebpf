@@ -10,7 +10,7 @@
 //! // Create a VM and register helpers
 //! let vm = Vm::new();
 //!
-//! // Register a helper function (type-safe); IDs 1 to 7 are the standard helpers
+//! // Register a helper function (type-safe), under an ID that no standard helper (`BPF_FUNC_*`) uses
 //! vm.register_helper(100, |x: u64| {
 //!     println!("eBPF called helper with: {}", x);
 //!     x * 2
@@ -47,16 +47,13 @@
 //!
 //! ## Cargo features
 //!
-//! - `link` (default): ELF parsing, CO-RE and the linker (`Module`, `HostTypes`, `Vm::prepare`, `Vm::load_elf` and
-//!   friends). Without it, rvm loads prepared images only.
-//! - `fuel` (default): `VmConfig::instruction_limit`. Without it, the interpreter doesn't count instructions.
-//! - `maps` (default): guest maps, with the map helpers (IDs 1 to 3), `Program::map` and `Vm::share_map`. Without it,
-//!   an image that declares maps fails to load.
-//! - `fixed-hash-seed`: guest hash maps use a fixed hash seed, for reproducible benchmarks.
+//! The features are described in the `[features]` table of rvm's `Cargo.toml`.
 
 #![feature(rust_preserve_none_cc)]
 #![cfg_attr(feature = "link", feature(reentrant_lock))]
 
+#[cfg(test)]
+mod bpf_sources;
 mod error;
 mod executor;
 mod helper;
@@ -117,4 +114,6 @@ pub use std_helpers::{
 #[cfg(feature = "link")]
 pub use symbol::{Export, Symbol};
 pub use sync::TryLockGuard;
+#[cfg(feature = "fuel")]
+pub use vm::DEFAULT_INSTRUCTION_LIMIT;
 pub use vm::{Vm, VmConfig};

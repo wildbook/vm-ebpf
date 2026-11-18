@@ -5,8 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use ebpf_asm::{Assembler, R0, R1, R2};
 use rvm::{
-    region_base, ExecError, FunctionInfo, Image, Module, Perms, Program, Vm, VmError, DATA_REGION, FIRST_FREE_REGION,
-    RODATA_REGION,
+    region_base, ExecError, Image, Module, Perms, Program, Vm, VmError, DATA_REGION, FIRST_FREE_REGION, RODATA_REGION,
 };
 
 use crate::common::object;
@@ -15,23 +14,15 @@ fn example() -> Program {
     Vm::new().load_elf(&object("examples/example.o")).unwrap()
 }
 
-/// A program whose `store_load` runs `*(u64 *)r1 = r2; r0 = *(u64 *)r1`, with 8 bytes of rodata, all 1s, and 8 of data.
+/// A program whose `main` runs `*(u64 *)r1 = r2; r0 = *(u64 *)r1`, with 8 bytes of rodata, all 1s, and 8 of data.
 fn store_load() -> Program {
     let mut asm = Assembler::new();
     asm.stxdw(R1, 0, R2).ldxdw(R0, R1, 0).exit();
-    let code = asm.assemble().unwrap();
-    let info = FunctionInfo {
-        pc: 0,
-        size: code.len() as u64,
-        borrows: Vec::new(),
-    };
     let image = Image {
-        code,
         rodata: vec![1; 8],
         rodata_len: 8,
         data_len: 8,
-        functions: vec![("store_load".into(), info)],
-        ..Image::default()
+        ..Image::from_code(asm.assemble().unwrap())
     };
     Vm::new().load(image).unwrap()
 }
@@ -51,9 +42,9 @@ fn rodata_is_read_only_data_is_writable() {
 
     let mut program = store_load();
     let rodata = region_base(RODATA_REGION);
-    assert!(is_mem_fault(program.call("store_load", &[rodata, 0])));
+    assert!(is_mem_fault(program.call("main", &[rodata, 0])));
     assert_eq!(program.memory().read::<u64>(rodata).unwrap(), 0x0101_0101_0101_0101);
-    assert_eq!(program.call("store_load", &[region_base(DATA_REGION), 77]).unwrap(), 77);
+    assert_eq!(program.call("main", &[region_base(DATA_REGION), 77]).unwrap(), 77);
 }
 
 /// `bpf_main` writes through host-mapped structs; the writes must not land on other code.

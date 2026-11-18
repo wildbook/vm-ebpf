@@ -5,37 +5,17 @@ use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use ebpf_asm::{Assembler, R0, R1, R10, R2, R6};
-use rvm::{FunctionInfo, Image, Import, Program, Vm};
+use rvm::{Image, Import, Program, Vm};
 
 const N: i32 = 10_000;
-
-/// Opcode byte of `call`.
-const CALL: u8 = 0x85;
 
 /// `asm` as the program's `main`; with `slot_calls`, its `call <id>` instructions bind to helper slots at load time,
 /// as linked calls do.
 fn load(vm: &Vm, asm: &mut Assembler, slot_calls: bool) -> Program {
-    let code = asm.assemble().unwrap();
-    let externs = if slot_calls {
-        let (insns, _) = code.as_chunks::<8>();
-        let calls = insns.iter().enumerate().filter(|(_, insn)| insn[0] == CALL);
-        calls
-            .map(|(at, insn)| (at as u32, Import::Helper(u32::from_le_bytes(insn[4..].try_into().unwrap()))))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let main = FunctionInfo {
-        pc: 0,
-        size: code.len() as u64,
-        borrows: Vec::new(),
-    };
-    let image = Image {
-        code,
-        functions: vec![("main".into(), main)],
-        externs,
-        ..Image::default()
-    };
+    let mut image = Image::from_code(asm.assemble().unwrap());
+    if slot_calls {
+        image.externs = image.helper_calls().map(|(at, id)| (at, Import::Helper(id))).collect();
+    }
     vm.load(image).unwrap()
 }
 

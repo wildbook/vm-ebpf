@@ -9,16 +9,14 @@
 //! and loads and stores reject. Data sections go into guest memory regions; see [`crate::layout`] for the complete
 //! table.
 
-use btf::{apply_core_relocations, Btf, BtfBuilder, BtfTypeInfo};
+use btf::{apply_core_relocations, Btf, BtfBuilder, BtfTypeInfo, BTF_FUNC_EXTERN};
 use constelf::raw::reloc;
 use hashbrown::HashMap;
-use rvm_core::opcode::{CALL, LD_IMM64};
-use rvm_core::Instruction;
 
 use crate::error::{LinkError, Result, VmError};
 use crate::executor::CORE_POISON_HELPER;
 use crate::helper::HelperRegistry;
-use crate::image::{imm, set_imm, set_slot_call, Image, Import, INSN_SIZE};
+use crate::image::{set_imm, set_slot_call, Image, Import, INSN_SIZE};
 use crate::layout::{CODE_REGION, DATA_REGION, RODATA_REGION};
 use crate::map_def::map_defs;
 use crate::memory::{region_base, split_addr, MAX_REGION_LEN};
@@ -230,8 +228,6 @@ fn lay_out_jump_tables(module: &Module, layout: &mut ModuleLayout, rodata: &mut 
 /// Compare each host-bound extern's BTF prototype with the registered function's argument count. Modules without BTF
 /// and host functions without a known arity (raw and context helpers) are not checked.
 fn check_extern_signatures(helpers: &HelperRegistry, btfs: &[Option<Btf<'_>>]) -> Result<()> {
-    const BTF_FUNC_EXTERN: u16 = 2;
-
     for btf in btfs.iter().flatten() {
         for (_, ty) in btf.types() {
             let BtfTypeInfo::Func {
@@ -364,20 +360,12 @@ fn apply_relocation(
 /// Record every `call <helper id>` as an extern, so loaded programs never look helpers up at runtime. Unregistered IDs
 /// fail the link.
 fn mark_helper_calls(helpers: &HelperRegistry, image: &mut Image) -> Result<()> {
-    let mut i = 0;
-    while let Some(insn) = image.code.as_chunks::<8>().0.get(i) {
-        if insn[0] == LD_IMM64 {
-            i += 2;
-            continue;
+    let calls: Vec<(u32, u32)> = image.helper_calls().collect();
+    for (at, id) in calls {
+        if helpers.slot_of_id(id).is_none() {
+            return Err(LinkError::UnknownHelper(id).into());
         }
-        if insn[0] == CALL && Instruction(u64::from_le_bytes(*insn)).src_reg() == 0 {
-            let id = imm(insn);
-            if helpers.slot_of_id(id).is_none() {
-                return Err(LinkError::UnknownHelper(id).into());
-            }
-            mark_extern(image, i as u64 * INSN_SIZE, Import::Helper(id))?;
-        }
-        i += 1;
+        mark_extern(image, at as u64 * INSN_SIZE, Import::Helper(id))?;
     }
     Ok(())
 }

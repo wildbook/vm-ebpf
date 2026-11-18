@@ -20,7 +20,7 @@ struct {
 u64 hash_update(u64 n) {
     for (u64 i = 0; i < n; i++) {
         u64 key = i & 1023;
-        bpf_map_update_elem(&hash, &key, &i, 0);
+        bpf_map_update_elem(&hash, &key, &i, BPF_ANY);
     }
     return 0;
 }

@@ -14,7 +14,7 @@ struct wave_state {
 
 /* Shared by the host, so the wave count survives a reload. */
 struct {
-    __uint(type, 2 /* BPF_MAP_TYPE_ARRAY */);
+    __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
     __type(key, u32);
     __type(value, struct wave_state);
@@ -73,7 +73,7 @@ u64 record_kills(const struct kill *kills BORROW_RO(1), u64 len) {
         struct score *score = bpf_map_lookup_elem(&scores, &hero);
         if (!score) {
             struct score fresh = {0};
-            bpf_map_update_elem(&scores, &hero, &fresh, 0);
+            bpf_map_update_elem(&scores, &hero, &fresh, BPF_ANY);
             score = bpf_map_lookup_elem(&scores, &hero);
             if (!score)
                 continue;

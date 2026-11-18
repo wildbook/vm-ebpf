@@ -1,7 +1,7 @@
 //! rvm as a C library: load a prepared image, map guest memory and call functions by name.
 //!
 //! `include/rvmrt.h` declares these functions for C. Images come from `rvm::Vm::prepare` and `rvm::Image::to_bytes`;
-//! the runtime has no helpers and no maps, and the default instruction limit of `rvm::VmConfig`.
+//! the runtime has no helpers and no maps, and its instruction limit is `rvm::DEFAULT_INSTRUCTION_LIMIT`.
 
 use std::slice;
 
@@ -218,4 +218,48 @@ unsafe fn slice_or_empty<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
 /// As [`slice_or_empty`].
 unsafe fn str_or_none<'a>(ptr: *const u8, len: usize) -> Option<&'a str> {
     std::str::from_utf8(unsafe { slice_or_empty(ptr, len) }).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Status;
+
+    #[test]
+    fn status_matches_rvmrt_h() {
+        let header: Vec<(&str, i32)> = include_str!("../include/rvmrt.h")
+            .lines()
+            .filter_map(|line| {
+                let (name, value) = line.trim().strip_suffix(',')?.split_once(" = ")?;
+                Some((name, value.parse().ok()?))
+            })
+            .collect();
+        let rust = [
+            Status::Ok,
+            Status::Image,
+            Status::Link,
+            Status::NotFound,
+            Status::Argument,
+            Status::Limit,
+            Status::Fault,
+            Status::Helper,
+            Status::Other,
+        ]
+        .map(|status| (c_name(&status), status as i32));
+
+        assert_eq!(header, rust);
+    }
+
+    fn c_name(status: &Status) -> &'static str {
+        match status {
+            Status::Ok => "RVM_OK",
+            Status::Image => "RVM_ERR_IMAGE",
+            Status::Link => "RVM_ERR_LINK",
+            Status::NotFound => "RVM_ERR_NOT_FOUND",
+            Status::Argument => "RVM_ERR_ARGUMENT",
+            Status::Limit => "RVM_ERR_LIMIT",
+            Status::Fault => "RVM_ERR_FAULT",
+            Status::Helper => "RVM_ERR_HELPER",
+            Status::Other => "RVM_ERR_OTHER",
+        }
+    }
 }

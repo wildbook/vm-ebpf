@@ -43,7 +43,7 @@ u64 aggregate(u64 n) {
             __sync_fetch_and_add(count, 1);
         } else {
             u64 one = 1;
-            bpf_map_update_elem(&counts, &key, &one, 0);
+            bpf_map_update_elem(&counts, &key, &one, BPF_ANY);
         }
     }
     return 0;

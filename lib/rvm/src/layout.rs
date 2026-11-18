@@ -18,11 +18,11 @@ use crate::memory::MAX_REGIONS;
 /// Guest region holding the stack.
 pub const STACK_REGION: usize = 1;
 /// Guest region holding read-only data.
-pub const RODATA_REGION: usize = 2;
+pub const RODATA_REGION: usize = STACK_REGION + 1;
 /// Guest region holding writable data and bss.
-pub const DATA_REGION: usize = 3;
+pub const DATA_REGION: usize = RODATA_REGION + 1;
 /// Guest region holding all map values.
-pub const MAPS_REGION: usize = 4;
+pub const MAPS_REGION: usize = DATA_REGION + 1;
 /// First region index the linker leaves free for the host.
 pub const FIRST_FREE_REGION: usize = MAPS_REGION + 1;
 /// First of the [`BORROW_REGIONS`] regions in each program reserved for borrowed buffers.
@@ -35,3 +35,6 @@ pub const SHARED_MAPS_FIRST_REGION: usize = MAX_REGIONS / 2;
 /// past the last mappable region, so loads and stores through a code address fault and no data pointer is a valid call
 /// target.
 pub const CODE_REGION: usize = MAX_REGIONS;
+
+// Each region range in the table above holds at least one region.
+const _: () = assert!(FIRST_FREE_REGION < BORROW_FIRST_REGION && SHARED_MAPS_FIRST_REGION < MAX_REGIONS);

@@ -56,6 +56,12 @@ impl fmt::Display for Section {
     }
 }
 
+/// Section of the libbpf map definitions, which the module's BTF describes as a DataSec of the same name.
+pub const MAPS_SECTION: &str = ".maps";
+
+/// Section of pre-BTF `struct bpf_map_def` map definitions, which libbpf 1.0 dropped and rvm rejects.
+pub const LEGACY_MAPS_SECTION: &str = "maps";
+
 /// Section kind from its name, for sections not flagged executable.
 pub fn section_kind_from_name(name: &str) -> SectionKind {
     if name == ".text" || name.starts_with(".text.") {
@@ -70,7 +76,7 @@ pub fn section_kind_from_name(name: &str) -> SectionKind {
     if name == ".bss" || name.starts_with(".bss.") {
         return SectionKind::Bss;
     }
-    if name == ".maps" || name == "maps" {
+    if name == MAPS_SECTION {
         return SectionKind::Maps;
     }
     if name == ".jumptables" {

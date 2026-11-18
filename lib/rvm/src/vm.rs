@@ -25,6 +25,10 @@ use crate::program::Program;
 use crate::std_helpers;
 use crate::sync::{lock, Published};
 
+/// [`VmConfig::instruction_limit`] in [`VmConfig::default`].
+#[cfg(feature = "fuel")]
+pub const DEFAULT_INSTRUCTION_LIMIT: u64 = 1_000_000;
+
 /// Configuration for the VM.
 #[derive(Debug, Clone)]
 pub struct VmConfig {
@@ -41,7 +45,7 @@ impl Default for VmConfig {
     fn default() -> Self {
         Self {
             #[cfg(feature = "fuel")]
-            instruction_limit: 1_000_000,
+            instruction_limit: DEFAULT_INSTRUCTION_LIMIT,
             frame_size: DEFAULT_FRAME_SIZE,
         }
     }
@@ -73,8 +77,8 @@ impl Vm {
         Self::with_config(VmConfig::default())
     }
 
-    /// A VM with `config`. Its only helpers are the map helpers (1 to 3) with the `maps` feature, which touch nothing
-    /// outside the VM.
+    /// A VM with `config`. Its only helpers are the map helpers with the `maps` feature, which touch nothing outside
+    /// the VM.
     pub fn with_config(config: VmConfig) -> Self {
         let helpers = Arc::new(SharedHelpers::default());
         #[cfg(feature = "maps")]
@@ -205,13 +209,11 @@ impl Vm {
     /// # Example
     ///
     /// ```
-    /// use rvm::{FunctionInfo, Image, Vm};
+    /// use rvm::{Image, Vm};
     ///
     /// // r0 = r1 + 10
     /// let code = [0xbf, 0x10, 0, 0, 0, 0, 0, 0, 0x07, 0, 0, 0, 10, 0, 0, 0, 0x95, 0, 0, 0, 0, 0, 0, 0];
-    /// let main = FunctionInfo { pc: 0, size: code.len() as u64, borrows: Vec::new() };
-    /// let image = Image { code: code.to_vec(), functions: vec![("main".into(), main)], ..Image::default() };
-    /// let mut program = Vm::new().load(image)?;
+    /// let mut program = Vm::new().load(Image::from_code(code.to_vec()))?;
     /// assert_eq!(program.call("main", &[32])?, 42);
     /// # Ok::<_, rvm::VmError>(())
     /// ```

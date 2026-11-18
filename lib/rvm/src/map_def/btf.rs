@@ -5,7 +5,7 @@ use btf::{Btf, BtfTypeInfo};
 use super::{check_def, MapDef, MapKind};
 use crate::error::{LinkError, Result, VmError};
 use crate::module::Module;
-use crate::section::SectionKind;
+use crate::section::{SectionKind, MAPS_SECTION};
 
 const BPF_MAP_TYPE_HASH: u32 = 1;
 const BPF_MAP_TYPE_ARRAY: u32 = 2;
@@ -20,7 +20,9 @@ pub fn map_defs(module: &Module, btf: Option<&Btf<'_>>) -> Result<Vec<MapDef>> {
     let mut defs = Vec::new();
     for (_, ty) in btf.types() {
         let BtfTypeInfo::DataSec {
-            name: ".maps", vars, ..
+            name: MAPS_SECTION,
+            vars,
+            ..
         } = ty
         else {
             continue;
@@ -90,4 +92,15 @@ fn resolve<'a, 'b>(btf: &'b Btf<'a>, id: u32) -> Option<&'b BtfTypeInfo<'a>> {
 
 fn resolve_size(btf: &Btf<'_>, id: u32) -> Option<u32> {
     btf.resolve_size(id).and_then(|s| u32::try_from(s).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::bpf_sources::define;
+
+    #[test]
+    fn map_types_match_rvm_bpf_h() {
+        assert_eq!(define("BPF_MAP_TYPE_HASH"), super::BPF_MAP_TYPE_HASH.into());
+        assert_eq!(define("BPF_MAP_TYPE_ARRAY"), super::BPF_MAP_TYPE_ARRAY.into());
+    }
 }

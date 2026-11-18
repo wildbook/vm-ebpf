@@ -8,9 +8,9 @@ use constelf::relocs::ElfRelocsChunk;
 use constelf::sections::ElfSections;
 use hashbrown::HashMap;
 
-use crate::error::Result;
+use crate::error::{LinkError, Result};
 use crate::image::INSN_SIZE;
-use crate::section::{section_kind_from_name, Section, SectionKind};
+use crate::section::{section_kind_from_name, Section, SectionKind, LEGACY_MAPS_SECTION, MAPS_SECTION};
 use crate::symbol::{Export, Symbol};
 
 /// Relocation entry for a module.
@@ -86,6 +86,11 @@ impl Module {
             if let Some(btf) = btf {
                 *btf = sect.bytes().ok().map(<[u8]>::to_vec);
                 continue;
+            }
+
+            if name == LEGACY_MAPS_SECTION {
+                let msg = format!("legacy `{LEGACY_MAPS_SECTION}` section; declare maps in `{MAPS_SECTION}` with BTF");
+                return Err(LinkError::InvalidMap(msg).into());
             }
 
             let kind = if (sect.sh_flags & shf::EXECINSTR as u64) != 0 {

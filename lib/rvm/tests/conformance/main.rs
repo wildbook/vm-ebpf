@@ -9,7 +9,7 @@
 mod asm;
 mod data;
 
-use rvm::{FunctionInfo, Image, Perms, Vm, FIRST_FREE_REGION};
+use rvm::{Image, Perms, Vm, FIRST_FREE_REGION};
 
 /// Files that exercise something rvm deliberately does not implement, with why.
 const SKIP: &[(&str, &str)] = &[];
@@ -53,17 +53,7 @@ fn run_one(text: &str) -> Result<(), String> {
     // helper 5 is `unwind` in the classic interpreter test ABI; call_unwind_fail.data and callx.data only check that
     // calling it doesn't abort the program
     vm.register_helper(5, |_: ()| 0u64);
-    let main = FunctionInfo {
-        pc: 0,
-        size: case.code.len() as u64,
-        borrows: Vec::new(),
-    };
-    let image = Image {
-        code: case.code,
-        functions: vec![("main".into(), main)],
-        ..Image::default()
-    };
-    let mut program = vm.load(image).map_err(|e| e.to_string())?;
+    let mut program = vm.load(Image::from_code(case.code)).map_err(|e| e.to_string())?;
     let mem_ptr = program
         .memory_mut()
         .map_bytes(FIRST_FREE_REGION, &case.mem, case.mem.len(), Perms::RW)

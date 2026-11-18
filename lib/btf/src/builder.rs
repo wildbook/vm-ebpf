@@ -27,6 +27,7 @@ enum TypeEntry {
         name: u32,
         size: u32,
         encoding: u8,
+        offset: u8,
         bits: u8,
     },
     Ptr {
@@ -140,6 +141,7 @@ impl BtfBuilder {
             name,
             size,
             encoding,
+            offset: 0,
             bits,
         })
     }
@@ -277,12 +279,13 @@ impl BtfBuilder {
                 name,
                 size,
                 encoding,
+                offset,
                 bits,
-                ..
             } => TypeEntry::Int {
                 name: self.string(name),
                 size,
                 encoding,
+                offset,
                 bits,
             },
             &BtfTypeInfo::Ptr { pointee_type } => TypeEntry::Ptr {
@@ -450,10 +453,11 @@ impl TypeEntry {
                 name,
                 size,
                 encoding,
+                offset,
                 bits,
             } => {
                 header(out, *name, BtfKind::Int, 0, false, *size);
-                let int_info = (u32::from(*encoding) << 24) | u32::from(*bits);
+                let int_info = (u32::from(*encoding) << 24) | (u32::from(*offset) << 16) | u32::from(*bits);
                 out.extend_from_slice(&int_info.to_le_bytes());
             }
             Self::Ptr { pointee } => header(out, 0, BtfKind::Ptr, 0, false, *pointee),

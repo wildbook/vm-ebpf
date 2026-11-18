@@ -3,7 +3,7 @@
 //! Run with: cargo run -p rvm --example hello
 
 use ebpf_asm::{Assembler, R0, R1, R2};
-use rvm::{FunctionInfo, Image, Vm};
+use rvm::{Image, Vm};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // these replace the map helpers, which also use IDs 1 to 3
@@ -59,16 +59,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Load `asm` as the program's `main` and call it with `args`.
 fn run(mut asm: Assembler, vm: &Vm, args: &[u64]) -> Result<u64, Box<dyn std::error::Error>> {
-    let code = asm.assemble()?;
-    let main = FunctionInfo {
-        pc: 0,
-        size: code.len() as u64,
-        borrows: Vec::new(),
-    };
-    let image = Image {
-        code,
-        functions: vec![("main".into(), main)],
-        ..Image::default()
-    };
+    let image = Image::from_code(asm.assemble()?);
     Ok(vm.load(image)?.call("main", args)?)
 }

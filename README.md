@@ -16,12 +16,16 @@ cargo run -p rvm --example hello               # hand-assembled bytecode with ho
 ```
 
 The eBPF objects are built from the C sources under `bpf/` (`examples/`, `bench/`, `tests/`) and checked in under
-`bpf/prebuilt/`. Rebuilding them needs CMake 3.21 or newer and clang on `PATH` (LLVM 18 or newer for `-mcpu=v4`):
+`bpf/prebuilt/`. Rebuilding them needs clang on `PATH`, and the CMake version and clang flags that `CMakeLists.txt`
+sets:
 
 ```bash
 cmake --preset bpf && cmake --build --preset bpf
 cmake --build --preset update-prebuilt         # copies the built objects into bpf/prebuilt/
 ```
+
+`update-prebuilt` also records the hashes of the sources, headers and CMake files in `bpf/prebuilt/inputs.sha256`,
+and `cargo test` fails when they change without a rebuild.
 
 ## Crates
 
@@ -42,19 +46,7 @@ cmake --build --preset update-prebuilt         # copies the built objects into b
 
 ## Features and profiles
 
-rvm's features:
-
-- `link` (default): ELF parsing, BTF, CO-RE and the linker (`Module`,
-  `HostTypes`, `Vm::with_types`, `Vm::prepare`, `Vm::load_elf`, `Vm::load_plugin`).
-  Without it, rvm loads prepared images only.
-- `fuel` (default): enforces `VmConfig::instruction_limit`. Limits above
-  `i64::MAX`, and 0 for no limit, count as `i64::MAX`. Without it the field
-  doesn't exist and the interpreter doesn't count instructions.
-- `maps` (default): guest maps, with the map helpers (IDs 1 to 3),
-  `Program::map` and `Vm::share_map`. Without it, an image that declares maps
-  fails to load with `LinkError::InvalidMap`.
-- `fixed-hash-seed`: guest hash maps use a fixed seed, for reproducible
-  benchmarks.
+rvm's features are described in [`lib/rvm/Cargo.toml`](lib/rvm/Cargo.toml).
 
 The `release` profile optimizes for size but builds rvm at `opt-level = 3`,
 because the interpreter inlines into rvm. The `embedded` profile
@@ -68,8 +60,8 @@ use rvm::Vm;
 
 let vm = Vm::new();
 
-// Numeric helper, called from the guest via `call <id>`. IDs 1 to 3 are the
-// built-in map helpers.
+// Numeric helper, called from the guest via `call <id>`, under an ID that no
+// standard helper (`rvm::BPF_FUNC_*`) uses.
 vm.register_helper(100, |x: u64| x * 2);
 
 // Named extern, imported by the guest as `extern u64 host_add(u64, u64);`.
@@ -96,9 +88,10 @@ code instead, return it as an `i64`.
 Registering a helper again replaces it everywhere: programs linked earlier use
 the new one from their next call.
 
-Helpers that touch host state are opt-in: `Vm::enable_time` adds `ktime_get_ns`
-(5), `Vm::enable_random` adds `get_prandom_u32` (7), and `Vm::enable_print(sink)`
-adds `trace_printk` (6), passing each line to `sink`.
+Helpers that touch host state are opt-in: `Vm::enable_time` adds `ktime_get_ns`,
+`Vm::enable_random` adds `get_prandom_u32`, and `Vm::enable_print(sink)` adds
+`trace_printk`, passing each line to `sink`. `rvm::BPF_FUNC_*` holds their IDs,
+and `bpf/rvm_bpf.h` declares them for C.
 
 ## Linking
 
@@ -137,20 +130,22 @@ index and map definition, so images may come from untrusted files. `Vm::load`
 takes an `Image` directly, including one built by hand around raw bytecode,
 whose `call <id>` instructions reach the helpers registered under those IDs. A
 host that ships images can build rvm without `link`, and without `maps` if its
-images declare none, as `bin/emu` does.
+images declare none, as `bin/emu` does (see
+[`bin/emu/Cargo.toml`](bin/emu/Cargo.toml)).
 
 ## C library
 
-`lib/rvmrt` builds rvm, without `link` and `maps` and with `fuel`, as
-`rvmrt.dll` and a static `rvmrt.lib`. `lib/rvmrt/include/rvmrt.h` declares its
+`lib/rvmrt` builds rvm, with the features that
+[`lib/rvmrt/Cargo.toml`](lib/rvmrt/Cargo.toml) selects, as `rvmrt.dll` and a
+static `rvmrt.lib`. `lib/rvmrt/include/rvmrt.h` declares its
 functions: `rvm_load` loads a prepared image, `rvm_map` maps zeroed guest
 memory, `rvm_call` calls a function by name, and `rvm_free` frees the program.
 Functions also have indices, in name order: `rvm_function_count` and
 `rvm_function_name` list them, `rvm_func` finds a name's index once, and
 `rvm_call_func` calls by index without the name lookup, which saves about 15 ns
 per call. Errors come back as `rvm_status` codes. The runtime has no helpers and
-the default instruction limit; an image that declares maps fails with
-`RVM_ERR_LINK`.
+its instruction limit is `rvm::DEFAULT_INSTRUCTION_LIMIT`; an image that
+declares maps fails with `RVM_ERR_LINK`.
 
 ```bash
 cd lib/rvmrt
@@ -239,9 +234,9 @@ programs may write them during the borrow; `VmMemory::read_bytes` copies instead
 ## Maps
 
 Array and hash maps are declared libbpf style in `.maps` (`__uint(type, ...)`,
-`__type(key, ...)`, `__type(value, ...)`, `max_entries`). Helpers 1 to 3
+`__type(key, ...)`, `__type(value, ...)`, `max_entries`). The map helpers
 (`map_lookup_elem`, `map_update_elem`, `map_delete_elem`) are built in unless the
-host registers its own under those IDs. Values live in `MAPS_REGION`, or in
+host registers its own under their IDs. Values live in `MAPS_REGION`, or in
 their own region for a shared map, so a looked up pointer is an ordinary guest
 address.
 

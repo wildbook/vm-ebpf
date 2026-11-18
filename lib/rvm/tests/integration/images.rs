@@ -4,6 +4,7 @@ use rvm::{
     region_base, FunctionInfo, Image, Import, LinkError, Module, Plugin, Program, Vm, VmError, FIRST_FREE_REGION,
     MAX_REGION_LEN,
 };
+use rvm_core::opcode::CALL;
 
 use crate::common::{host_vm, object};
 
@@ -123,7 +124,7 @@ fn malformed_images_fail_to_load() {
     assert!(err.contains(&format!("rvm {theirs} ")) && err.contains(&format!("rvm {ours} ")), "{err}");
 
     let insns = (good.code.len() / 8) as u32;
-    let not_a_call = good.code.chunks(8).position(|insn| insn[0] != 0x85).unwrap() as u32;
+    let not_a_call = good.code.chunks(8).position(|insn| insn[0] != CALL).unwrap() as u32;
     for at in [insns, not_a_call] {
         let mut image = good.clone();
         image.externs.push((at, Import::Helper(1)));

@@ -23,12 +23,12 @@ struct entity {
 
 /* The host's array stride is its struct size, which may differ from ours. */
 static inline struct entity *entity_at(struct entity *ents, u64 i) {
-    u64 size = __builtin_preserve_type_info(*(struct entity *)0, 1 /* BPF_TYPE_SIZE */);
+    u64 size = __builtin_preserve_type_info(*(struct entity *)0, BPF_TYPE_SIZE);
     return (struct entity *)((char *)ents + i * size);
 }
 
 static inline s32 armor_of(struct entity *e) {
-    if (!__builtin_preserve_field_info(e->armor, 2 /* BPF_FIELD_EXISTS */))
+    if (!__builtin_preserve_field_info(e->armor, BPF_FIELD_EXISTS))
         return 0;
     return e->armor;
 }
@@ -80,7 +80,7 @@ struct score {
 
 /* Points and kills per hero id. The host shares this map between all plugins. */
 struct {
-    __uint(type, 1 /* BPF_MAP_TYPE_HASH */);
+    __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 16);
     __type(key, u32);
     __type(value, struct score);

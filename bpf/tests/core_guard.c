@@ -14,7 +14,7 @@ u64 read_pid(struct event *e) {
 }
 
 u64 read_flags(struct event *e) {
-    if (!__builtin_preserve_field_info(e->flags, 2 /* BPF_FIELD_EXISTS */))
+    if (!__builtin_preserve_field_info(e->flags, BPF_FIELD_EXISTS))
         return 0xdead;
     return e->flags;
 }

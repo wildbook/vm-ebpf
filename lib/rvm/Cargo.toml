@@ -15,18 +15,23 @@ btf       = { workspace = true, optional = true }
 hashbrown = { workspace = true }
 foldhash  = { version = "0.2.0", default-features = false }
 
+# These comments are the feature reference; the README and the crate docs link here.
 [features]
 default = ["link", "fuel", "maps"]
-# ELF parsing, CO-RE and the linker. Without it, rvm loads prepared images only.
+# ELF parsing, BTF, CO-RE and the linker: `Module`, `HostTypes`, `Vm::with_types`, `Vm::prepare`, `Vm::load_elf`,
+# `Vm::link` and `Vm::load_plugin`. Without it, rvm loads prepared images only.
 link = ["dep:constelf", "dep:btf"]
-# `VmConfig::instruction_limit`. Without it, the interpreter doesn't count instructions.
+# Enforces `VmConfig::instruction_limit`. Without it, the field doesn't exist and the interpreter doesn't count
+# instructions.
 fuel = ["rvm-core/fuel"]
-# Guest maps: the map helpers, `Program::map` and `Vm::share_map`. Without it, an image that declares maps doesn't load.
+# Guest maps: the map helpers, `Program::map` and `Vm::share_map`. Without it, an image that declares maps fails to
+# load with `LinkError::InvalidMap`.
 maps = []
 # Guest hash maps use a fixed hash seed, so builds compared in benchmarks probe the same way.
 fixed-hash-seed = []
 
 [dev-dependencies]
+btf       = { workspace = true }
 criterion = "0.7"
 ebpf-asm  = { workspace = true }
 
@@ -48,10 +53,13 @@ required-features = ["link", "maps"]
 name = "core_reloc"
 required-features = ["link"]
 
+# `test = true` runs the examples' layout checks under `cargo test`
 [[example]]
 name = "modding"
 required-features = ["link", "maps"]
+test = true
 
 [[example]]
 name = "msgpack_logs"
 required-features = ["link", "maps"]
+test = true

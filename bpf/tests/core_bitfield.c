@@ -8,14 +8,6 @@ struct bits {
     int b : 12;
 } __attribute__((preserve_access_index));
 
-enum {
-    BPF_FIELD_BYTE_OFFSET = 0,
-    BPF_FIELD_BYTE_SIZE = 1,
-    BPF_FIELD_LSHIFT_U64 = 4,
-    BPF_FIELD_RSHIFT_U64 = 5,
-    BPF_FIELD_SIGNED = 3,
-};
-
 static u64 extract(const void *p, unsigned byte_size, unsigned lshift, unsigned rshift, int is_signed) {
     u64 val;
     switch (byte_size) {
