@@ -99,8 +99,8 @@ fn fuse(code: &mut [Instruction]) {
 
     // A superinstruction or r10 access changes only its first slot, and there only the opcode byte, unless the slot
     // holds a register `mov` with `imm` 0: then it also puts its operand in `imm`, which a register `mov` ignores. So
-    // the code from slot `i` on is still as loaded, and a tail, which reads only its slot's fields, later reads an
-    // instruction that runs the same.
+    // the code from slot `i` on is still as loaded, and a tail, which reads its own slot's fields and the first slot's
+    // `dst_reg`, later reads an instruction that runs the same.
     for i in 0..code.len() {
         // the slot after LD_IMM64 holds the upper half of its immediate
         if i > 0 && code[i - 1].0 as u8 == LD_IMM64 {
@@ -219,8 +219,8 @@ pub struct Super {
     ops: [u8; MAX_LEN],
     len: u8,
     /// Whether the second instruction is an ALU instruction on the destination of the first, a register `mov`, whose
-    /// slot also holds the source operand of the ALU instruction in its `imm` field. Each other instruction the
-    /// superinstruction reads from its own slot.
+    /// slot also holds the source operand of the ALU instruction in its `imm` field. Each other instruction reads its
+    /// own slot, except that a final load, store or branch takes its base or compared register from the first slot.
     alu: bool,
 }
 
@@ -502,6 +502,21 @@ impl Super {
         let start = 1 + self.alu as usize;
         for k in start..self.len() {
             insns[k] = Instruction(window[k].0 & !0xFF | u64::from(self.ops[k]));
+        }
+        // A final load, store or branch addresses or compares the register the first instruction wrote. Taking that
+        // register's number from the first slot lets the compiler see they are the same register, so it carries the
+        // value the first instruction wrote to `ctx.regs` in a host register instead of reloading it. That value still
+        // equals `ctx.regs` there: the first instruction wrote both, and only an ALU instruction on the same register,
+        // which updates both again, runs in between. `encode` fuses a sequence only if its decoded form equals the code,
+        // so a sequence whose tail reads another register isn't fused.
+        let last = self.len() - 1;
+        let tail = OpCode(self.ops[last]);
+        if matches!(tail.class(), Class::LdReg | Class::StImm | Class::StReg | Class::Jmp32 | Class::Jmp64) {
+            let (insn, dst) = (insns[last].0, u64::from(slot.dst_reg()));
+            insns[last] = Instruction(match tail.class() {
+                Class::LdReg => insn & !0xF000 | dst << 12,
+                _ => insn & !0x0F00 | dst << 8,
+            });
         }
         insns
     }
