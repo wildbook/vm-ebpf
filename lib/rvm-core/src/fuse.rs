@@ -62,7 +62,7 @@ impl Code {
         // the first slot of a superinstruction or r10 access holds a reserved byte in place of its opcode
         let byte = match (STACK.iter().find(|s| s.0 == byte), SUPERS.iter().find(|s| s.0 == byte)) {
             (Some(&(_, usual)), _) => usual,
-            (None, Some(&(_, sup))) => sup.first,
+            (None, Some(&(_, sup))) => sup.ops[0],
             (None, None) => byte,
         };
         let opc = OpCode(byte);
@@ -88,10 +88,12 @@ impl Code {
 fn fuse(code: &mut [Instruction]) {
     // Only the opcode byte changes, so the second slot of LD_IMM64 keeps its `imm`.
     for insn in code.iter_mut() {
-        if is_reserved(insn.0 as u8) {
-            insn.0 = insn.0 & !0xFF | u64::from(MISSING);
-        } else if writes_r10(*insn) {
-            insn.0 = insn.0 & !0xFF | u64::from(INVALID);
+        let writes = WRITES[insn.0 as u8 as usize];
+        // `&` and `|` don't branch, so only the rare rewrite and atomics do
+        let r10 = (writes.dst & (insn.dst_reg() == 10)) | (writes.atomic && atomic_writes_r10(*insn));
+        if writes.reserved | r10 {
+            let byte = if writes.reserved { MISSING } else { INVALID };
+            insn.0 = insn.0 & !0xFF | u64::from(byte);
         }
     }
 
@@ -105,7 +107,7 @@ fn fuse(code: &mut [Instruction]) {
             continue;
         }
         let window = &code[i..];
-        let found = candidates(window[0].0 as u8)
+        let found = candidates(window)
             .iter()
             .find_map(|&(byte, sup)| sup.encode(byte, window));
         debug_assert_eq!(found, SUPERS.iter().find_map(|&(byte, sup)| sup.encode(byte, window)));
@@ -117,34 +119,61 @@ fn fuse(code: &mut [Instruction]) {
     }
 }
 
-/// Whether `insn` writes r10.
-fn writes_r10(insn: Instruction) -> bool {
+/// What an instruction with a given opcode byte may write that the first pass of [`fuse`] rewrites.
+#[derive(Clone, Copy)]
+struct Writes {
+    /// The byte [`is_reserved`].
+    reserved: bool,
+    /// `dst_reg`.
+    dst: bool,
+    /// The byte is an atomic's: [`atomic_writes_r10`] decides.
+    atomic: bool,
+}
+
+/// The [`Writes`] of each opcode byte.
+const WRITES: [Writes; 256] = {
+    let mut table = [Writes {
+        reserved: false,
+        dst: false,
+        atomic: false,
+    }; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        let opc = OpCode(byte as u8);
+        let writes = &mut table[byte];
+        match opc.class() {
+            _ if is_reserved(opc.0) => writes.reserved = true,
+            Class::Alu32 | Class::Alu64 | Class::LdReg => writes.dst = true,
+            Class::LdImm => writes.dst = opc.0 == LD_IMM64,
+            Class::StReg => writes.atomic = matches!(opc.mem_mode(), MemMode::Atomic),
+            Class::StImm | Class::Jmp32 | Class::Jmp64 => {}
+        }
+        byte += 1;
+    }
+    table
+};
+
+/// Whether the atomic `insn` writes r10.
+fn atomic_writes_r10(insn: Instruction) -> bool {
     const FETCH: i32 = 0x01;
     const CMPXCHG: i32 = 0xf0 | FETCH;
     const LOAD_ACQ: i32 = 0x100;
 
-    let opc = insn.opcode();
-    match opc.class() {
-        Class::Alu32 | Class::Alu64 | Class::LdReg => insn.dst_reg() == 10,
-        Class::LdImm => opc.0 == LD_IMM64 && insn.dst_reg() == 10,
-        Class::StReg if matches!(opc.mem_mode(), MemMode::Atomic) => match insn.imm() {
-            LOAD_ACQ => insn.dst_reg() == 10,
-            // CMPXCHG fetches into r0
-            imm => insn.src_reg() == 10 && imm & FETCH != 0 && imm != CMPXCHG,
-        },
-        Class::StReg | Class::StImm | Class::Jmp32 | Class::Jmp64 => false,
+    match insn.imm() {
+        LOAD_ACQ => insn.dst_reg() == 10,
+        // CMPXCHG fetches into r0
+        imm => insn.src_reg() == 10 && imm & FETCH != 0 && imm != CMPXCHG,
     }
 }
 
 /// The opcode byte of the r10 access `insn`, if it is a load or store with one.
 fn stack_byte(insn: Instruction) -> Option<u8> {
-    let opc = insn.opcode();
-    let base = match opc.class() {
+    let byte = STACK_BYTES[insn.0 as u8 as usize]?;
+    let base = match insn.opcode().class() {
         Class::LdReg => insn.src_reg(),
         _ => insn.dst_reg(),
     };
-    let (byte, _) = STACK.iter().find(|&&(_, usual)| usual == opc.0)?;
-    (base == 10).then_some(*byte)
+    (base == 10).then_some(byte)
 }
 
 const LD_IMM64: u8 = OpCode(Class::LdImm as u8 | MemMode::Imm as u8 | MemSize::DWord as u8).0;
@@ -186,13 +215,13 @@ const fn is_reserved(byte: u8) -> bool {
 /// The opcodes of the sequence a superinstruction runs.
 #[derive(Clone, Copy)]
 pub struct Super {
-    /// The first instruction. With `alu`, a register `mov` whose slot also holds the source operand of `alu` in its
-    /// `imm` field.
-    first: u8,
-    /// An ALU instruction on the destination of the `mov`, or 0.
-    alu: u8,
-    /// The next instructions, each of which the superinstruction reads from its own slot; 0 after the last.
-    tail: [u8; 3],
+    /// The opcode of each instruction, then zeros.
+    ops: [u8; MAX_LEN],
+    len: u8,
+    /// Whether the second instruction is an ALU instruction on the destination of the first, a register `mov`, whose
+    /// slot also holds the source operand of the ALU instruction in its `imm` field. Each other instruction the
+    /// superinstruction reads from its own slot.
+    alu: bool,
 }
 
 /// The most instructions a superinstruction runs.
@@ -277,44 +306,94 @@ const _: () = {
     }
 };
 
-/// [`SUPERS`] grouped by first opcode, each group in [`SUPERS`] order, so that the first match is the same.
-const BY_FIRST: [(u8, Super); SUPERS.len()] = {
+/// For each opcode byte, the byte of the r10 access with that opcode, if there is one.
+const STACK_BYTES: [Option<u8>; 256] = {
+    let mut table = [None; 256];
+    let mut i = 0;
+    while i < STACK.len() {
+        table[STACK[i].1 as usize] = Some(STACK[i].0);
+        i += 1;
+    }
+    table
+};
+
+/// [`SUPERS`] grouped by their first two opcodes, each group in [`SUPERS`] order, so that the first match is the same.
+const BY_PAIR: [(u8, Super); SUPERS.len()] = {
+    const fn pair(sup: Super) -> u16 {
+        (sup.ops[0] as u16) << 8 | sup.ops[1] as u16
+    }
+
+    // a stable insertion sort
     let mut sorted = [SUPERS[0]; SUPERS.len()];
-    let mut n = 0;
-    let mut first = 0;
-    while first < 256 {
-        let mut i = 0;
-        while i < SUPERS.len() {
-            if SUPERS[i].1.first as usize == first {
-                sorted[n] = SUPERS[i];
-                n += 1;
-            }
-            i += 1;
+    let mut i = 0;
+    while i < SUPERS.len() {
+        let mut j = i;
+        while j > 0 && pair(sorted[j - 1].1) > pair(SUPERS[i].1) {
+            sorted[j] = sorted[j - 1];
+            j -= 1;
         }
-        first += 1;
+        sorted[j] = SUPERS[i];
+        i += 1;
     }
     sorted
 };
 
-/// For each first opcode byte, the range of [`BY_FIRST`] whose superinstructions start with it.
-const GROUPS: [(u8, u8); 256] = {
-    let mut groups = [(0, 0); 256];
+/// The number of opcodes that start a superinstruction.
+const FIRSTS: usize = {
+    let mut n = 1;
+    let mut i = 1;
+    while i < BY_PAIR.len() {
+        n += (BY_PAIR[i].1.ops[0] != BY_PAIR[i - 1].1.ops[0]) as usize;
+        i += 1;
+    }
+    n
+};
+
+/// For each opcode byte, the row of [`GROUPS`] for the superinstructions that start with it: 0 if none does.
+const ROWS: [u8; 256] = {
+    let mut rows = [0; 256];
+    let mut row = 0;
     let mut i = 0;
-    while i < BY_FIRST.len() {
-        let first = BY_FIRST[i].1.first as usize;
-        if groups[first].1 == 0 {
-            groups[first].0 = i as u8;
+    while i < BY_PAIR.len() {
+        let first = BY_PAIR[i].1.ops[0] as usize;
+        if rows[first] == 0 {
+            row += 1;
+            rows[first] = row;
         }
-        groups[first].1 += 1;
+        i += 1;
+    }
+    rows
+};
+
+/// For each row of [`ROWS`] and second opcode byte, the range of [`BY_PAIR`] whose superinstructions start with
+/// those two opcodes. Row 0 is empty.
+const GROUPS: [[(u8, u8); 256]; 1 + FIRSTS] = {
+    let mut groups = [[(0, 0); 256]; 1 + FIRSTS];
+    let mut i = 0;
+    while i < BY_PAIR.len() {
+        let sup = BY_PAIR[i].1;
+        let group = &mut groups[ROWS[sup.ops[0] as usize] as usize][sup.ops[1] as usize];
+        if group.1 == 0 {
+            group.0 = i as u8;
+        }
+        group.1 += 1;
         i += 1;
     }
     groups
 };
 
-/// The superinstructions that start with opcode byte `first`, in the order [`Code::new`] tries them.
-fn candidates(first: u8) -> &'static [(u8, Super)] {
-    let (start, len) = GROUPS[first as usize];
-    &BY_FIRST[start as usize..][..len as usize]
+/// The superinstructions that start with the first two opcodes of `window`, in the order [`Code::new`] tries them.
+fn candidates(window: &[Instruction]) -> &'static [(u8, Super)] {
+    let [first, second, ..] = window else {
+        return &[];
+    };
+    let row = ROWS[first.0 as u8 as usize];
+    // most slots start none
+    if row == 0 {
+        return &[];
+    }
+    let (start, len) = GROUPS[row as usize][second.0 as u8 as usize];
+    &BY_PAIR[start as usize..][..len as usize]
 }
 
 /// Give each superinstruction and r10 access byte its handler.
@@ -326,14 +405,20 @@ pub const fn install<M: Memory, H: Host<M>, const FUEL: bool>(table: &mut [Handl
 impl Super {
     const fn new(first: u8, alu: u8, tail: &[u8]) -> Self {
         let mut sup = Self {
-            first,
-            alu,
-            tail: [0; 3],
+            ops: [0; MAX_LEN],
+            len: 1,
+            alu: alu != 0,
         };
+        sup.ops[0] = first;
+        if sup.alu {
+            sup.ops[1] = alu;
+            sup.len += 1;
+        }
         let mut k = 0;
         while k < tail.len() {
             assert!(tail[k] != 0);
-            sup.tail[k] = tail[k];
+            sup.ops[sup.len as usize] = tail[k];
+            sup.len += 1;
             k += 1;
         }
         sup
@@ -371,7 +456,7 @@ impl Super {
         assert!(self.len() > 1);
         let mut k = 0;
         while k < self.len() {
-            let opc = OpCode(self.opcode(k));
+            let opc = OpCode(self.ops[k]);
             assert!(!matches!(opc.class(), Class::LdImm));
             if matches!(opc.class(), Class::Jmp32 | Class::Jmp64) {
                 assert!(k == self.len() - 1 && k > 0);
@@ -379,37 +464,25 @@ impl Super {
             }
             k += 1;
         }
-        if self.alu != 0 {
-            assert!(self.first == MOV64 || self.first == MOV32);
-            assert!(OpCode(self.alu).class() as u8 == OpCode(self.first).class() as u8);
+        if self.alu {
+            assert!(self.ops[0] == MOV64 || self.ops[0] == MOV32);
+            assert!(OpCode(self.ops[1]).class() as u8 == OpCode(self.ops[0]).class() as u8);
         }
         (byte, self)
     }
 
     /// The number of instructions in the sequence.
+    #[inline(always)]
     pub const fn len(self) -> usize {
-        let mut tail = 0;
-        while tail < self.tail.len() && self.tail[tail] != 0 {
-            tail += 1;
-        }
-        1 + (self.alu != 0) as usize + tail
-    }
-
-    /// The opcode of instruction `k` of the sequence.
-    const fn opcode(self, k: usize) -> u8 {
-        match (k, self.alu != 0) {
-            (0, _) => self.first,
-            (1, true) => self.alu,
-            (_, alu) => self.tail[k - 1 - alu as usize],
-        }
+        self.len as usize
     }
 
     /// The first instruction of the sequence whose first slot holds `slot`.
     #[inline(always)]
     pub fn first_of(self, slot: Instruction) -> Instruction {
         match self.alu {
-            0 => Instruction(slot.0 & !0xFF | u64::from(self.first)),
-            _ => Instruction::from_parts(OpCode(self.first), slot.dst_reg(), slot.src_reg(), 0, 0),
+            false => Instruction(slot.0 & !0xFF | u64::from(self.ops[0])),
+            true => Instruction::from_parts(OpCode(self.ops[0]), slot.dst_reg(), slot.src_reg(), 0, 0),
         }
     }
 
@@ -418,29 +491,34 @@ impl Super {
     #[inline(always)]
     fn decode(self, slot: Instruction, window: &[Instruction]) -> [Instruction; MAX_LEN] {
         let mut insns = [self.first_of(slot); MAX_LEN];
-        if self.alu != 0 {
+        if self.alu {
             let (dst, operand) = (slot.dst_reg(), slot.imm());
-            let alu = OpCode(self.alu);
+            let alu = OpCode(self.ops[1]);
             insns[1] = match alu.alu_src() {
                 Source::Imm => Instruction::from_parts(alu, dst, 0, 0, operand),
                 Source::Reg => Instruction::from_parts(alu, dst, operand as u8, 0, 0),
             };
         }
-        let start = 1 + (self.alu != 0) as usize;
+        let start = 1 + self.alu as usize;
         for k in start..self.len() {
-            insns[k] = Instruction(window[k].0 & !0xFF | u64::from(self.opcode(k)));
+            insns[k] = Instruction(window[k].0 & !0xFF | u64::from(self.ops[k]));
         }
         insns
     }
 
     /// The first slot of this superinstruction, with opcode byte `byte`, for the sequence at the start of `window`, if
     /// it has one.
+    #[inline(always)]
     fn encode(self, byte: u8, window: &[Instruction]) -> Option<Instruction> {
         let sequence = window.get(..self.len())?;
+        // `candidates` matched the first two opcodes, and the candidates that share those mostly differ in the last
+        if sequence[self.len() - 1].0 as u8 != self.ops[self.len() - 1] {
+            return None;
+        }
         let first = sequence[0];
         let slot = match self.alu {
-            0 => Instruction(first.0 & !0xFF | u64::from(byte)),
-            _ => {
+            false => Instruction(first.0 & !0xFF | u64::from(byte)),
+            true => {
                 let alu = sequence[1];
                 let operand = match alu.opcode().alu_src() {
                     Source::Imm => alu.imm(),
@@ -453,11 +531,13 @@ impl Super {
     }
 
     /// Whether instruction `k` of the sequence may branch.
+    #[inline(always)]
     const fn branches_at(self, k: usize) -> bool {
-        k == self.len() - 1 && matches!(OpCode(self.opcode(k)).class(), Class::Jmp32 | Class::Jmp64)
+        k == self.len() - 1 && matches!(OpCode(self.ops[k]).class(), Class::Jmp32 | Class::Jmp64)
     }
 
     /// Whether the last instruction of the sequence may branch.
+    #[inline(always)]
     pub const fn branches(self) -> bool {
         self.branches_at(self.len() - 1)
     }
@@ -479,7 +559,7 @@ extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool, co
 
     // the fuel runs out inside the sequence
     if FUEL && fuel < len as u64 - 1 {
-        let alone = const { Handlers::<M, H, FUEL>::TABLE[Super::of(S).first as usize] };
+        let alone = const { Handlers::<M, H, FUEL>::TABLE[Super::of(S).ops[0] as usize] };
         become alone(ctx, code, sup.first_of(insn), pc, fuel, calls)
     }
     // SAFETY: `transfer::bound` leaves a superinstruction only where its sequence lies in the code, and the guard slot

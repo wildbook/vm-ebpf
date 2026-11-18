@@ -65,22 +65,61 @@ pub fn bound(code: &mut Vec<Instruction>) {
 /// The displacement of the fixed target the handler of `insn` may continue at, `pc + 1 + displacement`, as
 /// [`ops::jump`] computes it, or `None` if it continues only at `pc + 1` or a target it computes at run time.
 fn displacement(insn: Instruction) -> Option<i64> {
-    let opc = insn.opcode();
-    if !matches!(opc.class(), Class::Jmp64 | Class::Jmp32) {
+    let target = TARGETS[insn.0 as u8 as usize];
+    if !target.fixed || (target.local_call && insn.src_reg() != BPF_PSEUDO_CALL) {
         return None;
     }
-    let jmp64 = matches!(opc.class(), Class::Jmp64);
-    let imm = opc.alu_src() == Source::Imm;
-    match opc.jmp_opc() {
-        JmpOpc::Ja if imm && jmp64 => Some(insn.offset().into()),
-        JmpOpc::Ja if imm => Some(insn.imm().into()),
-        JmpOpc::Call if imm && jmp64 && insn.src_reg() == BPF_PSEUDO_CALL => Some(insn.imm().into()),
-        // `gotox`, helper and kfunc calls, `callx`, `exit`, `may_goto` and the encodings that fail
-        JmpOpc::Ja | JmpOpc::Call | JmpOpc::Exit | JmpOpc::Jcond | JmpOpc::UndefF => None,
-        // conditional jumps
-        _ => Some(insn.offset().into()),
-    }
+    Some(if target.in_imm {
+        insn.imm().into()
+    } else {
+        insn.offset().into()
+    })
 }
+
+/// Whether and where an instruction with a given opcode byte holds the displacement of a fixed target.
+#[derive(Clone, Copy)]
+struct Target {
+    fixed: bool,
+    /// In `imm`, else in `offset`.
+    in_imm: bool,
+    /// A call, which has a fixed target only if it is a local one.
+    local_call: bool,
+}
+
+/// The [`Target`] of each opcode byte.
+const TARGETS: [Target; 256] = {
+    const NONE: Target = Target {
+        fixed: false,
+        in_imm: false,
+        local_call: false,
+    };
+    const OFFSET: Target = Target { fixed: true, ..NONE };
+    const IMM: Target = Target { in_imm: true, ..OFFSET };
+    const CALL: Target = Target {
+        local_call: true,
+        ..IMM
+    };
+
+    let mut table = [NONE; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        let opc = OpCode(byte as u8);
+        let jmp64 = matches!(opc.class(), Class::Jmp64);
+        let imm = matches!(opc.alu_src(), Source::Imm);
+        table[byte] = match opc.jmp_opc() {
+            _ if !matches!(opc.class(), Class::Jmp64 | Class::Jmp32) => NONE,
+            JmpOpc::Ja if imm && jmp64 => OFFSET,
+            JmpOpc::Ja if imm => IMM,
+            JmpOpc::Call if imm && jmp64 => CALL,
+            // `gotox`, helper and kfunc calls, `callx`, `exit`, `may_goto` and the encodings that fail
+            JmpOpc::Ja | JmpOpc::Call | JmpOpc::Exit | JmpOpc::Jcond | JmpOpc::UndefF => NONE,
+            // conditional jumps
+            _ => OFFSET,
+        };
+        byte += 1;
+    }
+    table
+};
 
 /// The second slot of the LD_IMM64 whose second slot holds `second`, or `None` if the code ends before it.
 #[inline(always)]
