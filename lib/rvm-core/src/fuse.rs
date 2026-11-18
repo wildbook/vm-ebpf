@@ -88,7 +88,11 @@ fn fuse(code: &mut [Instruction]) {
             continue;
         }
         let window = &code[i..];
-        if let Some(slot) = SUPERS.iter().find_map(|&(byte, sup)| sup.encode(byte, window)) {
+        let found = candidates(window[0].0 as u8)
+            .iter()
+            .find_map(|&(byte, sup)| sup.encode(byte, window));
+        debug_assert_eq!(found, SUPERS.iter().find_map(|&(byte, sup)| sup.encode(byte, window)));
+        if let Some(slot) = found {
             code[i] = slot;
         } else if let Some(byte) = stack_byte(code[i]) {
             code[i].0 = code[i].0 & !0xFF | u64::from(byte);
@@ -253,6 +257,46 @@ const _: () = {
         i += 1;
     }
 };
+
+/// [`SUPERS`] grouped by first opcode, each group in [`SUPERS`] order, so that the first match is the same.
+const BY_FIRST: [(u8, Super); SUPERS.len()] = {
+    let mut sorted = [SUPERS[0]; SUPERS.len()];
+    let mut n = 0;
+    let mut first = 0;
+    while first < 256 {
+        let mut i = 0;
+        while i < SUPERS.len() {
+            if SUPERS[i].1.first as usize == first {
+                sorted[n] = SUPERS[i];
+                n += 1;
+            }
+            i += 1;
+        }
+        first += 1;
+    }
+    sorted
+};
+
+/// For each first opcode byte, the range of [`BY_FIRST`] whose superinstructions start with it.
+const GROUPS: [(u8, u8); 256] = {
+    let mut groups = [(0, 0); 256];
+    let mut i = 0;
+    while i < BY_FIRST.len() {
+        let first = BY_FIRST[i].1.first as usize;
+        if groups[first].1 == 0 {
+            groups[first].0 = i as u8;
+        }
+        groups[first].1 += 1;
+        i += 1;
+    }
+    groups
+};
+
+/// The superinstructions that start with opcode byte `first`, in the order [`Code::new`] tries them.
+fn candidates(first: u8) -> &'static [(u8, Super)] {
+    let (start, len) = GROUPS[first as usize];
+    &BY_FIRST[start as usize..][..len as usize]
+}
 
 /// Give each superinstruction and r10 access byte its handler.
 pub const fn install<M: Memory, H: Host<M>, const FUEL: bool>(table: &mut [Handler<M, H>; 256]) {
