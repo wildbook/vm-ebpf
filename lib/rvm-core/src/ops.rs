@@ -1,33 +1,51 @@
 use crate::opcode::{AluEnd, AluOpc, JmpOpc, Source};
-use crate::{Context, Flow, Instruction, Memory, BPF_PSEUDO_CALL, BPF_PSEUDO_KFUNC_CALL};
+use crate::{Flow, Instruction, BPF_PSEUDO_CALL, BPF_PSEUDO_KFUNC_CALL};
 
 pub const BITS_32: bool = false;
 pub const BITS_64: bool = true;
 
+/// The registers an instruction reads and writes, by the number in its `dst_reg` or `src_reg` field.
+pub trait Regs {
+    fn get(&self, reg: u8) -> u64;
+    fn set(&mut self, reg: u8, value: u64);
+}
+
+impl Regs for [u64; 16] {
+    #[inline(always)]
+    fn get(&self, reg: u8) -> u64 {
+        self[usize::from(reg)]
+    }
+
+    #[inline(always)]
+    fn set(&mut self, reg: u8, value: u64) {
+        self[usize::from(reg)] = value;
+    }
+}
+
 #[inline(always)]
-pub fn math<M: Memory, const BITS: bool>(ctx: &mut Context<M>, insn: Instruction) -> Flow<M::Err> {
+pub fn math<E, R: Regs, const BITS: bool>(regs: &mut R, insn: Instruction) -> Flow<E> {
     let opc = insn.opcode();
     let alu_opc = opc.alu_opc();
     let alu_src = opc.alu_src();
     let alu_end = opc.alu_end();
 
-    let src_reg = insn.src_reg() as usize;
-    let dst_reg = insn.dst_reg() as usize;
+    let src_reg = insn.src_reg();
+    let dst_reg = insn.dst_reg();
 
     let imm = insn.imm();
     let offset = insn.offset();
 
     let d = match BITS {
-        BITS_64 => ctx.regs[dst_reg],
-        BITS_32 => ctx.regs[dst_reg] & 0xFFFFFFFF,
+        BITS_64 => regs.get(dst_reg),
+        BITS_32 => regs.get(dst_reg) & 0xFFFFFFFF,
     };
 
     let s = match (alu_src, BITS) {
         (Source::Imm, BITS_64) => imm as i64 as u64,
         // ALU32 treats the immediate as a 32-bit value.
         (Source::Imm, BITS_32) => imm as u32 as u64,
-        (Source::Reg, BITS_64) => ctx.regs[src_reg],
-        (Source::Reg, BITS_32) => ctx.regs[src_reg] & 0xFFFFFFFF,
+        (Source::Reg, BITS_64) => regs.get(src_reg),
+        (Source::Reg, BITS_32) => regs.get(src_reg) & 0xFFFFFFFF,
     };
 
     let result = match alu_opc {
@@ -128,13 +146,13 @@ pub fn math<M: Memory, const BITS: bool>(ctx: &mut Context<M>, insn: Instruction
         // END: width comes from imm and the result is not zero-extended by class. Guest memory is little-endian, so
         // LE truncates and BE swaps; ALU64 TO_LE is the unconditional BSWAP and ALU64 TO_BE is reserved.
         AluOpc::End => {
-            let full_d = ctx.regs[dst_reg];
+            let full_d = regs.get(dst_reg);
             let swap = match (BITS, alu_end) {
                 (BITS_32, AluEnd::ToLE) => false,
                 (BITS_32, AluEnd::ToBE) | (BITS_64, AluEnd::ToLE) => true,
                 (BITS_64, AluEnd::ToBE) => return Flow::FailCpu,
             };
-            ctx.regs[dst_reg] = match (swap, imm) {
+            let result = match (swap, imm) {
                 (false, 16) => full_d as u16 as u64,
                 (false, 32) => full_d as u32 as u64,
                 (false, 64) => full_d,
@@ -143,40 +161,42 @@ pub fn math<M: Memory, const BITS: bool>(ctx: &mut Context<M>, insn: Instruction
                 (true, 64) => full_d.swap_bytes(),
                 _ => return Flow::FailCpu,
             };
+            regs.set(dst_reg, result);
             return Flow::Next;
         }
         AluOpc::UndefE | AluOpc::UndefF => return Flow::FailCpu,
     };
 
-    ctx.regs[dst_reg] = match BITS {
+    let value = match BITS {
         BITS_64 => result,
         BITS_32 => result & 0xFFFFFFFF,
     };
+    regs.set(dst_reg, value);
 
     Flow::Next
 }
 
 #[inline(always)]
-pub fn jump<M: Memory, const BITS: bool>(ctx: &mut Context<M>, insn: Instruction) -> Flow<M::Err> {
+pub fn jump<E, R: Regs, const BITS: bool>(regs: &R, insn: Instruction) -> Flow<E> {
     let opc = insn.opcode();
     let jmp_opc = opc.jmp_opc();
     let jmp_src = opc.alu_src();
 
-    let src_reg = insn.src_reg() as usize;
-    let dst_reg = insn.dst_reg() as usize;
+    let src_reg = insn.src_reg();
+    let dst_reg = insn.dst_reg();
 
     let imm = insn.imm();
 
     let d = match BITS {
-        BITS_64 => ctx.regs[dst_reg],
-        BITS_32 => ctx.regs[dst_reg] & 0xFFFFFFFF,
+        BITS_64 => regs.get(dst_reg),
+        BITS_32 => regs.get(dst_reg) & 0xFFFFFFFF,
     };
 
     let s = match (jmp_src, BITS) {
         (Source::Imm, BITS_64) => imm as i64 as u64,
         (Source::Imm, BITS_32) => imm as u32 as u64,
-        (Source::Reg, BITS_64) => ctx.regs[src_reg],
-        (Source::Reg, BITS_32) => ctx.regs[src_reg] & 0xFFFFFFFF,
+        (Source::Reg, BITS_64) => regs.get(src_reg),
+        (Source::Reg, BITS_32) => regs.get(src_reg) & 0xFFFFFFFF,
     };
 
     let cond = match jmp_opc {

@@ -1,7 +1,8 @@
 use std::ops::ControlFlow;
 
 use crate::opcode::{MemMode, MemSize};
-use crate::{AtomicOp, Context, Flow, Instruction, Memory};
+use crate::ops::Regs;
+use crate::{AtomicOp, Flow, Instruction, Memory};
 
 pub const WITH_REG: bool = true;
 pub const WITH_IMM: bool = false;
@@ -52,13 +53,13 @@ fn store_release<M: Memory>(mem: &mut M, size: MemSize, addr: u64, value: u64) -
 }
 
 #[inline(always)]
-pub fn save<M: Memory, const X: bool>(ctx: &mut Context<M>, insn: Instruction) -> Flow<M::Err> {
+pub fn save<M: Memory, R: Regs, const X: bool>(regs: &mut R, mem: &mut M, insn: Instruction) -> Flow<M::Err> {
     let val = match X {
-        true => ctx.regs[usize::from(insn.src_reg())],
+        true => regs.get(insn.src_reg()),
         false => i64::from(insn.imm()) as u64,
     };
 
-    let dst = ctx.regs[usize::from(insn.dst_reg())];
+    let dst = regs.get(insn.dst_reg());
     let addr = dst.wrapping_add_signed(i64::from(insn.offset()));
 
     let opc = insn.opcode();
@@ -66,8 +67,8 @@ pub fn save<M: Memory, const X: bool>(ctx: &mut Context<M>, insn: Instruction) -
     let mode = opc.mem_mode();
 
     let result = match mode {
-        MemMode::Mem => mem_store(&mut ctx.data, size, addr, val),
-        MemMode::Atomic if X => return atomic(ctx, insn, size, addr, val),
+        MemMode::Mem => mem_store(mem, size, addr, val),
+        MemMode::Atomic if X => return atomic(regs, mem, insn, size, addr, val),
 
         // ABS and IND exist only in the LD class
         MemMode::Imm
@@ -87,7 +88,14 @@ pub fn save<M: Memory, const X: bool>(ctx: &mut Context<M>, insn: Instruction) -
 
 /// `STX | ATOMIC`: `imm` selects the operation. The read-modify-write operations take W and DW sizes only;
 /// [`ordered`] runs the rest.
-fn atomic<M: Memory>(ctx: &mut Context<M>, insn: Instruction, size: MemSize, addr: u64, src: u64) -> Flow<M::Err> {
+fn atomic<M: Memory, R: Regs>(
+    regs: &mut R,
+    mem: &mut M,
+    insn: Instruction,
+    size: MemSize,
+    addr: u64,
+    src: u64,
+) -> Flow<M::Err> {
     const FETCH: i32 = 0x01;
     const ADD: i32 = 0x00;
     const OR: i32 = 0x40;
@@ -96,7 +104,7 @@ fn atomic<M: Memory>(ctx: &mut Context<M>, insn: Instruction, size: MemSize, add
     const XCHG: i32 = 0xe0 | FETCH;
     const CMPXCHG: i32 = 0xf0 | FETCH;
 
-    let src_reg = usize::from(insn.src_reg());
+    let src_reg = insn.src_reg();
     let imm = insn.imm();
 
     // `CmpXchg` compares against r0 and writes the old value there instead of `src`.
@@ -106,16 +114,16 @@ fn atomic<M: Memory>(ctx: &mut Context<M>, insn: Instruction, size: MemSize, add
             let op = match imm & !FETCH {
                 _ if imm == XCHG => AtomicOp::Xchg(v),
                 _ if imm == CMPXCHG => AtomicOp::CmpXchg {
-                    expected: ctx.regs[0] as $ty,
+                    expected: regs.get(0) as $ty,
                     new: v,
                 },
                 ADD => AtomicOp::Add(v),
                 OR => AtomicOp::Or(v),
                 AND => AtomicOp::And(v),
                 XOR => AtomicOp::Xor(v),
-                _ => return ordered(ctx, insn, size, addr, src),
+                _ => return ordered(regs, mem, insn, size, addr, src),
             };
-            match ctx.data.$method(addr, op) {
+            match mem.$method(addr, op) {
                 Ok(old) => old as u64,
                 Err(err) => return Flow::FailMem(err),
             }
@@ -125,12 +133,12 @@ fn atomic<M: Memory>(ctx: &mut Context<M>, insn: Instruction, size: MemSize, add
     let old = match size {
         MemSize::Word => run!(u32, atomic_u32),
         MemSize::DWord => run!(u64, atomic_u64),
-        MemSize::Byte | MemSize::Half => return ordered(ctx, insn, size, addr, src),
+        MemSize::Byte | MemSize::Half => return ordered(regs, mem, insn, size, addr, src),
     };
 
     match imm {
-        CMPXCHG => ctx.regs[0] = old,
-        _ if imm & FETCH != 0 => ctx.regs[src_reg] = old,
+        CMPXCHG => regs.set(0, old),
+        _ if imm & FETCH != 0 => regs.set(src_reg, old),
         _ => {}
     }
     Flow::Next
@@ -140,17 +148,24 @@ fn atomic<M: Memory>(ctx: &mut Context<M>, insn: Instruction, size: MemSize, add
 /// take every size. Load-acquire reads through `src_reg` into `dst_reg`, the reverse of the other operations.
 // outlined to keep the read-modify-write path in `atomic` short
 #[inline(never)]
-fn ordered<M: Memory>(ctx: &mut Context<M>, insn: Instruction, size: MemSize, addr: u64, src: u64) -> Flow<M::Err> {
+fn ordered<M: Memory, R: Regs>(
+    regs: &mut R,
+    mem: &mut M,
+    insn: Instruction,
+    size: MemSize,
+    addr: u64,
+    src: u64,
+) -> Flow<M::Err> {
     const LOAD_ACQ: i32 = 0x100;
     const STORE_REL: i32 = 0x110;
 
     let result = match insn.imm() {
         LOAD_ACQ => {
-            let base = ctx.regs[usize::from(insn.src_reg())];
+            let base = regs.get(insn.src_reg());
             let addr = base.wrapping_add_signed(i64::from(insn.offset()));
-            load_acquire(&ctx.data, size, addr).map(|val| ctx.regs[usize::from(insn.dst_reg())] = val)
+            load_acquire(mem, size, addr).map(|val| regs.set(insn.dst_reg(), val))
         }
-        STORE_REL => store_release(&mut ctx.data, size, addr, src),
+        STORE_REL => store_release(mem, size, addr, src),
         _ => return Flow::FailCpu,
     };
     match result {
@@ -160,10 +175,8 @@ fn ordered<M: Memory>(ctx: &mut Context<M>, insn: Instruction, size: MemSize, ad
 }
 
 #[inline(always)]
-pub fn load<M: Memory>(ctx: &mut Context<M>, insn: Instruction) -> Flow<M::Err> {
-    let dst = usize::from(insn.dst_reg());
-
-    let src = ctx.regs[usize::from(insn.src_reg())];
+pub fn load<M: Memory, R: Regs>(regs: &mut R, mem: &M, insn: Instruction) -> Flow<M::Err> {
+    let src = regs.get(insn.src_reg());
     let addr = src.wrapping_add_signed(i64::from(insn.offset()));
 
     let opc = insn.opcode();
@@ -171,9 +184,9 @@ pub fn load<M: Memory>(ctx: &mut Context<M>, insn: Instruction) -> Flow<M::Err> 
     let mode = opc.mem_mode();
 
     match match mode {
-        MemMode::Mem => mem_load(&ctx.data, size, addr),
+        MemMode::Mem => mem_load(mem, size, addr),
         // RFC 9669 defines MEMSX for B, H and W only
-        MemMode::MemSX if !matches!(size, MemSize::DWord) => mem_load_sx(&ctx.data, size, addr),
+        MemMode::MemSX if !matches!(size, MemSize::DWord) => mem_load_sx(mem, size, addr),
 
         // ABS and IND exist only in the LD class
         MemMode::Imm
@@ -184,7 +197,7 @@ pub fn load<M: Memory>(ctx: &mut Context<M>, insn: Instruction) -> Flow<M::Err> 
         | MemMode::UndefA
         | MemMode::UndefE => return Flow::FailCpu,
     } {
-        Ok(val) => ctx.regs[dst] = val,
+        Ok(val) => regs.set(insn.dst_reg(), val),
         Err(err) => return Flow::FailMem(err),
     }
 

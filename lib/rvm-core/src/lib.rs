@@ -84,22 +84,26 @@ impl<M: Memory> Context<M> {
 }
 
 #[inline(always)]
-pub(crate) fn step<M: Memory>(ctx: &mut Context<M>, insn: Instruction) -> ControlFlow<Flow<M::Err>, Instruction> {
+pub(crate) fn step<M: Memory, R: ops::Regs>(
+    regs: &mut R,
+    mem: &mut M,
+    insn: Instruction,
+) -> ControlFlow<Flow<M::Err>, Instruction> {
     use mem::{WITH_IMM, WITH_REG};
     use ops::{BITS_32, BITS_64};
 
     match insn.opcode().class() {
-        Class::Alu32 => ControlFlow::Break(ops::math::<_, BITS_32>(ctx, insn)),
-        Class::Alu64 => ControlFlow::Break(ops::math::<_, BITS_64>(ctx, insn)),
+        Class::Alu32 => ControlFlow::Break(ops::math::<_, _, BITS_32>(regs, insn)),
+        Class::Alu64 => ControlFlow::Break(ops::math::<_, _, BITS_64>(regs, insn)),
 
-        Class::Jmp32 => ControlFlow::Break(ops::jump::<_, BITS_32>(ctx, insn)),
-        Class::Jmp64 => ControlFlow::Break(ops::jump::<_, BITS_64>(ctx, insn)),
+        Class::Jmp32 => ControlFlow::Break(ops::jump::<_, _, BITS_32>(regs, insn)),
+        Class::Jmp64 => ControlFlow::Break(ops::jump::<_, _, BITS_64>(regs, insn)),
 
         Class::LdImm => mem::ld64(insn),
-        Class::LdReg => ControlFlow::Break(mem::load(ctx, insn)),
+        Class::LdReg => ControlFlow::Break(mem::load(regs, mem, insn)),
 
-        Class::StImm => ControlFlow::Break(mem::save::<_, WITH_IMM>(ctx, insn)),
-        Class::StReg => ControlFlow::Break(mem::save::<_, WITH_REG>(ctx, insn)),
+        Class::StImm => ControlFlow::Break(mem::save::<_, _, WITH_IMM>(regs, mem, insn)),
+        Class::StReg => ControlFlow::Break(mem::save::<_, _, WITH_REG>(regs, mem, insn)),
     }
 }
 
@@ -176,7 +180,7 @@ extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, 
     // Only jump-class opcodes jump, call or exit. Without the guards, a handler whose `step` returns from an outlined
     // call (atomics) would test for those flows too.
     let jumps = matches!(OpCode(OP).class(), Class::Jmp32 | Class::Jmp64);
-    match step(ctx, Instruction(insn.0 & !0xFF | OP as u64)) {
+    match step(&mut ctx.regs, &mut ctx.data, Instruction(insn.0 & !0xFF | OP as u64)) {
         ControlFlow::Break(Flow::Next) => {}
         ControlFlow::Break(Flow::Jump(offset)) if jumps => slot = slot.offset(offset),
         ControlFlow::Break(Flow::Call(offset)) if jumps => {

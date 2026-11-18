@@ -237,8 +237,8 @@ extern "rust-preserve-none" fn far<M: Memory, H: Host<M>, const FUEL: bool>(
     let byte = insn.dst_reg() | insn.src_reg() << 4;
     let jump = Instruction(code[insn.imm() as u32 as usize].0 & !0xFF | u64::from(byte));
     let flow = match jump.opcode().class() {
-        Class::Jmp32 => ops::jump::<_, BITS_32>(ctx, jump),
-        _ => ops::jump::<_, BITS_64>(ctx, jump),
+        Class::Jmp32 => ops::jump::<_, _, BITS_32>(&ctx.regs, jump),
+        _ => ops::jump::<_, _, BITS_64>(&ctx.regs, jump),
     };
     let mut pc = slot.pc(code);
     match flow {

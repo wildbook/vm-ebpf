@@ -45,14 +45,14 @@ fn instr(opc: OpCode, dst: u8, src: u8, off: i16, imm: i32) -> Instruction {
 }
 
 fn exec(ctx: &mut Context<TestMem>, instruction: Instruction) -> Flow<()> {
-    match step(ctx, instruction) {
+    match step(&mut ctx.regs, &mut ctx.data, instruction) {
         ControlFlow::Break(flow) => flow,
         ControlFlow::Continue(_) => panic!("unexpected LD_IMM64 first half"),
     }
 }
 
 fn exec_ld64(ctx: &mut Context<TestMem>, first: Instruction, second: Instruction) -> Flow<()> {
-    match step(ctx, first) {
+    match step(&mut ctx.regs, &mut ctx.data, first) {
         ControlFlow::Continue(_) => {
             step_ld64(ctx, first, second);
             Flow::Next
