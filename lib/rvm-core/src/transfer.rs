@@ -1,10 +1,10 @@
 //! Control transfers that need no bounds check.
 //!
 //! [`Code::new`](crate::Code::new) ends the code with a [`GUARD`] slot, and [`bound`] proves that every pc a handler
-//! continues at without a check lies in `0..=len`, the guard included. So [`fetch`](crate::fetch) reads such a pc
-//! without checking it, and the guard stops with [`Flow::BadPc`] where the code ends, as a checked fetch would.
-//! [`run`](crate::run) checks the pc it starts at, the `exit` handler the pc it returns to, and the runtime the
-//! targets of `callx` and `gotox`.
+//! continues at without a check lies in `0..=len`, the guard included. Handlers carry the pc as a [`Slot`], a pointer
+//! to the slot, and read such a slot without a check; the guard stops with [`Flow::BadPc`] where the code ends, as a
+//! checked fetch would. [`run`](crate::run) checks the pc it starts at, the `exit` handler the pc it returns to, and
+//! the runtime the targets of `callx` and `gotox`.
 
 use crate::fuse::Super;
 use crate::opcode::{Class, JmpOpc, OpCode, Source};
@@ -60,6 +60,70 @@ pub fn bound(code: &mut Vec<Instruction>) {
     code.reserve_exact(1 + far.len());
     code.push(Instruction(u64::from(GUARD)));
     code.extend(far);
+}
+
+/// A pointer to the slot of the instruction a handler runs, which handlers carry in place of its pc.
+///
+/// Every `Slot` a handler receives points into the slots of the [`Code`](crate::Code) that [`run`](crate::run) runs:
+/// `run` and the checked fetches make one only for a pc they found in the slots, and a handler moves one without a check
+/// only from a slot below `len`, to the next slot or to a target that [`bound`] proves lies in `0..=len`. The slots
+/// from `len` on all hold [`GUARD`], whose handler continues nowhere. So a handler reads its own slot, and the slot it
+/// continues at, without a check.
+#[derive(Clone, Copy)]
+pub struct Slot(*const Instruction);
+
+impl Slot {
+    /// The slot at `pc` in the slots `code`, which may lie outside them. The pointer comes from the whole slice, so it
+    /// may reach every slot.
+    #[inline(always)]
+    pub fn at(code: &[Instruction], pc: u64) -> Self {
+        Self(code.as_ptr().wrapping_add(pc as usize))
+    }
+
+    /// The slot `n` slots on, which may lie outside the code.
+    #[inline(always)]
+    pub fn offset(self, n: i64) -> Self {
+        Self(self.0.wrapping_offset(n as isize))
+    }
+
+    /// The pc of the slot in the slots `code`, which it lies in.
+    #[inline(always)]
+    pub fn pc(self, code: &[Instruction]) -> u64 {
+        pc_at(self.addr(), code)
+    }
+
+    #[inline(always)]
+    pub fn addr(self) -> usize {
+        self.0.addr()
+    }
+
+    /// The instruction in the slot.
+    ///
+    /// # Safety
+    ///
+    /// The slot must lie in the slots of a [`Code`](crate::Code) that is still borrowed.
+    #[inline(always)]
+    pub unsafe fn get(self) -> Instruction {
+        // SAFETY: the caller's
+        unsafe { *self.0 }
+    }
+
+    /// The `n` slots from this one on, borrowed from `code`.
+    ///
+    /// # Safety
+    ///
+    /// They must lie in `code`.
+    #[inline(always)]
+    pub unsafe fn window(self, _code: &[Instruction], n: usize) -> &[Instruction] {
+        // SAFETY: the caller's
+        unsafe { std::slice::from_raw_parts(self.0, n) }
+    }
+}
+
+/// The pc of the slot at address `addr` in the slots `code`, which it lies in.
+#[inline(always)]
+pub fn pc_at(addr: usize, code: &[Instruction]) -> u64 {
+    ((addr - code.as_ptr().addr()) / size_of::<Instruction>()) as u64
 }
 
 /// The displacement of the fixed target the handler of `insn` may continue at, `pc + 1 + displacement`, as
@@ -141,20 +205,20 @@ pub const fn install<M: Memory, H: Host<M>, const FUEL: bool>(table: &mut [Handl
     table[FAR as usize] = far::<M, H, FUEL>;
 }
 
-/// The handler of [`GUARD`]: the code has no instruction at `pc`.
+/// The handler of [`GUARD`]: the code has no instruction in `slot`.
 #[cold]
 #[inline(never)]
 extern "rust-preserve-none" fn guard<M: Memory, H: Host<M>, const FUEL: bool>(
     _ctx: &mut Context<M>,
-    _code: &[Instruction],
     _insn: Instruction,
-    pc: u64,
+    _code: &[Instruction],
+    slot: Slot,
     fuel: u64,
-    calls: &mut CallStack<H>,
+    calls: &mut CallStack<H, M::Err>,
     _table: &Table<M, H>,
-) -> Flow<M> {
+) {
     // the fetch charged the unit of an instruction that doesn't run
-    calls.stop.at(pc, fuel + u64::from(FUEL), Flow::BadPc)
+    calls.stop.at(slot, fuel + u64::from(FUEL), Flow::BadPc)
 }
 
 /// The handler of [`FAR`]: runs the jump or local call that `bound` moved behind the guard, and checks where it
@@ -163,36 +227,37 @@ extern "rust-preserve-none" fn guard<M: Memory, H: Host<M>, const FUEL: bool>(
 #[inline(never)]
 extern "rust-preserve-none" fn far<M: Memory, H: Host<M>, const FUEL: bool>(
     ctx: &mut Context<M>,
-    code: &[Instruction],
     insn: Instruction,
-    mut pc: u64,
+    code: &[Instruction],
+    slot: Slot,
     fuel: u64,
-    calls: &mut CallStack<H>,
+    calls: &mut CallStack<H, M::Err>,
     table: &Table<M, H>,
-) -> Flow<M> {
+) {
     let byte = insn.dst_reg() | insn.src_reg() << 4;
     let jump = Instruction(code[insn.imm() as u32 as usize].0 & !0xFF | u64::from(byte));
     let flow = match jump.opcode().class() {
         Class::Jmp32 => ops::jump::<_, BITS_32>(ctx, jump),
         _ => ops::jump::<_, BITS_64>(ctx, jump),
     };
+    let mut pc = slot.pc(code);
     match flow {
         Flow::Next => {}
         Flow::Jump(offset) => pc = pc.wrapping_add_signed(offset),
         Flow::Call(offset) => {
             if !calls.push(&mut ctx.regs, pc) {
-                return calls.stop.at(pc, fuel, Flow::StackOverflow);
+                return calls.stop.at(slot, fuel, Flow::StackOverflow);
             }
             pc = pc.wrapping_add_signed(offset);
         }
         // `bound` moves only jumps and local calls with a fixed target
-        flow => return calls.stop.at(pc, fuel, flow),
+        flow => return calls.stop.at(slot, fuel, flow),
     }
 
     let pc = pc.wrapping_add(1);
     match fetch_checked::<M, H, FUEL>(table, code, pc, fuel) {
-        Ok((next, insn, fuel)) => become next(ctx, code, insn, pc, fuel, calls, table),
-        Err(flow) => calls.stop.at(pc, fuel, flow),
+        Ok((next, insn, slot, fuel)) => become next(ctx, insn, code, slot, fuel, calls, table),
+        Err(flow) => calls.stop.at_pc(pc, fuel, flow),
     }
 }
 

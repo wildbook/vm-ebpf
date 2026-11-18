@@ -52,7 +52,7 @@ fn store_release<M: Memory>(mem: &mut M, size: MemSize, addr: u64, value: u64) -
 }
 
 #[inline(always)]
-pub fn save<M: Memory, const X: bool>(ctx: &mut Context<M>, insn: Instruction) -> Flow<M> {
+pub fn save<M: Memory, const X: bool>(ctx: &mut Context<M>, insn: Instruction) -> Flow<M::Err> {
     let val = match X {
         true => ctx.regs[usize::from(insn.src_reg())],
         false => i64::from(insn.imm()) as u64,
@@ -87,7 +87,7 @@ pub fn save<M: Memory, const X: bool>(ctx: &mut Context<M>, insn: Instruction) -
 
 /// `STX | ATOMIC`: `imm` selects the operation. The read-modify-write operations take W and DW sizes only;
 /// [`ordered`] runs the rest.
-fn atomic<M: Memory>(ctx: &mut Context<M>, insn: Instruction, size: MemSize, addr: u64, src: u64) -> Flow<M> {
+fn atomic<M: Memory>(ctx: &mut Context<M>, insn: Instruction, size: MemSize, addr: u64, src: u64) -> Flow<M::Err> {
     const FETCH: i32 = 0x01;
     const ADD: i32 = 0x00;
     const OR: i32 = 0x40;
@@ -140,7 +140,7 @@ fn atomic<M: Memory>(ctx: &mut Context<M>, insn: Instruction, size: MemSize, add
 /// take every size. Load-acquire reads through `src_reg` into `dst_reg`, the reverse of the other operations.
 // outlined to keep the read-modify-write path in `atomic` short
 #[inline(never)]
-fn ordered<M: Memory>(ctx: &mut Context<M>, insn: Instruction, size: MemSize, addr: u64, src: u64) -> Flow<M> {
+fn ordered<M: Memory>(ctx: &mut Context<M>, insn: Instruction, size: MemSize, addr: u64, src: u64) -> Flow<M::Err> {
     const LOAD_ACQ: i32 = 0x100;
     const STORE_REL: i32 = 0x110;
 
@@ -160,7 +160,7 @@ fn ordered<M: Memory>(ctx: &mut Context<M>, insn: Instruction, size: MemSize, ad
 }
 
 #[inline(always)]
-pub fn load<M: Memory>(ctx: &mut Context<M>, insn: Instruction) -> Flow<M> {
+pub fn load<M: Memory>(ctx: &mut Context<M>, insn: Instruction) -> Flow<M::Err> {
     let dst = usize::from(insn.dst_reg());
 
     let src = ctx.regs[usize::from(insn.src_reg())];
@@ -194,7 +194,7 @@ pub fn load<M: Memory>(ctx: &mut Context<M>, insn: Instruction) -> Flow<M> {
 /// Continues with LD_IMM64 that loads its immediate. The pseudo loads (`src_reg` other than 0) are [`Flow::Missing`]
 /// at their first slot.
 #[inline(always)]
-pub fn ld64<M: Memory>(insn: Instruction) -> ControlFlow<Flow<M>, Instruction> {
+pub fn ld64<E>(insn: Instruction) -> ControlFlow<Flow<E>, Instruction> {
     let opc = insn.opcode();
     let size = opc.mem_size();
     let mode = opc.mem_mode();

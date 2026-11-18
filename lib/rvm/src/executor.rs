@@ -25,7 +25,7 @@ pub const CORE_POISON_HELPER: u32 = 0xbad2310;
 /// next: the extern table, the maps, the frame size and the r10 window.
 pub struct Executor {
     /// The frames of the local calls in progress, and the frame size, r10 window and host.
-    calls: CallStack<Helpers>,
+    calls: CallStack<Helpers, u64>,
     /// Initial r10.
     stack_top: u64,
     /// Maximum instructions to execute, at most `i64::MAX`.
@@ -120,12 +120,12 @@ impl fmt::Debug for Executor {
 // Out of line, so that the call's usual path keeps nothing across `run` that only resuming needs.
 #[cold]
 #[inline(never)]
-fn run_on<'m>(
-    mut flow: Flow<&'m mut VmMemory>,
+fn run_on(
+    mut flow: Flow<u64>,
     mut pc: u64,
     code: &Code,
-    ctx: &mut Context<&'m mut VmMemory>,
-    calls: &mut CallStack<Helpers>,
+    ctx: &mut Context<&mut VmMemory>,
+    calls: &mut CallStack<Helpers, u64>,
     #[cfg(feature = "fuel")] mut fuel: u64,
     #[cfg(feature = "fuel")] limit: u64,
 ) -> Result<u64> {
@@ -150,11 +150,11 @@ fn run_on<'m>(
 #[cold]
 #[inline(never)]
 fn resume(
-    flow: Flow<&mut VmMemory>,
+    flow: Flow<u64>,
     pc: u64,
     code: &Code,
     ctx: &mut Context<&mut VmMemory>,
-    calls: &mut CallStack<Helpers>,
+    calls: &mut CallStack<Helpers, u64>,
     #[cfg(feature = "fuel")] limit: u64,
 ) -> Result<u64> {
     match flow {
@@ -240,7 +240,7 @@ fn call_indirect(
     pc: u64,
     code: &Code,
     ctx: &mut Context<&mut VmMemory>,
-    calls: &mut CallStack<Helpers>,
+    calls: &mut CallStack<Helpers, u64>,
 ) -> Result<u64> {
     if let Some(callee) = code_index(target, code) {
         if !calls.push(&mut ctx.regs, pc) {

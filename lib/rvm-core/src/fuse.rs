@@ -12,7 +12,7 @@
 use std::ops::ControlFlow;
 
 use crate::opcode::{AluOpc, Class, JmpOpc, MemMode, MemSize, OpCode, Source};
-use crate::transfer::{self, FAR, GUARD};
+use crate::transfer::{self, Slot, FAR, GUARD};
 use crate::{charge, stack, step, CallStack, Context, Flow, Handler, Handlers, Host, Instruction, Memory, Table};
 
 /// Bytecode prepared for [`run`](crate::run).
@@ -563,24 +563,24 @@ impl Super {
 #[inline(never)]
 extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool, const S: u8>(
     ctx: &mut Context<M>,
-    code: &[Instruction],
     insn: Instruction,
-    pc: u64,
+    code: &[Instruction],
+    slot: Slot,
     fuel: u64,
-    calls: &mut CallStack<H>,
+    calls: &mut CallStack<H, M::Err>,
     table: &Table<M, H>,
-) -> Flow<M> {
+) {
     let sup = const { Super::of(S) };
     let len = const { Super::of(S).len() };
 
     // the fuel runs out inside the sequence
     if FUEL && fuel < len as u64 - 1 {
         let alone = const { Handlers::<M, H, FUEL>::TABLE.0[Super::of(S).ops[0] as usize] };
-        become alone(ctx, code, sup.first_of(insn), pc, fuel, calls, table)
+        become alone(ctx, sup.first_of(insn), code, slot, fuel, calls, table)
     }
     // SAFETY: `transfer::bound` leaves a superinstruction only where its sequence lies in the code, and the guard slot
-    // follows the code
-    let window = unsafe { code.get_unchecked(pc as usize..=pc as usize + len) };
+    // follows the code (see `Slot`)
+    let window = unsafe { slot.window(code, len + 1) };
 
     // one block per instruction, so that each `step` sees a constant opcode
     let [i0, i1, i2, i3, i4] = sup.decode(insn, window);
@@ -588,11 +588,11 @@ extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool, co
     macro_rules! exec {
         ($k:literal, $insn:expr) => {
             if $k < len {
-                let at = pc + $k;
+                let at = slot.offset($k);
                 match step(ctx, $insn) {
                     ControlFlow::Break(Flow::Next) => {}
                     ControlFlow::Break(Flow::Jump(offset)) if const { Super::of(S).branches_at($k) } => {
-                        target = Some(at.wrapping_add_signed(offset).wrapping_add(1));
+                        target = Some(at.offset(offset).offset(1));
                     }
                     ControlFlow::Break(flow) => return calls.stop.at(at, fuel - $k * u64::from(FUEL), flow),
                     // `Super::checked` keeps LD_IMM64 out
@@ -608,16 +608,18 @@ extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool, co
     exec!(4, i4);
 
     let fuel = fuel - (len as u64 - 1) * u64::from(FUEL);
-    let pc = target.unwrap_or(pc + len as u64);
+    let next = target.unwrap_or(slot.offset(len as i64));
     let Some(left) = charge::<FUEL>(fuel) else {
-        return calls.stop.at(pc, 0, Flow::OutOfFuel);
+        return calls.stop.at(next, 0, Flow::OutOfFuel);
     };
-    // two loads, so that the branch to `target` stays a branch: a `cmov` would make the next fetch wait for the
-    // registers it compares
-    let insn = match target {
-        None => window[len],
-        // SAFETY: `transfer::bound` leaves a superinstruction only where its branch target lies in `0..=len`
-        Some(target) => unsafe { *code.get_unchecked(target as usize) },
-    };
-    become table.of(insn)(ctx, code, insn, pc, left, calls, table)
+    // a dispatch on each side, so that the branch to `target` stays a branch: a `cmov` of the next slot's address
+    // would make the next fetch wait for the registers the branch compares
+    if let Some(target) = target {
+        // SAFETY: `transfer::bound` leaves a superinstruction only where its branch target lies in `0..=len` (see
+        // `Slot`)
+        let insn = unsafe { target.get() };
+        become table.of(insn)(ctx, insn, code, target, left, calls, table)
+    }
+    let insn = window[len];
+    become table.of(insn)(ctx, insn, code, next, left, calls, table)
 }

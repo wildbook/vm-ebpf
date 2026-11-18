@@ -5,7 +5,7 @@ pub const BITS_32: bool = false;
 pub const BITS_64: bool = true;
 
 #[inline(always)]
-pub fn math<M: Memory, const BITS: bool>(ctx: &mut Context<M>, insn: Instruction) -> Flow<M> {
+pub fn math<M: Memory, const BITS: bool>(ctx: &mut Context<M>, insn: Instruction) -> Flow<M::Err> {
     let opc = insn.opcode();
     let alu_opc = opc.alu_opc();
     let alu_src = opc.alu_src();
@@ -157,7 +157,7 @@ pub fn math<M: Memory, const BITS: bool>(ctx: &mut Context<M>, insn: Instruction
 }
 
 #[inline(always)]
-pub fn jump<M: Memory, const BITS: bool>(ctx: &mut Context<M>, insn: Instruction) -> Flow<M> {
+pub fn jump<M: Memory, const BITS: bool>(ctx: &mut Context<M>, insn: Instruction) -> Flow<M::Err> {
     let opc = insn.opcode();
     let jmp_opc = opc.jmp_opc();
     let jmp_src = opc.alu_src();

@@ -9,6 +9,7 @@
 use std::ptr;
 
 use crate::opcode::{Class, MemSize, OpCode};
+use crate::transfer::Slot;
 use crate::{fetch, CallStack, Context, Flow, Handlers, Host, Instruction, Memory, Table};
 
 /// Host memory that guest loads and stores near some address reach directly; see [`Memory::window`].
@@ -115,20 +116,20 @@ const fn kind(opc: OpCode) -> usize {
 #[inline(never)]
 pub extern "rust-preserve-none" fn access<M: Memory, H: Host<M>, const FUEL: bool, const OP: u8>(
     ctx: &mut Context<M>,
-    code: &[Instruction],
     insn: Instruction,
-    pc: u64,
+    code: &[Instruction],
+    slot: Slot,
     fuel: u64,
-    calls: &mut CallStack<H>,
+    calls: &mut CallStack<H, M::Err>,
     table: &Table<M, H>,
-) -> Flow<M> {
+) {
     let opc = OpCode(OP);
     let kind = const { kind(OpCode(OP)) };
 
     let addr = ctx.regs[10].wrapping_add_signed(i64::from(insn.offset()));
     let at = addr.wrapping_sub(calls.stack.base);
     if at >= calls.stack.fits[kind] {
-        become miss::<M, H, FUEL, OP>(ctx, code, insn, pc, fuel, calls, table)
+        become miss::<M, H, FUEL, OP>(ctx, insn, code, slot, fuel, calls, table)
     }
 
     // SAFETY: the access fits in the window at `at`, and the window is still valid
@@ -148,11 +149,11 @@ pub extern "rust-preserve-none" fn access<M: Memory, H: Host<M>, const FUEL: boo
         }
     }
 
-    let pc = pc + 1;
-    // SAFETY: the slots from `len` on hold the guard, so this handler ran below `len`
-    match unsafe { fetch::<M, H, FUEL>(table, code, pc, fuel) } {
-        Some((next, insn, fuel)) => become next(ctx, code, insn, pc, fuel, calls, table),
-        None => calls.stop.at(pc, 0, Flow::OutOfFuel),
+    let slot = slot.offset(1);
+    // SAFETY: the slots from `len` on hold the guard, so this handler ran below `len` (see `Slot`)
+    match unsafe { fetch::<M, H, FUEL>(table, slot, fuel) } {
+        Some((next, insn, fuel)) => become next(ctx, insn, code, slot, fuel, calls, table),
+        None => calls.stop.at(slot, 0, Flow::OutOfFuel),
     }
 }
 
@@ -161,15 +162,15 @@ pub extern "rust-preserve-none" fn access<M: Memory, H: Host<M>, const FUEL: boo
 #[inline(never)]
 extern "rust-preserve-none" fn miss<M: Memory, H: Host<M>, const FUEL: bool, const OP: u8>(
     ctx: &mut Context<M>,
-    code: &[Instruction],
     insn: Instruction,
-    pc: u64,
+    code: &[Instruction],
+    slot: Slot,
     fuel: u64,
-    calls: &mut CallStack<H>,
+    calls: &mut CallStack<H, M::Err>,
     table: &Table<M, H>,
-) -> Flow<M> {
+) {
     // the frame is the bytes below r10
     calls.stack.refresh(ctx.data.window(ctx.regs[10].wrapping_sub(1)));
     let usual = const { Handlers::<M, H, FUEL>::TABLE.0[OP as usize] };
-    become usual(ctx, code, insn, pc, fuel, calls, table)
+    become usual(ctx, insn, code, slot, fuel, calls, table)
 }

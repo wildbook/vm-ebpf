@@ -1,6 +1,7 @@
 use std::mem::MaybeUninit;
 
-use crate::{stack, Context, Flow, Memory};
+use crate::transfer::{self, Slot};
+use crate::{stack, Context, Flow, Instruction, Memory};
 
 /// Host functions the `call` handler runs without leaving [`run`](crate::run).
 ///
@@ -17,15 +18,16 @@ pub trait Host<M: Memory> {
 /// Maximum nesting of BPF-to-BPF calls below the entry frame.
 pub const MAX_CALL_DEPTH: usize = 8;
 
-/// The BPF-to-BPF calls in progress, which [`run`](crate::run) pushes and pops, the slot where it records where it
-/// stopped, the window of the stack that r10 accesses use, and the [`Host`] that runs its helper and kfunc calls.
+/// The BPF-to-BPF calls in progress, which [`run`](crate::run) pushes and pops, the slot where it records where and why
+/// it stopped, the window of the stack that r10 accesses use, and the [`Host`] that runs its helper and kfunc calls. `E`
+/// is the error type of the memory, [`Memory::Err`].
 // `repr(C)` keeps the scalars ahead of the frames, so every handler reaches them with a one-byte displacement.
 #[repr(C)]
-pub struct CallStack<H> {
+pub struct CallStack<H, E> {
     depth: usize,
     /// Bytes r10 moves down per nested call.
     frame_size: u64,
-    pub(crate) stop: Stop,
+    pub(crate) stop: Stop<E>,
     pub(crate) stack: stack::Cache,
     pub host: H,
 
@@ -41,14 +43,19 @@ struct Frame {
     call_pc: u64,
 }
 
-impl<H> CallStack<H> {
+impl<H, E> CallStack<H, E> {
     /// An empty call stack giving each callee `frame_size` bytes below its caller's r10.
     #[inline]
     pub fn new(frame_size: u64, host: H) -> Self {
         Self {
             depth: 0,
             frame_size,
-            stop: Stop { pc: 0, fuel: 0 },
+            stop: Stop {
+                slot: 0,
+                pc: 0,
+                fuel: 0,
+                flow: Flow::Next,
+            },
             stack: stack::Cache::STALE,
             host,
             frames: [const { MaybeUninit::uninit() }; MAX_CALL_DEPTH],
@@ -96,17 +103,35 @@ impl<H> CallStack<H> {
     }
 }
 
-/// Where [`run`](crate::run) stopped, written once when execution leaves the handler chain.
-pub struct Stop {
-    pub pc: u64,
+/// Where and why [`run`](crate::run) stopped, written once when execution leaves the handler chain.
+pub struct Stop<E> {
+    /// The address of the slot it stopped at, or 0 if it stopped at `pc`.
+    slot: usize,
+    pc: u64,
     pub fuel: u64,
+    pub flow: Flow<E>,
 }
 
-impl Stop {
+impl<E> Stop<E> {
     #[inline(always)]
-    pub fn at<M: Memory>(&mut self, pc: u64, fuel: u64, flow: Flow<M>) -> Flow<M> {
+    pub fn at(&mut self, slot: Slot, fuel: u64, flow: Flow<E>) {
         core::hint::cold_path();
-        (self.pc, self.fuel) = (pc, fuel);
-        flow
+        (self.slot, self.fuel, self.flow) = (slot.addr(), fuel, flow);
+    }
+
+    /// Stop at `pc`, which may lie outside the code.
+    #[inline(always)]
+    pub fn at_pc(&mut self, pc: u64, fuel: u64, flow: Flow<E>) {
+        core::hint::cold_path();
+        (self.slot, self.pc, self.fuel, self.flow) = (0, pc, fuel, flow);
+    }
+
+    /// The pc it stopped at, in the slots `code` of the code it ran.
+    #[inline(always)]
+    pub fn pc(&self, code: &[Instruction]) -> u64 {
+        match self.slot {
+            0 => self.pc,
+            slot => transfer::pc_at(slot, code),
+        }
     }
 }
