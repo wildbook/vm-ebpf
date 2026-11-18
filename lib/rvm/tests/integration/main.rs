@@ -1,6 +1,6 @@
 //! Integration tests against the compiled fixtures under `bpf/prebuilt/`.
 
-#![feature(alloc_error_hook)]
+#![cfg_attr(not(miri), feature(alloc_error_hook))]
 
 mod common;
 mod images;
