@@ -112,7 +112,7 @@ fn atomic<M: Memory, R: Regs>(
                 OR => AtomicOp::Or(v),
                 AND => AtomicOp::And(v),
                 XOR => AtomicOp::Xor(v),
-                _ => return ordered(regs, mem, insn, size, addr, src),
+                _ => return ordered(regs, mem, insn),
             };
             match mem.$method(addr, op) {
                 Ok(old) => old as u64,
@@ -124,7 +124,7 @@ fn atomic<M: Memory, R: Regs>(
     let old = match size {
         MemSize::Word => run!(u32, atomic_u32),
         MemSize::DWord => run!(u64, atomic_u64),
-        MemSize::Byte | MemSize::Half => return ordered(regs, mem, insn, size, addr, src),
+        MemSize::Byte | MemSize::Half => return ordered(regs, mem, insn),
     };
 
     match imm {
@@ -137,22 +137,20 @@ fn atomic<M: Memory, R: Regs>(
 
 /// `STX | ATOMIC` with an `imm` that names no read-modify-write operation: load-acquire and store-release, which
 /// take every size. Load-acquire reads through `src_reg` into `dst_reg`, the reverse of the other operations.
-// outlined to keep the read-modify-write path in `atomic` short
+// outlined to keep the read-modify-write path in `atomic` short; it takes only `insn` and reads the operands again,
+// so that the Windows x64 ABI passes every argument in a register
 #[inline(never)]
-fn ordered<M: Memory, R: Regs>(
-    regs: &mut R,
-    mem: &mut M,
-    insn: Instruction,
-    size: MemSize,
-    addr: u64,
-    src: u64,
-) -> Flow<M::Err> {
+fn ordered<M: Memory, R: Regs>(regs: &mut R, mem: &mut M, insn: Instruction) -> Flow<M::Err> {
+    let size = insn.opcode().mem_size();
     let result = match insn.imm() {
         LOAD_ACQ => {
             let addr = address(regs.get(insn.src_reg()), insn);
             load_acquire(mem, size, addr).map(|val| regs.set(insn.dst_reg(), val))
         }
-        STORE_REL => store_release(mem, size, addr, src),
+        STORE_REL => {
+            let addr = address(regs.get(insn.dst_reg()), insn);
+            store_release(mem, size, addr, regs.get(insn.src_reg()))
+        }
         _ => return Flow::FailCpu,
     };
     match result {

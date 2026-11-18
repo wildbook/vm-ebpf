@@ -18,9 +18,9 @@ pub trait Host<M: Memory> {
 /// Maximum nesting of BPF-to-BPF calls below the entry frame.
 pub const MAX_CALL_DEPTH: usize = 8;
 
-/// The BPF-to-BPF calls in progress, which [`run`](crate::run) pushes and pops, the slot where it records where and why
-/// it stopped, the window of the stack that r10 accesses use, and the [`Host`] that runs its helper and kfunc calls. `E`
-/// is the error type of the memory, [`Memory::Err`].
+/// The BPF-to-BPF calls in progress, which [`run`](crate::run) pushes and pops, the record of where and why it stopped,
+/// the window of the stack that r10 accesses use, and the [`Host`] that runs its helper and kfunc calls. `E` is the
+/// error type of the memory, [`Memory::Err`].
 // `repr(C)` keeps the scalars ahead of the frames, so every handler reaches them with a one-byte displacement.
 #[repr(C)]
 pub struct CallStack<H, E> {

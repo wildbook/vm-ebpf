@@ -80,7 +80,9 @@ pub mod opcode;
 
 pub use call::{CallStack, Host, MAX_CALL_DEPTH};
 pub use fuse::Code;
-pub use instruction::{instructions_from_bytes, Instruction, BPF_PSEUDO_CALL, BPF_PSEUDO_KFUNC_CALL};
+pub use instruction::{
+    decode_instructions, instructions_from_bytes, Instruction, BPF_PSEUDO_CALL, BPF_PSEUDO_KFUNC_CALL,
+};
 pub use memory::{AtomicOp, Memory};
 pub use stack::Window;
 
@@ -130,7 +132,7 @@ pub struct Context<M: Memory> {
     // R1 - R5: arguments for function calls
     // R6 - R9: callee saved registers that function calls will preserve
     // R10: read-only frame pointer to access stack
-    // R11 - R15: unused; a 4-bit register index into 16 slots needs no bounds check
+    // R11 - R15: unused; a 4-bit register index into 16 entries needs no bounds check
     pub regs: [u64; 16],
     pub data: M,
 }

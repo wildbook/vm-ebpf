@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use rvm_core::opcode::CALL;
-use rvm_core::{Code, Instruction, BPF_PSEUDO_KFUNC_CALL, MAX_CALL_DEPTH};
+use rvm_core::{decode_instructions, Code, Instruction, BPF_PSEUDO_KFUNC_CALL, MAX_CALL_DEPTH};
 
 use crate::error::{LinkError, Result, VmError};
 use crate::helper::{HelperRegistry, SharedHelpers};
@@ -277,10 +277,8 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
         return Err(LinkError::InvalidMap(msg).into());
     }
 
-    let words = code_words(&s)?;
-    // room for the guard slot that `Code::new` appends
-    let mut insns = Vec::with_capacity(words.len() + 1);
-    insns.extend(words.iter().map(|w| Instruction(u64::from_le_bytes(*w))));
+    check_lengths(&s)?;
+    let mut insns = decode_instructions(s.code);
     // Bind against one version of the table; the program refreshes from there.
     let snapshot = helpers.snapshot();
     bind_externs(&mut insns, &s.externs, &snapshot.table)?;
@@ -314,10 +312,9 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
     Ok(program)
 }
 
-/// The code as instruction words. Fails unless the code and the initial data fit their regions.
-fn code_words<'a>(s: &Sections<'a>) -> Result<&'a [[u8; 8]]> {
-    let (words, rest) = s.code.as_chunks::<8>();
-    if !rest.is_empty() {
+/// Fails unless the code is whole instructions and the code and the initial data fit their regions.
+fn check_lengths(s: &Sections<'_>) -> Result<()> {
+    if !s.code.len().is_multiple_of(8) {
         return Err(invalid(format!("code is {} bytes", s.code.len())));
     }
     for (region, init, len) in [
@@ -332,7 +329,7 @@ fn code_words<'a>(s: &Sections<'a>) -> Result<&'a [[u8; 8]]> {
             return Err(invalid(format!("{} initial bytes in a {len} byte {region} region", init.len())));
         }
     }
-    Ok(words)
+    Ok(())
 }
 
 /// Turn each extern call in `insns` into a call to the slot of its import in `table`.
