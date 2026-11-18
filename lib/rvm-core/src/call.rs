@@ -55,6 +55,13 @@ impl<H> CallStack<H> {
         }
     }
 
+    /// Drop the frames of local calls in progress, which a call that stopped inside a callee leaves behind, so that
+    /// the next [`run`](crate::run) starts in the entry frame.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.depth = 0;
+    }
+
     /// Save the caller's state for the call at `call_pc` and give the callee its stack frame. Returns false, changing
     /// nothing, on a [`Flow::StackOverflow`].
     #[inline(always)]

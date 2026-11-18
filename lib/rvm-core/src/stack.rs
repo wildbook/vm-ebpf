@@ -61,6 +61,12 @@ pub struct Cache {
     epoch: u64,
 }
 
+// SAFETY: `access` dereferences `ptr` only through `&mut CallStack`, while the memory that `run` was given is at
+// `epoch`. Only one memory ever takes an epoch (see `Memory`), so the pointer is only used together with the memory it
+// points into, on whichever thread holds that memory.
+unsafe impl Send for Cache {}
+unsafe impl Sync for Cache {}
+
 impl Cache {
     pub const STALE: Self = Self {
         base: 0,

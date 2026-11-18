@@ -1,6 +1,6 @@
 //! Runs eBPF bytecode on rvm-core and dispatches helper calls to a [`HelperRegistry`].
 
-use std::mem::ManuallyDrop;
+use std::fmt;
 
 use rvm_core::{run, CallStack, Code, Context, Flow, Host};
 
@@ -10,6 +10,7 @@ use crate::layout::CODE_REGION;
 #[cfg(feature = "maps")]
 use crate::maps::Maps;
 use crate::memory::{region_base, VmMemory};
+use crate::vm::VmConfig;
 
 /// Default stack bytes reserved per call frame (eBPF's `MAX_BPF_STACK`).
 pub const DEFAULT_FRAME_SIZE: u64 = 512;
@@ -17,98 +18,130 @@ pub const DEFAULT_FRAME_SIZE: u64 = 512;
 /// Helper ID of the call the linker plants for a CO-RE relocation the host can't resolve (`btf::CORE_POISON_HELPER`).
 pub const CORE_POISON_HELPER: u32 = 0xbad2310;
 
-/// Runs functions of one piece of code against one memory, with BPF-to-BPF calls on their own stack frames.
+/// Runs the functions of one program, with BPF-to-BPF calls on their own stack frames.
 ///
-/// Code is a separate instruction slice, so the guest can neither read nor modify it through memory. Memory stays
-/// borrowed, so it survives errors.
-pub struct Executor<'a> {
-    code: &'a Code,
-    memory: &'a mut VmMemory,
-    helpers: &'a HelperRegistry,
+/// Each call borrows the code and the memory, so the memory survives errors. Code is a separate instruction slice, so
+/// the guest can neither read nor modify it through memory. The executor keeps what carries over from one call to the
+/// next: the extern table, the maps, the frame size and the r10 window.
+pub struct Executor {
+    /// The frames of the local calls in progress, and the frame size, r10 window and host.
+    calls: CallStack<Helpers>,
     /// Initial r10.
     stack_top: u64,
-    /// Bytes r10 moves down per nested call.
-    frame_size: u64,
     /// Maximum instructions to execute; `u64::MAX` for no limit.
     #[cfg(feature = "fuel")]
     instruction_limit: u64,
-    /// Maps passed to helpers through [`HelperContext::maps`].
-    #[cfg(feature = "maps")]
-    maps: Option<&'a mut Maps>,
 }
 
-impl<'a> Executor<'a> {
-    /// Create a new executor.
-    pub fn new(code: &'a Code, memory: &'a mut VmMemory, helpers: &'a HelperRegistry, stack_top: u64) -> Self {
-        Self {
-            code,
-            memory,
-            helpers,
-            stack_top,
-            frame_size: DEFAULT_FRAME_SIZE,
-            #[cfg(feature = "fuel")]
-            instruction_limit: u64::MAX,
+impl Executor {
+    /// An executor whose calls start with r10 at `stack_top`, with the frame size and instruction limit of `config`.
+    pub fn new(helpers: HelperRegistry, stack_top: u64, config: &VmConfig) -> Self {
+        let helpers = Helpers {
+            registry: helpers,
             #[cfg(feature = "maps")]
-            maps: None,
+            maps: Maps::default(),
+            error: None,
+        };
+        Self {
+            calls: CallStack::new(config.frame_size, helpers),
+            stack_top,
+            // `VmConfig` says 0 for no limit
+            #[cfg(feature = "fuel")]
+            instruction_limit: match config.instruction_limit {
+                0 => u64::MAX,
+                limit => limit,
+            },
         }
     }
 
-    /// Set the instruction limit; `u64::MAX` for no limit.
-    #[cfg(feature = "fuel")]
-    pub fn set_instruction_limit(&mut self, limit: u64) {
-        self.instruction_limit = limit;
+    /// Replace the extern table that helper and kfunc calls use.
+    pub fn set_helpers(&mut self, helpers: HelperRegistry) {
+        self.calls.host.registry = helpers;
     }
 
-    /// Set the stack bytes reserved per call frame.
-    pub fn set_frame_size(&mut self, size: u64) {
-        self.frame_size = size;
-    }
-
-    /// Give helpers access to `maps`.
+    /// The maps passed to helpers through [`HelperContext::maps`].
     #[cfg(feature = "maps")]
-    pub fn set_maps(&mut self, maps: &'a mut Maps) {
-        self.maps = Some(maps);
+    pub fn maps_mut(&mut self) -> &mut Maps {
+        &mut self.calls.host.maps
     }
 
-    /// Call the function at `pc` (instruction index) with `args` in r1-r5; returns r0. More than 5 arguments fail with
-    /// [`VmError::TooManyArgs`].
-    pub fn call(&mut self, pc: u64, args: &[u64]) -> Result<u64> {
+    /// Call the function at `pc` (instruction index) of `code` with `args` in r1-r5; returns r0. More than 5 arguments
+    /// fail with [`VmError::TooManyArgs`].
+    pub fn call(&mut self, code: &Code, memory: &mut VmMemory, pc: u64, args: &[u64]) -> Result<u64> {
         if args.len() > 5 {
             return Err(VmError::TooManyArgs(args.len()));
         }
-        let mut ctx = Context::new(&mut *self.memory);
+
+        // A call starts with fresh registers and no frames. Guest code can read and write all 16 registers, r11-r15
+        // included, so each starts at a defined value: r1-r5 hold the arguments and 0 past `args.len()`, r10 the stack
+        // top, the others 0. A call that failed inside a local call leaves its frames behind. The rest of `self.calls`
+        // carries over: `run` writes `stop` before reading it and drops the r10 window when the memory has moved to
+        // another epoch, and the executor takes the host's error whenever a host call set one.
+        let mut ctx = Context::new(memory);
         // at most 5 stores; `copy_from_slice` calls memcpy
         for (i, &arg) in args.iter().take(5).enumerate() {
             ctx.regs[i + 1] = arg;
         }
         ctx.regs[10] = self.stack_top;
+        let calls = &mut self.calls;
+        calls.clear();
 
-        let helpers = Helpers {
-            registry: self.helpers,
-            #[cfg(feature = "maps")]
-            maps: self.maps.as_deref_mut(),
-            error: ManuallyDrop::new(None),
-        };
-        let mut calls = CallStack::new(self.frame_size, helpers);
         let mut pc = pc;
         #[cfg(feature = "fuel")]
-        let limit = self.instruction_limit;
+        let mut fuel = self.instruction_limit;
         #[cfg(feature = "fuel")]
-        let mut fuel = limit;
+        let flow = run(&mut ctx, code, &mut pc, &mut fuel, calls);
+        #[cfg(not(feature = "fuel"))]
+        let flow = run(&mut ctx, code, &mut pc, calls);
+        if let Flow::Exit = flow {
+            return Ok(ctx.regs[0]);
+        }
+        #[cfg(feature = "fuel")]
+        return run_on(flow, pc, code, &mut ctx, calls, fuel, self.instruction_limit);
+        #[cfg(not(feature = "fuel"))]
+        return run_on(flow, pc, code, &mut ctx, calls);
+    }
+}
 
-        loop {
-            #[cfg(feature = "fuel")]
-            let flow = run(&mut ctx, self.code, &mut pc, &mut fuel, &mut calls);
-            #[cfg(not(feature = "fuel"))]
-            let flow = run(&mut ctx, self.code, &mut pc, &mut calls);
-            if let Flow::Exit = flow {
-                return Ok(ctx.regs[0]);
-            }
-            #[cfg(feature = "fuel")]
-            let next = resume(flow, pc, self.code, &mut ctx, &mut calls, limit);
-            #[cfg(not(feature = "fuel"))]
-            let next = resume(flow, pc, self.code, &mut ctx, &mut calls);
-            pc = next?;
+impl fmt::Debug for Executor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut s = f.debug_struct("Executor");
+        s.field("helpers", &self.calls.host.registry);
+        #[cfg(feature = "maps")]
+        s.field("maps", &self.calls.host.maps);
+        s.field("stack_top", &self.stack_top);
+        #[cfg(feature = "fuel")]
+        s.field("instruction_limit", &self.instruction_limit);
+        s.finish_non_exhaustive()
+    }
+}
+
+/// Continue a call after [`run`] stopped at `pc` with `flow`, which is not [`Flow::Exit`], until it returns or fails.
+// Out of line, so that the call's usual path keeps nothing across `run` that only resuming needs.
+#[cold]
+#[inline(never)]
+fn run_on<'m>(
+    mut flow: Flow<&'m mut VmMemory>,
+    mut pc: u64,
+    code: &Code,
+    ctx: &mut Context<&'m mut VmMemory>,
+    calls: &mut CallStack<Helpers>,
+    #[cfg(feature = "fuel")] mut fuel: u64,
+    #[cfg(feature = "fuel")] limit: u64,
+) -> Result<u64> {
+    loop {
+        #[cfg(feature = "fuel")]
+        {
+            pc = resume(flow, pc, code, ctx, calls, limit)?;
+            flow = run(ctx, code, &mut pc, &mut fuel, calls);
+        }
+        #[cfg(not(feature = "fuel"))]
+        {
+            pc = resume(flow, pc, code, ctx, calls)?;
+            flow = run(ctx, code, &mut pc, calls);
+        }
+        if let Flow::Exit = flow {
+            return Ok(ctx.regs[0]);
         }
     }
 }
@@ -121,7 +154,7 @@ fn resume(
     pc: u64,
     code: &Code,
     ctx: &mut Context<&mut VmMemory>,
-    calls: &mut CallStack<Helpers<'_>>,
+    calls: &mut CallStack<Helpers>,
     #[cfg(feature = "fuel")] limit: u64,
 ) -> Result<u64> {
     match flow {
@@ -145,16 +178,15 @@ fn resume(
 }
 
 /// The extern table and maps that helper and kfunc calls reach from inside [`run`].
-struct Helpers<'a> {
-    registry: &'a HelperRegistry,
+struct Helpers {
+    registry: HelperRegistry,
     #[cfg(feature = "maps")]
-    maps: Option<&'a mut Maps>,
-    /// Why the call that stopped [`run`] failed. The executor takes it as soon as `run` stops, so it never needs
-    /// dropping and costs no check on the way out.
-    error: ManuallyDrop<Option<HelperError>>,
+    maps: Maps,
+    /// Why the call that stopped [`run`] failed, until the executor takes it.
+    error: Option<HelperError>,
 }
 
-impl Helpers<'_> {
+impl Helpers {
     /// Call the extern table entry at `slot` with the arguments in `ctx.regs[1..=5]`.
     #[inline]
     fn call_slot(&mut self, ctx: &mut Context<&mut VmMemory>, slot: u32) -> std::result::Result<u64, HelperError> {
@@ -162,7 +194,7 @@ impl Helpers<'_> {
             args: HelperArgs::from_regs(&ctx.regs),
             memory: &mut *ctx.data,
             #[cfg(feature = "maps")]
-            maps: self.maps.as_deref_mut(),
+            maps: Some(&mut self.maps),
         };
         self.registry.call_slot(slot, &mut helper_ctx)
     }
@@ -174,7 +206,7 @@ impl Helpers<'_> {
     }
 }
 
-impl Host<&mut VmMemory> for Helpers<'_> {
+impl Host<&mut VmMemory> for Helpers {
     // Raw bytecode calls helpers by ID; linked programs call slots only, except for calls the linker planted for
     // unresolved CO-RE relocations, which the executor reports.
     #[inline]
@@ -183,7 +215,7 @@ impl Host<&mut VmMemory> for Helpers<'_> {
             return None;
         }
         let Some(slot) = self.registry.slot_of_id(id) else {
-            *self.error = Some(HelperError::UnknownHelper(id));
+            self.error = Some(HelperError::UnknownHelper(id));
             return None;
         };
         self.kfunc(ctx, slot)
@@ -194,7 +226,7 @@ impl Host<&mut VmMemory> for Helpers<'_> {
         match self.call_slot(ctx, slot) {
             Ok(r0) => Some(r0),
             Err(err) => {
-                *self.error = Some(err);
+                self.error = Some(err);
                 None
             }
         }
@@ -208,7 +240,7 @@ fn call_indirect(
     pc: u64,
     code: &Code,
     ctx: &mut Context<&mut VmMemory>,
-    calls: &mut CallStack<Helpers<'_>>,
+    calls: &mut CallStack<Helpers>,
 ) -> Result<u64> {
     if let Some(callee) = code_index(target, code) {
         if !calls.push(&mut ctx.regs, pc) {
@@ -259,23 +291,16 @@ mod tests {
     use crate::layout::STACK_REGION;
     use crate::memory::{GuestMemory, Perms};
 
-    /// Run `code` from its first instruction on `memory` plus a one-frame stack; `setup` adjusts the executor.
-    fn run_with(
-        code: &[u8],
-        helpers: &HelperRegistry,
-        mut memory: VmMemory,
-        setup: impl FnOnce(&mut Executor),
-    ) -> Result<u64> {
+    /// Run `code` from its first instruction on `memory` plus a one-frame stack.
+    fn run_with(code: &[u8], helpers: &HelperRegistry, mut memory: VmMemory, config: &VmConfig) -> Result<u64> {
         let code = instructions_from_bytes(code);
-        let len = DEFAULT_FRAME_SIZE as usize;
-        let stack_top = memory.map_any(STACK_REGION, len, Perms::RW) + DEFAULT_FRAME_SIZE;
-        let mut executor = Executor::new(&code, &mut memory, helpers, stack_top);
-        setup(&mut executor);
-        executor.call(0, &[])
+        let len = config.frame_size as usize;
+        let stack_top = memory.map_any(STACK_REGION, len, Perms::RW) + config.frame_size;
+        Executor::new(helpers.clone(), stack_top, config).call(&code, &mut memory, 0, &[])
     }
 
     fn run(asm: &mut Assembler) -> Result<u64> {
-        run_with(&asm.assemble().unwrap(), &HelperRegistry::default(), VmMemory::new(), |_| {})
+        run_with(&asm.assemble().unwrap(), &HelperRegistry::default(), VmMemory::new(), &VmConfig::default())
     }
 
     #[cfg(feature = "fuel")]
@@ -286,8 +311,11 @@ mod tests {
         asm.set_label(&loop_label).unwrap();
         asm.ja(&loop_label);
         let code = asm.assemble().unwrap();
-        let result =
-            run_with(&code, &HelperRegistry::default(), VmMemory::new(), |executor| executor.set_instruction_limit(10));
+        let config = VmConfig {
+            instruction_limit: 10,
+            ..VmConfig::default()
+        };
+        let result = run_with(&code, &HelperRegistry::default(), VmMemory::new(), &config);
         assert!(matches!(result, Err(VmError::Exec(ExecError::InstructionLimit(_)))));
     }
 
@@ -373,7 +401,8 @@ mod tests {
             ctx.memory.write(ctx.args.r2, 7u64).unwrap();
             ctx.args.r1 * 2
         });
-        let run = |asm: &mut Assembler| run_with(&asm.assemble().unwrap(), &helpers, VmMemory::new(), |_| {});
+        let run =
+            |asm: &mut Assembler| run_with(&asm.assemble().unwrap(), &helpers, VmMemory::new(), &VmConfig::default());
 
         // the helper's r0 and its store are visible to the next instructions
         let mut asm = Assembler::new();
@@ -426,7 +455,7 @@ mod tests {
 
             let mut memory = VmMemory::new();
             memory.map_bytes_any(2, &[7; 8], 8, Perms::R);
-            run_with(&code, &helpers, memory, |_| {})
+            run_with(&code, &helpers, memory, &VmConfig::default())
         };
 
         // r0 in the low half, the stack slot in the high half

@@ -82,20 +82,12 @@ pub struct Program {
     code: Code,
     /// Guest memory regions (stack, data, maps). See [`crate::layout`] for the layout.
     memory: VmMemory,
-    #[cfg(feature = "maps")]
-    maps: Maps,
     functions: Functions,
-    /// Stack top address (r10 initial value).
-    stack_top: u64,
-    /// The VM's extern table, and this program's copy of it at `helpers_version`.
+    /// The VM's extern table, and the version of it that `executor` holds a copy of.
     shared_helpers: Arc<SharedHelpers>,
-    helpers: HelperRegistry,
     helpers_version: u64,
-    /// Maximum instructions per call; `u64::MAX` for no limit.
-    #[cfg(feature = "fuel")]
-    instruction_limit: u64,
-    /// Stack bytes per call frame.
-    frame_size: u64,
+    /// Runs the calls, with this program's maps and its copy of the extern table.
+    executor: Executor,
 }
 
 impl Program {
@@ -113,20 +105,10 @@ impl Program {
             id: NEXT_PROGRAM_ID.fetch_add(1, Ordering::Relaxed),
             code,
             memory,
-            #[cfg(feature = "maps")]
-            maps: Maps::default(),
             functions,
-            stack_top,
             shared_helpers,
-            helpers,
             helpers_version,
-            // `VmConfig` says 0 for no limit
-            #[cfg(feature = "fuel")]
-            instruction_limit: match config.instruction_limit {
-                0 => u64::MAX,
-                limit => limit,
-            },
-            frame_size: config.frame_size,
+            executor: Executor::new(helpers, stack_top, config),
         }
     }
 
@@ -142,18 +124,19 @@ impl Program {
 
     /// The program with `maps`, whose values `memory` holds.
     #[cfg(feature = "maps")]
-    pub(crate) fn with_maps(self, maps: Maps) -> Self {
-        Self { maps, ..self }
+    pub(crate) fn with_maps(mut self, maps: Maps) -> Self {
+        *self.executor.maps_mut() = maps;
+        self
     }
 
     /// Host access to the map called `name`. Fails with [`VmError::MapNotFound`] if the program has none.
     #[cfg(feature = "maps")]
     pub fn map(&mut self, name: &str) -> Result<MapRef<'_>> {
-        let handle = self
-            .maps
-            .handle(name)
-            .ok_or_else(|| VmError::MapNotFound(name.to_string()))?;
-        Ok(MapRef::new(&mut self.maps, &mut self.memory, handle))
+        let maps = self.executor.maps_mut();
+        let Some(handle) = maps.handle(name) else {
+            return Err(VmError::MapNotFound(name.to_string()));
+        };
+        Ok(MapRef::new(maps, &mut self.memory, handle))
     }
 
     /// The exported functions, sorted by name. A function's position here is its index for [`Program::func_at`].
@@ -239,20 +222,15 @@ impl Program {
         if self.shared_helpers.version() != self.helpers_version {
             self.refresh_helpers();
         }
-
-        let mut executor = Executor::new(&self.code, &mut self.memory, &self.helpers, self.stack_top);
-        #[cfg(feature = "fuel")]
-        executor.set_instruction_limit(self.instruction_limit);
-        executor.set_frame_size(self.frame_size);
-        #[cfg(feature = "maps")]
-        executor.set_maps(&mut self.maps);
-        executor.call(pc, args)
+        self.executor.call(&self.code, &mut self.memory, pc, args)
     }
 
     #[cold]
     #[inline(never)]
     fn refresh_helpers(&mut self) {
-        (self.helpers, self.helpers_version) = self.shared_helpers.snapshot();
+        let (helpers, version) = self.shared_helpers.snapshot();
+        self.executor.set_helpers(helpers);
+        self.helpers_version = version;
     }
 }
 
