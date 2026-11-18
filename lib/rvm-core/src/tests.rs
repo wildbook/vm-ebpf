@@ -214,6 +214,24 @@ fn reserved_encodings() {
 }
 
 #[test]
+fn may_goto() {
+    // the kernel verifier accepts only JMP | JCOND | K with `dst_reg`, `src_reg` and `imm` 0 (`src_reg` 1 is the
+    // newer `unwind_goto`); rvm never takes the jump
+    let k = OpCode::jmp64_from_parts(JmpOpc::Jcond, Source::Imm);
+    let mut ctx = Context::new(TestMem::new());
+    assert!(matches!(exec(&mut ctx, instr(k, 0, 0, 5, 0)), Flow::Next));
+    for insn in [
+        instr(k, 1, 0, 5, 0),
+        instr(k, 0, 1, 5, 0),
+        instr(k, 0, 0, 5, 1),
+        instr(OpCode::jmp64_from_parts(JmpOpc::Jcond, Source::Reg), 0, 0, 5, 0),
+        instr(OpCode::jmp32_from_parts(JmpOpc::Jcond, Source::Imm), 0, 0, 5, 0),
+    ] {
+        assert!(matches!(exec(&mut ctx, insn), Flow::FailCpu), "{insn:?}");
+    }
+}
+
+#[test]
 fn mem_fault() {
     // (base address in r1, offset) pairs that must fault for both loads and stores.
     for (addr, off) in [

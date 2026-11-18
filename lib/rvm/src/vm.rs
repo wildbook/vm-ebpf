@@ -1,5 +1,9 @@
 //! [`Vm`], the entry point. See the crate documentation for a usage example.
 
+#[cfg(feature = "link")]
+use std::cell::RefCell;
+#[cfg(feature = "link")]
+use std::sync::ReentrantLock;
 use std::sync::{Arc, Mutex};
 
 use crate::error::{Result, VmError};
@@ -50,9 +54,10 @@ pub struct Vm {
     shared_maps: SharedMaps,
     /// Buffers mapped into every program this VM links.
     shared_regions: Mutex<Vec<SharedRegion>>,
-    /// Host BTF the program's own BTF resolves CO-RE relocations against.
+    /// Host BTF the program's own BTF resolves CO-RE relocations against. Reentrant, so that a link inside
+    /// [`Vm::with_types`] finds the cell borrowed and fails instead of deadlocking.
     #[cfg(feature = "link")]
-    types: Mutex<HostTypes>,
+    types: ReentrantLock<RefCell<HostTypes>>,
     /// VM configuration.
     config: VmConfig,
 }
@@ -80,7 +85,7 @@ impl Vm {
             shared_maps: SharedMaps::default(),
             shared_regions: Mutex::default(),
             #[cfg(feature = "link")]
-            types: Mutex::default(),
+            types: ReentrantLock::default(),
             config,
         }
     }
@@ -254,8 +259,9 @@ impl Vm {
 /// ELF parsing, CO-RE and linking.
 #[cfg(feature = "link")]
 impl Vm {
-    /// Run `f` on the host's types, as BTF, for CO-RE; returns what `f` returns. Linking reads the same types, so `f`
-    /// must not link or load ELF files through this VM.
+    /// Run `f` on the host's types, as BTF, for CO-RE; returns what `f` returns. Linking reads the same types, so a
+    /// link or ELF load through this VM inside `f` fails with [`VmError::TypesBusy`], and `with_types` inside `f`
+    /// panics.
     ///
     /// # Example
     ///
@@ -270,7 +276,7 @@ impl Vm {
     /// vm.with_types(|types| rvm::host_struct!(types, Event as "event" { timestamp, pid }));
     /// ```
     pub fn with_types<R>(&self, f: impl FnOnce(&mut HostTypes) -> R) -> R {
-        f(&mut lock(&self.types))
+        f(&mut self.types.lock().borrow_mut())
     }
 
     /// Link one ELF file into an image, to load later with [`Vm::load`] or, written out, [`Vm::load_image`].
@@ -284,7 +290,9 @@ impl Vm {
 
     /// Link modules into one image, resolving symbols between them.
     pub fn prepare_modules(&self, modules: &[&Module]) -> Result<Image> {
-        linker::link(&self.helpers.read(), &lock(&self.types), modules)
+        let types = self.types.lock();
+        let types = types.try_borrow().map_err(|_| VmError::TypesBusy)?;
+        linker::link(&self.helpers.read(), &types, modules)
     }
 
     /// Link modules into an executable program: [`Vm::prepare_modules`], then load.

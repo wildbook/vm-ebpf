@@ -225,7 +225,12 @@ pub fn jump<M: Memory, const BITS: bool>(ctx: &mut Context<M>, insn: Instruction
 
         JmpOpc::Exit => return Flow::Exit,
 
-        JmpOpc::UndefE | JmpOpc::UndefF => return Flow::FailCpu,
+        // `may_goto`: the kernel takes the jump once a loop's budget runs out; rvm never does and bounds loops with
+        // fuel. The kernel verifier rejects JMP32, source X and nonzero `dst_reg`, `src_reg` or `imm`.
+        JmpOpc::Jcond if BITS == BITS_64 && jmp_src == Source::Imm && dst_reg == 0 && src_reg == 0 && imm == 0 => {
+            return Flow::Next
+        }
+        JmpOpc::Jcond | JmpOpc::UndefF => return Flow::FailCpu,
     };
 
     match cond {

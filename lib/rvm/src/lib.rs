@@ -52,6 +52,7 @@
 //! - `fixed-hash-seed`: guest hash maps use a fixed hash seed, for reproducible benchmarks.
 
 #![feature(rust_preserve_none_cc)]
+#![cfg_attr(feature = "link", feature(reentrant_lock))]
 
 mod error;
 mod executor;

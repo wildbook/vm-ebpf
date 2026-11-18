@@ -12,6 +12,7 @@ bpf_objects(rvm_bpf
     host_event.c
     link_lib.c
     link_main.c
+    may_goto.c
     maps.c
     plugin_a.c
     plugin_b.c

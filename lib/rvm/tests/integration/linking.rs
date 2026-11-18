@@ -66,6 +66,15 @@ fn link_failures() {
     }
 }
 
+/// Linking inside `with_types` fails instead of deadlocking on the types the closure holds.
+#[test]
+fn link_inside_with_types_fails() {
+    let vm = full_vm();
+    let err = vm.with_types(|_| link(&vm)).unwrap_err();
+    assert!(matches!(err, VmError::TypesBusy), "{err}");
+    link(&vm).unwrap();
+}
+
 /// Re-registering a function reaches already linked programs at their next call.
 #[test]
 fn replacing_extern_rebinds_linked_calls() {

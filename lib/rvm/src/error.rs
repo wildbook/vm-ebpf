@@ -63,6 +63,10 @@ pub enum VmError {
 
     /// An export outlived the plugin it calls into.
     PluginUnloaded(String),
+
+    /// A link or ELF load ran inside the [`Vm::with_types`](crate::Vm::with_types) closure of the same VM.
+    #[cfg(feature = "link")]
+    TypesBusy,
 }
 
 impl fmt::Display for VmError {
@@ -92,6 +96,8 @@ impl fmt::Display for VmError {
             }
             Self::PluginBusy(name) => write!(f, "plugin {name} is already running a call"),
             Self::PluginUnloaded(name) => write!(f, "plugin {name} was unloaded"),
+            #[cfg(feature = "link")]
+            Self::TypesBusy => write!(f, "cannot link inside Vm::with_types; link after the closure returns"),
         }
     }
 }

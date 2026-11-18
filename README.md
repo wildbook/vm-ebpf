@@ -229,6 +229,8 @@ The interpreter covers the ISA up to `-mcpu=v4`, with these details:
 - Jump tables. Clang 22 lowers a dense `switch` of 13 or more cases to `gotox`
   through `.jumptables`; the linker copies each table into `.rodata` as code
   addresses, and `gotox` checks its target like `callx`.
+- `may_goto` (libbpf's `can_loop`, Linux 6.9) never jumps. The kernel jumps
+  once a loop's budget runs out; rvm bounds loops with fuel instead.
 
 Not implemented: kfunc BTF ID resolution, and the legacy packet access modes
 `BPF_ABS` and `BPF_IND`, which return `Flow::Missing`.

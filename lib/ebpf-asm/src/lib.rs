@@ -178,7 +178,7 @@ mod tests {
 
         asm.call(1);
         asm.callx(R1);
-        asm.gotox(R1);
+        asm.gotox(R1).may_goto(&l2);
         let func = asm.create_label();
         asm.call_local(&func);
         asm.set_label(&func).unwrap();

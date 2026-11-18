@@ -635,6 +635,14 @@ impl Assembler {
         self
     }
 
+    /// `may_goto label`: jump to a label once the runtime's loop budget runs out (`JMP | JCOND`, `src_reg` 0).
+    pub fn may_goto(&mut self, label: &Label) -> &mut Self {
+        let opcode = class::JMP64 | jmp::JCOND;
+        self.emit(RawInstruction::from_parts(opcode, 0, 0, 0, 0));
+        self.add_label_ref(label, LabelRefType::Jump);
+        self
+    }
+
     jmp_family!(JMP64;
         jeq, jeq_imm = JEQ;
         jne, jne_imm = JNE;
