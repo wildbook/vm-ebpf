@@ -9,7 +9,7 @@
 use std::ptr;
 
 use crate::opcode::{Class, MemSize, OpCode};
-use crate::{fetch, CallStack, Context, Flow, Handlers, Host, Instruction, Memory};
+use crate::{fetch, CallStack, Context, Flow, Handlers, Host, Instruction, Memory, Table};
 
 /// Host memory that guest loads and stores near some address reach directly; see [`Memory::window`].
 #[derive(Clone, Copy, Debug)]
@@ -120,6 +120,7 @@ pub extern "rust-preserve-none" fn access<M: Memory, H: Host<M>, const FUEL: boo
     pc: u64,
     fuel: u64,
     calls: &mut CallStack<H>,
+    table: &Table<M, H>,
 ) -> Flow<M> {
     let opc = OpCode(OP);
     let kind = const { kind(OpCode(OP)) };
@@ -127,7 +128,7 @@ pub extern "rust-preserve-none" fn access<M: Memory, H: Host<M>, const FUEL: boo
     let addr = ctx.regs[10].wrapping_add_signed(i64::from(insn.offset()));
     let at = addr.wrapping_sub(calls.stack.base);
     if at >= calls.stack.fits[kind] {
-        become miss::<M, H, FUEL, OP>(ctx, code, insn, pc, fuel, calls)
+        become miss::<M, H, FUEL, OP>(ctx, code, insn, pc, fuel, calls, table)
     }
 
     // SAFETY: the access fits in the window at `at`, and the window is still valid
@@ -149,9 +150,9 @@ pub extern "rust-preserve-none" fn access<M: Memory, H: Host<M>, const FUEL: boo
 
     let pc = pc + 1;
     // SAFETY: the slots from `len` on hold the guard, so this handler ran below `len`
-    match unsafe { fetch::<M, H, FUEL>(code, pc, fuel) } {
-        Ok((next, insn)) => become next(ctx, code, insn, pc, fuel - u64::from(FUEL), calls),
-        Err(flow) => calls.stop.at(pc, fuel, flow),
+    match unsafe { fetch::<M, H, FUEL>(table, code, pc, fuel) } {
+        Some((next, insn, fuel)) => become next(ctx, code, insn, pc, fuel, calls, table),
+        None => calls.stop.at(pc, 0, Flow::OutOfFuel),
     }
 }
 
@@ -165,9 +166,10 @@ extern "rust-preserve-none" fn miss<M: Memory, H: Host<M>, const FUEL: bool, con
     pc: u64,
     fuel: u64,
     calls: &mut CallStack<H>,
+    table: &Table<M, H>,
 ) -> Flow<M> {
     // the frame is the bytes below r10
     calls.stack.refresh(ctx.data.window(ctx.regs[10].wrapping_sub(1)));
-    let usual = const { Handlers::<M, H, FUEL>::TABLE[OP as usize] };
-    become usual(ctx, code, insn, pc, fuel, calls)
+    let usual = const { Handlers::<M, H, FUEL>::TABLE.0[OP as usize] };
+    become usual(ctx, code, insn, pc, fuel, calls, table)
 }

@@ -13,7 +13,7 @@ use std::ops::ControlFlow;
 
 use crate::opcode::{AluOpc, Class, JmpOpc, MemMode, MemSize, OpCode, Source};
 use crate::transfer::{self, FAR, GUARD};
-use crate::{handler_of, stack, step, CallStack, Context, Flow, Handler, Handlers, Host, Instruction, Memory};
+use crate::{charge, stack, step, CallStack, Context, Flow, Handler, Handlers, Host, Instruction, Memory, Table};
 
 /// Bytecode prepared for [`run`](crate::run).
 #[derive(Debug)]
@@ -553,14 +553,15 @@ extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool, co
     pc: u64,
     fuel: u64,
     calls: &mut CallStack<H>,
+    table: &Table<M, H>,
 ) -> Flow<M> {
     let sup = const { Super::of(S) };
     let len = const { Super::of(S).len() };
 
     // the fuel runs out inside the sequence
     if FUEL && fuel < len as u64 - 1 {
-        let alone = const { Handlers::<M, H, FUEL>::TABLE[Super::of(S).ops[0] as usize] };
-        become alone(ctx, code, sup.first_of(insn), pc, fuel, calls)
+        let alone = const { Handlers::<M, H, FUEL>::TABLE.0[Super::of(S).ops[0] as usize] };
+        become alone(ctx, code, sup.first_of(insn), pc, fuel, calls, table)
     }
     // SAFETY: `transfer::bound` leaves a superinstruction only where its sequence lies in the code, and the guard slot
     // follows the code
@@ -593,13 +594,15 @@ extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool, co
 
     let fuel = fuel - (len as u64 - 1) * u64::from(FUEL);
     let pc = target.unwrap_or(pc + len as u64);
-    if FUEL && fuel == 0 {
-        return calls.stop.at(pc, fuel, Flow::OutOfFuel);
-    }
+    let Some(left) = charge::<FUEL>(fuel) else {
+        return calls.stop.at(pc, 0, Flow::OutOfFuel);
+    };
+    // two loads, so that the branch to `target` stays a branch: a `cmov` would make the next fetch wait for the
+    // registers it compares
     let insn = match target {
         None => window[len],
         // SAFETY: `transfer::bound` leaves a superinstruction only where its branch target lies in `0..=len`
         Some(target) => unsafe { *code.get_unchecked(target as usize) },
     };
-    become handler_of::<M, H, FUEL>(insn)(ctx, code, insn, pc, fuel - u64::from(FUEL), calls)
+    become table.of(insn)(ctx, code, insn, pc, left, calls, table)
 }

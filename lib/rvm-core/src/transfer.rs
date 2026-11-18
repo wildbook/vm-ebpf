@@ -9,7 +9,7 @@
 use crate::fuse::Super;
 use crate::opcode::{Class, JmpOpc, OpCode, Source};
 use crate::ops::{self, BITS_32, BITS_64};
-use crate::{fetch_checked, CallStack, Context, Flow, Handler, Host, Instruction, Memory, BPF_PSEUDO_CALL};
+use crate::{fetch_checked, CallStack, Context, Flow, Handler, Host, Instruction, Memory, Table, BPF_PSEUDO_CALL};
 
 /// The slot after the code, and every slot after it: there is no instruction here.
 pub const GUARD: u8 = 0xe0;
@@ -151,6 +151,7 @@ extern "rust-preserve-none" fn guard<M: Memory, H: Host<M>, const FUEL: bool>(
     pc: u64,
     fuel: u64,
     calls: &mut CallStack<H>,
+    _table: &Table<M, H>,
 ) -> Flow<M> {
     // the fetch charged the unit of an instruction that doesn't run
     calls.stop.at(pc, fuel + u64::from(FUEL), Flow::BadPc)
@@ -167,6 +168,7 @@ extern "rust-preserve-none" fn far<M: Memory, H: Host<M>, const FUEL: bool>(
     mut pc: u64,
     fuel: u64,
     calls: &mut CallStack<H>,
+    table: &Table<M, H>,
 ) -> Flow<M> {
     let byte = insn.dst_reg() | insn.src_reg() << 4;
     let jump = Instruction(code[insn.imm() as u32 as usize].0 & !0xFF | u64::from(byte));
@@ -188,8 +190,8 @@ extern "rust-preserve-none" fn far<M: Memory, H: Host<M>, const FUEL: bool>(
     }
 
     let pc = pc.wrapping_add(1);
-    match fetch_checked::<M, H, FUEL>(code, pc, fuel) {
-        Ok((next, insn)) => become next(ctx, code, insn, pc, fuel - u64::from(FUEL), calls),
+    match fetch_checked::<M, H, FUEL>(table, code, pc, fuel) {
+        Ok((next, insn, fuel)) => become next(ctx, code, insn, pc, fuel, calls, table),
         Err(flow) => calls.stop.at(pc, fuel, flow),
     }
 }

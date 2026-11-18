@@ -102,7 +102,8 @@ pub(crate) fn step<M: Memory>(ctx: &mut Context<M>, insn: Instruction) -> Contro
 }
 
 /// Runs the instruction `insn` at `pc` and continues with the next one. A metering handler receives `fuel` already
-/// charged for `insn`; the others pass it on as is.
+/// charged for `insn`; the others pass it on as is. `table` is the [`Table`] the handler belongs to, which dispatch
+/// indexes from a register.
 ///
 /// `preserve_none` passes all arguments in registers (the Windows x64 C convention has four) and saves no registers, so
 /// a tail call between handlers is a jump.
@@ -113,15 +114,19 @@ type Handler<M, H> = extern "rust-preserve-none" fn(
     u64,
     u64,
     &mut CallStack<H>,
+    &Table<M, H>,
 ) -> Flow<M>;
 
-/// The handler of every opcode byte. Each runs [`step`] with its opcode as a constant, so the class, operation, source,
-/// mode and size matches fold away; the bytes of superinstructions and r10 accesses get theirs from [`fuse::install`].
-/// With `FUEL`, the handlers meter fuel; without it, they never read it.
+/// The handler of every opcode byte.
+struct Table<M: Memory, H>([Handler<M, H>; 256]);
+
+/// The [`Table`] of the handlers with and without `FUEL`. Each handler runs [`step`] with its opcode as a constant, so
+/// the class, operation, source, mode and size matches fold away; the bytes of superinstructions and r10 accesses get
+/// theirs from [`fuse::install`]. With `FUEL`, the handlers meter fuel; without it, they never read it.
 struct Handlers<M, H, const FUEL: bool>(PhantomData<(M, H)>);
 
 impl<M: Memory, H: Host<M>, const FUEL: bool> Handlers<M, H, FUEL> {
-    const TABLE: [Handler<M, H>; 256] = {
+    const TABLE: Table<M, H> = {
         macro_rules! table {
             ($($op:literal)*) => {
                 [$(handler::<M, H, FUEL, $op> as Handler<M, H>,)*]
@@ -148,7 +153,7 @@ impl<M: Memory, H: Host<M>, const FUEL: bool> Handlers<M, H, FUEL> {
         );
         fuse::install::<M, H, FUEL>(&mut table);
         transfer::install::<M, H, FUEL>(&mut table);
-        table
+        Table(table)
     };
 }
 
@@ -162,6 +167,7 @@ extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, 
     mut pc: u64,
     mut fuel: u64,
     calls: &mut CallStack<H>,
+    table: &Table<M, H>,
 ) -> Flow<M> {
     // Only jump-class opcodes jump, call or exit. Without the guards, a handler whose `step` returns from an outlined
     // call (atomics) would test for those flows too.
@@ -179,18 +185,18 @@ extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, 
             // `CallStack::push` takes any pc, so this one has no proof
             Some(call_pc) => {
                 let pc = call_pc.wrapping_add(1);
-                match fetch_checked::<M, H, FUEL>(code, pc, fuel) {
-                    Ok((next, insn)) => become next(ctx, code, insn, pc, fuel - u64::from(FUEL), calls),
+                match fetch_checked::<M, H, FUEL>(table, code, pc, fuel) {
+                    Ok((next, insn, fuel)) => become next(ctx, code, insn, pc, fuel, calls, table),
                     Err(flow) => return calls.stop.at(pc, fuel, flow),
                 }
             }
             None => return calls.stop.at(pc, fuel, Flow::Exit),
         },
         ControlFlow::Break(Flow::CallHelper(_)) if jumps => {
-            become host_call::<M, H, FUEL, false>(ctx, code, insn, pc, fuel, calls)
+            become host_call::<M, H, FUEL, false>(ctx, code, insn, pc, fuel, calls, table)
         }
         ControlFlow::Break(Flow::CallKfunc(_)) if jumps => {
-            become host_call::<M, H, FUEL, true>(ctx, code, insn, pc, fuel, calls)
+            become host_call::<M, H, FUEL, true>(ctx, code, insn, pc, fuel, calls, table)
         }
         ControlFlow::Continue(first) => {
             // without a unit for the second slot, LD_IMM64 doesn't run and gets its unit back
@@ -214,9 +220,9 @@ extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, 
     // SAFETY: `pc` follows a slot below `len`, or the second slot of LD_IMM64, which `second_half` found below `len`,
     // or it is the target of a jump or local call that `transfer::bound` left in `0..=len`
     let pc = pc.wrapping_add(1);
-    match unsafe { fetch::<M, H, FUEL>(code, pc, fuel) } {
-        Ok((next, insn)) => become next(ctx, code, insn, pc, fuel - u64::from(FUEL), calls),
-        Err(flow) => calls.stop.at(pc, fuel, flow),
+    match unsafe { fetch::<M, H, FUEL>(table, code, pc, fuel) } {
+        Some((next, insn, fuel)) => become next(ctx, code, insn, pc, fuel, calls, table),
+        None => calls.stop.at(pc, 0, Flow::OutOfFuel),
     }
 }
 
@@ -231,6 +237,7 @@ extern "rust-preserve-none" fn host_call<M: Memory, H: Host<M>, const FUEL: bool
     pc: u64,
     fuel: u64,
     calls: &mut CallStack<H>,
+    table: &Table<M, H>,
 ) -> Flow<M> {
     let id = insn.imm() as u32;
     let (r0, flow) = match KFUNC {
@@ -245,13 +252,13 @@ extern "rust-preserve-none" fn host_call<M: Memory, H: Host<M>, const FUEL: bool
 
     let pc = pc + 1;
     // SAFETY: the slots from `len` on hold the guard, so this handler ran below `len`
-    match unsafe { fetch::<M, H, FUEL>(code, pc, fuel) } {
-        Ok((next, insn)) => become next(ctx, code, insn, pc, fuel - u64::from(FUEL), calls),
-        Err(flow) => calls.stop.at(pc, fuel, flow),
+    match unsafe { fetch::<M, H, FUEL>(table, code, pc, fuel) } {
+        Some((next, insn, fuel)) => become next(ctx, code, insn, pc, fuel, calls, table),
+        None => calls.stop.at(pc, 0, Flow::OutOfFuel),
     }
 }
 
-/// The instruction at `pc` and its handler, or why it can't run.
+/// The instruction at `pc`, its handler and the fuel left once it is charged, or `None` if no fuel is left.
 ///
 /// # Safety
 ///
@@ -259,38 +266,49 @@ extern "rust-preserve-none" fn host_call<M: Memory, H: Host<M>, const FUEL: bool
 /// ends with a guard slot at `len`; [`transfer`] states which pcs those are.
 #[inline(always)]
 unsafe fn fetch<M: Memory, H: Host<M>, const FUEL: bool>(
+    table: &Table<M, H>,
     code: &[Instruction],
     pc: u64,
     fuel: u64,
-) -> Result<(Handler<M, H>, Instruction), Flow<M>> {
-    if FUEL && fuel == 0 {
-        return Err(Flow::OutOfFuel);
-    }
+) -> Option<(Handler<M, H>, Instruction, u64)> {
+    let left = charge::<FUEL>(fuel)?;
     // SAFETY: the caller's
     let insn = unsafe { *code.get_unchecked(pc as usize) };
-    Ok((handler_of::<M, H, FUEL>(insn), insn))
+    Some((table.of(insn), insn, left))
 }
 
-/// [`fetch`] at a pc no proof covers.
+/// The fuel left once an instruction is charged, or `None` if none is left. It takes at most `i64::MAX` units, and
+/// returns `None` for more too: [`start`] hands out larger amounts in parts.
+#[inline(always)]
+fn charge<const FUEL: bool>(fuel: u64) -> Option<u64> {
+    // a decrement and a sign test, where `fuel == 0` would take a test, a branch and a decrement
+    let left = fuel.wrapping_sub(u64::from(FUEL));
+    (!FUEL || left as i64 >= 0).then_some(left)
+}
+
+/// [`fetch`] at a pc no proof covers, or why it can't run.
 #[inline(always)]
 fn fetch_checked<M: Memory, H: Host<M>, const FUEL: bool>(
+    table: &Table<M, H>,
     code: &[Instruction],
     pc: u64,
     fuel: u64,
-) -> Result<(Handler<M, H>, Instruction), Flow<M>> {
-    if FUEL && fuel == 0 {
+) -> Result<(Handler<M, H>, Instruction, u64), Flow<M>> {
+    let Some(left) = charge::<FUEL>(fuel) else {
         return Err(Flow::OutOfFuel);
-    }
+    };
     let Some(&insn) = code.get(pc as usize) else {
         return Err(Flow::BadPc);
     };
-    Ok((handler_of::<M, H, FUEL>(insn), insn))
+    Ok((table.of(insn), insn, left))
 }
 
-/// The handler of `insn` from the set that meters fuel, or the one that never reads it.
-#[inline(always)]
-fn handler_of<M: Memory, H: Host<M>, const FUEL: bool>(insn: Instruction) -> Handler<M, H> {
-    Handlers::<M, H, FUEL>::TABLE[usize::from(insn.0 as u8)]
+impl<M: Memory, H> Table<M, H> {
+    /// The handler of `insn`.
+    #[inline(always)]
+    fn of(&self, insn: Instruction) -> Handler<M, H> {
+        self.0[usize::from(insn.0 as u8)]
+    }
 }
 
 #[inline(always)]
@@ -329,13 +347,59 @@ pub fn run<M: Memory, H: Host<M>>(
     #[cfg(not(feature = "fuel"))]
     let fuel = &mut 0;
 
-    let code = code.slots();
+    start::<M, H, METERED>(ctx, code, pc, fuel, calls)
+}
+
+/// [`run`], metering fuel with `FUEL`.
+#[inline(always)]
+fn start<M: Memory, H: Host<M>, const FUEL: bool>(
+    ctx: &mut Context<M>,
+    code: &Code,
+    pc: &mut u64,
+    fuel: &mut u64,
+    calls: &mut CallStack<H>,
+) -> Flow<M> {
+    let slots = code.slots();
+    let table = &Handlers::<M, H, FUEL>::TABLE;
     calls.stack.revalidate(&ctx.data);
-    let (first, insn) = match fetch_checked::<M, H, METERED>(code, *pc, *fuel) {
+    let (first, insn, left) = match fetch_checked::<M, H, FUEL>(table, slots, *pc, *fuel) {
         Ok(next) => next,
+        Err(Flow::OutOfFuel) => {
+            let flow;
+            // the charge computed `fuel - 1` already, and `fuel` isn't needed elsewhere
+            (flow, *pc, *fuel) = start_uncharged::<M, H, FUEL>(ctx, code, *pc, fuel.wrapping_sub(1), calls);
+            return flow;
+        }
         Err(flow) => return flow,
     };
-    let flow = first(ctx, code, insn, *pc, *fuel - u64::from(METERED), calls);
+    let flow = first(ctx, slots, insn, *pc, left, calls, table);
     (*pc, *fuel) = (calls.stop.pc, calls.stop.fuel);
     flow
+}
+
+/// [`start`] when [`charge`] fails, given the fuel less one: with no fuel it stops, and more than `charge` takes it
+/// hands out `i64::MAX` units at a time. Also returns where it stopped.
+#[cold]
+#[inline(never)]
+fn start_uncharged<M: Memory, H: Host<M>, const FUEL: bool>(
+    ctx: &mut Context<M>,
+    code: &Code,
+    mut pc: u64,
+    less_one: u64,
+    calls: &mut CallStack<H>,
+) -> (Flow<M>, u64, u64) {
+    let mut fuel = less_one.wrapping_add(1);
+    if fuel == 0 {
+        return (Flow::OutOfFuel, pc, fuel);
+    }
+    loop {
+        let kept = fuel.saturating_sub(i64::MAX as u64);
+        fuel -= kept;
+        let flow = start::<M, H, FUEL>(ctx, code, &mut pc, &mut fuel, calls);
+        fuel += kept;
+        // an `OutOfFuel` stop resumes exactly where it stopped
+        if kept == 0 || !matches!(flow, Flow::OutOfFuel) {
+            return (flow, pc, fuel);
+        }
+    }
 }
