@@ -1,5 +1,6 @@
-//! Standard BPF helpers that touch host state. None is registered by default; a host enables each with the matching
-//! `Vm::enable_*` call, and a program calling a disabled one fails to link.
+//! Standard BPF helper IDs, and the standard helpers that touch host state. None of those is registered by default; a
+//! host enables each with the matching `Vm::enable_*` call, and a program calling a disabled one fails to link. The
+//! map helpers are in `maps`.
 
 use std::cell::Cell;
 use std::hash::BuildHasher;
@@ -7,9 +8,14 @@ use std::sync::LazyLock;
 use std::time::Instant;
 
 use crate::helper::{HelperContext, HelperRegistry};
-use crate::maps::{BPF_FUNC_MAP_DELETE_ELEM, BPF_FUNC_MAP_LOOKUP_ELEM, BPF_FUNC_MAP_UPDATE_ELEM};
 use crate::memory::GuestMemory;
 
+/// `void *map_lookup_elem(void *map, const void *key)`
+pub const BPF_FUNC_MAP_LOOKUP_ELEM: u32 = 1;
+/// `long map_update_elem(void *map, const void *key, const void *value, u64 flags)`
+pub const BPF_FUNC_MAP_UPDATE_ELEM: u32 = 2;
+/// `long map_delete_elem(void *map, const void *key)`
+pub const BPF_FUNC_MAP_DELETE_ELEM: u32 = 3;
 /// `u64 bpf_ktime_get_ns(void)`
 pub const BPF_FUNC_KTIME_GET_NS: u32 = 5;
 /// `long bpf_trace_printk(const char *fmt, u32 fmt_size, ...)`

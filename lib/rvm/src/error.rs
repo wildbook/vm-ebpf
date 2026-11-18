@@ -5,6 +5,7 @@
 
 use std::fmt;
 
+#[cfg(feature = "maps")]
 use crate::maps::MapError;
 
 /// Result type alias for rvm operations.
@@ -38,12 +39,14 @@ pub enum VmError {
     Memory(MemoryError),
 
     /// Map access error.
+    #[cfg(feature = "maps")]
     Map(MapError),
 
     /// No function `func`, in the plugin `plugin` if the lookup went through one.
     FunctionNotFound { plugin: Option<String>, func: String },
 
     /// No map with this name.
+    #[cfg(feature = "maps")]
     MapNotFound(String),
 
     /// A function handle looked up in another program.
@@ -81,12 +84,14 @@ impl fmt::Display for VmError {
             Self::Exec(e) => write!(f, "execution error: {e}"),
             Self::Helper(e) => write!(f, "helper error: {e}"),
             Self::Memory(e) => write!(f, "memory error: {e}"),
+            #[cfg(feature = "maps")]
             Self::Map(e) => write!(f, "map error: {e}"),
             Self::FunctionNotFound { plugin: None, func } => write!(f, "function not found: {func}"),
             Self::FunctionNotFound {
                 plugin: Some(plugin),
                 func,
             } => write!(f, "function not found: {plugin}::{func}"),
+            #[cfg(feature = "maps")]
             Self::MapNotFound(name) => write!(f, "map not found: {name}"),
             Self::ForeignFunc => write!(f, "function handle belongs to another program; look the function up again"),
             Self::TooManyArgs(count) => write!(f, "{count} arguments, but eBPF functions take at most 5"),
@@ -142,6 +147,7 @@ impl From<MemoryError> for VmError {
     }
 }
 
+#[cfg(feature = "maps")]
 impl From<MapError> for VmError {
     fn from(e: MapError) -> Self {
         Self::Map(e)
@@ -159,12 +165,14 @@ pub enum LinkError {
     /// An extern's declared parameter count differs from the host function's.
     SignatureMismatch { name: String, declared: usize, host: u8 },
     /// A program declares a shared map with a different layout than the existing one.
+    #[cfg(feature = "maps")]
     MapMismatch(String),
     /// Duplicate symbol.
     DuplicateSymbol(String),
     /// Invalid reference.
     InvalidReference(String),
-    /// A map definition no program can use, or maps that don't fit in guest memory.
+    /// A map definition no program can use, maps that don't fit in guest memory, or any map when rvm is built without
+    /// the `maps` feature.
     InvalidMap(String),
     /// A malformed or unsupported CO-RE relocation.
     #[cfg(feature = "link")]
@@ -182,6 +190,7 @@ impl fmt::Display for LinkError {
             Self::SignatureMismatch { name, declared, host } => {
                 write!(f, "extern {name} declares {declared} parameters but the host function takes {host}")
             }
+            #[cfg(feature = "maps")]
             Self::MapMismatch(name) => write!(f, "shared map {name} is declared with a different layout"),
             Self::DuplicateSymbol(name) => write!(f, "duplicate symbol: {name}"),
             Self::InvalidReference(msg) => write!(f, "invalid reference: {msg}"),

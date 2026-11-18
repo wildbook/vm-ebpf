@@ -19,7 +19,7 @@ typedef enum rvm_status {
     RVM_OK = 0,
     // a malformed image, or one written by another rvm version
     RVM_ERR_IMAGE = 1,
-    // the image imports a helper or host function that the runtime doesn't have
+    // the image imports a helper or host function that the runtime doesn't have, or declares maps
     RVM_ERR_LINK = 2,
     // no function with this name
     RVM_ERR_NOT_FOUND = 3,

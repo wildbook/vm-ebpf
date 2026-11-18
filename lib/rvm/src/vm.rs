@@ -15,14 +15,15 @@ use crate::image::{self, Image};
 use crate::layout::{BORROW_FIRST_REGION, FIRST_FREE_REGION};
 #[cfg(feature = "link")]
 use crate::linker;
-use crate::maps::SharedMaps;
+#[cfg(feature = "maps")]
+use crate::maps::{self, SharedMaps};
 use crate::memory::{GuestMemory, Perms, SharedBuffer, SharedRegion, MAX_REGION_LEN};
 #[cfg(feature = "link")]
 use crate::module::Module;
 use crate::plugin::Plugin;
 use crate::program::Program;
+use crate::std_helpers;
 use crate::sync::lock;
-use crate::{maps, std_helpers};
 
 /// Configuration for the VM.
 #[derive(Debug, Clone)]
@@ -50,10 +51,8 @@ impl Default for VmConfig {
 pub struct Vm {
     /// Extern table shared with every program this VM links.
     helpers: Arc<SharedHelpers>,
-    /// Maps shared by name between the programs this VM links.
-    shared_maps: SharedMaps,
-    /// Buffers mapped into every program this VM links.
-    shared_regions: Mutex<Vec<SharedRegion>>,
+    /// Maps and regions shared between the programs this VM links.
+    shared: Shared,
     /// Host BTF the program's own BTF resolves CO-RE relocations against. Reentrant, so that a link inside
     /// [`Vm::with_types`] finds the cell borrowed and fails instead of deadlocking.
     #[cfg(feature = "link")]
@@ -76,14 +75,14 @@ impl Vm {
 
     /// Create a new VM with custom configuration.
     ///
-    /// Only the map helpers (1 to 3) are registered; they touch nothing outside the VM.
+    /// Only the map helpers (1 to 3) are registered, with the `maps` feature; they touch nothing outside the VM.
     pub fn with_config(config: VmConfig) -> Self {
         let helpers = Arc::new(SharedHelpers::default());
+        #[cfg(feature = "maps")]
         helpers.update(maps::register_helpers);
         Self {
             helpers,
-            shared_maps: SharedMaps::default(),
-            shared_regions: Mutex::default(),
+            shared: Shared::default(),
             #[cfg(feature = "link")]
             types: ReentrantLock::default(),
             config,
@@ -177,8 +176,9 @@ impl Vm {
     /// # Safety
     ///
     /// As [`Vm::share_region`], for the maps' values.
+    #[cfg(feature = "maps")]
     pub unsafe fn share_map(&self, name: &str, pad_values: bool) {
-        self.shared_maps.declare(name, pad_values);
+        self.shared.maps.declare(name, pad_values);
     }
 
     /// Allocate `len` zeroed bytes and map them as region `region` into every program linked afterwards, so plugins can
@@ -187,14 +187,13 @@ impl Vm {
     ///
     /// # Safety
     ///
-    /// For every program linked afterwards: while a value from [`MapRef::entries`](crate::MapRef::entries) over a
-    /// shared map is borrowed, neither another program that maps the map nor a [`SharedRegion`] over the region may
-    /// access its bytes. Code on different threads may only touch bytes another thread writes concurrently with
-    /// atomics, guest load-acquire and store-release among them; other guest stores, map helper writes and host writes
-    /// all count as plain stores, and host reads, including [`GuestMemory`] and [`SharedRegion`] copies, as plain
-    /// loads.
+    /// For every program linked afterwards: while a value from `MapRef::entries` over a shared map is borrowed,
+    /// neither another program that maps the map nor a [`SharedRegion`] over the region may access its bytes. Code on
+    /// different threads may only touch bytes another thread writes concurrently with atomics, guest load-acquire and
+    /// store-release among them; other guest stores, map helper writes and host writes all count as plain stores, and
+    /// host reads, including [`GuestMemory`] and [`SharedRegion`] copies, as plain loads.
     pub unsafe fn share_region(&self, region: usize, len: usize, perms: Perms) -> Result<SharedRegion> {
-        let mut regions = lock(&self.shared_regions);
+        let mut regions = lock(&self.shared.regions);
         let invalid = |msg: String| Err(VmError::InvalidArgument(msg));
         if !(FIRST_FREE_REGION..BORROW_FIRST_REGION).contains(&region) {
             return invalid(format!("region {region} is outside {FIRST_FREE_REGION}..{BORROW_FIRST_REGION}"));
@@ -242,7 +241,7 @@ impl Vm {
     /// # Ok::<_, rvm::VmError>(())
     /// ```
     pub fn load(&self, image: Image) -> Result<Program> {
-        image::load(image, &self.helpers, &self.shared_maps, &lock(&self.shared_regions), &self.config)
+        image::load(image, &self.helpers, &self.shared, &self.config)
     }
 
     /// Publish `func` from `plugin` as an extern of the same name.
@@ -334,4 +333,14 @@ impl std::fmt::Debug for Vm {
             .field("config", &self.config)
             .finish()
     }
+}
+
+/// What a VM maps into every program it links.
+#[derive(Default)]
+pub struct Shared {
+    /// Maps shared by name.
+    #[cfg(feature = "maps")]
+    pub maps: SharedMaps,
+    /// Buffers mapped at the same region in every program.
+    pub regions: Mutex<Vec<SharedRegion>>,
 }

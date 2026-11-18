@@ -5,13 +5,7 @@
 
 use crate::helper::{HelperContext, HelperRegistry};
 use crate::memory::Perms;
-
-/// Helper ID of `void *map_lookup_elem(void *map, const void *key)`.
-pub const BPF_FUNC_MAP_LOOKUP_ELEM: u32 = 1;
-/// Helper ID of `long map_update_elem(void *map, const void *key, const void *value, u64 flags)`.
-pub const BPF_FUNC_MAP_UPDATE_ELEM: u32 = 2;
-/// Helper ID of `long map_delete_elem(void *map, const void *key)`.
-pub const BPF_FUNC_MAP_DELETE_ELEM: u32 = 3;
+use crate::std_helpers::{BPF_FUNC_MAP_DELETE_ELEM, BPF_FUNC_MAP_LOOKUP_ELEM, BPF_FUNC_MAP_UPDATE_ELEM};
 
 pub const ENOENT: i64 = 2;
 pub const E2BIG: i64 = 7;

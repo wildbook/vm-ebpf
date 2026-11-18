@@ -11,6 +11,7 @@ use rvm_core::Code;
 use crate::error::{Result, VmError};
 use crate::executor::Executor;
 use crate::helper::{HelperRegistry, SharedHelpers};
+#[cfg(feature = "maps")]
 use crate::maps::{MapRef, Maps};
 use crate::memory::VmMemory;
 use crate::plugin::not_found;
@@ -81,6 +82,7 @@ pub struct Program {
     code: Code,
     /// Guest memory regions (stack, data, maps). See [`crate::layout`] for the layout.
     memory: VmMemory,
+    #[cfg(feature = "maps")]
     maps: Maps,
     /// Function table: name -> function info.
     functions: HashMap<String, FunctionInfo>,
@@ -103,7 +105,6 @@ impl Program {
         code: Code,
         memory: VmMemory,
         stack_top: u64,
-        maps: Maps,
         functions: HashMap<String, FunctionInfo>,
         helpers: (Arc<SharedHelpers>, HelperRegistry, u64),
         config: &VmConfig,
@@ -113,7 +114,8 @@ impl Program {
             id: NEXT_PROGRAM_ID.fetch_add(1, Ordering::Relaxed),
             code,
             memory,
-            maps,
+            #[cfg(feature = "maps")]
+            maps: Maps::default(),
             functions,
             stack_top,
             shared_helpers,
@@ -139,7 +141,14 @@ impl Program {
         &mut self.memory
     }
 
+    /// The program with `maps`, whose values `memory` holds.
+    #[cfg(feature = "maps")]
+    pub(crate) fn with_maps(self, maps: Maps) -> Self {
+        Self { maps, ..self }
+    }
+
     /// Host access to the map called `name`. Fails with [`VmError::MapNotFound`] if the program has none.
+    #[cfg(feature = "maps")]
     pub fn map(&mut self, name: &str) -> Result<MapRef<'_>> {
         let handle = self
             .maps
@@ -219,6 +228,7 @@ impl Program {
         #[cfg(feature = "fuel")]
         executor.set_instruction_limit(self.instruction_limit);
         executor.set_frame_size(self.frame_size);
+        #[cfg(feature = "maps")]
         executor.set_maps(&mut self.maps);
         executor.call(pc, args)
     }

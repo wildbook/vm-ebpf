@@ -49,6 +49,9 @@ rvm's features:
   Without it, rvm loads prepared images only.
 - `fuel` (default): enforces `VmConfig::instruction_limit`. Without it the field
   doesn't exist and the interpreter doesn't count instructions.
+- `maps` (default): guest maps, with the map helpers (IDs 1 to 3),
+  `Program::map` and `Vm::share_map`. Without it, an image that declares maps
+  fails to load with `LinkError::InvalidMap`.
 - `fixed-hash-seed`: guest hash maps use a fixed seed, for reproducible
   benchmarks.
 
@@ -132,16 +135,18 @@ loads only into the rvm version that wrote it. Loading checks every length,
 index and map definition, so images may come from untrusted files. `Vm::load`
 takes an `Image` directly, including one built by hand around raw bytecode,
 whose `call <id>` instructions reach the helpers registered under those IDs. A
-host that ships images can build rvm without `link`, as `bin/emu` does.
+host that ships images can build rvm without `link`, and without `maps` if its
+images declare none, as `bin/emu` does.
 
 ## C library
 
-`lib/rvmrt` builds rvm, without `link` and with `fuel`, as `rvmrt.dll` and a
-static `rvmrt.lib`. `lib/rvmrt/include/rvmrt.h` declares its functions:
-`rvm_load` loads a prepared image, `rvm_map` maps zeroed guest memory,
-`rvm_call` calls a function by name, and `rvm_free` frees the program. Errors
-come back as `rvm_status` codes. The runtime has the map helpers and the default
-instruction limit.
+`lib/rvmrt` builds rvm, without `link` and `maps` and with `fuel`, as
+`rvmrt.dll` and a static `rvmrt.lib`. `lib/rvmrt/include/rvmrt.h` declares its
+functions: `rvm_load` loads a prepared image, `rvm_map` maps zeroed guest
+memory, `rvm_call` calls a function by name, and `rvm_free` frees the program.
+Errors come back as `rvm_status` codes. The runtime has no helpers and the
+default instruction limit; an image that declares maps fails with
+`RVM_ERR_LINK`.
 
 ```bash
 cd lib/rvmrt
@@ -161,8 +166,8 @@ rvmrt it is 9,216 bytes with 44 imports.
 
 | build | `rvmrt.dll` | added to the C host by `rvmrt.lib` |
 |---|---|---|
-| in `lib/rvmrt` | 87,552 B, 35 imports from 4 DLLs | 78,336 B, 12 imports |
-| at the root | 173,056 B, 58 imports from 6 DLLs | 163,840 B, 33 imports |
+| in `lib/rvmrt` | 72,704 B, 35 imports from 4 DLLs | 64,512 B, 12 imports |
+| at the root | 156,672 B, 58 imports from 6 DLLs | 147,968 B, 33 imports |
 
 The 12 imports are the process heap (`GetProcessHeap`, `HeapAlloc`, `HeapFree`,
 `HeapReAlloc`), `WaitOnAddress`, `WakeByAddressAll`, `WakeByAddressSingle`,

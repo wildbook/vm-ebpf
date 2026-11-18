@@ -21,19 +21,16 @@ use hashbrown::{hash_table, HashMap};
 
 use crate::error::{LinkError, Result};
 use crate::layout::MAPS_REGION;
+use crate::map_def::{check_def, MapDef, MapKind, CACHE_LINE};
 use crate::memory::{region_base, Perms, Pod, VmMemory, MAX_REGION_LEN};
 use crate::sync::{read, write};
 
-#[cfg(feature = "link")]
-mod btf;
 mod hash;
 mod helpers;
 mod shared;
 
-#[cfg(feature = "link")]
-pub use btf::map_defs;
 use hash::HashIndex;
-pub use helpers::{register_helpers, BPF_FUNC_MAP_DELETE_ELEM, BPF_FUNC_MAP_LOOKUP_ELEM, BPF_FUNC_MAP_UPDATE_ELEM};
+pub use helpers::register_helpers;
 pub use shared::{SharedMap, SharedMaps};
 
 /// `map_update_elem` flag: insert the key or replace its value.
@@ -42,25 +39,6 @@ pub const BPF_ANY: u64 = 0;
 pub const BPF_NOEXIST: u64 = 1;
 /// `map_update_elem` flag: replace the value only if the key is present.
 pub const BPF_EXIST: u64 = 2;
-
-const CACHE_LINE: u64 = 64;
-
-/// Kind of map.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MapKind {
-    Array,
-    Hash,
-}
-
-/// A map declaration read from a module's BTF.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MapDef {
-    pub name: String,
-    pub kind: MapKind,
-    pub key_size: u32,
-    pub value_size: u32,
-    pub max_entries: u32,
-}
 
 /// Why a map access failed. Guest helpers return these as negative errno.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -463,24 +441,6 @@ impl Map {
         }
         Ok(idx)
     }
-}
-
-/// Reject a map no program can use, or whose values or keys don't fit in a region with values padded to a cache line,
-/// as shared maps may be.
-pub fn check_def(def: &MapDef) -> Result<()> {
-    let bad = |what: &str| Err(LinkError::InvalidMap(format!("map {}: {what}", def.name)).into());
-    if def.value_size == 0 || def.max_entries == 0 {
-        return bad("zero value size or max_entries");
-    }
-    if def.kind == MapKind::Array && def.key_size != 4 {
-        return bad("array map keys must be 4 bytes");
-    }
-    let entries = u64::from(def.max_entries);
-    let values = u64::from(def.value_size).next_multiple_of(CACHE_LINE) * entries;
-    if values.max(u64::from(def.key_size) * entries) > MAX_REGION_LEN as u64 {
-        return bad("too large");
-    }
-    Ok(())
 }
 
 fn check_sizes<K: Pod, V: Pod>(def: &MapDef) -> std::result::Result<(), MapError> {

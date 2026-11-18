@@ -49,6 +49,8 @@
 //!
 //! - `link` (default): ELF parsing, CO-RE and the linker (`Module`, `HostTypes`, `Vm::prepare`, `Vm::load_elf` and
 //!   friends). Without it, rvm loads prepared images only.
+//! - `maps` (default): guest maps, with the map helpers (IDs 1 to 3), `Program::map` and `Vm::share_map`. Without it,
+//!   an image that declares maps fails to load.
 //! - `fixed-hash-seed`: guest hash maps use a fixed hash seed, for reproducible benchmarks.
 
 #![feature(rust_preserve_none_cc)]
@@ -63,6 +65,8 @@ mod image;
 mod layout;
 #[cfg(feature = "link")]
 mod linker;
+mod map_def;
+#[cfg(feature = "maps")]
 mod maps;
 mod memory;
 #[cfg(feature = "link")]
@@ -92,10 +96,9 @@ pub use layout::{
     BORROW_FIRST_REGION, BORROW_REGIONS, CODE_REGION, DATA_REGION, FIRST_FREE_REGION, MAPS_REGION, RODATA_REGION,
     SHARED_MAPS_FIRST_REGION, STACK_REGION,
 };
-pub use maps::{
-    Entries, MapDef, MapError, MapIter, MapKey, MapKind, MapRef, BPF_ANY, BPF_EXIST, BPF_FUNC_MAP_DELETE_ELEM,
-    BPF_FUNC_MAP_LOOKUP_ELEM, BPF_FUNC_MAP_UPDATE_ELEM, BPF_NOEXIST,
-};
+pub use map_def::{MapDef, MapKind};
+#[cfg(feature = "maps")]
+pub use maps::{Entries, MapError, MapIter, MapKey, MapRef, BPF_ANY, BPF_EXIST, BPF_NOEXIST};
 pub use memory::{
     region_base, GuestMemory, Perms, Pod, Scalar, SharedRegion, VmMemory, MAX_REGIONS, MAX_REGION_LEN, REGION_SHIFT,
 };
@@ -106,7 +109,10 @@ pub use program::{Borrow, Func, FunctionInfo, Program};
 pub use rvm_core::{AtomicOp, MAX_CALL_DEPTH};
 #[cfg(feature = "link")]
 pub use section::{Section, SectionKind};
-pub use std_helpers::{BPF_FUNC_GET_PRANDOM_U32, BPF_FUNC_KTIME_GET_NS, BPF_FUNC_TRACE_PRINTK};
+pub use std_helpers::{
+    BPF_FUNC_GET_PRANDOM_U32, BPF_FUNC_KTIME_GET_NS, BPF_FUNC_MAP_DELETE_ELEM, BPF_FUNC_MAP_LOOKUP_ELEM,
+    BPF_FUNC_MAP_UPDATE_ELEM, BPF_FUNC_TRACE_PRINTK,
+};
 #[cfg(feature = "link")]
 pub use symbol::{Export, Symbol};
 pub use vm::{Vm, VmConfig};

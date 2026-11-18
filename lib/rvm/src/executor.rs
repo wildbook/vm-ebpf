@@ -7,6 +7,7 @@ use rvm_core::{run, CallStack, Code, Context, Flow, Host};
 use crate::error::{ExecError, HelperError, MemoryError, Result, VmError};
 use crate::helper::{HelperArgs, HelperContext, HelperRegistry};
 use crate::layout::CODE_REGION;
+#[cfg(feature = "maps")]
 use crate::maps::Maps;
 use crate::memory::{region_base, VmMemory};
 
@@ -32,6 +33,7 @@ pub struct Executor<'a> {
     #[cfg(feature = "fuel")]
     instruction_limit: u64,
     /// Maps passed to helpers through [`HelperContext::maps`].
+    #[cfg(feature = "maps")]
     maps: Option<&'a mut Maps>,
 }
 
@@ -46,6 +48,7 @@ impl<'a> Executor<'a> {
             frame_size: DEFAULT_FRAME_SIZE,
             #[cfg(feature = "fuel")]
             instruction_limit: u64::MAX,
+            #[cfg(feature = "maps")]
             maps: None,
         }
     }
@@ -62,6 +65,7 @@ impl<'a> Executor<'a> {
     }
 
     /// Give helpers access to `maps`.
+    #[cfg(feature = "maps")]
     pub fn set_maps(&mut self, maps: &'a mut Maps) {
         self.maps = Some(maps);
     }
@@ -81,6 +85,7 @@ impl<'a> Executor<'a> {
 
         let helpers = Helpers {
             registry: self.helpers,
+            #[cfg(feature = "maps")]
             maps: self.maps.as_deref_mut(),
             error: ManuallyDrop::new(None),
         };
@@ -142,6 +147,7 @@ fn resume(
 /// The extern table and maps that helper and kfunc calls reach from inside [`run`].
 struct Helpers<'a> {
     registry: &'a HelperRegistry,
+    #[cfg(feature = "maps")]
     maps: Option<&'a mut Maps>,
     /// Why the call that stopped [`run`] failed. The executor takes it as soon as `run` stops, so it never needs
     /// dropping and costs no check on the way out.
@@ -155,6 +161,7 @@ impl Helpers<'_> {
         let mut helper_ctx = HelperContext {
             args: HelperArgs::from_regs(&ctx.regs),
             memory: &mut *ctx.data,
+            #[cfg(feature = "maps")]
             maps: self.maps.as_deref_mut(),
         };
         self.registry.call_slot(slot, &mut helper_ctx)

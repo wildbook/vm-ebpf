@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock, RwLockReadGuard};
 use hashbrown::HashMap;
 
 use crate::error::HelperError;
+#[cfg(feature = "maps")]
 use crate::maps::Maps;
 use crate::memory::{GuestMemory, VmMemory};
 use crate::sync::{read, write};
@@ -40,6 +41,7 @@ pub struct HelperContext<'a> {
     /// Memory access.
     pub memory: &'a mut VmMemory,
     /// The calling program's maps (if it has any).
+    #[cfg(feature = "maps")]
     pub maps: Option<&'a mut Maps>,
 }
 

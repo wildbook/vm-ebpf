@@ -327,6 +327,7 @@ impl VmMemory {
     }
 
     /// Zero `len` bytes at guest address `addr` (host access).
+    #[cfg(feature = "maps")]
     pub(crate) fn zero(&mut self, addr: u64, len: usize) -> Result<(), MemoryError> {
         let dst = self.host_ptr(addr, len, Perms::NONE)?;
         // SAFETY: `host_ptr` checked the range.
@@ -352,6 +353,7 @@ impl VmMemory {
     }
 
     /// Copy the `V` at guest address `addr` out (host access).
+    #[cfg(feature = "maps")]
     pub(crate) fn read_pod<V: Pod>(&self, addr: u64) -> Result<V, MemoryError> {
         let src = self.host_ptr(addr, size_of::<V>(), Perms::NONE)?;
         // SAFETY: `host_ptr` checked the range, and `Pod` types accept every bit pattern.

@@ -1,7 +1,7 @@
 //! rvm as a C library: load a prepared image, map guest memory and call functions by name.
 //!
 //! `include/rvmrt.h` declares these functions for C. Images come from `rvm::Vm::prepare` and `rvm::Image::to_bytes`;
-//! the runtime has the standard helpers and the default instruction limit of `rvm::VmConfig`.
+//! the runtime has no helpers and no maps, and the default instruction limit of `rvm::VmConfig`.
 
 use std::slice;
 
@@ -13,7 +13,7 @@ pub enum Status {
     Ok = 0,
     /// A malformed image, or one written by another rvm version.
     Image = 1,
-    /// The image imports a helper or host function that the runtime doesn't have.
+    /// The image imports a helper or host function that the runtime doesn't have, or declares maps.
     Link = 2,
     /// No function with this name.
     NotFound = 3,

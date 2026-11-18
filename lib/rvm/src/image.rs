@@ -19,11 +19,16 @@ use rvm_core::{instructions_from_bytes, BPF_PSEUDO_KFUNC_CALL, MAX_CALL_DEPTH};
 
 use crate::error::{LinkError, Result, VmError};
 use crate::helper::SharedHelpers;
-use crate::layout::{DATA_REGION, MAPS_REGION, RODATA_REGION, STACK_REGION};
-use crate::maps::{MapDef, MapKind, Maps, SharedMaps};
-use crate::memory::{Perms, SharedRegion, VmMemory, MAX_REGION_LEN};
+#[cfg(feature = "maps")]
+use crate::layout::MAPS_REGION;
+use crate::layout::{DATA_REGION, RODATA_REGION, STACK_REGION};
+use crate::map_def::{MapDef, MapKind};
+#[cfg(feature = "maps")]
+use crate::maps::Maps;
+use crate::memory::{Perms, VmMemory, MAX_REGION_LEN};
 use crate::program::{Borrow, FunctionInfo, Program};
-use crate::vm::VmConfig;
+use crate::sync::lock;
+use crate::vm::{Shared, VmConfig};
 
 const MAGIC: &[u8; 4] = b"RVMI";
 const FORMAT_VERSION: u32 = 1;
@@ -203,13 +208,7 @@ impl Image {
 }
 
 /// Check `image`, bind its extern calls to `helpers`, and allocate its memory and maps.
-pub fn load(
-    image: Image,
-    helpers: &Arc<SharedHelpers>,
-    shared_maps: &SharedMaps,
-    shared_regions: &[SharedRegion],
-    config: &VmConfig,
-) -> Result<Program> {
+pub fn load(image: Image, helpers: &Arc<SharedHelpers>, shared: &Shared, config: &VmConfig) -> Result<Program> {
     let Image {
         mut code,
         rodata,
@@ -220,6 +219,13 @@ pub fn load(
         functions,
         externs,
     } = image;
+
+    #[cfg(not(feature = "maps"))]
+    if let Some(def) = maps.first() {
+        let msg = format!("map {}: rvm is built without the `maps` feature", def.name);
+        return Err(LinkError::InvalidMap(msg).into());
+    }
+    let shared_regions = lock(&shared.regions);
 
     if code.len() % 8 != 0 {
         return Err(invalid(format!("code is {} bytes", code.len())));
@@ -281,28 +287,34 @@ pub fn load(
             VmError::InvalidArgument(msg)
         })?;
 
-    let (maps, maps_len) = Maps::new(maps, shared_maps)?;
+    #[cfg(feature = "maps")]
+    let (maps, maps_len) = Maps::new(maps, &shared.maps)?;
 
     let mut memory = VmMemory::new();
     let stack_top = memory.map_any(STACK_REGION, stack_len as usize, Perms::RW) + stack_len;
     memory.map_bytes_any(RODATA_REGION, &rodata, rodata_len, Perms::R);
     memory.map_bytes_any(DATA_REGION, &data, data_len, Perms::RW);
+    #[cfg(feature = "maps")]
     if maps_len != 0 {
         memory.map_any(MAPS_REGION, maps_len, Perms::RW);
     }
     // SAFETY: the callers of `Vm::share_map`/`Vm::share_region` accepted the `Vm::share_region` contract.
     unsafe {
-        for shared in maps.shared() {
-            memory.map_shared(shared.region, shared.storage.clone(), Perms::RW);
+        #[cfg(feature = "maps")]
+        for map in maps.shared() {
+            memory.map_shared(map.region, map.storage.clone(), Perms::RW);
         }
-        for shared in shared_regions {
-            memory.map_shared(shared.region(), shared.buffer().clone(), shared.perms());
+        for region in shared_regions.iter() {
+            memory.map_shared(region.region(), region.buffer().clone(), region.perms());
         }
     }
 
     let code = instructions_from_bytes(&code);
     let helpers = (helpers.clone(), table, version);
-    Ok(Program::new(code, memory, stack_top, maps, functions, helpers, config))
+    let program = Program::new(code, memory, stack_top, functions, helpers, config);
+    #[cfg(feature = "maps")]
+    let program = program.with_maps(maps);
+    Ok(program)
 }
 
 /// Turn a call instruction into a call to extern-table `slot`.

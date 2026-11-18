@@ -20,7 +20,7 @@ use crate::executor::CORE_POISON_HELPER;
 use crate::helper::HelperRegistry;
 use crate::image::{imm, set_imm, set_slot_call, Image, Import, CALL};
 use crate::layout::{CODE_REGION, DATA_REGION, RODATA_REGION};
-use crate::maps::map_defs;
+use crate::map_def::map_defs;
 use crate::memory::{region_base, MAX_REGION_LEN, REGION_SHIFT};
 use crate::module::{Module, Relocation};
 use crate::program::{Borrow, FunctionInfo};
