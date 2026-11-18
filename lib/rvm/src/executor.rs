@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use rvm_core::{run, CallStack, Code, Context, Flow, Host};
+use rvm_core::{run, CallStack, Callee, Code, Context, Flow, Host};
 
 use crate::error::{ExecError, HelperError, MemoryError, Result, VmError};
 use crate::helper::{HelperArgs, HelperContext, HelperRegistry};
@@ -121,7 +121,7 @@ fn run_on(
     limit: u64,
 ) -> Result<u64> {
     loop {
-        pc = resume(flow, pc, code, ctx, calls, limit)?;
+        pc = resume(flow, pc, code, calls, limit)?;
         flow = run_metered(ctx, code, &mut pc, &mut fuel, calls);
         if let Flow::Exit = flow {
             return Ok(ctx.regs[0]);
@@ -132,14 +132,7 @@ fn run_on(
 /// Where to continue after [`run`] stopped at `pc` with `flow`, which is not [`Flow::Exit`], or why the call fails.
 #[cold]
 #[inline(never)]
-fn resume(
-    flow: Flow<u64>,
-    pc: u64,
-    code: &Code,
-    ctx: &mut Context<&mut VmMemory>,
-    calls: &mut CallStack<HostCalls, u64>,
-    limit: u64,
-) -> Result<u64> {
+fn resume(flow: Flow<u64>, pc: u64, code: &Code, calls: &mut CallStack<HostCalls, u64>, limit: u64) -> Result<u64> {
     match flow {
         Flow::StackOverflow => Err(ExecError::StackOverflow { pc }.into()),
         // a call the linker planted for an unresolved CO-RE relocation
@@ -150,14 +143,18 @@ fn resume(
         Flow::FailCpu => Err(ExecError::CpuFault { pc }.into()),
         Flow::FailMem(addr) => Err(memory_fault(pc, addr, code)),
         Flow::Missing => Err(ExecError::Unimplemented { pc }.into()),
-        Flow::CallIndirect(target) => call_indirect(target, pc, code, ctx, calls),
+        // a host call `HostCalls::callx` ran failed, or the target addresses neither a function nor a helper
+        Flow::CallIndirect(target) => match calls.host.error.take() {
+            Some(error) => Err(error.into()),
+            None => Err(ExecError::BadCodeAddress { pc, target }.into()),
+        },
         Flow::JumpIndirect(target) => jump_indirect(target, pc, code),
         // `run` handles these internally, and the executor `Exit`
         Flow::Exit | Flow::Next | Flow::Jump(_) | Flow::Call(_) => unreachable!(),
     }
 }
 
-/// The extern table and maps that helper and kfunc calls reach from inside [`run`].
+/// The extern table and maps that helper, kfunc and `callx` calls reach from inside [`run`].
 struct HostCalls {
     registry: HelperRegistry,
     #[cfg(feature = "maps")]
@@ -211,32 +208,21 @@ impl Host<&mut VmMemory> for HostCalls {
             }
         }
     }
-}
 
-/// `callx` at `pc`: enter the function at code address `target`, or call the helper whose ID is `target`. Returns the
-/// next pc.
-fn call_indirect(
-    target: u64,
-    pc: u64,
-    code: &Code,
-    ctx: &mut Context<&mut VmMemory>,
-    calls: &mut CallStack<HostCalls, u64>,
-) -> Result<u64> {
-    if let Some(callee) = code_index(target, code) {
-        if !calls.push(&mut ctx.regs, pc) {
-            return Err(ExecError::StackOverflow { pc }.into());
+    // A code address names a guest function, which `run` checks against the code. A helper's address is its ID, as in
+    // libbpf's `(void *)BPF_FUNC_*` helper declarations.
+    #[inline]
+    fn callx(&mut self, ctx: &mut Context<&mut VmMemory>, target: u64) -> Option<Callee> {
+        if let Some(pc) = code_index(target) {
+            return Some(Callee::Local(pc));
         }
-        return Ok(callee);
+        let id = u32::try_from(target).ok()?;
+        let Some(slot) = self.registry.slot_of_id(id) else {
+            self.error = Some(HelperError::UnknownHelper(id));
+            return None;
+        };
+        self.kfunc(ctx, slot).map(Callee::Host)
     }
-
-    // A helper's address is its ID, as in libbpf's `(void *)BPF_FUNC_*` helper declarations.
-    let id = u32::try_from(target).map_err(|_| ExecError::BadCodeAddress { pc, target })?;
-    let helpers = &mut calls.host;
-    let Some(slot) = helpers.registry.slot_of_id(id) else {
-        return Err(HelperError::UnknownHelper(id).into());
-    };
-    ctx.regs[0] = helpers.call_slot(ctx, slot)?;
-    Ok(pc + 1)
 }
 
 /// The fault of the load or store at `pc` that failed at `addr`.
@@ -252,13 +238,15 @@ fn memory_fault(pc: u64, addr: u64, code: &Code) -> VmError {
 
 /// `gotox` at `pc`: the instruction index of code address `target`.
 fn jump_indirect(target: u64, pc: u64, code: &Code) -> Result<u64> {
-    code_index(target, code).ok_or_else(|| ExecError::BadCodeAddress { pc, target }.into())
+    let index = code_index(target).filter(|&index| index < code.len() as u64);
+    index.ok_or_else(|| ExecError::BadCodeAddress { pc, target }.into())
 }
 
-/// Instruction index of the guest code address `addr`, if it is an instruction boundary inside `code`.
-fn code_index(addr: u64, code: &Code) -> Option<u64> {
+/// Instruction index of the guest code address `addr`, if it is an instruction boundary in the code region. The index
+/// may lie past the end of the code.
+fn code_index(addr: u64) -> Option<u64> {
     let offset = addr.checked_sub(region_base(CODE_REGION))?;
-    (offset % INSN_SIZE == 0 && offset / INSN_SIZE < code.len() as u64).then_some(offset / INSN_SIZE)
+    (offset % INSN_SIZE == 0).then_some(offset / INSN_SIZE)
 }
 
 /// The instruction budget of a call under `config`: `VmConfig` says 0 for no limit, and `run` takes at most
@@ -433,6 +421,32 @@ mod tests {
         asm.call(2);
         asm.exit();
         assert!(matches!(run(&mut asm), Err(VmError::Helper(HelperError::UnknownHelper(2)))));
+    }
+
+    // `callx` runs inside the handler chain too; this is the lib test that takes Miri through that path
+    #[test]
+    fn callx_calls() {
+        let mut helpers = HelperRegistry::default();
+        helpers.register_helper_raw(1, |ctx: &mut HelperContext| ctx.args.r1 * 2);
+        let run =
+            |asm: &mut Assembler| run_with(&asm.assemble().unwrap(), &helpers, VmMemory::new(), &VmConfig::default());
+        let addr = |pc: u64| (region_base(CODE_REGION) + pc * INSN_SIZE) as i64;
+
+        // the function at pc 8 returns r1 + 1, then helper 1 doubles it
+        let mut asm = Assembler::new();
+        asm.lddw(R2, addr(8)).mov64_imm(R1, 20).callx(R2);
+        asm.mov64(R1, R0).mov64_imm(R3, 1).callx(R3).exit();
+        asm.mov64(R0, R1).add64_imm(R0, 1).exit();
+        assert_eq!(run(&mut asm).unwrap(), 42);
+
+        let mut asm = Assembler::new();
+        asm.mov64_imm(R1, 2).callx(R1).exit();
+        assert!(matches!(run(&mut asm), Err(VmError::Helper(HelperError::UnknownHelper(2)))));
+
+        // the function at pc 0 calls itself until the frames run out
+        let mut asm = Assembler::new();
+        asm.lddw(R1, addr(0)).callx(R1).exit();
+        assert!(matches!(run(&mut asm), Err(VmError::Exec(ExecError::StackOverflow { pc: 2 }))));
     }
 
     // a host function with memory access runs inside the handler chain too, and an `Err` from it fails the guest call

@@ -3,8 +3,8 @@
 //! [`Code::new`](crate::Code::new) ends the code with a [`GUARD`] slot, and [`bound`] proves that every pc a handler
 //! continues at without a check lies in `0..=len`, the guard included. Handlers carry the pc as a [`Slot`], a pointer
 //! to the slot, and read such a slot without a check; the guard stops with [`Flow::BadPc`] where the code ends, as a
-//! checked fetch would. [`run`](crate::run) checks the pc it starts at, the `exit` handler the pc it returns to, and
-//! the runtime the targets of `callx` and `gotox`.
+//! checked fetch would. [`run`](crate::run) checks the pc it starts at, the `exit` handler the pc it returns to, the
+//! `callx` handler the pc [`Host::callx`] names, and the runtime the targets of `gotox`.
 
 use crate::fuse::Super;
 use crate::opcode::{Class, JmpOpc, OpCode, Source};
@@ -258,7 +258,7 @@ extern "rust-preserve-none" fn far<M: Memory, H: Host<M>, const FUEL: bool>(
 mod tests {
     use super::*;
     use crate::opcode::{AluOpc, LD_IMM64};
-    use crate::{run, Code};
+    use crate::{run, Callee, Code};
 
     #[derive(Debug)]
     struct NoMem;
@@ -284,6 +284,10 @@ mod tests {
         }
 
         fn kfunc(&mut self, _: &mut Context<NoMem>, _: u32) -> Option<u64> {
+            None
+        }
+
+        fn callx(&mut self, _: &mut Context<NoMem>, _: u64) -> Option<Callee> {
             None
         }
     }

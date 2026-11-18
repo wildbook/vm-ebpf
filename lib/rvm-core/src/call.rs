@@ -3,24 +3,37 @@ use std::mem::MaybeUninit;
 use crate::transfer::{self, Slot};
 use crate::{stack, Context, Flow, Instruction, Memory};
 
-/// Host functions the `call` handler runs without leaving [`run`](crate::run).
+/// Host functions the `call` and `callx` handlers run without leaving [`run`](crate::run).
 ///
 /// Each method gets the arguments in `ctx.regs[1..=5]` and returns the new r0. It returns `None` to stop
-/// [`run`](crate::run) at the `call` with [`Flow::CallHelper`] or [`Flow::CallKfunc`], having recorded whatever its
-/// caller needs to handle that.
+/// [`run`](crate::run) at the call with [`Flow::CallHelper`], [`Flow::CallKfunc`] or [`Flow::CallIndirect`], having
+/// recorded whatever its caller needs to handle that.
 pub trait Host<M: Memory> {
     /// Call helper `id` (`src_reg = 0`).
     fn helper(&mut self, ctx: &mut Context<M>, id: u32) -> Option<u64>;
     /// Call external function `id` (`src_reg = BPF_PSEUDO_KFUNC_CALL`).
     fn kfunc(&mut self, ctx: &mut Context<M>, id: u32) -> Option<u64>;
+    /// Call through `target`, the address in the `dst_reg` of a `callx`: name the guest function it addresses, or run
+    /// the host function it addresses.
+    fn callx(&mut self, ctx: &mut Context<M>, target: u64) -> Option<Callee>;
+}
+
+/// What a `callx` calls, as [`Host::callx`] resolves its target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Callee {
+    /// The guest function at this pc, which [`run`](crate::run) enters as it does a local call. A pc outside the code
+    /// stops `run` at the `callx` with [`Flow::CallIndirect`].
+    Local(u64),
+    /// A host function that [`Host::callx`] ran, which returned this r0.
+    Host(u64),
 }
 
 /// Maximum nesting of BPF-to-BPF calls below the entry frame.
 pub const MAX_CALL_DEPTH: usize = 8;
 
 /// The BPF-to-BPF calls in progress, which [`run`](crate::run) pushes and pops, the record of where and why it stopped,
-/// the window of the stack that r10 accesses use, and the [`Host`] that runs its helper and kfunc calls. `E` is the
-/// error type of the memory, [`Memory::Err`].
+/// the window of the stack that r10 accesses use, and the [`Host`] that runs its helper, kfunc and `callx` calls. `E`
+/// is the error type of the memory, [`Memory::Err`].
 // `repr(C)` keeps the scalars ahead of the frames, so every handler reaches them with a one-byte displacement.
 #[repr(C)]
 pub struct CallStack<H, E> {
@@ -73,7 +86,7 @@ impl<H, E> CallStack<H, E> {
     /// nothing, on a [`Flow::StackOverflow`].
     #[inline(always)]
     #[must_use]
-    pub fn push(&mut self, regs: &mut [u64; 16], call_pc: u64) -> bool {
+    pub(crate) fn push(&mut self, regs: &mut [u64; 16], call_pc: u64) -> bool {
         let Some(frame) = self.frames.get_mut(self.depth) else {
             return false;
         };

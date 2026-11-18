@@ -78,7 +78,7 @@ mod transfer;
 
 pub mod opcode;
 
-pub use call::{CallStack, Host, MAX_CALL_DEPTH};
+pub use call::{CallStack, Callee, Host, MAX_CALL_DEPTH};
 pub use fuse::Code;
 pub use instruction::{
     decode_instructions, instructions_from_bytes, Instruction, BPF_PSEUDO_CALL, BPF_PSEUDO_KFUNC_CALL,
@@ -120,7 +120,8 @@ pub enum Flow<E> {
     /// A local call found all [`MAX_CALL_DEPTH`] frames in use, or `r10` below the frame size.
     StackOverflow,
 
-    /// `callx`: call through the address in `dst_reg`, which the runtime decodes.
+    /// `callx`: call through the address in `dst_reg`, which [`Host::callx`] declined or resolved to a pc outside the
+    /// code.
     CallIndirect(u64),
     /// `gotox`: jump to the address in `dst_reg`, which the runtime decodes.
     JumpIndirect(u64),
@@ -260,6 +261,9 @@ extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, 
         ControlFlow::Break(Flow::CallKfunc(_)) if jumps => {
             become host_call::<M, H, FUEL, true>(ctx, insn, code, slot, fuel, calls, table)
         }
+        ControlFlow::Break(Flow::CallIndirect(_)) if jumps => {
+            become indirect_call::<M, H, FUEL>(ctx, insn, code, slot, fuel, calls, table)
+        }
         ControlFlow::Continue(first) => {
             // without a unit for the second slot, LD_IMM64 doesn't run and gets its unit back
             if FUEL && fuel == 0 {
@@ -309,6 +313,41 @@ extern "rust-preserve-none" fn host_call<M: Memory, H: Host<M>, const FUEL: bool
     ctx.regs[0] = r0;
 
     become_next!(ctx, code, slot, fuel, calls, table)
+}
+
+/// The rest of the handler of `callx`: enters the guest function that [`Host::callx`] names, as a local call does, or
+/// continues with the next instruction after the host function it ran.
+#[inline(never)]
+extern "rust-preserve-none" fn indirect_call<M: Memory, H: Host<M>, const FUEL: bool>(
+    ctx: &mut Context<M>,
+    insn: Instruction,
+    code: &[Instruction],
+    slot: Slot,
+    fuel: u64,
+    calls: &mut CallStack<H, M::Err>,
+    table: &Table<M, H>,
+) {
+    let target = ctx.regs[usize::from(insn.dst_reg())];
+    let callee = calls.host.callx(ctx, target);
+    calls.stack.revalidate(&ctx.data);
+    match callee {
+        Some(Callee::Local(pc)) => {
+            // the slots from `len` on all hold the guard, and no slot below it does
+            let in_code = pc < code.len() as u64 && code[pc as usize].byte() != transfer::GUARD;
+            if !in_code {
+                return calls.stop.at(slot, fuel, Flow::CallIndirect(target));
+            }
+            if !calls.push(&mut ctx.regs, slot.pc(code)) {
+                return calls.stop.at(slot, fuel, Flow::StackOverflow);
+            }
+            become_at_pc!(ctx, code, pc, fuel, calls, table)
+        }
+        Some(Callee::Host(r0)) => {
+            ctx.regs[0] = r0;
+            become_next!(ctx, code, slot, fuel, calls, table)
+        }
+        None => calls.stop.at(slot, fuel, Flow::CallIndirect(target)),
+    }
 }
 
 /// The instruction in `slot`, its handler and the fuel left once it is charged, or `None` if no fuel is left.
@@ -381,14 +420,15 @@ const METERED: bool = cfg!(feature = "fuel");
 
 /// Execute from `*pc` until an instruction the caller must handle.
 ///
-/// ALU, memory and jump instructions, local calls and their returns, and helper and kfunc calls that `calls.host` runs
-/// stay inside the handler chain, so each one costs a single dispatch. `calls` holds the frames of the local calls in
-/// progress and keeps them from one `run` to the next. Execution returns helper and kfunc calls that the host declined,
-/// indirect calls and jumps, [`Flow::Exit`] from the entry frame and faults with `*pc` at the instruction that produced
-/// them, and [`Flow::OutOfFuel`] or [`Flow::BadPc`] with `*pc` at the instruction that could not run. With the `fuel`
-/// feature, each executed instruction consumes one unit of `fuel`, and LD_IMM64 one per slot: with one unit left, it
-/// stops with [`Flow::OutOfFuel`] and that unit. `*fuel` must be at most `i64::MAX`; a larger budget may stop at once
-/// with [`Flow::OutOfFuel`]. Without the feature, `run` takes no `fuel` and never runs out.
+/// ALU, memory and jump instructions, local calls and their returns, and helper, kfunc and `callx` calls that
+/// `calls.host` runs or resolves stay inside the handler chain, so each one costs a single dispatch. `calls` holds the
+/// frames of the local calls in progress and keeps them from one `run` to the next. Execution returns helper, kfunc and
+/// `callx` calls that the host declined, indirect jumps, [`Flow::Exit`] from the entry frame and faults with `*pc` at
+/// the instruction that produced them, and [`Flow::OutOfFuel`] or [`Flow::BadPc`] with `*pc` at the instruction that
+/// could not run. With the `fuel` feature, each executed instruction consumes one unit of `fuel`, and LD_IMM64 one per
+/// slot: with one unit left, it stops with [`Flow::OutOfFuel`] and that unit. `*fuel` must be at most `i64::MAX`; a
+/// larger budget may stop at once with [`Flow::OutOfFuel`]. Without the feature, `run` takes no `fuel` and never runs
+/// out.
 #[inline]
 pub fn run<M: Memory, H: Host<M>>(
     ctx: &mut Context<M>,
