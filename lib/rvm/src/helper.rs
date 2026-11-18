@@ -200,7 +200,7 @@ impl Slot {
 #[derive(Default, Clone)]
 pub struct HelperRegistry {
     slots: Vec<Slot>,
-    by_id: HashMap<u32, u32>,
+    by_id: Vec<(u32, u32)>, // (helper ID, slot)
     by_name: HashMap<String, u32>,
 }
 
@@ -255,9 +255,11 @@ impl HelperRegistry {
 
     /// Replace the function registered under `id`, or append a new slot.
     fn put_id(&mut self, id: u32, helper: Slot) {
-        let slot = self.by_id.get(&id).copied();
-        let slot = self.put(slot, helper);
-        self.by_id.insert(id, slot);
+        let found = self.slot_of_id(id);
+        let slot = self.put(found, helper);
+        if found.is_none() {
+            self.by_id.push((id, slot));
+        }
     }
 
     /// Replace the function registered under `name`, or append a new slot.
@@ -289,7 +291,7 @@ impl HelperRegistry {
 
     /// Slot of a helper ID.
     pub fn slot_of_id(&self, id: u32) -> Option<u32> {
-        self.by_id.get(&id).copied()
+        self.by_id.iter().find(|e| e.0 == id).map(|e| e.1)
     }
 
     /// Slot of a named extern function.

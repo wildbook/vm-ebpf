@@ -439,6 +439,13 @@ name = "rvm-core"
 version = "0.1.0"
 
 [[package]]
+name = "rvmrt"
+version = "0.1.0"
+dependencies = [
+ "rvm",
+]
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

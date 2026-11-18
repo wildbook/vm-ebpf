@@ -1,0 +1,14 @@
+# Builds started in this directory rebuild std for size, and panics abort without a message. Builds from the workspace
+# root don't read this file.
+
+[unstable]
+build-std = ["std", "panic_abort"]
+build-std-features = ["optimize_for_size"]
+panic-immediate-abort = true
+
+[build]
+# build-std needs an explicit target
+target = "host-tuple"
+
+[profile.release]
+panic = "immediate-abort"

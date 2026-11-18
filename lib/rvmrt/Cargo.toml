@@ -1,0 +1,15 @@
+[package]
+name = "rvmrt"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "rvm as a C library that runs prepared images"
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+rvm = { path = "../rvm", default-features = false, features = ["fuel"] }

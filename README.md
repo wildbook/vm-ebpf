@@ -36,6 +36,8 @@ cmake --build --preset update-prebuilt         # copies the built objects into b
 - `lib/constelf`: a `const fn` ELF reader for the linker.
 - `lib/ebpf-asm`: an assembler and disassembler for writing bytecode in Rust,
   used by tests, benches and examples.
+- `lib/rvmrt`: rvm as a C library that runs prepared images (see
+  [C library](#c-library)).
 - `bin/loader`, `bin/emu`: the programs above.
 
 ## Features and profiles
@@ -131,6 +133,41 @@ index and map definition, so images may come from untrusted files. `Vm::load`
 takes an `Image` directly, including one built by hand around raw bytecode,
 whose `call <id>` instructions reach the helpers registered under those IDs. A
 host that ships images can build rvm without `link`, as `bin/emu` does.
+
+## C library
+
+`lib/rvmrt` builds rvm, without `link` and with `fuel`, as `rvmrt.dll` and a
+static `rvmrt.lib`. `lib/rvmrt/include/rvmrt.h` declares its functions:
+`rvm_load` loads a prepared image, `rvm_map` maps zeroed guest memory,
+`rvm_call` calls a function by name, and `rvm_free` frees the program. Errors
+come back as `rvm_status` codes. The runtime has the map helpers and the default
+instruction limit.
+
+```bash
+cd lib/rvmrt
+cargo build --profile embedded    # target/x86_64-pc-windows-msvc/embedded/rvmrt.{dll,dll.lib,lib}
+cargo rustc --profile embedded --crate-type staticlib -- --print native-static-libs   # system libraries for rvmrt.lib
+```
+
+`lib/rvmrt/.cargo/config.toml` applies only to builds started in `lib/rvmrt`. It
+rebuilds std with `optimize_for_size`, which needs the `rust-src` component, and
+makes panics trap: a panic inside the library ends the host process at once,
+without a message. A build from the workspace root uses the prebuilt std and
+prints the panic message before it aborts.
+
+Sizes on x86_64 Windows with the embedded profile. The C host reads the image
+file and calls `bpf_main`, built with clang-cl `-O1 -MD`. Without the calls into
+rvmrt it is 9,216 bytes with 44 imports.
+
+| build | `rvmrt.dll` | added to the C host by `rvmrt.lib` |
+|---|---|---|
+| in `lib/rvmrt` | 87,552 B, 35 imports from 4 DLLs | 78,336 B, 12 imports |
+| at the root | 173,056 B, 58 imports from 6 DLLs | 163,840 B, 33 imports |
+
+The 12 imports are the process heap (`GetProcessHeap`, `HeapAlloc`, `HeapFree`,
+`HeapReAlloc`), `WaitOnAddress`, `WakeByAddressAll`, `WakeByAddressSingle`,
+`GetLastError`, `memcmp`, `memmove`, and `GetCurrentProcess` with
+`TerminateProcess` for aborts.
 
 ## Plugins
 

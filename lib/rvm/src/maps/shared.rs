@@ -2,8 +2,6 @@
 
 use std::sync::{Arc, Mutex, RwLock};
 
-use hashbrown::HashMap;
-
 use super::hash::HashIndex;
 use super::{MapDef, MapKind, CACHE_LINE};
 use crate::error::{LinkError, Result};
@@ -18,9 +16,9 @@ pub struct SharedMaps {
 
 #[derive(Debug, Default)]
 struct SharedState {
-    // name -> pad values to a cache line
-    declared: HashMap<String, bool>,
-    bound: HashMap<String, Arc<SharedMap>>,
+    // name, pad values to a cache line
+    declared: Vec<(String, bool)>,
+    bound: Vec<Arc<SharedMap>>,
     next_region: usize,
 }
 
@@ -37,7 +35,11 @@ pub struct SharedMap {
 impl SharedMaps {
     /// Make maps called `name` shared by every program linked afterwards.
     pub fn declare(&self, name: &str, pad_values: bool) {
-        lock(&self.state).declared.insert(name.to_string(), pad_values);
+        let mut state = lock(&self.state);
+        match state.declared.iter_mut().find(|e| e.0 == name) {
+            Some(e) => e.1 = pad_values,
+            None => state.declared.push((name.to_string(), pad_values)),
+        }
     }
 
     /// The shared instance for `def`, created by the first program that declares it. `None` if maps with this name
@@ -46,13 +48,13 @@ impl SharedMaps {
         use crate::layout::SHARED_MAPS_FIRST_REGION;
 
         let mut state = lock(&self.state);
-        if let Some(map) = state.bound.get(&def.name) {
+        if let Some(map) = state.bound.iter().find(|m| m.def.name == def.name) {
             if map.def != *def {
                 return Err(LinkError::MapMismatch(def.name.clone()).into());
             }
             return Ok(Some(map.clone()));
         }
-        let Some(&pad_values) = state.declared.get(&def.name) else {
+        let Some(&(_, pad_values)) = state.declared.iter().find(|e| e.0 == def.name) else {
             return Ok(None);
         };
 
@@ -69,7 +71,7 @@ impl SharedMaps {
             index: (def.kind == MapKind::Hash).then(|| RwLock::new(HashIndex::new(def.key_size, def.max_entries))),
         });
         state.next_region += 1;
-        state.bound.insert(def.name.clone(), map.clone());
+        state.bound.push(map.clone());
         Ok(Some(map))
     }
 }
