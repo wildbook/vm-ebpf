@@ -213,7 +213,9 @@ fn call_indirect(
     // A helper's address is its ID, as in libbpf's `(void *)BPF_FUNC_*` helper declarations.
     let id = u32::try_from(target).map_err(|_| ExecError::BadCodeAddress { pc, target })?;
     let helpers = &mut calls.host;
-    let slot = helpers.registry.slot_of_id(id).ok_or(HelperError::UnknownHelper(id))?;
+    let Some(slot) = helpers.registry.slot_of_id(id) else {
+        return Err(HelperError::UnknownHelper(id).into());
+    };
     ctx.regs[0] = helpers.call_slot(ctx, slot)?;
     Ok(pc + 1)
 }

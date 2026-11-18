@@ -300,7 +300,10 @@ impl HelperRegistry {
     /// Call the function in `slot`.
     #[inline]
     pub fn call_slot(&self, slot: u32, ctx: &mut HelperContext) -> Result<u64, HelperError> {
-        let helper = self.slots.get(slot as usize).ok_or(HelperError::UnknownSlot(slot))?;
+        // not `ok_or`, which builds and drops the error on every call
+        let Some(helper) = self.slots.get(slot as usize) else {
+            return Err(HelperError::UnknownSlot(slot));
+        };
         // SAFETY: `Slot::new` paired `call` with a `data` pointer of the type it expects.
         unsafe { (helper.call)(helper.data, ctx) }
     }

@@ -51,8 +51,7 @@ impl Plugin {
         let found = self.lock()?.func(func).map_err(|e| in_plugin(e, &self.name))?;
         Ok(PluginFunc {
             plugin: self.clone(),
-            name: func.into(),
-            func: FuncSlot::new(found),
+            func: FuncSlot::new(found, func.into()),
         })
     }
 
@@ -197,7 +196,6 @@ impl WeakPlugin {
 #[derive(Debug)]
 pub struct PluginFunc {
     plugin: Plugin,
-    name: Arc<str>,
     func: FuncSlot,
 }
 
@@ -205,13 +203,11 @@ impl PluginFunc {
     /// Call the function in the plugin's current program; arguments go in r1-r5. Fails with
     /// [`VmError::FunctionNotFound`] if that program lacks it.
     pub fn call(&self, args: &[u64]) -> Result<u64> {
-        let mut program = self.plugin.lock()?;
-        let result = self.func.call(&mut program, &self.name, args);
-        result.map_err(|e| in_plugin(e, &self.plugin.name))
+        self.func.call(&mut *self.plugin.lock()?, &self.plugin.name, args)
     }
 }
 
-fn not_found(plugin: &str, func: &str) -> VmError {
+pub fn not_found(plugin: &str, func: &str) -> VmError {
     VmError::FunctionNotFound {
         plugin: Some(plugin.to_string()),
         func: func.to_string(),
@@ -228,13 +224,27 @@ fn in_plugin(error: VmError, plugin: &str) -> VmError {
     }
 }
 
-fn try_lock<'a>(program: &'a Mutex<Program>, name: &str) -> Result<MutexGuard<'a, Program>> {
+// `name` by reference to the `Arc`: the call path then passes an address instead of loading the name
+#[inline]
+fn try_lock<'a>(program: &'a Mutex<Program>, name: &Arc<str>) -> Result<MutexGuard<'a, Program>> {
     match program.try_lock() {
         Ok(guard) => Ok(guard),
-        Err(TryLockError::WouldBlock) => Err(VmError::PluginBusy(name.to_string())),
+        Err(e) => lock_failed(program, name, e),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn lock_failed<'a>(
+    program: &'a Mutex<Program>,
+    name: &Arc<str>,
+    error: TryLockError<MutexGuard<'a, Program>>,
+) -> Result<MutexGuard<'a, Program>> {
+    match error {
+        TryLockError::WouldBlock => Err(VmError::PluginBusy(name.to_string())),
         // a panic during a call poisons the lock and may have skipped unmapping borrowed caller memory, which may be
         // gone by now
-        Err(TryLockError::Poisoned(e)) => {
+        TryLockError::Poisoned(e) => {
             let mut guard = e.into_inner();
             for region in BORROW_FIRST_REGION..BORROW_FIRST_REGION + BORROW_REGIONS {
                 guard.memory_mut().unmap_any(region);

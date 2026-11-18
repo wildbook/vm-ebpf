@@ -13,6 +13,7 @@ use crate::executor::Executor;
 use crate::helper::{HelperRegistry, SharedHelpers};
 use crate::maps::{MapRef, Maps};
 use crate::memory::VmMemory;
+use crate::plugin::not_found;
 use crate::vm::VmConfig;
 
 /// Information about an executable function.
@@ -229,32 +230,46 @@ impl Program {
     }
 }
 
-/// A [`Func`] that follows its function into whichever program it is called with, for handles that outlive the program
-/// they were looked up in. Callers serialize access per slot, e.g. under a plugin's lock.
+/// A [`Func`] that follows its function by name into whichever program it is called with, for handles that outlive the
+/// program they were looked up in. Callers serialize access per slot, e.g. under a plugin's lock.
 #[derive(Debug)]
 pub struct FuncSlot {
     program: AtomicU64,
     pc: AtomicU64,
+    name: Arc<str>,
 }
 
 impl FuncSlot {
-    pub fn new(func: Func) -> Self {
+    pub fn new(func: Func, name: Arc<str>) -> Self {
         Self {
             program: AtomicU64::new(func.program),
             pc: AtomicU64::new(func.pc),
+            name,
         }
     }
 
-    /// Call the function in `program`, looking `name` up again if the slot holds a function of another program.
+    /// Call the function in `program`, looking it up again if the slot holds a function of another program. Fails
+    /// with [`VmError::FunctionNotFound`] naming `plugin` if `program` lacks it.
     #[inline]
-    pub fn call(&self, program: &mut Program, name: &str, args: &[u64]) -> Result<u64> {
-        let mut pc = self.pc.load(Ordering::Relaxed);
-        if self.program.load(Ordering::Relaxed) != program.id {
-            pc = program.func(name)?.pc;
-            self.pc.store(pc, Ordering::Relaxed);
-            self.program.store(program.id, Ordering::Relaxed);
-        }
+    pub fn call(&self, program: &mut Program, plugin: &Arc<str>, args: &[u64]) -> Result<u64> {
+        let pc = if self.program.load(Ordering::Relaxed) == program.id {
+            self.pc.load(Ordering::Relaxed)
+        } else {
+            self.follow(program, plugin)?
+        };
         program.call_pc(pc, args)
+    }
+
+    /// Look the function up in `program`, which replaced the slot's program, and keep its pc.
+    #[cold]
+    #[inline(never)]
+    fn follow(&self, program: &Program, plugin: &Arc<str>) -> Result<u64> {
+        let Some((func, _)) = program.func_with_info(&self.name) else {
+            return Err(not_found(plugin, &self.name));
+        };
+        self.pc.store(func.pc, Ordering::Relaxed);
+        self.program.store(func.program, Ordering::Relaxed);
+        Ok(func.pc)
     }
 }
 
