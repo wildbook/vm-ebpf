@@ -452,7 +452,7 @@ impl<'a> GuestMemory<'a> {
 
 /// Zeroed, cache-line aligned host memory that several programs map at once.
 #[derive(Debug)]
-pub(crate) struct SharedBuffer {
+pub struct SharedBuffer {
     ptr: NonNull<u8>,
     len: usize,
 }

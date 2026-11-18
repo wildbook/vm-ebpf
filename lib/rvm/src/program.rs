@@ -320,7 +320,7 @@ impl FuncSlot {
 
 /// A program's exported functions: sorted by name, which gives each its index, and hashed for calls by name.
 #[derive(Debug)]
-pub(crate) struct Functions {
+pub struct Functions {
     list: Vec<(String, FunctionInfo)>,
     // the pc sits in the map, which measured faster for calls by name than reading it from `list`
     by_name: HashMap<String, Entry>,
@@ -328,7 +328,7 @@ pub(crate) struct Functions {
 
 impl Functions {
     /// The table of `list`; `None` unless `list` is sorted by name with every name once.
-    pub(crate) fn new(list: Vec<(String, FunctionInfo)>) -> Option<Self> {
+    pub fn new(list: Vec<(String, FunctionInfo)>) -> Option<Self> {
         if !list.is_sorted_by(|(a, _), (b, _)| a < b) {
             return None;
         }

@@ -49,6 +49,6 @@ pub use core_relo::{apply_core_relocations, CoreReloError, Unresolved};
 pub use ext::{BtfExt, CoreRelo, CoreReloKind};
 pub use parse::{Btf, BtfError};
 pub use patch::CORE_POISON_HELPER;
-pub use raw::*;
+pub use raw::{BtfKind, BTF_INT_SIGNED, BTF_MAGIC, BTF_VERSION, TYPE_HEADER_LEN};
 pub use strings::BtfStrings;
 pub use types::*;

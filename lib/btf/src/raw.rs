@@ -97,7 +97,7 @@ const _: () = {
 
 /// The `btf_type` header, with its `info` word split into fields.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct TypeHeader {
+pub struct TypeHeader {
     pub name_off: u32,
     pub kind: BtfKind,
     pub vlen: u16,
