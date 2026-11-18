@@ -51,6 +51,8 @@
 //!   friends). Without it, rvm loads prepared images only.
 //! - `fixed-hash-seed`: guest hash maps use a fixed hash seed, for reproducible benchmarks.
 
+#![feature(rust_preserve_none_cc)]
+
 mod error;
 mod executor;
 mod helper;

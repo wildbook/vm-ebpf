@@ -28,7 +28,7 @@ pub struct Executor<'a> {
     stack_top: u64,
     /// Bytes r10 moves down per nested call.
     frame_size: u64,
-    /// Maximum instructions to execute (0 = unlimited).
+    /// Maximum instructions to execute; `u64::MAX` for no limit.
     #[cfg(feature = "fuel")]
     instruction_limit: u64,
     /// Maps passed to helpers through [`HelperContext::maps`].
@@ -45,12 +45,12 @@ impl<'a> Executor<'a> {
             stack_top,
             frame_size: DEFAULT_FRAME_SIZE,
             #[cfg(feature = "fuel")]
-            instruction_limit: 0,
+            instruction_limit: u64::MAX,
             maps: None,
         }
     }
 
-    /// Set the instruction limit (0 = unlimited).
+    /// Set the instruction limit; `u64::MAX` for no limit.
     #[cfg(feature = "fuel")]
     pub fn set_instruction_limit(&mut self, limit: u64) {
         self.instruction_limit = limit;
@@ -73,7 +73,10 @@ impl<'a> Executor<'a> {
             return Err(VmError::TooManyArgs(args.len()));
         }
         let mut ctx = Context::new(&mut *self.memory);
-        ctx.regs[1..=args.len()].copy_from_slice(args);
+        // at most 5 stores; `copy_from_slice` calls memcpy
+        for (i, &arg) in args.iter().take(5).enumerate() {
+            ctx.regs[i + 1] = arg;
+        }
         ctx.regs[10] = self.stack_top;
 
         let helpers = Helpers {
@@ -84,10 +87,7 @@ impl<'a> Executor<'a> {
         let mut calls = CallStack::new(self.frame_size, helpers);
         let mut pc = pc;
         #[cfg(feature = "fuel")]
-        let limit = match self.instruction_limit {
-            0 => u64::MAX,
-            limit => limit,
-        };
+        let limit = self.instruction_limit;
         #[cfg(feature = "fuel")]
         let mut fuel = limit;
 
@@ -96,28 +96,46 @@ impl<'a> Executor<'a> {
             let flow = run(&mut ctx, self.code, &mut pc, &mut fuel, &mut calls);
             #[cfg(not(feature = "fuel"))]
             let flow = run(&mut ctx, self.code, &mut pc, &mut calls);
-            pc = match flow {
-                Flow::Exit => return Ok(ctx.regs[0]),
-                Flow::StackOverflow => return Err(ExecError::StackOverflow { pc }.into()),
-                // a call the linker planted for an unresolved CO-RE relocation
-                Flow::CallHelper(CORE_POISON_HELPER) => {
-                    return Err(ExecError::UnresolvedCoreRelo { pc }.into());
-                }
-                Flow::CallHelper(_) | Flow::CallKfunc(_) => return Err(calls.host.take_error().into()),
-                #[cfg(feature = "fuel")]
-                Flow::OutOfFuel => return Err(ExecError::InstructionLimit(limit).into()),
-                Flow::BadPc => return Err(ExecError::InvalidPc(pc).into()),
-                Flow::FailCpu => return Err(ExecError::CpuFault { pc }.into()),
-                Flow::FailMem(addr) => return Err(memory_fault(pc, addr, self.code)),
-                Flow::Missing => return Err(ExecError::Unimplemented { pc }.into()),
-                Flow::CallIndirect(target) => call_indirect(target, pc, self.code, &mut ctx, &mut calls)?,
-                Flow::JumpIndirect(target) => jump_indirect(target, pc, self.code)?,
-                // `run` handles these internally
-                Flow::Next | Flow::Jump(_) | Flow::Call(_) => unreachable!(),
-                #[cfg(not(feature = "fuel"))]
-                Flow::OutOfFuel => unreachable!(),
-            };
+            if let Flow::Exit = flow {
+                return Ok(ctx.regs[0]);
+            }
+            #[cfg(feature = "fuel")]
+            let next = resume(flow, pc, self.code, &mut ctx, &mut calls, limit);
+            #[cfg(not(feature = "fuel"))]
+            let next = resume(flow, pc, self.code, &mut ctx, &mut calls);
+            pc = next?;
         }
+    }
+}
+
+/// Where to continue after [`run`] stopped at `pc` with `flow`, which is not [`Flow::Exit`], or why the call fails.
+#[cold]
+#[inline(never)]
+fn resume(
+    flow: Flow<&mut VmMemory>,
+    pc: u64,
+    code: &Code,
+    ctx: &mut Context<&mut VmMemory>,
+    calls: &mut CallStack<Helpers<'_>>,
+    #[cfg(feature = "fuel")] limit: u64,
+) -> Result<u64> {
+    match flow {
+        Flow::StackOverflow => Err(ExecError::StackOverflow { pc }.into()),
+        // a call the linker planted for an unresolved CO-RE relocation
+        Flow::CallHelper(CORE_POISON_HELPER) => Err(ExecError::UnresolvedCoreRelo { pc }.into()),
+        Flow::CallHelper(_) | Flow::CallKfunc(_) => Err(calls.host.take_error().into()),
+        #[cfg(feature = "fuel")]
+        Flow::OutOfFuel => Err(ExecError::InstructionLimit(limit).into()),
+        Flow::BadPc => Err(ExecError::InvalidPc(pc).into()),
+        Flow::FailCpu => Err(ExecError::CpuFault { pc }.into()),
+        Flow::FailMem(addr) => Err(memory_fault(pc, addr, code)),
+        Flow::Missing => Err(ExecError::Unimplemented { pc }.into()),
+        Flow::CallIndirect(target) => call_indirect(target, pc, code, ctx, calls),
+        Flow::JumpIndirect(target) => jump_indirect(target, pc, code),
+        // `run` handles these internally, and the executor `Exit`
+        Flow::Exit | Flow::Next | Flow::Jump(_) | Flow::Call(_) => unreachable!(),
+        #[cfg(not(feature = "fuel"))]
+        Flow::OutOfFuel => unreachable!(),
     }
 }
 
@@ -178,8 +196,6 @@ impl Host<&mut VmMemory> for Helpers<'_> {
 
 /// `callx` at `pc`: enter the function at code address `target`, or call the helper whose ID is `target`. Returns the
 /// next pc.
-#[cold]
-#[inline(never)]
 fn call_indirect(
     target: u64,
     pc: u64,
@@ -203,8 +219,6 @@ fn call_indirect(
 }
 
 /// The fault of the load or store at `pc` that failed at `addr`.
-#[cold]
-#[inline(never)]
 fn memory_fault(pc: u64, addr: u64, code: &Code) -> VmError {
     // only loads and stores fail with `Flow::FailMem`
     let size = code.access_size(pc).expect("memory fault outside a load or store");
@@ -216,8 +230,6 @@ fn memory_fault(pc: u64, addr: u64, code: &Code) -> VmError {
 }
 
 /// `gotox` at `pc`: the instruction index of code address `target`.
-#[cold]
-#[inline(never)]
 fn jump_indirect(target: u64, pc: u64, code: &Code) -> Result<u64> {
     code_index(target, code).ok_or_else(|| ExecError::BadCodeAddress { pc, target }.into())
 }

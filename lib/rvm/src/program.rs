@@ -89,7 +89,7 @@ pub struct Program {
     shared_helpers: Arc<SharedHelpers>,
     helpers: HelperRegistry,
     helpers_version: u64,
-    /// Maximum instructions per call (0 = unlimited).
+    /// Maximum instructions per call; `u64::MAX` for no limit.
     #[cfg(feature = "fuel")]
     instruction_limit: u64,
     /// Stack bytes per call frame.
@@ -118,8 +118,12 @@ impl Program {
             shared_helpers,
             helpers,
             helpers_version,
+            // `VmConfig` says 0 for no limit
             #[cfg(feature = "fuel")]
-            instruction_limit: config.instruction_limit,
+            instruction_limit: match config.instruction_limit {
+                0 => u64::MAX,
+                limit => limit,
+            },
             frame_size: config.frame_size,
         }
     }
@@ -201,7 +205,11 @@ impl Program {
     // Out of line: the executor and interpreter compile once, in this crate, behind one call. Inlined into the
     // embedder's crate, this either calls the executor separately or compiles another copy of the interpreter, which
     // measured slower.
-    fn call_pc(&mut self, pc: u64, args: &[u64]) -> Result<u64> {
+    //
+    // The interpreter's handlers save no registers. With the default convention, this function would save and restore
+    // every callee-saved register (on Windows also xmm6 to xmm15) on each call; with `rust-preserve-none`, callers keep
+    // only what they need after the call, and a caller in a loop saves its own registers once.
+    extern "rust-preserve-none" fn call_pc(&mut self, pc: u64, args: &[u64]) -> Result<u64> {
         if self.shared_helpers.version() != self.helpers_version {
             self.refresh_helpers();
         }
