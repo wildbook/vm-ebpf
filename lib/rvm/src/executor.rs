@@ -28,7 +28,7 @@ pub struct Executor {
     calls: CallStack<Helpers>,
     /// Initial r10.
     stack_top: u64,
-    /// Maximum instructions to execute; `u64::MAX` for no limit.
+    /// Maximum instructions to execute, at most `i64::MAX`.
     #[cfg(feature = "fuel")]
     instruction_limit: u64,
 }
@@ -45,11 +45,11 @@ impl Executor {
         Self {
             calls: CallStack::new(config.frame_size, helpers),
             stack_top,
-            // `VmConfig` says 0 for no limit
+            // `VmConfig` says 0 for no limit, and `run` takes at most `i64::MAX`
             #[cfg(feature = "fuel")]
             instruction_limit: match config.instruction_limit {
-                0 => u64::MAX,
-                limit => limit,
+                0 => i64::MAX as u64,
+                limit => limit.min(i64::MAX as u64),
             },
         }
     }

@@ -47,7 +47,8 @@ rvm's features:
 - `link` (default): ELF parsing, BTF, CO-RE and the linker (`Module`,
   `HostTypes`, `Vm::with_types`, `Vm::prepare`, `Vm::load_elf`, `Vm::load_plugin`).
   Without it, rvm loads prepared images only.
-- `fuel` (default): enforces `VmConfig::instruction_limit`. Without it the field
+- `fuel` (default): enforces `VmConfig::instruction_limit`. Limits above
+  `i64::MAX`, and 0 for no limit, count as `i64::MAX`. Without it the field
   doesn't exist and the interpreter doesn't count instructions.
 - `maps` (default): guest maps, with the map helpers (IDs 1 to 3),
   `Program::map` and `Vm::share_map`. Without it, an image that declares maps

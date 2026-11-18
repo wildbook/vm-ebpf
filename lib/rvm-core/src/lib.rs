@@ -277,8 +277,8 @@ unsafe fn fetch<M: Memory, H: Host<M>, const FUEL: bool>(
     Some((table.of(insn), insn, left))
 }
 
-/// The fuel left once an instruction is charged, or `None` if none is left. It takes at most `i64::MAX` units, and
-/// returns `None` for more too: [`start`] hands out larger amounts in parts.
+/// The fuel left once an instruction is charged, or `None` if none is left. It takes at most `i64::MAX` units, the
+/// most [`run`] accepts.
 #[inline(always)]
 fn charge<const FUEL: bool>(fuel: u64) -> Option<u64> {
     // a decrement and a sign test, where `fuel == 0` would take a test, a branch and a decrement
@@ -335,7 +335,8 @@ const METERED: bool = cfg!(feature = "fuel");
 /// indirect calls and jumps, [`Flow::Exit`] from the entry frame and faults with `*pc` at the instruction that produced
 /// them, and [`Flow::OutOfFuel`] or [`Flow::BadPc`] with `*pc` at the instruction that could not run. With the `fuel`
 /// feature, each executed instruction consumes one unit of `fuel`, and LD_IMM64 one per slot: with one unit left, it
-/// stops with [`Flow::OutOfFuel`] and that unit. Without the feature, `run` takes no `fuel` and never runs out.
+/// stops with [`Flow::OutOfFuel`] and that unit. `*fuel` must be at most `i64::MAX`; a larger budget may stop at once
+/// with [`Flow::OutOfFuel`]. Without the feature, `run` takes no `fuel` and never runs out.
 #[inline]
 pub fn run<M: Memory, H: Host<M>>(
     ctx: &mut Context<M>,
@@ -347,59 +348,14 @@ pub fn run<M: Memory, H: Host<M>>(
     #[cfg(not(feature = "fuel"))]
     let fuel = &mut 0;
 
-    start::<M, H, METERED>(ctx, code, pc, fuel, calls)
-}
-
-/// [`run`], metering fuel with `FUEL`.
-#[inline(always)]
-fn start<M: Memory, H: Host<M>, const FUEL: bool>(
-    ctx: &mut Context<M>,
-    code: &Code,
-    pc: &mut u64,
-    fuel: &mut u64,
-    calls: &mut CallStack<H>,
-) -> Flow<M> {
     let slots = code.slots();
-    let table = &Handlers::<M, H, FUEL>::TABLE;
+    let table = &Handlers::<M, H, METERED>::TABLE;
     calls.stack.revalidate(&ctx.data);
-    let (first, insn, left) = match fetch_checked::<M, H, FUEL>(table, slots, *pc, *fuel) {
+    let (first, insn, left) = match fetch_checked::<M, H, METERED>(table, slots, *pc, *fuel) {
         Ok(next) => next,
-        Err(Flow::OutOfFuel) => {
-            let flow;
-            // the charge computed `fuel - 1` already, and `fuel` isn't needed elsewhere
-            (flow, *pc, *fuel) = start_uncharged::<M, H, FUEL>(ctx, code, *pc, fuel.wrapping_sub(1), calls);
-            return flow;
-        }
         Err(flow) => return flow,
     };
     let flow = first(ctx, slots, insn, *pc, left, calls, table);
     (*pc, *fuel) = (calls.stop.pc, calls.stop.fuel);
     flow
-}
-
-/// [`start`] when [`charge`] fails, given the fuel less one: with no fuel it stops, and more than `charge` takes it
-/// hands out `i64::MAX` units at a time. Also returns where it stopped.
-#[cold]
-#[inline(never)]
-fn start_uncharged<M: Memory, H: Host<M>, const FUEL: bool>(
-    ctx: &mut Context<M>,
-    code: &Code,
-    mut pc: u64,
-    less_one: u64,
-    calls: &mut CallStack<H>,
-) -> (Flow<M>, u64, u64) {
-    let mut fuel = less_one.wrapping_add(1);
-    if fuel == 0 {
-        return (Flow::OutOfFuel, pc, fuel);
-    }
-    loop {
-        let kept = fuel.saturating_sub(i64::MAX as u64);
-        fuel -= kept;
-        let flow = start::<M, H, FUEL>(ctx, code, &mut pc, &mut fuel, calls);
-        fuel += kept;
-        // an `OutOfFuel` stop resumes exactly where it stopped
-        if kept == 0 || !matches!(flow, Flow::OutOfFuel) {
-            return (flow, pc, fuel);
-        }
-    }
 }

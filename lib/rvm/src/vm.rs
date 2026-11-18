@@ -29,7 +29,8 @@ use crate::sync::lock;
 /// Configuration for the VM.
 #[derive(Debug, Clone)]
 pub struct VmConfig {
-    /// Maximum number of instructions to execute (0 = no limit).
+    /// Maximum number of instructions to execute, with 0 for no limit. Limits above `i64::MAX`, and no limit, count
+    /// as `i64::MAX`.
     #[cfg(feature = "fuel")]
     pub instruction_limit: u64,
     /// Stack bytes reserved per call frame. Loading fails with [`VmError::InvalidArgument`] if the stack for
