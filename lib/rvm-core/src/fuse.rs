@@ -12,37 +12,53 @@
 use std::ops::ControlFlow;
 
 use crate::opcode::{AluOpc, Class, JmpOpc, MemMode, MemSize, OpCode, Source};
+use crate::transfer::{self, FAR, GUARD};
 use crate::{handler_of, stack, step, CallStack, Context, Flow, Handler, Handlers, Host, Instruction, Memory};
 
 /// Bytecode prepared for [`run`](crate::run).
 #[derive(Debug)]
-pub struct Code(Box<[Instruction]>);
+pub struct Code {
+    /// The code, then the slots [`transfer::bound`] appends.
+    slots: Box<[Instruction]>,
+    len: usize,
+}
 
 impl Code {
     /// Prepare `insns` for [`run`](crate::run): fuse the sequences that have a superinstruction.
     ///
     /// r10 is read-only, so an instruction that would write it fails with [`Flow::FailCpu`]: an ALU, ALU64 or LDX
     /// instruction, LD_IMM64 or a load-acquire with `dst_reg` 10, and an atomic that fetches into `src_reg` 10.
-    pub fn new(insns: impl Into<Box<[Instruction]>>) -> Self {
-        let mut insns = insns.into();
-        fuse(&mut insns);
-        Self(insns)
+    ///
+    /// The code keeps the allocation of `insns` if it has room for one more slot.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `insns` has 2^31 slots or more.
+    pub fn new(insns: impl Into<Vec<Instruction>>) -> Self {
+        let mut slots = insns.into();
+        let len = slots.len();
+        fuse(&mut slots);
+        transfer::bound(&mut slots);
+        Self {
+            slots: slots.into_boxed_slice(),
+            len,
+        }
     }
 
     /// The number of instruction slots.
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.len == 0
     }
 
     /// Bytes the load or store in slot `pc` accesses, or `None` if the slot holds none, for reporting a
     /// [`Flow::FailMem`] at `pc`.
     #[cold]
     pub fn access_size(&self, pc: u64) -> Option<usize> {
-        let byte = self.0.get(usize::try_from(pc).ok()?)?.0 as u8;
+        let byte = self.slots.get(usize::try_from(pc).ok()?)?.0 as u8;
         // the first slot of a superinstruction or r10 access holds a reserved byte in place of its opcode
         let byte = match (STACK.iter().find(|s| s.0 == byte), SUPERS.iter().find(|s| s.0 == byte)) {
             (Some(&(_, usual)), _) => usual,
@@ -61,8 +77,9 @@ impl Code {
         })
     }
 
+    /// The code and the slots after it, which all hold [`GUARD`].
     pub(crate) fn slots(&self) -> &[Instruction] {
-        &self.0
+        &self.slots
     }
 }
 
@@ -168,7 +185,7 @@ const fn is_reserved(byte: u8) -> bool {
 
 /// The opcodes of the sequence a superinstruction runs.
 #[derive(Clone, Copy)]
-struct Super {
+pub struct Super {
     /// The first instruction. With `alu`, a register `mov` whose slot also holds the source operand of `alu` in its
     /// `imm` field.
     first: u8,
@@ -242,14 +259,16 @@ stack_accesses! {
     0xc8: st(MemSize::DWord);
 }
 
-// Every byte above is a reserved one and has one use.
+// Every byte above and those of `transfer` is a reserved one and has one use.
 const _: () = {
     let mut bytes = [false; 256];
     let mut i = 0;
-    while i < SUPERS.len() + STACK.len() {
-        let byte = match i < SUPERS.len() {
-            true => SUPERS[i].0,
-            false => STACK[i - SUPERS.len()].0,
+    while i < SUPERS.len() + STACK.len() + 2 {
+        let byte = match i {
+            _ if i < SUPERS.len() => SUPERS[i].0,
+            _ if i < SUPERS.len() + STACK.len() => STACK[i - SUPERS.len()].0,
+            _ if i == SUPERS.len() + STACK.len() => GUARD,
+            _ => FAR,
         };
         assert!(is_reserved(byte));
         assert!(!bytes[byte as usize], "two uses of one opcode byte");
@@ -320,6 +339,20 @@ impl Super {
         sup
     }
 
+    /// The superinstruction with opcode byte `byte`, if there is one.
+    pub fn with_byte(byte: u8) -> Option<Self> {
+        const BY_BYTE: [Option<Super>; 256] = {
+            let mut table = [None; 256];
+            let mut i = 0;
+            while i < SUPERS.len() {
+                table[SUPERS[i].0 as usize] = Some(SUPERS[i].1);
+                i += 1;
+            }
+            table
+        };
+        BY_BYTE[byte as usize]
+    }
+
     /// The superinstruction with opcode byte `byte`.
     const fn of(byte: u8) -> Self {
         let mut i = 0;
@@ -354,7 +387,7 @@ impl Super {
     }
 
     /// The number of instructions in the sequence.
-    const fn len(self) -> usize {
+    pub const fn len(self) -> usize {
         let mut tail = 0;
         while tail < self.tail.len() && self.tail[tail] != 0 {
             tail += 1;
@@ -373,7 +406,7 @@ impl Super {
 
     /// The first instruction of the sequence whose first slot holds `slot`.
     #[inline(always)]
-    fn first_of(self, slot: Instruction) -> Instruction {
+    pub fn first_of(self, slot: Instruction) -> Instruction {
         match self.alu {
             0 => Instruction(slot.0 & !0xFF | u64::from(self.first)),
             _ => Instruction::from_parts(OpCode(self.first), slot.dst_reg(), slot.src_reg(), 0, 0),
@@ -423,6 +456,11 @@ impl Super {
     const fn branches_at(self, k: usize) -> bool {
         k == self.len() - 1 && matches!(OpCode(self.opcode(k)).class(), Class::Jmp32 | Class::Jmp64)
     }
+
+    /// Whether the last instruction of the sequence may branch.
+    pub const fn branches(self) -> bool {
+        self.branches_at(self.len() - 1)
+    }
 }
 
 /// The handler of superinstruction `S`. It runs the sequence as the handlers of its instructions would, one after
@@ -439,14 +477,14 @@ extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool, co
     let sup = const { Super::of(S) };
     let len = const { Super::of(S).len() };
 
-    // the sequence and the slot after it
-    let at = pc as usize;
-    let window = code.get(at..=at + len);
-    let Some(window) = window.filter(|_| !FUEL || fuel >= len as u64 - 1) else {
-        // the fuel runs out inside the sequence, or the code ends with it
+    // the fuel runs out inside the sequence
+    if FUEL && fuel < len as u64 - 1 {
         let alone = const { Handlers::<M, H, FUEL>::TABLE[Super::of(S).first as usize] };
         become alone(ctx, code, sup.first_of(insn), pc, fuel, calls)
-    };
+    }
+    // SAFETY: `transfer::bound` leaves a superinstruction only where its sequence lies in the code, and the guard slot
+    // follows the code
+    let window = unsafe { code.get_unchecked(pc as usize..=pc as usize + len) };
 
     // one block per instruction, so that each `step` sees a constant opcode
     let [i0, i1, i2, i3, i4] = sup.decode(insn, window);
@@ -478,13 +516,10 @@ extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool, co
     if FUEL && fuel == 0 {
         return calls.stop.at(pc, fuel, Flow::OutOfFuel);
     }
-    // a negative jump target wraps to a huge pc and fails the fetch
     let insn = match target {
         None => window[len],
-        Some(target) => match code.get(target as usize) {
-            Some(&insn) => insn,
-            None => return calls.stop.at(pc, fuel, Flow::BadPc),
-        },
+        // SAFETY: `transfer::bound` leaves a superinstruction only where its branch target lies in `0..=len`
+        Some(target) => unsafe { *code.get_unchecked(target as usize) },
     };
     become handler_of::<M, H, FUEL>(insn)(ctx, code, insn, pc, fuel - u64::from(FUEL), calls)
 }

@@ -142,7 +142,8 @@ pub extern "rust-preserve-none" fn access<M: Memory, H: Host<M>, const FUEL: boo
     }
 
     let pc = pc + 1;
-    match fetch::<M, H, FUEL>(code, pc, fuel) {
+    // SAFETY: the slots from `len` on hold the guard, so this handler ran below `len`
+    match unsafe { fetch::<M, H, FUEL>(code, pc, fuel) } {
         Ok((next, insn)) => become next(ctx, code, insn, pc, fuel - u64::from(FUEL), calls),
         Err(flow) => calls.stop.at(pc, fuel, flow),
     }

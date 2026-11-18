@@ -15,6 +15,7 @@ mod mem;
 mod memory;
 mod ops;
 mod stack;
+mod transfer;
 
 pub mod opcode;
 
@@ -146,6 +147,7 @@ impl<M: Memory, H: Host<M>, const FUEL: bool> Handlers<M, H, FUEL> {
             0xf0 0xf1 0xf2 0xf3 0xf4 0xf5 0xf6 0xf7 0xf8 0xf9 0xfa 0xfb 0xfc 0xfd 0xfe 0xff
         );
         fuse::install::<M, H, FUEL>(&mut table);
+        transfer::install::<M, H, FUEL>(&mut table);
         table
     };
 }
@@ -174,7 +176,14 @@ extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, 
             pc = pc.wrapping_add_signed(offset);
         }
         ControlFlow::Break(Flow::Exit) if jumps => match calls.pop(&mut ctx.regs) {
-            Some(call_pc) => pc = call_pc,
+            // `CallStack::push` takes any pc, so this one has no proof
+            Some(call_pc) => {
+                let pc = call_pc.wrapping_add(1);
+                match fetch_checked::<M, H, FUEL>(code, pc, fuel) {
+                    Ok((next, insn)) => become next(ctx, code, insn, pc, fuel - u64::from(FUEL), calls),
+                    Err(flow) => return calls.stop.at(pc, fuel, flow),
+                }
+            }
             None => return calls.stop.at(pc, fuel, Flow::Exit),
         },
         ControlFlow::Break(Flow::CallHelper(_)) if jumps => {
@@ -189,7 +198,9 @@ extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, 
                 return calls.stop.at(pc, 1, Flow::OutOfFuel);
             }
             pc += 1;
-            let Some(&second) = code.get(pc as usize) else {
+            // SAFETY: the slots from `len` on hold the guard, so this handler ran below `len`
+            let second = unsafe { *code.get_unchecked(pc as usize) };
+            let Some(second) = transfer::second_half(code, second) else {
                 return calls.stop.at(pc, fuel, Flow::BadPc);
             };
             if FUEL {
@@ -200,9 +211,10 @@ extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, 
         ControlFlow::Break(flow) => return calls.stop.at(pc, fuel, flow),
     }
 
-    // a negative jump target wraps to a huge pc and fails the fetch
+    // SAFETY: `pc` follows a slot below `len`, or the second slot of LD_IMM64, which `second_half` found below `len`,
+    // or it is the target of a jump or local call that `transfer::bound` left in `0..=len`
     let pc = pc.wrapping_add(1);
-    match fetch::<M, H, FUEL>(code, pc, fuel) {
+    match unsafe { fetch::<M, H, FUEL>(code, pc, fuel) } {
         Ok((next, insn)) => become next(ctx, code, insn, pc, fuel - u64::from(FUEL), calls),
         Err(flow) => calls.stop.at(pc, fuel, flow),
     }
@@ -232,15 +244,36 @@ extern "rust-preserve-none" fn host_call<M: Memory, H: Host<M>, const FUEL: bool
     ctx.regs[0] = r0;
 
     let pc = pc + 1;
-    match fetch::<M, H, FUEL>(code, pc, fuel) {
+    // SAFETY: the slots from `len` on hold the guard, so this handler ran below `len`
+    match unsafe { fetch::<M, H, FUEL>(code, pc, fuel) } {
         Ok((next, insn)) => become next(ctx, code, insn, pc, fuel - u64::from(FUEL), calls),
         Err(flow) => calls.stop.at(pc, fuel, flow),
     }
 }
 
 /// The instruction at `pc` and its handler, or why it can't run.
+///
+/// # Safety
+///
+/// `pc` must be below `code.len()`. The callers pass a pc in `0..=len` of the [`Code`] that `code` comes from, which
+/// ends with a guard slot at `len`; [`transfer`] states which pcs those are.
 #[inline(always)]
-fn fetch<M: Memory, H: Host<M>, const FUEL: bool>(
+unsafe fn fetch<M: Memory, H: Host<M>, const FUEL: bool>(
+    code: &[Instruction],
+    pc: u64,
+    fuel: u64,
+) -> Result<(Handler<M, H>, Instruction), Flow<M>> {
+    if FUEL && fuel == 0 {
+        return Err(Flow::OutOfFuel);
+    }
+    // SAFETY: the caller's
+    let insn = unsafe { *code.get_unchecked(pc as usize) };
+    Ok((handler_of::<M, H, FUEL>(insn), insn))
+}
+
+/// [`fetch`] at a pc no proof covers.
+#[inline(always)]
+fn fetch_checked<M: Memory, H: Host<M>, const FUEL: bool>(
     code: &[Instruction],
     pc: u64,
     fuel: u64,
@@ -298,7 +331,7 @@ pub fn run<M: Memory, H: Host<M>>(
 
     let code = code.slots();
     calls.stack.revalidate(&ctx.data);
-    let (first, insn) = match fetch::<M, H, METERED>(code, *pc, *fuel) {
+    let (first, insn) = match fetch_checked::<M, H, METERED>(code, *pc, *fuel) {
         Ok(next) => next,
         Err(flow) => return flow,
     };

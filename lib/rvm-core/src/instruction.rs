@@ -6,12 +6,10 @@ pub struct Instruction(pub u64);
 
 /// Decode little-endian bytecode (a trailing partial word is ignored) and prepare it for [`run`](crate::run).
 pub fn instructions_from_bytes(bytes: &[u8]) -> Code {
-    let insns: Box<[Instruction]> = bytes
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .map(|w| Instruction(u64::from_le_bytes(*w)))
-        .collect();
+    let words = bytes.as_chunks::<8>().0;
+    // room for the guard slot that `Code::new` appends
+    let mut insns = Vec::with_capacity(words.len() + 1);
+    insns.extend(words.iter().map(|w| Instruction(u64::from_le_bytes(*w))));
     Code::new(insns)
 }
 

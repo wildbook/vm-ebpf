@@ -288,7 +288,9 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
         }
     }
 
-    let mut insns: Box<[Instruction]> = words.iter().map(|w| Instruction(u64::from_le_bytes(*w))).collect();
+    // room for the guard slot that `Code::new` appends
+    let mut insns = Vec::with_capacity(words.len() + 1);
+    insns.extend(words.iter().map(|w| Instruction(u64::from_le_bytes(*w))));
     // Bind against one version of the table; the program refreshes from there.
     let (table, version) = helpers.snapshot();
     for (at, import) in &s.externs {
