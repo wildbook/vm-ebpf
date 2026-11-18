@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use crate::opcode::{AluEnd, AluOpc, JmpOpc, Source};
 use crate::{Flow, Instruction, BPF_PSEUDO_CALL, BPF_PSEUDO_KFUNC_CALL};
 
@@ -22,6 +24,21 @@ impl Regs for [u64; 16] {
     }
 }
 
+/// SDIV or SMOD (`$op` is `/` or `%`) of `$d` by `$s` as `$ty`, with the results RFC 9669 gives where Rust's would
+/// panic: `$by_zero` for a divisor of 0, and `$overflow` for the smallest value divided by -1.
+macro_rules! signed_div_rem {
+    ($ty:ty: $d:ident $op:tt $s:ident, by_zero: $by_zero:expr, overflow: $overflow:expr) => {{
+        let (ds, ss) = ($d as $ty, $s as $ty);
+        if ss == 0 {
+            $by_zero
+        } else if ss == -1 && ds == <$ty>::MIN {
+            $overflow
+        } else {
+            (ds $op ss) as u64
+        }
+    }};
+}
+
 #[inline(always)]
 pub fn math<E, R: Regs, const BITS: bool>(regs: &mut R, insn: Instruction) -> Flow<E> {
     let opc = insn.opcode();
@@ -29,24 +46,10 @@ pub fn math<E, R: Regs, const BITS: bool>(regs: &mut R, insn: Instruction) -> Fl
     let alu_src = opc.alu_src();
     let alu_end = opc.alu_end();
 
-    let src_reg = insn.src_reg();
     let dst_reg = insn.dst_reg();
-
     let imm = insn.imm();
     let offset = insn.offset();
-
-    let d = match BITS {
-        BITS_64 => regs.get(dst_reg),
-        BITS_32 => regs.get(dst_reg) & 0xFFFFFFFF,
-    };
-
-    let s = match (alu_src, BITS) {
-        (Source::Imm, BITS_64) => imm as i64 as u64,
-        // ALU32 treats the immediate as a 32-bit value.
-        (Source::Imm, BITS_32) => imm as u32 as u64,
-        (Source::Reg, BITS_64) => regs.get(src_reg),
-        (Source::Reg, BITS_32) => regs.get(src_reg) & 0xFFFFFFFF,
-    };
+    let (d, s) = operands::<R, BITS>(regs, insn);
 
     let result = match alu_opc {
         AluOpc::Add => d.wrapping_add(s),
@@ -55,74 +58,20 @@ pub fn math<E, R: Regs, const BITS: bool>(regs: &mut R, insn: Instruction) -> Fl
         // DIV (offset=0) or SDIV (offset=1)
         AluOpc::Div => match (offset, BITS) {
             (0, _) => d.checked_div(s).unwrap_or(0),
-            (1, BITS_64) => {
-                let ds = d as i64;
-                let ss = s as i64;
-                if ss == 0 {
-                    0
-                } else if ss == -1 && ds == i64::MIN {
-                    i64::MIN as u64
-                } else {
-                    (ds / ss) as u64
-                }
-            }
-            (1, BITS_32) => {
-                let ds = d as i32;
-                let ss = s as i32;
-                if ss == 0 {
-                    0
-                } else if ss == -1 && ds == i32::MIN {
-                    i32::MIN as u64
-                } else {
-                    (ds / ss) as u64
-                }
-            }
+            (1, BITS_64) => signed_div_rem!(i64: d / s, by_zero: 0, overflow: i64::MIN as u64),
+            (1, BITS_32) => signed_div_rem!(i32: d / s, by_zero: 0, overflow: i32::MIN as u64),
             _ => return Flow::FailCpu,
         },
         AluOpc::Or => d | s,
         AluOpc::And => d & s,
-        AluOpc::Lsh => match BITS {
-            BITS_64 => d << (s & 63),
-            BITS_32 => d << (s & 31),
-        },
-        AluOpc::Rsh => match BITS {
-            BITS_64 => d >> (s & 63),
-            BITS_32 => d >> (s & 31),
-        },
+        AluOpc::Lsh => d << shift::<BITS>(s),
+        AluOpc::Rsh => d >> shift::<BITS>(s),
         AluOpc::Neg => d.wrapping_neg(),
         // MOD (offset=0) or SMOD (offset=1)
         AluOpc::Mod => match (offset, BITS) {
-            (0, BITS_64) => d.checked_rem(s).unwrap_or(d),
-            (0, BITS_32) => {
-                // the upper 32 bits are zeroed below
-                if s == 0 {
-                    d
-                } else {
-                    d % s
-                }
-            }
-            (1, BITS_64) => {
-                let ds = d as i64;
-                let ss = s as i64;
-                if ss == 0 {
-                    d
-                } else if ss == -1 && ds == i64::MIN {
-                    0u64
-                } else {
-                    (ds % ss) as u64
-                }
-            }
-            (1, BITS_32) => {
-                let ds = d as i32;
-                let ss = s as i32;
-                if ss == 0 {
-                    d // zero-extended below
-                } else if ss == -1 && ds == i32::MIN {
-                    0u64
-                } else {
-                    (ds % ss) as u64
-                }
-            }
+            (0, _) => d.checked_rem(s).unwrap_or(d),
+            (1, BITS_64) => signed_div_rem!(i64: d % s, by_zero: d, overflow: 0),
+            (1, BITS_32) => signed_div_rem!(i32: d % s, by_zero: d, overflow: 0),
             _ => return Flow::FailCpu,
         },
         AluOpc::Xor => d ^ s,
@@ -140,8 +89,8 @@ pub fn math<E, R: Regs, const BITS: bool>(regs: &mut R, insn: Instruction) -> Fl
             }
         }
         AluOpc::Arsh => match BITS {
-            BITS_64 => ((d as i64) >> (s & 63)) as u64,
-            BITS_32 => ((d as i32) >> (s & 31)) as u64,
+            BITS_64 => ((d as i64) >> shift::<BITS>(s)) as u64,
+            BITS_32 => ((d as i32) >> shift::<BITS>(s)) as u64,
         },
         // END: width comes from imm and the result is not zero-extended by class. Guest memory is little-endian, so
         // LE truncates and BE swaps; ALU64 TO_LE is the unconditional BSWAP and ALU64 TO_BE is reserved.
@@ -166,12 +115,7 @@ pub fn math<E, R: Regs, const BITS: bool>(regs: &mut R, insn: Instruction) -> Fl
         }
         AluOpc::UndefE | AluOpc::UndefF => return Flow::FailCpu,
     };
-
-    let value = match BITS {
-        BITS_64 => result,
-        BITS_32 => result & 0xFFFFFFFF,
-    };
-    regs.set(dst_reg, value);
+    regs.set(dst_reg, truncate::<BITS>(result));
 
     Flow::Next
 }
@@ -184,20 +128,8 @@ pub fn jump<E, R: Regs, const BITS: bool>(regs: &R, insn: Instruction) -> Flow<E
 
     let src_reg = insn.src_reg();
     let dst_reg = insn.dst_reg();
-
     let imm = insn.imm();
-
-    let d = match BITS {
-        BITS_64 => regs.get(dst_reg),
-        BITS_32 => regs.get(dst_reg) & 0xFFFFFFFF,
-    };
-
-    let s = match (jmp_src, BITS) {
-        (Source::Imm, BITS_64) => imm as i64 as u64,
-        (Source::Imm, BITS_32) => imm as u32 as u64,
-        (Source::Reg, BITS_64) => regs.get(src_reg),
-        (Source::Reg, BITS_32) => regs.get(src_reg) & 0xFFFFFFFF,
-    };
+    let (d, s) = operands::<R, BITS>(regs, insn);
 
     let cond = match jmp_opc {
         // RFC 9669 defines CALL and EXIT only in the JMP class, EXIT only with source K, and JMP32 JA only with K
@@ -218,24 +150,12 @@ pub fn jump<E, R: Regs, const BITS: bool>(regs: &R, insn: Instruction) -> Flow<E
         JmpOpc::Jge => d >= s,
         JmpOpc::Jset => (d & s) != 0,
         JmpOpc::Jne => d != s,
-        JmpOpc::Jsgt => match BITS {
-            BITS_64 => (d as i64) > (s as i64),
-            BITS_32 => (d as i32) > (s as i32),
-        },
-        JmpOpc::Jsge => match BITS {
-            BITS_64 => (d as i64) >= (s as i64),
-            BITS_32 => (d as i32) >= (s as i32),
-        },
+        JmpOpc::Jsgt => signed_cmp::<BITS>(d, s).is_gt(),
+        JmpOpc::Jsge => signed_cmp::<BITS>(d, s).is_ge(),
         JmpOpc::Jlt => d < s,
         JmpOpc::Jle => d <= s,
-        JmpOpc::Jslt => match BITS {
-            BITS_64 => (d as i64) < (s as i64),
-            BITS_32 => (d as i32) < (s as i32),
-        },
-        JmpOpc::Jsle => match BITS {
-            BITS_64 => (d as i64) <= (s as i64),
-            BITS_32 => (d as i32) <= (s as i32),
-        },
+        JmpOpc::Jslt => signed_cmp::<BITS>(d, s).is_lt(),
+        JmpOpc::Jsle => signed_cmp::<BITS>(d, s).is_le(),
 
         JmpOpc::Call if jmp_src == Source::Reg => return Flow::CallIndirect(d),
         JmpOpc::Call if insn.src_reg() == 0 => return Flow::CallHelper(imm as u32),
@@ -256,5 +176,45 @@ pub fn jump<E, R: Regs, const BITS: bool>(regs: &R, insn: Instruction) -> Flow<E
     match cond {
         true => Flow::Jump(insn.offset() as i64),
         false => Flow::Next,
+    }
+}
+
+/// The operands of the ALU or jump instruction `insn` on `BITS` bits: `dst_reg`, and `src_reg` or `imm` as its
+/// source bit selects, cut to `BITS` bits.
+#[inline(always)]
+fn operands<R: Regs, const BITS: bool>(regs: &R, insn: Instruction) -> (u64, u64) {
+    let d = truncate::<BITS>(regs.get(insn.dst_reg()));
+    let s = match (insn.opcode().alu_src(), BITS) {
+        (Source::Imm, BITS_64) => insn.imm() as i64 as u64,
+        (Source::Imm, BITS_32) => insn.imm() as u32 as u64,
+        (Source::Reg, _) => truncate::<BITS>(regs.get(insn.src_reg())),
+    };
+    (d, s)
+}
+
+/// `x` cut to `BITS` bits.
+#[inline(always)]
+fn truncate<const BITS: bool>(x: u64) -> u64 {
+    match BITS {
+        BITS_64 => x,
+        BITS_32 => x as u32 as u64,
+    }
+}
+
+/// `d` compared with `s` as signed values of `BITS` bits.
+#[inline(always)]
+fn signed_cmp<const BITS: bool>(d: u64, s: u64) -> Ordering {
+    match BITS {
+        BITS_64 => (d as i64).cmp(&(s as i64)),
+        BITS_32 => (d as i32).cmp(&(s as i32)),
+    }
+}
+
+/// The shift amount of a shift by `s` on `BITS` bits.
+#[inline(always)]
+fn shift<const BITS: bool>(s: u64) -> u64 {
+    match BITS {
+        BITS_64 => s & 63,
+        BITS_32 => s & 31,
     }
 }

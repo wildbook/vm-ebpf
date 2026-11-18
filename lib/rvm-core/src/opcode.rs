@@ -22,6 +22,22 @@ impl OpCode {
         OpCode(Class::LdReg as u8 | size as u8 | mode as u8)
     }
 
+    pub const fn alu32_from_parts(opc: AluOpc, src: Source) -> Self {
+        OpCode(Class::Alu32 as u8 | opc as u8 | src as u8)
+    }
+
+    pub const fn alu64_from_parts(opc: AluOpc, src: Source) -> Self {
+        OpCode(Class::Alu64 as u8 | opc as u8 | src as u8)
+    }
+
+    pub const fn end32_from_parts(end: AluEnd) -> Self {
+        OpCode(Class::Alu32 as u8 | AluOpc::End as u8 | end as u8)
+    }
+
+    pub const fn end64_from_parts(end: AluEnd) -> Self {
+        OpCode(Class::Alu64 as u8 | AluOpc::End as u8 | end as u8)
+    }
+
     pub const fn jmp32_from_parts(opc: JmpOpc, src: Source) -> Self {
         OpCode(Class::Jmp32 as u8 | opc as u8 | src as u8)
     }
@@ -30,6 +46,12 @@ impl OpCode {
         OpCode(Class::Jmp64 as u8 | opc as u8 | src as u8)
     }
 }
+
+/// The opcode byte of LD_IMM64, whose two slots load a 64-bit immediate.
+pub const LD_IMM64: u8 = OpCode(Class::LdImm as u8 | MemMode::Imm as u8 | MemSize::DWord as u8).0;
+
+/// The opcode byte of `call`: a helper, local or kfunc call, as `src_reg` selects.
+pub const CALL: u8 = OpCode::jmp64_from_parts(JmpOpc::Call, Source::Imm).0;
 
 #[rustfmt::skip]
 #[allow(clippy::unusual_byte_groupings)]
@@ -122,39 +144,6 @@ bits_enum! {
     }
 }
 
-#[rustfmt::skip]
-impl AluOpc {
-    pub const fn add_32(src: Source)   -> OpCode { OpCode(Class::Alu32 as u8 | AluOpc::Add  as u8 | src as u8) }
-    pub const fn sub_32(src: Source)   -> OpCode { OpCode(Class::Alu32 as u8 | AluOpc::Sub  as u8 | src as u8) }
-    pub const fn mul_32(src: Source)   -> OpCode { OpCode(Class::Alu32 as u8 | AluOpc::Mul  as u8 | src as u8) }
-    pub const fn div_32(src: Source)   -> OpCode { OpCode(Class::Alu32 as u8 | AluOpc::Div  as u8 | src as u8) }
-    pub const fn or_32(src: Source)    -> OpCode { OpCode(Class::Alu32 as u8 | AluOpc::Or   as u8 | src as u8) }
-    pub const fn and_32(src: Source)   -> OpCode { OpCode(Class::Alu32 as u8 | AluOpc::And  as u8 | src as u8) }
-    pub const fn lsh_32(src: Source)   -> OpCode { OpCode(Class::Alu32 as u8 | AluOpc::Lsh  as u8 | src as u8) }
-    pub const fn rsh_32(src: Source)   -> OpCode { OpCode(Class::Alu32 as u8 | AluOpc::Rsh  as u8 | src as u8) }
-    pub const fn neg_32(src: Source)   -> OpCode { OpCode(Class::Alu32 as u8 | AluOpc::Neg  as u8 | src as u8) }
-    pub const fn mod_32(src: Source)   -> OpCode { OpCode(Class::Alu32 as u8 | AluOpc::Mod  as u8 | src as u8) }
-    pub const fn xor_32(src: Source)   -> OpCode { OpCode(Class::Alu32 as u8 | AluOpc::Xor  as u8 | src as u8) }
-    pub const fn mov_32(src: Source)   -> OpCode { OpCode(Class::Alu32 as u8 | AluOpc::Mov  as u8 | src as u8) }
-    pub const fn arsh_32(src: Source)  -> OpCode { OpCode(Class::Alu32 as u8 | AluOpc::Arsh as u8 | src as u8) }
-    pub const fn end_32(end: AluEnd)   -> OpCode { OpCode(Class::Alu32 as u8 | AluOpc::End  as u8 | end as u8) }
-
-    pub const fn add_64(src: Source)   -> OpCode { OpCode(Class::Alu64 as u8 | AluOpc::Add  as u8 | src as u8) }
-    pub const fn sub_64(src: Source)   -> OpCode { OpCode(Class::Alu64 as u8 | AluOpc::Sub  as u8 | src as u8) }
-    pub const fn mul_64(src: Source)   -> OpCode { OpCode(Class::Alu64 as u8 | AluOpc::Mul  as u8 | src as u8) }
-    pub const fn div_64(src: Source)   -> OpCode { OpCode(Class::Alu64 as u8 | AluOpc::Div  as u8 | src as u8) }
-    pub const fn or_64(src: Source)    -> OpCode { OpCode(Class::Alu64 as u8 | AluOpc::Or   as u8 | src as u8) }
-    pub const fn and_64(src: Source)   -> OpCode { OpCode(Class::Alu64 as u8 | AluOpc::And  as u8 | src as u8) }
-    pub const fn lsh_64(src: Source)   -> OpCode { OpCode(Class::Alu64 as u8 | AluOpc::Lsh  as u8 | src as u8) }
-    pub const fn rsh_64(src: Source)   -> OpCode { OpCode(Class::Alu64 as u8 | AluOpc::Rsh  as u8 | src as u8) }
-    pub const fn neg_64(src: Source)   -> OpCode { OpCode(Class::Alu64 as u8 | AluOpc::Neg  as u8 | src as u8) }
-    pub const fn mod_64(src: Source)   -> OpCode { OpCode(Class::Alu64 as u8 | AluOpc::Mod  as u8 | src as u8) }
-    pub const fn xor_64(src: Source)   -> OpCode { OpCode(Class::Alu64 as u8 | AluOpc::Xor  as u8 | src as u8) }
-    pub const fn mov_64(src: Source)   -> OpCode { OpCode(Class::Alu64 as u8 | AluOpc::Mov  as u8 | src as u8) }
-    pub const fn arsh_64(src: Source)  -> OpCode { OpCode(Class::Alu64 as u8 | AluOpc::Arsh as u8 | src as u8) }
-    pub const fn end_64(end: AluEnd)   -> OpCode { OpCode(Class::Alu64 as u8 | AluOpc::End  as u8 | end as u8) }
-}
-
 bits_enum! {
     pub enum AluEnd : 0b0000_1000 {
         ToLE = 0x00, // 0b....'0'...
@@ -192,6 +181,18 @@ bits_enum! {
     }
 }
 
+impl MemSize {
+    /// The number of bytes an access of this size reads or writes.
+    pub const fn bytes(self) -> usize {
+        match self {
+            MemSize::Byte => 1,
+            MemSize::Half => 2,
+            MemSize::Word => 4,
+            MemSize::DWord => 8,
+        }
+    }
+}
+
 bits_enum! {
     pub enum MemMode : 0b1110_0000 {
         Imm = 0x00,    // 0b000'..'...
@@ -203,4 +204,21 @@ bits_enum! {
         Atomic = 0xC0, // 0b110'..'...
         UndefE = 0xE0, // 0b111'..'...
     }
+}
+
+/// The `imm` of an `STX | ATOMIC` instruction, which selects its operation.
+pub mod atomic {
+    pub const ADD: i32 = 0x00;
+    pub const OR: i32 = 0x40;
+    pub const AND: i32 = 0x50;
+    pub const XOR: i32 = 0xa0;
+    pub const XCHG: i32 = 0xe0 | FETCH;
+    /// Compares with r0 and writes the old value there.
+    pub const CMPXCHG: i32 = 0xf0 | FETCH;
+    /// Set in a read-modify-write operation that writes the old value to `src_reg`.
+    pub const FETCH: i32 = 0x01;
+    /// Load-acquire, which reads through `src_reg` into `dst_reg`; any size.
+    pub const LOAD_ACQ: i32 = 0x100;
+    /// Store-release; any size.
+    pub const STORE_REL: i32 = 0x110;
 }

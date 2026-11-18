@@ -5,8 +5,66 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::ControlFlow;
 
-use opcode::{Class, MemMode, MemSize, OpCode};
+use opcode::{Class, OpCode, LD_IMM64};
 use transfer::Slot;
+
+/// `for $i in $range $body` in a const context, where `for` isn't allowed. `$i` takes each value of the
+/// [`Range`](std::ops::Range) `$range` in turn; `continue` and `break` work as in `for`.
+macro_rules! const_for {
+    ($i:ident in $range:expr => $body:block) => {{
+        let std::ops::Range { start, end } = $range;
+        let mut next = start;
+        while next < end {
+            let $i = next;
+            next += 1;
+            $body
+        }
+    }};
+}
+
+/// A table with the value of `$value` for each opcode byte `$byte`.
+macro_rules! byte_table {
+    (|$byte:ident| $value:expr) => {{
+        let mut table = [{
+            let $byte = 0u8;
+            $value
+        }; 256];
+        const_for!(i in 1..256 => {
+            let $byte = i as u8;
+            table[i] = $value;
+        });
+        table
+    }};
+}
+
+/// Continues at the slot after `$slot`: tail-calls the handler of its instruction, or stops with
+/// [`Flow::OutOfFuel`]. Either way, the handler that expands it ends here; the handler's generic parameters must be
+/// `M`, `H` and `FUEL`. `$slot` must lie below `len`, as the slot of every handler but the guard's does, or precede a
+/// target that [`transfer::bound`] proves lies in `0..=len`.
+macro_rules! become_next {
+    ($ctx:expr, $code:expr, $slot:expr, $fuel:expr, $calls:expr, $table:expr) => {{
+        let slot = $slot.offset(1);
+        // SAFETY: the slot after one below `len` lies in `0..=len`, as do the targets `transfer::bound` proves (see
+        // `Slot`)
+        match unsafe { $crate::fetch::<M, H, FUEL>($table, slot, $fuel) } {
+            Some((next, insn, fuel)) => become next($ctx, insn, $code, slot, fuel, $calls, $table),
+            None => return $calls.stop.at(slot, 0, $crate::Flow::OutOfFuel),
+        }
+    }};
+}
+
+/// Continues at `$pc`, which no proof covers: tail-calls the handler of its instruction, or stops with the flow
+/// [`fetch_checked`] reports. Either way, the handler that expands it ends here; its generic parameters are named as
+/// for [`become_next!`].
+macro_rules! become_at_pc {
+    ($ctx:expr, $code:expr, $pc:expr, $fuel:expr, $calls:expr, $table:expr) => {{
+        let pc = $pc;
+        match $crate::fetch_checked::<M, H, FUEL>($table, $code, pc, $fuel) {
+            Ok((next, insn, slot, fuel)) => become next($ctx, insn, $code, slot, fuel, $calls, $table),
+            Err(flow) => return $calls.stop.at_pc(pc, $fuel, flow),
+        }
+    }};
+}
 
 mod call;
 mod debug;
@@ -84,12 +142,12 @@ impl<M: Memory> Context<M> {
 }
 
 #[inline(always)]
-pub(crate) fn step<M: Memory, R: ops::Regs>(
+fn step<M: Memory, R: ops::Regs>(
     regs: &mut R,
     mem: &mut M,
     insn: Instruction,
 ) -> ControlFlow<Flow<M::Err>, Instruction> {
-    use mem::{WITH_IMM, WITH_REG};
+    use mem::{SOURCE_IMM, SOURCE_REG};
     use ops::{BITS_32, BITS_64};
 
     match insn.opcode().class() {
@@ -102,8 +160,8 @@ pub(crate) fn step<M: Memory, R: ops::Regs>(
         Class::LdImm => mem::ld64(insn),
         Class::LdReg => ControlFlow::Break(mem::load(regs, mem, insn)),
 
-        Class::StImm => ControlFlow::Break(mem::save::<_, _, WITH_IMM>(regs, mem, insn)),
-        Class::StReg => ControlFlow::Break(mem::save::<_, _, WITH_REG>(regs, mem, insn)),
+        Class::StImm => ControlFlow::Break(mem::store::<_, _, SOURCE_IMM>(regs, mem, insn)),
+        Class::StReg => ControlFlow::Break(mem::store::<_, _, SOURCE_REG>(regs, mem, insn)),
     }
 }
 
@@ -180,7 +238,7 @@ extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, 
     // Only jump-class opcodes jump, call or exit. Without the guards, a handler whose `step` returns from an outlined
     // call (atomics) would test for those flows too.
     let jumps = matches!(OpCode(OP).class(), Class::Jmp32 | Class::Jmp64);
-    match step(&mut ctx.regs, &mut ctx.data, Instruction(insn.0 & !0xFF | OP as u64)) {
+    match step(&mut ctx.regs, &mut ctx.data, insn.with_opcode(OP)) {
         ControlFlow::Break(Flow::Next) => {}
         ControlFlow::Break(Flow::Jump(offset)) if jumps => slot = slot.offset(offset),
         ControlFlow::Break(Flow::Call(offset)) if jumps => {
@@ -191,13 +249,7 @@ extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, 
         }
         ControlFlow::Break(Flow::Exit) if jumps => match calls.pop(&mut ctx.regs) {
             // `CallStack::push` takes any pc, so this one has no proof
-            Some(call_pc) => {
-                let pc = call_pc.wrapping_add(1);
-                match fetch_checked::<M, H, FUEL>(table, code, pc, fuel) {
-                    Ok((next, insn, slot, fuel)) => become next(ctx, insn, code, slot, fuel, calls, table),
-                    Err(flow) => return calls.stop.at_pc(pc, fuel, flow),
-                }
-            }
+            Some(call_pc) => become_at_pc!(ctx, code, call_pc.wrapping_add(1), fuel, calls, table),
             None => return calls.stop.at(slot, fuel, Flow::Exit),
         },
         ControlFlow::Break(Flow::CallHelper(_)) if jumps => {
@@ -225,13 +277,9 @@ extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, 
         ControlFlow::Break(flow) => return calls.stop.at(slot, fuel, flow),
     }
 
-    // SAFETY: the next slot follows a slot below `len`, or the second slot of LD_IMM64, which `second_half` found
-    // below `len`, or the target of a jump or local call that `transfer::bound` left in `0..=len` (see `Slot`)
-    let slot = slot.offset(1);
-    match unsafe { fetch::<M, H, FUEL>(table, slot, fuel) } {
-        Some((next, insn, fuel)) => become next(ctx, insn, code, slot, fuel, calls, table),
-        None => calls.stop.at(slot, 0, Flow::OutOfFuel),
-    }
+    // `slot` is the slot of `insn` or of the second half of LD_IMM64, which `second_half` found below `len`, or it
+    // precedes the target of a jump or local call
+    become_next!(ctx, code, slot, fuel, calls, table)
 }
 
 /// The rest of the handler of a helper `call`, or with `KFUNC` a kfunc `call`: runs it on the host and continues with
@@ -258,12 +306,7 @@ extern "rust-preserve-none" fn host_call<M: Memory, H: Host<M>, const FUEL: bool
     calls.stack.revalidate(&ctx.data);
     ctx.regs[0] = r0;
 
-    let slot = slot.offset(1);
-    // SAFETY: the slots from `len` on hold the guard, so this handler ran below `len` (see `Slot`)
-    match unsafe { fetch::<M, H, FUEL>(table, slot, fuel) } {
-        Some((next, insn, fuel)) => become next(ctx, insn, code, slot, fuel, calls, table),
-        None => calls.stop.at(slot, 0, Flow::OutOfFuel),
-    }
+    become_next!(ctx, code, slot, fuel, calls, table)
 }
 
 /// The instruction in `slot`, its handler and the fuel left once it is charged, or `None` if no fuel is left.
@@ -317,16 +360,13 @@ impl<M: Memory, H> Table<M, H> {
     /// The handler of `insn`.
     #[inline(always)]
     fn of(&self, insn: Instruction) -> Handler<M, H> {
-        self.0[usize::from(insn.0 as u8)]
+        self.0[usize::from(insn.byte())]
     }
 }
 
 #[inline(always)]
-pub(crate) fn step_ld64<M: Memory>(ctx: &mut Context<M>, insn: Instruction, second: Instruction) {
-    debug_assert!(matches!(
-        (insn.opcode().class(), insn.opcode().mem_mode(), insn.opcode().mem_size(), insn.src_reg()),
-        (Class::LdImm, MemMode::Imm, MemSize::DWord, 0)
-    ));
+fn step_ld64<M: Memory>(ctx: &mut Context<M>, insn: Instruction, second: Instruction) {
+    debug_assert!(insn.byte() == LD_IMM64 && insn.src_reg() == 0);
 
     // the first slot carries the low 32 bits, the second the high 32 bits
     let imm_lo = insn.imm() as u32 as u64;

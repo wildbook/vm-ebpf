@@ -33,6 +33,16 @@ impl Instruction {
     pub const fn opcode(self) -> OpCode {
         OpCode((self.0 & 0x00000000000000FF) as u8)
     }
+
+    /// The opcode byte.
+    pub const fn byte(self) -> u8 {
+        self.0 as u8
+    }
+
+    /// This instruction with the opcode byte `byte`.
+    pub const fn with_opcode(self, byte: u8) -> Self {
+        Self(self.0 & !0xFF | byte as u64)
+    }
 }
 
 impl Instruction {

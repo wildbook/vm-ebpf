@@ -1,13 +1,20 @@
 use std::ops::ControlFlow;
 
+use crate::opcode::atomic::{ADD, AND, CMPXCHG, FETCH, LOAD_ACQ, OR, STORE_REL, XCHG, XOR};
 use crate::opcode::{MemMode, MemSize};
 use crate::ops::Regs;
 use crate::{AtomicOp, Flow, Instruction, Memory};
 
-pub const WITH_REG: bool = true;
-pub const WITH_IMM: bool = false;
+pub const SOURCE_REG: bool = true;
+pub const SOURCE_IMM: bool = false;
 
-fn mem_store<M: Memory>(mem: &mut M, size: MemSize, addr: u64, value: u64) -> Result<(), M::Err> {
+/// The address `insn` accesses through the base register value `base`.
+#[inline(always)]
+pub fn address(base: u64, insn: Instruction) -> u64 {
+    base.wrapping_add_signed(i64::from(insn.offset()))
+}
+
+fn store_plain<M: Memory>(mem: &mut M, size: MemSize, addr: u64, value: u64) -> Result<(), M::Err> {
     match size {
         MemSize::Byte => mem.store_u8(addr, value as u8),
         MemSize::Half => mem.store_u16(addr, value as u16),
@@ -16,7 +23,7 @@ fn mem_store<M: Memory>(mem: &mut M, size: MemSize, addr: u64, value: u64) -> Re
     }
 }
 
-fn mem_load<M: Memory>(mem: &M, size: MemSize, addr: u64) -> Result<u64, M::Err> {
+fn load_plain<M: Memory>(mem: &M, size: MemSize, addr: u64) -> Result<u64, M::Err> {
     match size {
         MemSize::Byte => mem.load_u8(addr).map(u64::from),
         MemSize::Half => mem.load_u16(addr).map(u64::from),
@@ -25,7 +32,7 @@ fn mem_load<M: Memory>(mem: &M, size: MemSize, addr: u64) -> Result<u64, M::Err>
     }
 }
 
-fn mem_load_sx<M: Memory>(mem: &M, size: MemSize, addr: u64) -> Result<u64, M::Err> {
+fn load_sx<M: Memory>(mem: &M, size: MemSize, addr: u64) -> Result<u64, M::Err> {
     match size {
         MemSize::Byte => mem.load_u8(addr).map(|x| x as i8 as i64 as u64),
         MemSize::Half => mem.load_u16(addr).map(|x| x as i16 as i64 as u64),
@@ -52,32 +59,24 @@ fn store_release<M: Memory>(mem: &mut M, size: MemSize, addr: u64, value: u64) -
     }
 }
 
+/// `ST` or, with [`SOURCE_REG`], `STX`.
 #[inline(always)]
-pub fn save<M: Memory, R: Regs, const X: bool>(regs: &mut R, mem: &mut M, insn: Instruction) -> Flow<M::Err> {
-    let val = match X {
-        true => regs.get(insn.src_reg()),
-        false => i64::from(insn.imm()) as u64,
+pub fn store<M: Memory, R: Regs, const SOURCE: bool>(regs: &mut R, mem: &mut M, insn: Instruction) -> Flow<M::Err> {
+    let val = match SOURCE {
+        SOURCE_REG => regs.get(insn.src_reg()),
+        SOURCE_IMM => i64::from(insn.imm()) as u64,
     };
-
-    let dst = regs.get(insn.dst_reg());
-    let addr = dst.wrapping_add_signed(i64::from(insn.offset()));
+    let addr = address(regs.get(insn.dst_reg()), insn);
 
     let opc = insn.opcode();
     let size = opc.mem_size();
     let mode = opc.mem_mode();
 
     let result = match mode {
-        MemMode::Mem => mem_store(mem, size, addr, val),
-        MemMode::Atomic if X => return atomic(regs, mem, insn, size, addr, val),
-
+        MemMode::Mem => store_plain(mem, size, addr, val),
+        MemMode::Atomic if SOURCE == SOURCE_REG => return atomic(regs, mem, insn, size, addr, val),
         // ABS and IND exist only in the LD class
-        MemMode::Imm
-        | MemMode::Abs
-        | MemMode::Ind
-        | MemMode::MemSX
-        | MemMode::Atomic
-        | MemMode::UndefA
-        | MemMode::UndefE => return Flow::FailCpu,
+        _ => return Flow::FailCpu,
     };
     if let Err(err) = result {
         return Flow::FailMem(err);
@@ -96,14 +95,6 @@ fn atomic<M: Memory, R: Regs>(
     addr: u64,
     src: u64,
 ) -> Flow<M::Err> {
-    const FETCH: i32 = 0x01;
-    const ADD: i32 = 0x00;
-    const OR: i32 = 0x40;
-    const AND: i32 = 0x50;
-    const XOR: i32 = 0xa0;
-    const XCHG: i32 = 0xe0 | FETCH;
-    const CMPXCHG: i32 = 0xf0 | FETCH;
-
     let src_reg = insn.src_reg();
     let imm = insn.imm();
 
@@ -156,13 +147,9 @@ fn ordered<M: Memory, R: Regs>(
     addr: u64,
     src: u64,
 ) -> Flow<M::Err> {
-    const LOAD_ACQ: i32 = 0x100;
-    const STORE_REL: i32 = 0x110;
-
     let result = match insn.imm() {
         LOAD_ACQ => {
-            let base = regs.get(insn.src_reg());
-            let addr = base.wrapping_add_signed(i64::from(insn.offset()));
+            let addr = address(regs.get(insn.src_reg()), insn);
             load_acquire(mem, size, addr).map(|val| regs.set(insn.dst_reg(), val))
         }
         STORE_REL => store_release(mem, size, addr, src),
@@ -174,29 +161,23 @@ fn ordered<M: Memory, R: Regs>(
     }
 }
 
+/// `LDX`.
 #[inline(always)]
 pub fn load<M: Memory, R: Regs>(regs: &mut R, mem: &M, insn: Instruction) -> Flow<M::Err> {
-    let src = regs.get(insn.src_reg());
-    let addr = src.wrapping_add_signed(i64::from(insn.offset()));
+    let addr = address(regs.get(insn.src_reg()), insn);
 
     let opc = insn.opcode();
     let size = opc.mem_size();
     let mode = opc.mem_mode();
 
-    match match mode {
-        MemMode::Mem => mem_load(mem, size, addr),
+    let loaded = match mode {
+        MemMode::Mem => load_plain(mem, size, addr),
         // RFC 9669 defines MEMSX for B, H and W only
-        MemMode::MemSX if !matches!(size, MemSize::DWord) => mem_load_sx(mem, size, addr),
-
+        MemMode::MemSX if !matches!(size, MemSize::DWord) => load_sx(mem, size, addr),
         // ABS and IND exist only in the LD class
-        MemMode::Imm
-        | MemMode::Abs
-        | MemMode::Ind
-        | MemMode::MemSX
-        | MemMode::Atomic
-        | MemMode::UndefA
-        | MemMode::UndefE => return Flow::FailCpu,
-    } {
+        _ => return Flow::FailCpu,
+    };
+    match loaded {
         Ok(val) => regs.set(insn.dst_reg(), val),
         Err(err) => return Flow::FailMem(err),
     }

@@ -11,7 +11,8 @@
 
 use std::ops::ControlFlow;
 
-use crate::opcode::{AluOpc, Class, JmpOpc, MemMode, MemSize, OpCode, Source};
+use crate::opcode::atomic::{CMPXCHG, FETCH, LOAD_ACQ};
+use crate::opcode::{AluOpc, Class, JmpOpc, MemMode, MemSize, OpCode, Source, LD_IMM64};
 use crate::ops::Regs;
 use crate::transfer::{self, Slot, FAR, GUARD};
 use crate::{charge, stack, step, CallStack, Context, Flow, Handler, Handlers, Host, Instruction, Memory, Table};
@@ -59,23 +60,18 @@ impl Code {
     /// [`Flow::FailMem`] at `pc`.
     #[cold]
     pub fn access_size(&self, pc: u64) -> Option<usize> {
-        let byte = self.slots.get(usize::try_from(pc).ok()?)?.0 as u8;
+        let byte = self.slots.get(usize::try_from(pc).ok()?)?.byte();
         // the first slot of a superinstruction or r10 access holds a reserved byte in place of its opcode
-        let byte = match (STACK.iter().find(|s| s.0 == byte), SUPERS.iter().find(|s| s.0 == byte)) {
+        let byte = match (STACK.iter().find(|s| s.0 == byte), Super::with_byte(byte)) {
             (Some(&(_, usual)), _) => usual,
-            (None, Some(&(_, sup, _))) => sup.op(0),
+            (None, Some(sup)) => sup.op(0),
             (None, None) => byte,
         };
         let opc = OpCode(byte);
         if !matches!(opc.class(), Class::LdReg | Class::StReg | Class::StImm) {
             return None;
         }
-        Some(match opc.mem_size() {
-            MemSize::Byte => 1,
-            MemSize::Half => 2,
-            MemSize::Word => 4,
-            MemSize::DWord => 8,
-        })
+        Some(opc.mem_size().bytes())
     }
 
     /// The code and the slots after it, which all hold [`GUARD`].
@@ -89,12 +85,12 @@ impl Code {
 fn fuse(code: &mut [Instruction]) {
     // Only the opcode byte changes, so the second slot of LD_IMM64 keeps its `imm`.
     for insn in code.iter_mut() {
-        let writes = WRITES[insn.0 as u8 as usize];
+        let writes = WRITES[usize::from(insn.byte())];
         // `&` and `|` don't branch, so only the rare rewrite and atomics do
         let r10 = (writes.dst & (insn.dst_reg() == 10)) | (writes.atomic && atomic_writes_r10(*insn));
         if writes.reserved | r10 {
             let byte = if writes.reserved { MISSING } else { INVALID };
-            insn.0 = insn.0 & !0xFF | u64::from(byte);
+            *insn = insn.with_opcode(byte);
         }
     }
 
@@ -103,7 +99,7 @@ fn fuse(code: &mut [Instruction]) {
     // reads the fields `encode` checked.
     for i in 0..code.len() {
         // the slot after LD_IMM64 holds the upper half of its immediate
-        if i > 0 && code[i - 1].0 as u8 == LD_IMM64 {
+        if i > 0 && code[i - 1].byte() == LD_IMM64 {
             continue;
         }
         let window = &code[i..];
@@ -112,7 +108,7 @@ fn fuse(code: &mut [Instruction]) {
         if let Some(slot) = found {
             code[i] = slot;
         } else if let Some(byte) = stack_byte(code[i]) {
-            code[i].0 = code[i].0 & !0xFF | u64::from(byte);
+            code[i] = code[i].with_opcode(byte);
         }
     }
 }
@@ -130,33 +126,32 @@ struct Writes {
 
 /// The [`Writes`] of each opcode byte.
 const WRITES: [Writes; 256] = {
-    let mut table = [Writes {
+    const NONE: Writes = Writes {
         reserved: false,
         dst: false,
         atomic: false,
-    }; 256];
-    let mut byte = 0;
-    while byte < 256 {
-        let opc = OpCode(byte as u8);
-        let writes = &mut table[byte];
+    };
+
+    byte_table!(|byte| {
+        let opc = OpCode(byte);
         match opc.class() {
-            _ if is_reserved(opc.0) => writes.reserved = true,
-            Class::Alu32 | Class::Alu64 | Class::LdReg => writes.dst = true,
-            Class::LdImm => writes.dst = opc.0 == LD_IMM64,
-            Class::StReg => writes.atomic = matches!(opc.mem_mode(), MemMode::Atomic),
-            Class::StImm | Class::Jmp32 | Class::Jmp64 => {}
+            _ if is_reserved(byte) => Writes { reserved: true, ..NONE },
+            Class::Alu32 | Class::Alu64 | Class::LdReg => Writes { dst: true, ..NONE },
+            Class::LdImm => Writes {
+                dst: byte == LD_IMM64,
+                ..NONE
+            },
+            Class::StReg => Writes {
+                atomic: matches!(opc.mem_mode(), MemMode::Atomic),
+                ..NONE
+            },
+            Class::StImm | Class::Jmp32 | Class::Jmp64 => NONE,
         }
-        byte += 1;
-    }
-    table
+    })
 };
 
 /// Whether the atomic `insn` writes r10.
 fn atomic_writes_r10(insn: Instruction) -> bool {
-    const FETCH: i32 = 0x01;
-    const CMPXCHG: i32 = 0xf0 | FETCH;
-    const LOAD_ACQ: i32 = 0x100;
-
     match insn.imm() {
         LOAD_ACQ => insn.dst_reg() == 10,
         // CMPXCHG fetches into r0
@@ -166,15 +161,13 @@ fn atomic_writes_r10(insn: Instruction) -> bool {
 
 /// The opcode byte of the r10 access `insn`, if it is a load or store with one.
 fn stack_byte(insn: Instruction) -> Option<u8> {
-    let byte = STACK_BYTES[insn.0 as u8 as usize]?;
+    let byte = STACK_BYTES[usize::from(insn.byte())]?;
     let base = match insn.opcode().class() {
         Class::LdReg => insn.src_reg(),
         _ => insn.dst_reg(),
     };
     (base == 10).then_some(byte)
 }
-
-const LD_IMM64: u8 = OpCode(Class::LdImm as u8 | MemMode::Imm as u8 | MemSize::DWord as u8).0;
 
 const fn ldx(size: MemSize) -> u8 {
     OpCode::ldreg_from_parts(size, MemMode::Mem).0
@@ -195,7 +188,7 @@ const MISSING: u8 = Class::LdImm as u8;
 
 /// An undefined ALU64 operation, which always fails with [`Flow::FailCpu`]; the byte of every instruction that would
 /// write r10.
-const INVALID: u8 = AluOpc::UndefE as u8 | Class::Alu64 as u8;
+const INVALID: u8 = OpCode::alu64_from_parts(AluOpc::UndefE, Source::Imm).0;
 
 const fn is_reserved(byte: u8) -> bool {
     byte & 0b111 == Class::LdImm as u8 && byte != LD_IMM64 && byte != MISSING
@@ -315,30 +308,38 @@ stack_accesses! {
 
 // Every byte above and those of `transfer` is a reserved one and has one use.
 const _: () = {
-    let mut bytes = [false; 256];
-    let mut i = 0;
-    while i < SUPERS.len() + STACK.len() + 2 {
-        let byte = match i {
-            _ if i < SUPERS.len() => SUPERS[i].0,
-            _ if i < SUPERS.len() + STACK.len() => STACK[i - SUPERS.len()].0,
-            _ if i == SUPERS.len() + STACK.len() => GUARD,
-            _ => FAR,
-        };
+    const fn claim(used: &mut [bool; 256], byte: u8) {
         assert!(is_reserved(byte));
-        assert!(!bytes[byte as usize], "two uses of one opcode byte");
-        bytes[byte as usize] = true;
-        i += 1;
+        assert!(!used[byte as usize], "two uses of one opcode byte");
+        used[byte as usize] = true;
     }
+
+    let mut used = [false; 256];
+    const_for!(i in 0..SUPERS.len() => {
+        claim(&mut used, SUPERS[i].0);
+    });
+    const_for!(i in 0..STACK.len() => {
+        claim(&mut used, STACK[i].0);
+    });
+    claim(&mut used, GUARD);
+    claim(&mut used, FAR);
+};
+
+/// For each opcode byte, the index in [`SUPERS`] of its superinstruction: `u8::MAX` if it has none.
+const BY_BYTE: [u8; 256] = {
+    let mut table = [u8::MAX; 256];
+    const_for!(i in 0..SUPERS.len() => {
+        table[SUPERS[i].0 as usize] = i as u8;
+    });
+    table
 };
 
 /// For each opcode byte, the byte of the r10 access with that opcode, if there is one.
 const STACK_BYTES: [Option<u8>; 256] = {
     let mut table = [None; 256];
-    let mut i = 0;
-    while i < STACK.len() {
+    const_for!(i in 0..STACK.len() => {
         table[STACK[i].1 as usize] = Some(STACK[i].0);
-        i += 1;
-    }
+    });
     table
 };
 
@@ -350,27 +351,23 @@ const BY_PAIR: [(u8, Super, Encode); SUPERS.len()] = {
 
     // a stable insertion sort
     let mut sorted = [SUPERS[0]; SUPERS.len()];
-    let mut i = 0;
-    while i < SUPERS.len() {
+    const_for!(i in 0..SUPERS.len() => {
         let mut j = i;
         while j > 0 && pair(sorted[j - 1].1) > pair(SUPERS[i].1) {
             sorted[j] = sorted[j - 1];
             j -= 1;
         }
         sorted[j] = SUPERS[i];
-        i += 1;
-    }
+    });
     sorted
 };
 
 /// The number of opcodes that start a superinstruction.
 const FIRSTS: usize = {
     let mut n = 1;
-    let mut i = 1;
-    while i < BY_PAIR.len() {
+    const_for!(i in 1..BY_PAIR.len() => {
         n += (BY_PAIR[i].1.op(0) != BY_PAIR[i - 1].1.op(0)) as usize;
-        i += 1;
-    }
+    });
     n
 };
 
@@ -378,15 +375,13 @@ const FIRSTS: usize = {
 const ROWS: [u8; 256] = {
     let mut rows = [0; 256];
     let mut row = 0;
-    let mut i = 0;
-    while i < BY_PAIR.len() {
+    const_for!(i in 0..BY_PAIR.len() => {
         let first = BY_PAIR[i].1.op(0) as usize;
         if rows[first] == 0 {
             row += 1;
             rows[first] = row;
         }
-        i += 1;
-    }
+    });
     rows
 };
 
@@ -394,16 +389,14 @@ const ROWS: [u8; 256] = {
 /// those two opcodes. Row 0 is empty.
 const GROUPS: [[(u8, u8); 256]; 1 + FIRSTS] = {
     let mut groups = [[(0, 0); 256]; 1 + FIRSTS];
-    let mut i = 0;
-    while i < BY_PAIR.len() {
+    const_for!(i in 0..BY_PAIR.len() => {
         let sup = BY_PAIR[i].1;
         let group = &mut groups[ROWS[sup.op(0) as usize] as usize][sup.op(1) as usize];
         if group.1 == 0 {
             group.0 = i as u8;
         }
         group.1 += 1;
-        i += 1;
-    }
+    });
     groups
 };
 
@@ -412,12 +405,12 @@ fn candidates(window: &[Instruction]) -> &'static [(u8, Super, Encode)] {
     let [first, second, ..] = window else {
         return &[];
     };
-    let row = ROWS[first.0 as u8 as usize];
+    let row = ROWS[usize::from(first.byte())];
     // most slots start none
     if row == 0 {
         return &[];
     }
-    let (start, len) = GROUPS[row as usize][second.0 as u8 as usize];
+    let (start, len) = GROUPS[row as usize][usize::from(second.byte())];
     &BY_PAIR[start as usize..][..len as usize]
 }
 
@@ -433,20 +426,19 @@ impl Super {
     const fn new(insns: &[(&'static str, &[Operand])]) -> Self {
         let len = insns.len();
         assert!(1 < len && len <= MAX_LEN);
+
         let mut names = Names {
             names: [""; MAX_ROLES],
             len: 0,
         };
         let mut steps = [Step::NONE; MAX_LEN];
-        let mut k = 0;
-        while k < len {
+        const_for!(k in 0..len => {
             steps[k] = Step::parse(insns[k].0, insns[k].1, &mut names);
             // only the last instruction may branch, and it continues at `pc + 1` or a fixed target
             if matches!(OpCode(steps[k].op).class(), Class::Jmp32 | Class::Jmp64) {
                 assert!(k == len - 1, "a branch before the end of a sequence");
             }
-            k += 1;
-        }
+        });
 
         let mut sup = Self {
             steps,
@@ -459,28 +451,29 @@ impl Super {
             unsaved: [0; MAX_LEN],
             free: None,
         };
-        let mut role = 0;
-        while role < names.len {
+        const_for!(role in 0..names.len => {
             sup.homes[role as usize] = sup.home(role);
-            role += 1;
-        }
+        });
 
-        let mut k = 0;
-        while k < len {
-            let step = steps[k];
-            let mut role = 0;
-            while role < names.len {
-                if step.reads(Field::Role(role)) && sup.writes & 1 << role == 0 {
+        const_for!(k in 0..len => {
+            const_for!(role in 0..names.len => {
+                if steps[k].reads(Field::Role(role)) && sup.writes & 1 << role == 0 {
                     sup.loads |= 1 << role;
                 }
-                role += 1;
-            }
+            });
             sup.unsaved[k] = sup.writes;
-            if let Field::Role(role) = step.written() {
+            if let Field::Role(role) = steps[k].written() {
                 sup.writes |= 1 << role;
                 sup.save_at = k as u8 + 1;
             }
-            let free = match (step.dst, step.src) {
+        });
+        // the written roles are back in their registers from `save_at` on
+        const_for!(k in sup.save_at as usize..len => {
+            sup.unsaved[k] = 0;
+        });
+
+        const_for!(k in 0..len => {
+            let free = match (steps[k].dst, steps[k].src) {
                 (Field::Any, _) => Some((k as u8, DST)),
                 (_, Field::Any) => Some((k as u8, SRC)),
                 _ => None,
@@ -489,14 +482,7 @@ impl Super {
                 assert!(sup.free.is_none(), "two register operands `_`");
                 sup.free = free;
             }
-            k += 1;
-        }
-        // the written roles are back in their registers from `save_at` on
-        let mut k = sup.save_at as usize;
-        while k < len {
-            sup.unsaved[k] = 0;
-            k += 1;
-        }
+        });
         // `Roles` gives the register `_` its value in the registers, so it may share a register with a role only where
         // the roles are back there for good
         if let Some((k, _)) = sup.free {
@@ -507,8 +493,7 @@ impl Super {
 
     /// The position of the operand that names `role` first, and the shift of its register field.
     const fn home(self, role: u8) -> (u8, u8) {
-        let mut k = 0;
-        while k < self.len() {
+        const_for!(k in 0..self.len() => {
             let step = self.steps[k];
             if step.dst.is(role) {
                 return (k as u8, DST);
@@ -516,37 +501,21 @@ impl Super {
             if step.src.is(role) {
                 return (k as u8, SRC);
             }
-            k += 1;
-        }
+        });
         unreachable!()
     }
 
     /// The superinstruction with opcode byte `byte`, if there is one.
     pub fn with_byte(byte: u8) -> Option<&'static Self> {
-        // the index in `SUPERS` of each byte's superinstruction; `u8::MAX` for none
-        const INDEXES: [u8; 256] = {
-            let mut table = [u8::MAX; 256];
-            let mut i = 0;
-            while i < SUPERS.len() {
-                table[SUPERS[i].0 as usize] = i as u8;
-                i += 1;
-            }
-            table
-        };
-        let index = INDEXES[usize::from(byte)];
+        let index = BY_BYTE[usize::from(byte)];
         SUPERS.get(usize::from(index)).map(|(_, sup, _)| sup)
     }
 
     /// The superinstruction with opcode byte `byte`.
     const fn of(byte: u8) -> Self {
-        let mut i = 0;
-        while i < SUPERS.len() {
-            if SUPERS[i].0 == byte {
-                return SUPERS[i].1;
-            }
-            i += 1;
-        }
-        panic!("not a superinstruction");
+        let index = BY_BYTE[byte as usize] as usize;
+        assert!(index < SUPERS.len(), "not a superinstruction");
+        SUPERS[index].1
     }
 
     /// The number of instructions in the sequence.
@@ -564,7 +533,7 @@ impl Super {
     /// The first instruction of the sequence whose first slot holds `slot`.
     #[inline(always)]
     pub fn first_of(self, slot: Instruction) -> Instruction {
-        Instruction(slot.0 & !0xFF | u64::from(self.op(0)))
+        slot.with_opcode(self.op(0))
     }
 
     /// The register of each role, from `slot(k)`, the slot of instruction `k` of the sequence.
@@ -596,7 +565,7 @@ impl Super {
     fn encode(self, byte: u8, window: &[Instruction]) -> Option<Instruction> {
         let sequence = window.get(..self.len())?;
         // `candidates` matched the first two opcodes, and the candidates that share those mostly differ in the last
-        if sequence[self.len() - 1].0 as u8 != self.op(self.len() - 1) {
+        if sequence[self.len() - 1].byte() != self.op(self.len() - 1) {
             return None;
         }
         let registers = self.registers(|k| sequence[k]);
@@ -611,7 +580,7 @@ impl Super {
                 return None;
             }
         }
-        Some(Instruction(sequence[0].0 & !0xFF | u64::from(byte)))
+        Some(sequence[0].with_opcode(byte))
     }
 
     /// Whether instruction `k` of the sequence may branch.
@@ -701,14 +670,13 @@ struct Names {
 impl Names {
     /// The field of the role `name`.
     const fn role(&mut self, name: &'static str) -> Field {
-        let mut role = 0;
-        while role < self.len {
+        const_for!(role in 0..self.len => {
             if eq(self.names[role as usize].as_bytes(), name.as_bytes()) {
                 return Field::Role(role);
             }
-            role += 1;
-        }
+        });
         assert!((self.len as usize) < MAX_ROLES, "too many roles");
+        let role = self.len;
         self.names[role as usize] = name;
         self.len += 1;
         Field::Role(role)
@@ -839,8 +807,8 @@ impl Step {
             }
         };
         step.op = match (find(&ALU, name), find(&JMP, name), width, target) {
-            (Some(alu), None, Some(32), None) => Class::Alu32 as u8 | alu as u8 | source as u8,
-            (Some(alu), None, Some(64), None) => Class::Alu64 as u8 | alu as u8 | source as u8,
+            (Some(alu), None, Some(32), None) => OpCode::alu32_from_parts(alu, source).0,
+            (Some(alu), None, Some(64), None) => OpCode::alu64_from_parts(alu, source).0,
             (None, Some(jmp), Some(32), Some(Operand::Any)) => OpCode::jmp32_from_parts(jmp, source).0,
             (None, Some(jmp), None | Some(64), Some(Operand::Any)) => OpCode::jmp64_from_parts(jmp, source).0,
             _ => panic!("unknown mnemonic, or a target that isn't `_`"),
@@ -879,13 +847,11 @@ const fn eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    let mut i = 0;
-    while i < a.len() {
+    const_for!(i in 0..a.len() => {
         if a[i] != b[i] {
             return false;
         }
-        i += 1;
-    }
+    });
     true
 }
 
@@ -903,13 +869,11 @@ const fn strip<'a>(name: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
 
 /// The value of `name` in `table`.
 const fn find<T: Copy>(table: &[(&str, T)], name: &[u8]) -> Option<T> {
-    let mut i = 0;
-    while i < table.len() {
+    const_for!(i in 0..table.len() => {
         if eq(table[i].0.as_bytes(), name) {
             return Some(table[i].1);
         }
-        i += 1;
-    }
+    });
     None
 }
 
@@ -995,6 +959,8 @@ extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool, co
             }
         };
     }
+    // one `exec!` per instruction a sequence may have
+    const _: () = assert!(MAX_LEN == 5);
     exec!(0);
     exec!(1);
     exec!(2);

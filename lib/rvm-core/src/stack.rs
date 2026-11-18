@@ -10,7 +10,7 @@ use std::ptr;
 
 use crate::opcode::{Class, MemSize, OpCode};
 use crate::transfer::Slot;
-use crate::{fetch, CallStack, Context, Flow, Handlers, Host, Instruction, Memory, Table};
+use crate::{mem, CallStack, Context, Handlers, Host, Instruction, Memory, Table};
 
 /// Host memory that guest loads and stores near some address reach directly; see [`Memory::window`].
 #[derive(Clone, Copy, Debug)]
@@ -126,7 +126,7 @@ pub extern "rust-preserve-none" fn access<M: Memory, H: Host<M>, const FUEL: boo
     let opc = OpCode(OP);
     let kind = const { kind(OpCode(OP)) };
 
-    let addr = ctx.regs[10].wrapping_add_signed(i64::from(insn.offset()));
+    let addr = mem::address(ctx.regs[10], insn);
     let at = addr.wrapping_sub(calls.stack.base);
     if at >= calls.stack.fits[kind] {
         become miss::<M, H, FUEL, OP>(ctx, insn, code, slot, fuel, calls, table)
@@ -149,12 +149,7 @@ pub extern "rust-preserve-none" fn access<M: Memory, H: Host<M>, const FUEL: boo
         }
     }
 
-    let slot = slot.offset(1);
-    // SAFETY: the slots from `len` on hold the guard, so this handler ran below `len` (see `Slot`)
-    match unsafe { fetch::<M, H, FUEL>(table, slot, fuel) } {
-        Some((next, insn, fuel)) => become next(ctx, insn, code, slot, fuel, calls, table),
-        None => calls.stop.at(slot, 0, Flow::OutOfFuel),
-    }
+    become_next!(ctx, code, slot, fuel, calls, table)
 }
 
 /// Takes the window around r10 and runs the access with its usual handler.

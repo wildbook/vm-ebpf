@@ -2,7 +2,7 @@
 
 use std::ops::ControlFlow;
 
-use crate::opcode::{AluEnd, AluOpc, JmpOpc, MemMode, MemSize, OpCode, Source};
+use crate::opcode::{AluEnd, AluOpc, JmpOpc, MemMode, MemSize, OpCode, Source, LD_IMM64};
 use crate::{step, step_ld64, Context, Flow, Instruction, Memory};
 
 #[derive(Debug)]
@@ -63,18 +63,19 @@ fn exec_ld64(ctx: &mut Context<TestMem>, first: Instruction, second: Instruction
 
 #[test]
 fn alu_edges() {
+    let (alu32, alu64) = (OpCode::alu32_from_parts, OpCode::alu64_from_parts);
     // (dst register's initial value, opcode, off, imm, expected result)
     for (dst_in, opc, off, imm, want) in [
-        (100u64, AluOpc::div_64(Source::Imm), 0, 0, 0u64), // div by zero returns 0
-        (i64::MIN as u64, AluOpc::div_64(Source::Imm), 1, -1, i64::MIN as u64), // MIN / -1 avoids overflow
-        (17u64, AluOpc::mod_64(Source::Imm), 0, 0, 17u64), // mod by zero leaves dst unchanged
-        ((-13i64) as u64, AluOpc::mod_64(Source::Imm), 1, 3, (-1i64) as u64), // smod (off=1), truncated division
-        (1u64, AluOpc::lsh_64(Source::Imm), 0, 64, 1u64),  // shift amount masked to 0 (64 & 63)
-        (999u64, AluOpc::mov_64(Source::Imm), 0, -1, u64::MAX), // imm sign-extended to 64 bits
-        (0xFFFF_FFFF_0000_0064, AluOpc::add_32(Source::Imm), 0, 50, 150u64), // upper 32 bits zeroed
-        (0xFFFF_FFFF, AluOpc::add_32(Source::Imm), 0, 1, 0u64), // 32-bit wrap, zero-extended
-        (1u64, AluOpc::lsh_32(Source::Imm), 0, 32, 1u64),  // shift amount masked to 0 (32 & 31)
-        (0x8000_0000, AluOpc::arsh_32(Source::Imm), 0, 31, 0xFFFF_FFFF), // sign extended within 32 bits
+        (100u64, alu64(AluOpc::Div, Source::Imm), 0, 0, 0u64), // div by zero returns 0
+        (i64::MIN as u64, alu64(AluOpc::Div, Source::Imm), 1, -1, i64::MIN as u64), // MIN / -1 avoids overflow
+        (17u64, alu64(AluOpc::Mod, Source::Imm), 0, 0, 17u64), // mod by zero leaves dst unchanged
+        ((-13i64) as u64, alu64(AluOpc::Mod, Source::Imm), 1, 3, (-1i64) as u64), // smod (off=1), truncated division
+        (1u64, alu64(AluOpc::Lsh, Source::Imm), 0, 64, 1u64),  // shift amount masked to 0 (64 & 63)
+        (999u64, alu64(AluOpc::Mov, Source::Imm), 0, -1, u64::MAX), // imm sign-extended to 64 bits
+        (0xFFFF_FFFF_0000_0064, alu32(AluOpc::Add, Source::Imm), 0, 50, 150u64), // upper 32 bits zeroed
+        (0xFFFF_FFFF, alu32(AluOpc::Add, Source::Imm), 0, 1, 0u64), // 32-bit wrap, zero-extended
+        (1u64, alu32(AluOpc::Lsh, Source::Imm), 0, 32, 1u64),  // shift amount masked to 0 (32 & 31)
+        (0x8000_0000, alu32(AluOpc::Arsh, Source::Imm), 0, 31, 0xFFFF_FFFF), // sign extended within 32 bits
     ] {
         let mut ctx = Context::new(TestMem::new());
         ctx.regs[0] = dst_in;
@@ -86,7 +87,7 @@ fn alu_edges() {
     let mut ctx = Context::new(TestMem::new());
     ctx.regs[0] = 0xDEAD_BEEF_CAFE_BABE;
     ctx.regs[1] = 0x1234_5678_9ABC_DEF0;
-    assert!(matches!(exec(&mut ctx, instr(AluOpc::mov_32(Source::Reg), 0, 1, 0, 0)), Flow::Next));
+    assert!(matches!(exec(&mut ctx, instr(alu32(AluOpc::Mov, Source::Reg), 0, 1, 0, 0)), Flow::Next));
     assert_eq!(ctx.regs[0], 0x9ABC_DEF0);
 }
 
@@ -181,14 +182,14 @@ fn load_acquire_zero_extends() {
 fn ld_imm64() {
     let mut ctx = Context::new(TestMem::new());
 
-    let first = instr(OpCode(0x18), 0, 0, 0, 0xDEADBEEFu32 as i32);
+    let first = instr(OpCode(LD_IMM64), 0, 0, 0, 0xDEADBEEFu32 as i32);
     let second = instr(OpCode(0x00), 0, 0, 0, 0x12345678u32 as i32);
 
     assert!(matches!(exec_ld64(&mut ctx, first, second), Flow::Next));
     assert_eq!(ctx.regs[0], 0x12345678_DEADBEEF);
 
     // a pseudo load (map fd and the like) stops at its first slot
-    let pseudo = instr(OpCode(0x18), 0, 1, 0, 7);
+    let pseudo = instr(OpCode(LD_IMM64), 0, 1, 0, 7);
     assert!(matches!(exec(&mut ctx, pseudo), Flow::Missing));
 }
 
@@ -255,11 +256,11 @@ fn mem_fault() {
 fn alu32_imm_is_unsigned_32bit() {
     let mut ctx = Context::new(TestMem::new());
     ctx.regs[1] = 0xFFFF_FFFF;
-    exec(&mut ctx, instr(AluOpc::div_32(Source::Imm), 1, 0, 0, -1));
+    exec(&mut ctx, instr(OpCode::alu32_from_parts(AluOpc::Div, Source::Imm), 1, 0, 0, -1));
     assert_eq!(ctx.regs[1], 1);
 
     ctx.regs[1] = 0xFFFF_FFFF;
-    exec(&mut ctx, instr(AluOpc::mod_32(Source::Imm), 1, 0, 0, -1));
+    exec(&mut ctx, instr(OpCode::alu32_from_parts(AluOpc::Mod, Source::Imm), 1, 0, 0, -1));
     assert_eq!(ctx.regs[1], 0);
 }
 
@@ -275,6 +276,7 @@ fn jmp32_unsigned_compare_negative_imm() {
 
 #[test]
 fn movsx() {
+    let (alu32, alu64) = (OpCode::alu32_from_parts, OpCode::alu64_from_parts);
     let mut ctx = Context::new(TestMem::new());
     ctx.regs[2] = 0x1234_5678_8000_8080;
     for (off, want) in [
@@ -282,29 +284,30 @@ fn movsx() {
         (16, 0xFFFF_FFFF_FFFF_8080),
         (32, 0xFFFF_FFFF_8000_8080),
     ] {
-        exec(&mut ctx, instr(AluOpc::mov_64(Source::Reg), 1, 2, off, 0));
+        exec(&mut ctx, instr(alu64(AluOpc::Mov, Source::Reg), 1, 2, off, 0));
         assert_eq!(ctx.regs[1], want, "movsx64 off={off}");
     }
     // ALU32: sign-extend to 32 bits, then zero-extend.
-    exec(&mut ctx, instr(AluOpc::mov_32(Source::Reg), 1, 2, 8, 0));
+    exec(&mut ctx, instr(alu32(AluOpc::Mov, Source::Reg), 1, 2, 8, 0));
     assert_eq!(ctx.regs[1], 0xFFFF_FF80);
     // Reserved: ALU32 offset 32, immediate source.
-    assert!(matches!(exec(&mut ctx, instr(AluOpc::mov_32(Source::Reg), 1, 2, 32, 0)), Flow::FailCpu));
-    assert!(matches!(exec(&mut ctx, instr(AluOpc::mov_64(Source::Imm), 1, 0, 8, 1)), Flow::FailCpu));
+    assert!(matches!(exec(&mut ctx, instr(alu32(AluOpc::Mov, Source::Reg), 1, 2, 32, 0)), Flow::FailCpu));
+    assert!(matches!(exec(&mut ctx, instr(alu64(AluOpc::Mov, Source::Imm), 1, 0, 8, 1)), Flow::FailCpu));
 }
 
 #[test]
 fn bswap_and_endianness() {
+    let (end32, end64) = (OpCode::end32_from_parts, OpCode::end64_from_parts);
     let v = 0x1122_3344_5566_7788;
     for (input, opc, imm, want) in [
-        (v, AluOpc::end_64(AluEnd::ToLE), 16, 0x8877),
-        (v, AluOpc::end_64(AluEnd::ToLE), 32, 0x8877_6655),
-        (v, AluOpc::end_64(AluEnd::ToLE), 64, 0x8877_6655_4433_2211),
-        (v, AluOpc::end_32(AluEnd::ToLE), 16, 0x7788),
-        (v, AluOpc::end_32(AluEnd::ToLE), 64, v),
-        (v, AluOpc::end_32(AluEnd::ToBE), 32, 0x8877_6655),
-        (0x1234, AluOpc::end_32(AluEnd::ToBE), 16, 0x3412),
-        (0x1234_5678_9ABC_DEF0, AluOpc::end_32(AluEnd::ToBE), 64, 0xF0DE_BC9A_7856_3412),
+        (v, end64(AluEnd::ToLE), 16, 0x8877),
+        (v, end64(AluEnd::ToLE), 32, 0x8877_6655),
+        (v, end64(AluEnd::ToLE), 64, 0x8877_6655_4433_2211),
+        (v, end32(AluEnd::ToLE), 16, 0x7788),
+        (v, end32(AluEnd::ToLE), 64, v),
+        (v, end32(AluEnd::ToBE), 32, 0x8877_6655),
+        (0x1234, end32(AluEnd::ToBE), 16, 0x3412),
+        (0x1234_5678_9ABC_DEF0, end32(AluEnd::ToBE), 64, 0xF0DE_BC9A_7856_3412),
     ] {
         let mut ctx = Context::new(TestMem::new());
         ctx.regs[1] = input;
@@ -312,5 +315,5 @@ fn bswap_and_endianness() {
         assert_eq!(ctx.regs[1], want, "{opc:?} imm={imm}");
     }
     let mut ctx = Context::new(TestMem::new());
-    assert!(matches!(exec(&mut ctx, instr(AluOpc::end_64(AluEnd::ToBE), 1, 0, 0, 16)), Flow::FailCpu));
+    assert!(matches!(exec(&mut ctx, instr(end64(AluEnd::ToBE), 1, 0, 0, 16)), Flow::FailCpu));
 }

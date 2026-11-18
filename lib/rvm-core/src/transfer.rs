@@ -9,7 +9,7 @@
 use crate::fuse::Super;
 use crate::opcode::{Class, JmpOpc, OpCode, Source};
 use crate::ops::{self, BITS_32, BITS_64};
-use crate::{fetch_checked, CallStack, Context, Flow, Handler, Host, Instruction, Memory, Table, BPF_PSEUDO_CALL};
+use crate::{CallStack, Context, Flow, Handler, Host, Instruction, Memory, Table, BPF_PSEUDO_CALL};
 
 /// The slot after the code, and every slot after it: there is no instruction here.
 pub const GUARD: u8 = 0xe0;
@@ -40,7 +40,7 @@ pub fn bound(code: &mut Vec<Instruction>) {
     let mut far = Vec::new();
     for pc in 0..len {
         let slot = code[pc];
-        if let Some(sup) = Super::with_byte(slot.0 as u8) {
+        if let Some(sup) = Super::with_byte(slot.byte()) {
             // the branch lies after `pc`, so this loop hasn't changed it yet
             let last = pc + sup.len() - 1;
             let fits = last < len && (!sup.branches() || lands(last, i64::from(code[last].offset())));
@@ -49,9 +49,9 @@ pub fn bound(code: &mut Vec<Instruction>) {
             }
         } else if let Some(displacement) = displacement(slot) {
             if !lands(pc, displacement) {
-                far.push(Instruction(slot.0 & !0xFF | u64::from(GUARD)));
+                far.push(slot.with_opcode(GUARD));
                 let at = u32::try_from(len + far.len()).expect("fewer than 2^31 slots");
-                let byte = slot.0 as u8;
+                let byte = slot.byte();
                 code[pc] = Instruction::from_parts(OpCode(FAR), byte, byte >> 4, 0, at as i32);
             }
         }
@@ -129,7 +129,7 @@ pub fn pc_at(addr: usize, code: &[Instruction]) -> u64 {
 /// The displacement of the fixed target the handler of `insn` may continue at, `pc + 1 + displacement`, as
 /// [`ops::jump`] computes it, or `None` if it continues only at `pc + 1` or a target it computes at run time.
 fn displacement(insn: Instruction) -> Option<i64> {
-    let target = TARGETS[insn.0 as u8 as usize];
+    let target = TARGETS[usize::from(insn.byte())];
     if !target.fixed || (target.local_call && insn.src_reg() != BPF_PSEUDO_CALL) {
         return None;
     }
@@ -164,13 +164,11 @@ const TARGETS: [Target; 256] = {
         ..IMM
     };
 
-    let mut table = [NONE; 256];
-    let mut byte = 0;
-    while byte < 256 {
-        let opc = OpCode(byte as u8);
+    byte_table!(|byte| {
+        let opc = OpCode(byte);
         let jmp64 = matches!(opc.class(), Class::Jmp64);
         let imm = matches!(opc.alu_src(), Source::Imm);
-        table[byte] = match opc.jmp_opc() {
+        match opc.jmp_opc() {
             _ if !matches!(opc.class(), Class::Jmp64 | Class::Jmp32) => NONE,
             JmpOpc::Ja if imm && jmp64 => OFFSET,
             JmpOpc::Ja if imm => IMM,
@@ -179,16 +177,14 @@ const TARGETS: [Target; 256] = {
             JmpOpc::Ja | JmpOpc::Call | JmpOpc::Exit | JmpOpc::Jcond | JmpOpc::UndefF => NONE,
             // conditional jumps
             _ => OFFSET,
-        };
-        byte += 1;
-    }
-    table
+        }
+    })
 };
 
 /// The second slot of the LD_IMM64 whose second slot holds `second`, or `None` if the code ends before it.
 #[inline(always)]
 pub fn second_half(code: &[Instruction], second: Instruction) -> Option<Instruction> {
-    match second.0 as u8 {
+    match second.byte() {
         GUARD => None,
         // a jump that `bound` moved: the instruction after the guard holds its `imm`
         FAR => {
@@ -235,7 +231,7 @@ extern "rust-preserve-none" fn far<M: Memory, H: Host<M>, const FUEL: bool>(
     table: &Table<M, H>,
 ) {
     let byte = insn.dst_reg() | insn.src_reg() << 4;
-    let jump = Instruction(code[insn.imm() as u32 as usize].0 & !0xFF | u64::from(byte));
+    let jump = code[insn.imm() as u32 as usize].with_opcode(byte);
     let flow = match jump.opcode().class() {
         Class::Jmp32 => ops::jump::<_, _, BITS_32>(&ctx.regs, jump),
         _ => ops::jump::<_, _, BITS_64>(&ctx.regs, jump),
@@ -254,18 +250,14 @@ extern "rust-preserve-none" fn far<M: Memory, H: Host<M>, const FUEL: bool>(
         flow => return calls.stop.at(slot, fuel, flow),
     }
 
-    let pc = pc.wrapping_add(1);
-    match fetch_checked::<M, H, FUEL>(table, code, pc, fuel) {
-        Ok((next, insn, slot, fuel)) => become next(ctx, insn, code, slot, fuel, calls, table),
-        Err(flow) => calls.stop.at_pc(pc, fuel, flow),
-    }
+    become_at_pc!(ctx, code, pc.wrapping_add(1), fuel, calls, table)
 }
 
 /// Every kind of fixed target at the edges `bound` decides, with ample fuel and with the fuel running out on the way.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::opcode::AluOpc;
+    use crate::opcode::{AluOpc, LD_IMM64};
     use crate::{run, Code};
 
     #[derive(Debug)]
@@ -331,7 +323,7 @@ mod tests {
             Instruction::from_parts(opc, 0, BPF_PSEUDO_CALL, 0, d as i32)
         };
         // r1 + 1 < r2
-        let add = Instruction::from_parts(AluOpc::add_64(Source::Imm), 1, 0, 0, 1);
+        let add = Instruction::from_parts(OpCode::alu64_from_parts(AluOpc::Add, Source::Imm), 1, 0, 0, 1);
         let jlt = |d: i64| {
             let opc = OpCode::jmp64_from_parts(JmpOpc::Jlt, Source::Reg);
             Instruction::from_parts(opc, 1, 2, d as i16, 0)
@@ -350,7 +342,7 @@ mod tests {
             ] {
                 if code[1] == add {
                     // a branch to the guard slot keeps the superinstruction
-                    let fused = Code::new(code).slots()[1].0 as u8 != add.0 as u8;
+                    let fused = Code::new(code).slots()[1].byte() != add.byte();
                     assert_eq!(fused, (0..=len).contains(&target), "{code:?}");
                 }
                 let stop = match (lands, returns) {
@@ -369,7 +361,7 @@ mod tests {
 
     #[test]
     fn ld_imm64_at_the_end() {
-        let lddw = Instruction::from_parts(OpCode(0x18), 0, 0, 0, 7);
+        let lddw = Instruction::from_parts(OpCode(LD_IMM64), 0, 0, 0, 7);
         expect(&[EXIT, lddw], 1, 10, ("BadPc", 2, 9, 0));
         if cfg!(feature = "fuel") {
             expect(&[EXIT, lddw], 1, 1, ("OutOfFuel", 1, 1, 0));
