@@ -12,6 +12,7 @@
 //! | [`SHARED_MAPS_FIRST_REGION`]..[`MAX_REGIONS`] | shared maps, one region each | RW |
 //! | [`CODE_REGION`] | code addresses for `callx` and `gotox`, never mapped | - |
 
+use crate::executor::MAX_ARGS;
 use crate::memory::MAX_REGIONS;
 
 /// Guest region holding the stack.
@@ -27,7 +28,7 @@ pub const FIRST_FREE_REGION: usize = MAPS_REGION + 1;
 /// First of the [`BORROW_REGIONS`] regions in each program reserved for borrowed buffers.
 pub const BORROW_FIRST_REGION: usize = SHARED_MAPS_FIRST_REGION - BORROW_REGIONS;
 /// Number of borrow regions, one per argument register.
-pub const BORROW_REGIONS: usize = 5;
+pub const BORROW_REGIONS: usize = MAX_ARGS;
 /// First guest region used for shared maps; each shared map has its own region at the same address in every program.
 pub const SHARED_MAPS_FIRST_REGION: usize = MAX_REGIONS / 2;
 /// Region index of guest code addresses: `region_base(CODE_REGION)` plus a byte offset into the program's code. It lies

@@ -5,6 +5,7 @@
 
 use std::fmt;
 
+use crate::executor::MAX_ARGS;
 #[cfg(feature = "maps")]
 use crate::maps::MapError;
 
@@ -94,7 +95,7 @@ impl fmt::Display for VmError {
             #[cfg(feature = "maps")]
             Self::MapNotFound(name) => write!(f, "map not found: {name}"),
             Self::ForeignFunc => write!(f, "function handle belongs to another program; look the function up again"),
-            Self::TooManyArgs(count) => write!(f, "{count} arguments, but eBPF functions take at most 5"),
+            Self::TooManyArgs(count) => write!(f, "{count} arguments, but eBPF functions take at most {MAX_ARGS}"),
             Self::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
             Self::ProgramTooLarge(region) => {
                 write!(f, "program {region} exceeds {} bytes", crate::memory::MAX_REGION_LEN)

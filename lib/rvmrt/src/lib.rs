@@ -97,7 +97,7 @@ pub unsafe extern "C" fn rvm_call(
     ret: *mut u64,
 ) -> Status {
     let program = unsafe { &mut *program };
-    let Ok(name) = std::str::from_utf8(unsafe { slice_or_empty(name, name_len) }) else {
+    let Some(name) = (unsafe { str_or_none(name, name_len) }) else {
         return Status::Argument;
     };
     let args = unsafe { slice_or_empty(args, nargs) };
@@ -118,7 +118,7 @@ pub unsafe extern "C" fn rvm_func(
     index: *mut usize,
 ) -> Status {
     let program = unsafe { &*program };
-    let Ok(name) = std::str::from_utf8(unsafe { slice_or_empty(name, name_len) }) else {
+    let Some(name) = (unsafe { str_or_none(name, name_len) }) else {
         return Status::Argument;
     };
     let Some(found) = program.function_index(name) else {
@@ -209,4 +209,13 @@ unsafe fn slice_or_empty<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
         return &[];
     }
     unsafe { slice::from_raw_parts(ptr, len) }
+}
+
+/// [`slice_or_empty`] as a string, or `None` if the bytes aren't UTF-8.
+///
+/// # Safety
+///
+/// As [`slice_or_empty`].
+unsafe fn str_or_none<'a>(ptr: *const u8, len: usize) -> Option<&'a str> {
+    std::str::from_utf8(unsafe { slice_or_empty(ptr, len) }).ok()
 }

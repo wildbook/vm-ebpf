@@ -22,9 +22,8 @@ use crate::memory::{GuestMemory, Perms, SharedBuffer, SharedRegion, VmMemory, MA
 use crate::module::Module;
 use crate::plugin::Plugin;
 use crate::program::Program;
-use crate::published::Published;
 use crate::std_helpers;
-use crate::sync::lock;
+use crate::sync::{lock, Published};
 
 /// Configuration for the VM.
 #[derive(Debug, Clone)]
@@ -59,7 +58,6 @@ pub struct Vm {
     /// [`Vm::with_types`] finds the cell borrowed and fails instead of deadlocking.
     #[cfg(feature = "link")]
     types: ReentrantLock<RefCell<HostTypes>>,
-    /// VM configuration.
     config: VmConfig,
 }
 
@@ -70,14 +68,13 @@ impl Default for Vm {
 }
 
 impl Vm {
-    /// Create a new VM with default configuration.
+    /// [`Vm::with_config`] with [`VmConfig::default`].
     pub fn new() -> Self {
         Self::with_config(VmConfig::default())
     }
 
-    /// Create a new VM with custom configuration.
-    ///
-    /// Only the map helpers (1 to 3) are registered, with the `maps` feature; they touch nothing outside the VM.
+    /// A VM with `config`. Its only helpers are the map helpers (1 to 3) with the `maps` feature, which touch nothing
+    /// outside the VM.
     pub fn with_config(config: VmConfig) -> Self {
         let helpers = Arc::new(SharedHelpers::default());
         #[cfg(feature = "maps")]
@@ -91,12 +88,8 @@ impl Vm {
         }
     }
 
-    // =========================================================================
-    // Helper Registration
-    // =========================================================================
-    //
-    // Changes reach programs linked earlier at their next call. Replacing a function keeps its slot, so linked call
-    // sites stay valid.
+    // Helper registration: changes reach programs linked earlier at their next call. Replacing a function keeps its
+    // slot, so linked call sites stay valid.
 
     /// Register a helper function with type-safe argument extraction.
     ///
@@ -197,10 +190,6 @@ impl Vm {
     pub unsafe fn share_region(&self, region: usize, len: usize, perms: Perms) -> Result<SharedRegion> {
         self.shared.regions.add(region, len, perms)
     }
-
-    // =========================================================================
-    // Loading
-    // =========================================================================
 
     /// Load an image written by [`Image::to_bytes`] as a program; [`Vm::load`] with the parsed image.
     pub fn load_image(&self, bytes: &[u8]) -> Result<Program> {

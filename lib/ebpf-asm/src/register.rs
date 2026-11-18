@@ -47,7 +47,7 @@ impl Register {
         }
     }
 
-    /// Get the register number (0-10).
+    /// Register number (0-10).
     #[inline]
     pub const fn number(self) -> u8 {
         self as u8

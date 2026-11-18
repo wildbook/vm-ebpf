@@ -9,7 +9,7 @@
 use hashbrown::HashMap;
 
 use crate::parse::{Btf, BtfError};
-use crate::raw::{BtfKind, BTF_INT_SIGNED, BTF_MAGIC, BTF_VERSION};
+use crate::raw::{BtfKind, TypeHeader, BTF_INT_SIGNED, BTF_MAGIC, BTF_VERSION};
 use crate::types::{BtfTypeInfo, Member};
 
 /// One struct/union member, pending encoding.
@@ -433,10 +433,14 @@ impl BtfBuilder {
 
 /// Write a BTF type header: name offset, kind/vlen/kind_flag info, and size-or-type.
 fn header(out: &mut Vec<u8>, name_off: u32, kind: BtfKind, vlen: u16, kind_flag: bool, size_or_type: u32) {
-    out.extend_from_slice(&name_off.to_le_bytes());
-    let info = (u32::from(kind_flag) << 31) | ((kind as u32) << 24) | u32::from(vlen);
-    out.extend_from_slice(&info.to_le_bytes());
-    out.extend_from_slice(&size_or_type.to_le_bytes());
+    TypeHeader {
+        name_off,
+        kind,
+        vlen,
+        kind_flag,
+        size_or_type,
+    }
+    .encode(out);
 }
 
 impl TypeEntry {

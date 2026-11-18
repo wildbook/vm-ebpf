@@ -13,11 +13,11 @@
 
 use std::sync::Arc;
 
-use rvm_core::opcode::{JmpOpc, OpCode, Source};
+use rvm_core::opcode::CALL;
 use rvm_core::{Code, Instruction, BPF_PSEUDO_KFUNC_CALL, MAX_CALL_DEPTH};
 
 use crate::error::{LinkError, Result, VmError};
-use crate::helper::SharedHelpers;
+use crate::helper::{HelperRegistry, SharedHelpers};
 #[cfg(feature = "maps")]
 use crate::layout::MAPS_REGION;
 use crate::layout::{DATA_REGION, RODATA_REGION, STACK_REGION};
@@ -32,13 +32,19 @@ const MAGIC: &[u8; 4] = b"RVMI";
 const FORMAT_VERSION: u32 = 1;
 const RVM_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Opcode byte of `call`.
-pub const CALL: u8 = OpCode::jmp64_from_parts(JmpOpc::Call, Source::Imm).0;
+// tag bytes of the `MapKind` and `Import` variants
+const MAP_ARRAY: u8 = 0;
+const MAP_HASH: u8 = 1;
+const IMPORT_NAME: u8 = 0;
+const IMPORT_HELPER: u8 = 1;
+
+/// Size of an instruction in bytes.
+pub const INSN_SIZE: u64 = size_of::<Instruction>() as u64;
 
 /// A linked program, ready to load into a [`crate::Vm`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Image {
-    /// Instructions, 8 bytes each.
+    /// Instructions, [`INSN_SIZE`] bytes each.
     pub code: Vec<u8>,
     /// Initial bytes of the `.rodata` region; the rest of its `rodata_len` bytes are zero.
     pub rodata: Vec<u8>,
@@ -87,8 +93,8 @@ impl Image {
             for def in &self.maps {
                 w.str(&def.name);
                 w.0.push(match def.kind {
-                    MapKind::Array => 0,
-                    MapKind::Hash => 1,
+                    MapKind::Array => MAP_ARRAY,
+                    MapKind::Hash => MAP_HASH,
                 });
                 w.u32(def.key_size);
                 w.u32(def.value_size);
@@ -113,11 +119,11 @@ impl Image {
                 w.u32(*at);
                 match import {
                     Import::Name(name) => {
-                        w.0.push(0);
+                        w.0.push(IMPORT_NAME);
                         w.str(name);
                     }
                     Import::Helper(id) => {
-                        w.0.push(1);
+                        w.0.push(IMPORT_HELPER);
                         w.u32(*id);
                     }
                 }
@@ -178,8 +184,8 @@ impl<'a> Sections<'a> {
         for _ in 0..s.u32()? {
             let name = s.str()?;
             let kind = match s.u8()? {
-                0 => MapKind::Array,
-                1 => MapKind::Hash,
+                MAP_ARRAY => MapKind::Array,
+                MAP_HASH => MapKind::Hash,
                 kind => return Err(invalid(format!("map {name}: unknown kind {kind}"))),
             };
             maps.push(MapDef {
@@ -212,8 +218,8 @@ impl<'a> Sections<'a> {
         for _ in 0..s.u32()? {
             let at = s.u32()?;
             let import = match s.u8()? {
-                0 => Import::Name(s.str()?),
-                1 => Import::Helper(s.u32()?),
+                IMPORT_NAME => Import::Name(s.str()?),
+                IMPORT_HELPER => Import::Helper(s.u32()?),
                 kind => return Err(invalid(format!("extern at instruction {at}: unknown kind {kind}"))),
             };
             externs.push((at, import));
@@ -271,67 +277,15 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
         return Err(LinkError::InvalidMap(msg).into());
     }
 
-    let (words, rest) = s.code.as_chunks::<8>();
-    if !rest.is_empty() {
-        return Err(invalid(format!("code is {} bytes", s.code.len())));
-    }
-    for (region, init, len) in [
-        ("code", s.code, s.code.len()),
-        ("rodata", s.rodata, s.rodata_len),
-        ("data", s.data, s.data_len),
-    ] {
-        if len > MAX_REGION_LEN {
-            return Err(VmError::ProgramTooLarge(region));
-        }
-        if init.len() > len {
-            return Err(invalid(format!("{} initial bytes in a {len} byte {region} region", init.len())));
-        }
-    }
-
+    let words = code_words(&s)?;
     // room for the guard slot that `Code::new` appends
     let mut insns = Vec::with_capacity(words.len() + 1);
     insns.extend(words.iter().map(|w| Instruction(u64::from_le_bytes(*w))));
     // Bind against one version of the table; the program refreshes from there.
-    let (table, version) = helpers.snapshot();
-    for (at, import) in &s.externs {
-        let insn = insns
-            .get_mut(*at as usize)
-            .filter(|insn| insn.opcode().0 == CALL)
-            .ok_or_else(|| invalid(format!("extern at instruction {at} is not a call")))?;
-        let slot = match import {
-            Import::Name(name) => table
-                .slot_of_name(name)
-                .ok_or_else(|| LinkError::UnresolvedSymbol(name.clone()))?,
-            Import::Helper(id) => table.slot_of_id(*id).ok_or(LinkError::UnknownHelper(*id))?,
-        };
-        let mut bytes = insn.0.to_le_bytes();
-        set_slot_call(&mut bytes, slot);
-        insn.0 = u64::from_le_bytes(bytes);
-    }
-
-    let insn_count = insns.len() as u64;
-    for (name, info) in &s.functions {
-        // each borrow maps its own region, so the pointer parameters must differ
-        let borrows = &info.borrows;
-        let distinct = borrows
-            .iter()
-            .enumerate()
-            .all(|(i, b)| borrows[..i].iter().all(|o| o.arg != b.arg));
-        if info.pc >= insn_count || !borrows.iter().all(Borrow::in_range) || !distinct {
-            return Err(invalid(format!("function {name}: entry or borrows out of range")));
-        }
-    }
-    let functions = Functions::new(s.functions).ok_or_else(|| invalid("functions are not sorted by unique name"))?;
-
-    let stack_len = config
-        .frame_size
-        .checked_mul(MAX_CALL_DEPTH as u64 + 1)
-        .filter(|&len| len <= MAX_REGION_LEN as u64)
-        .ok_or_else(|| {
-            let frame_size = config.frame_size;
-            let msg = format!("frame size {frame_size} makes the stack larger than {MAX_REGION_LEN} bytes");
-            VmError::InvalidArgument(msg)
-        })?;
+    let snapshot = helpers.snapshot();
+    bind_externs(&mut insns, &s.externs, &snapshot.table)?;
+    let functions = check_functions(s.functions, insns.len() as u64)?;
+    let stack_len = stack_len(config)?;
 
     #[cfg(feature = "maps")]
     let (maps, maps_len) = Maps::new(s.maps, &shared.maps)?;
@@ -353,11 +307,81 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
         shared.regions.map_into(&mut memory);
     }
 
-    let helpers = (helpers.clone(), table, version);
-    let program = Program::new(Code::new(insns), memory, stack_top, functions, helpers, config);
+    let code = Code::new(insns);
+    let program = Program::new(code, memory, stack_top, functions, helpers.clone(), snapshot, config);
     #[cfg(feature = "maps")]
     let program = program.with_maps(maps);
     Ok(program)
+}
+
+/// The code as instruction words. Fails unless the code and the initial data fit their regions.
+fn code_words<'a>(s: &Sections<'a>) -> Result<&'a [[u8; 8]]> {
+    let (words, rest) = s.code.as_chunks::<8>();
+    if !rest.is_empty() {
+        return Err(invalid(format!("code is {} bytes", s.code.len())));
+    }
+    for (region, init, len) in [
+        ("code", s.code, s.code.len()),
+        ("rodata", s.rodata, s.rodata_len),
+        ("data", s.data, s.data_len),
+    ] {
+        if len > MAX_REGION_LEN {
+            return Err(VmError::ProgramTooLarge(region));
+        }
+        if init.len() > len {
+            return Err(invalid(format!("{} initial bytes in a {len} byte {region} region", init.len())));
+        }
+    }
+    Ok(words)
+}
+
+/// Turn each extern call in `insns` into a call to the slot of its import in `table`.
+fn bind_externs(insns: &mut [Instruction], externs: &[(u32, Import)], table: &HelperRegistry) -> Result<()> {
+    for (at, import) in externs {
+        let insn = insns
+            .get_mut(*at as usize)
+            .filter(|insn| insn.byte() == CALL)
+            .ok_or_else(|| invalid(format!("extern at instruction {at} is not a call")))?;
+        let slot = match import {
+            Import::Name(name) => table
+                .slot_of_name(name)
+                .ok_or_else(|| LinkError::UnresolvedSymbol(name.clone()))?,
+            Import::Helper(id) => table.slot_of_id(*id).ok_or(LinkError::UnknownHelper(*id))?,
+        };
+        let mut bytes = insn.0.to_le_bytes();
+        set_slot_call(&mut bytes, slot);
+        insn.0 = u64::from_le_bytes(bytes);
+    }
+    Ok(())
+}
+
+/// The function table of `functions`, in code of `insn_count` instructions.
+fn check_functions(functions: Vec<(String, FunctionInfo)>, insn_count: u64) -> Result<Functions> {
+    for (name, info) in &functions {
+        // each borrow maps its own region, so the pointer parameters must differ
+        let borrows = &info.borrows;
+        let distinct = borrows
+            .iter()
+            .enumerate()
+            .all(|(i, b)| borrows[..i].iter().all(|o| o.arg != b.arg));
+        if info.pc >= insn_count || !borrows.iter().all(Borrow::in_range) || !distinct {
+            return Err(invalid(format!("function {name}: entry or borrows out of range")));
+        }
+    }
+    Functions::new(functions).ok_or_else(|| invalid("functions are not sorted by unique name"))
+}
+
+/// Length of the stack region: one frame per call level.
+fn stack_len(config: &VmConfig) -> Result<u64> {
+    config
+        .frame_size
+        .checked_mul(MAX_CALL_DEPTH as u64 + 1)
+        .filter(|&len| len <= MAX_REGION_LEN as u64)
+        .ok_or_else(|| {
+            let frame_size = config.frame_size;
+            let msg = format!("frame size {frame_size} makes the stack larger than {MAX_REGION_LEN} bytes");
+            VmError::InvalidArgument(msg)
+        })
 }
 
 /// Turn a call instruction into a call to extern-table `slot`.

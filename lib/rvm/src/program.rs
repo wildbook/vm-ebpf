@@ -9,8 +9,8 @@ use hashbrown::HashMap;
 use rvm_core::Code;
 
 use crate::error::{Result, VmError};
-use crate::executor::Executor;
-use crate::helper::{HelperRegistry, SharedHelpers};
+use crate::executor::{Executor, MAX_ARGS};
+use crate::helper::{SharedHelpers, Snapshot};
 #[cfg(feature = "maps")]
 use crate::maps::{MapRef, Maps};
 use crate::memory::VmMemory;
@@ -43,7 +43,7 @@ pub struct Borrow {
 impl Borrow {
     /// Both parameters are argument registers, and different ones.
     pub(crate) fn in_range(&self) -> bool {
-        self.arg < 5 && self.len_arg < 5 && self.arg != self.len_arg
+        usize::from(self.arg) < MAX_ARGS && usize::from(self.len_arg) < MAX_ARGS && self.arg != self.len_arg
     }
 }
 
@@ -91,33 +91,33 @@ pub struct Program {
 }
 
 impl Program {
-    /// `helpers` is the VM's extern table, the copy of it the image was bound against, and that copy's version.
+    /// `helpers` is the copy of the VM's extern table `shared_helpers` the image was bound against.
     pub(crate) fn new(
         code: Code,
         memory: VmMemory,
         stack_top: u64,
         functions: Functions,
-        helpers: (Arc<SharedHelpers>, HelperRegistry, u64),
+        shared_helpers: Arc<SharedHelpers>,
+        helpers: Snapshot,
         config: &VmConfig,
     ) -> Self {
-        let (shared_helpers, helpers, helpers_version) = helpers;
         Self {
             id: NEXT_PROGRAM_ID.fetch_add(1, Ordering::Relaxed),
             code,
             memory,
             functions,
             shared_helpers,
-            helpers_version,
-            executor: Executor::new(helpers, stack_top, config),
+            helpers_version: helpers.version,
+            executor: Executor::new(helpers.table, stack_top, config),
         }
     }
 
-    /// Get guest memory.
+    /// The program's guest memory.
     pub fn memory(&self) -> &VmMemory {
         &self.memory
     }
 
-    /// Get mutable access to memory.
+    /// [`memory`](Self::memory), mutably.
     pub fn memory_mut(&mut self) -> &mut VmMemory {
         &mut self.memory
     }
@@ -144,16 +144,16 @@ impl Program {
         self.functions.list.iter().map(|(name, info)| (name.as_str(), info))
     }
 
-    /// Get information about a function by name.
+    /// The exported function called `name`.
     pub fn function(&self, name: &str) -> Option<&FunctionInfo> {
-        let (index, _) = self.functions.find(name)?;
+        let index = self.functions.find(name)?.index;
         Some(&self.functions.list.get(index)?.1)
     }
 
     /// The index of the function called `name` in [`Program::functions`].
     #[inline]
     pub fn function_index(&self, name: &str) -> Option<usize> {
-        Some(self.functions.find(name)?.0)
+        Some(self.functions.find(name)?.index)
     }
 
     /// Call a function by name; arguments go in r1-r5.
@@ -166,7 +166,7 @@ impl Program {
     /// The function called `name`, for [`Program::call_func`].
     #[inline]
     pub fn func(&self, name: &str) -> Result<Func> {
-        let Some((_, pc)) = self.functions.find(name) else {
+        let Some(Entry { pc, .. }) = self.functions.find(name) else {
             return Err(VmError::FunctionNotFound {
                 plugin: None,
                 func: name.to_string(),
@@ -189,7 +189,7 @@ impl Program {
     /// The function called `name` and its table entry.
     #[inline]
     pub(crate) fn func_with_info(&self, name: &str) -> Option<(Func, &FunctionInfo)> {
-        let (index, pc) = self.functions.find(name)?;
+        let Entry { index, pc } = self.functions.find(name)?;
         let (_, info) = self.functions.list.get(index)?;
         Some((Func { program: self.id, pc }, info))
     }
@@ -228,8 +228,8 @@ impl Program {
     #[cold]
     #[inline(never)]
     fn refresh_helpers(&mut self) {
-        let (helpers, version) = self.shared_helpers.snapshot();
-        self.executor.set_helpers(helpers);
+        let Snapshot { table, version } = self.shared_helpers.snapshot();
+        self.executor.set_helpers(table);
         self.helpers_version = version;
     }
 }
@@ -280,28 +280,41 @@ impl FuncSlot {
         }
     }
 
+    /// The function's name in every program.
+    pub fn name(&self) -> &Arc<str> {
+        &self.name
+    }
+
     /// Call the function in `program`, looking it up again if the slot holds a function of another program. Fails
     /// with [`VmError::FunctionNotFound`] naming `plugin` if `program` lacks it.
     #[inline]
     pub fn call(&self, program: &mut Program, plugin: &Arc<str>, args: &[u64]) -> Result<u64> {
-        let func = self.func.load();
-        let pc = if program.owns(func) {
-            func.pc
-        } else {
-            self.follow(program, plugin)?
-        };
-        program.call_pc(pc, args)
-    }
-
-    /// Look the function up in `program`, which replaced the slot's program, and keep its pc.
-    #[cold]
-    #[inline(never)]
-    fn follow(&self, program: &Program, plugin: &Arc<str>) -> Result<u64> {
-        let Some((func, _)) = program.func_with_info(&self.name) else {
+        let Some(func) = self.get(program, |_| ()) else {
             return Err(not_found(plugin, &self.name));
         };
+        program.call_pc(func.pc, args)
+    }
+
+    /// The function in `program`, looked up again if the slot holds a function of another program; after such a
+    /// lookup, `followed` gets the new entry. `None` if `program` lacks the function.
+    #[inline]
+    pub fn get(&self, program: &Program, followed: impl FnOnce(&FunctionInfo)) -> Option<Func> {
+        let func = self.func.load();
+        if program.owns(func) {
+            Some(func)
+        } else {
+            self.follow(program, followed)
+        }
+    }
+
+    /// Look the function up in `program`, which replaced the slot's program, and keep it.
+    #[cold]
+    #[inline(never)]
+    fn follow(&self, program: &Program, followed: impl FnOnce(&FunctionInfo)) -> Option<Func> {
+        let (func, info) = program.func_with_info(&self.name)?;
         self.func.store(func);
-        Ok(func.pc)
+        followed(info);
+        Some(func)
     }
 }
 
@@ -309,8 +322,8 @@ impl FuncSlot {
 #[derive(Debug)]
 pub(crate) struct Functions {
     list: Vec<(String, FunctionInfo)>,
-    // name -> (index, pc); the pc sits in the map, which measured faster for calls by name than reading it from `list`
-    by_name: HashMap<String, (usize, u64)>,
+    // the pc sits in the map, which measured faster for calls by name than reading it from `list`
+    by_name: HashMap<String, Entry>,
 }
 
 impl Functions {
@@ -322,16 +335,22 @@ impl Functions {
         let by_name = list
             .iter()
             .enumerate()
-            .map(|(index, (name, info))| (name.clone(), (index, info.pc)))
+            .map(|(index, (name, info))| (name.clone(), Entry { index, pc: info.pc }))
             .collect();
         Some(Self { list, by_name })
     }
 
-    /// The index and pc of the function called `name`.
     #[inline(always)]
-    fn find(&self, name: &str) -> Option<(usize, u64)> {
+    fn find(&self, name: &str) -> Option<Entry> {
         self.by_name.get(name).copied()
     }
+}
+
+/// A function's position in [`Functions`] and its entry point.
+#[derive(Debug, Clone, Copy)]
+struct Entry {
+    index: usize,
+    pc: u64,
 }
 
 static NEXT_PROGRAM_ID: AtomicU64 = AtomicU64::new(0);

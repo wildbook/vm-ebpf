@@ -12,23 +12,21 @@
 use btf::{apply_core_relocations, Btf, BtfBuilder, BtfTypeInfo};
 use constelf::raw::reloc;
 use hashbrown::HashMap;
-use rvm_core::opcode::{Class, MemMode, MemSize, OpCode};
+use rvm_core::opcode::{CALL, LD_IMM64};
 use rvm_core::Instruction;
 
 use crate::error::{LinkError, Result, VmError};
 use crate::executor::CORE_POISON_HELPER;
 use crate::helper::HelperRegistry;
-use crate::image::{imm, set_imm, set_slot_call, Image, Import, CALL};
+use crate::image::{imm, set_imm, set_slot_call, Image, Import, INSN_SIZE};
 use crate::layout::{CODE_REGION, DATA_REGION, RODATA_REGION};
 use crate::map_def::map_defs;
-use crate::memory::{region_base, MAX_REGION_LEN, REGION_SHIFT};
+use crate::memory::{region_base, split_addr, MAX_REGION_LEN};
 use crate::module::{Module, Relocation};
 use crate::program::{Borrow, FunctionInfo};
 use crate::section::{Section, SectionKind};
 
 const _: () = assert!(CORE_POISON_HELPER == btf::CORE_POISON_HELPER);
-
-const LD_IMM64: u8 = OpCode(Class::LdImm as u8 | MemMode::Imm as u8 | MemSize::DWord as u8).0;
 
 /// Where a section or symbol lives after linking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,12 +77,12 @@ impl Image {
 
     /// `len` bytes of the data image at guest address `addr`.
     fn data_mut(&mut self, addr: u64, len: usize) -> Result<&mut [u8]> {
-        let buf = match (addr >> REGION_SHIFT) as usize {
+        let (region, at) = split_addr(addr);
+        let buf = match region {
             RODATA_REGION => &mut self.rodata,
             DATA_REGION => &mut self.data,
             _ => return Err(LinkError::InvalidReference(format!("data address {addr:#x}")).into()),
         };
-        let at = addr as u32 as usize;
         buf.get_mut(at..)
             .and_then(|b| b.get_mut(..len))
             .ok_or_else(|| LinkError::InvalidReference(format!("data address {addr:#x}")).into())
@@ -93,7 +91,7 @@ impl Image {
     /// Split `value` across the `imm` fields of the `lddw` at code offset `at` and its second slot.
     fn set_ld_imm64(&mut self, at: u64, value: u64) -> Result<()> {
         set_imm(self.insn_mut(at)?, value as u32);
-        set_imm(self.insn_mut(at + 8)?, (value >> 32) as u32);
+        set_imm(self.insn_mut(at + INSN_SIZE)?, (value >> 32) as u32);
         Ok(())
     }
 }
@@ -180,7 +178,7 @@ fn lay_out(modules: &[&Module]) -> Result<(Image, Vec<ModuleLayout>)> {
             let mut layout = ModuleLayout::default();
             for (idx, section) in module.sections.iter().enumerate() {
                 let addr = match section.kind {
-                    SectionKind::Code => Addr::Code(place(&mut image.code, "code", section, 8)?),
+                    SectionKind::Code => Addr::Code(place(&mut image.code, "code", section, INSN_SIZE as usize)?),
                     SectionKind::RoData => {
                         Addr::Data(region_base(RODATA_REGION) + place(&mut image.rodata, "rodata", section, 1)?)
                     }
@@ -348,7 +346,7 @@ fn apply_relocation(
         (reloc::bpf::BPF_64_32, Addr::Code(at), Addr::Code(target)) => {
             // BPF-to-BPF call: imm becomes the instruction offset from the next instruction.
             let target = target.wrapping_add_signed(reloc.addend);
-            let rel = (target.wrapping_sub(at.wrapping_add(8)) as i64 / 8) as i32;
+            let rel = (target.wrapping_sub(at.wrapping_add(INSN_SIZE)) as i64 / INSN_SIZE as i64) as i32;
             set_imm(image.insn_mut(at)?, rel as u32);
         }
         (reloc::bpf::BPF_64_ABS64, Addr::Data(at), target) => {
@@ -377,7 +375,7 @@ fn mark_helper_calls(helpers: &HelperRegistry, image: &mut Image) -> Result<()> 
             if helpers.slot_of_id(id).is_none() {
                 return Err(LinkError::UnknownHelper(id).into());
             }
-            mark_extern(image, i as u64 * 8, Import::Helper(id))?;
+            mark_extern(image, i as u64 * INSN_SIZE, Import::Helper(id))?;
         }
         i += 1;
     }
@@ -387,7 +385,7 @@ fn mark_helper_calls(helpers: &HelperRegistry, image: &mut Image) -> Result<()> 
 /// Record the call at code offset `at` as an extern. Until loading binds it, it calls a slot no table has.
 fn mark_extern(image: &mut Image, at: u64, import: Import) -> Result<()> {
     set_slot_call(image.insn_mut(at)?, u32::MAX);
-    image.externs.push(((at / 8) as u32, import));
+    image.externs.push(((at / INSN_SIZE) as u32, import));
     Ok(())
 }
 
@@ -444,7 +442,7 @@ fn build_function_table(
                 continue;
             };
             let info = FunctionInfo {
-                pc: at / 8,
+                pc: at / INSN_SIZE,
                 size: export.size,
                 borrows: borrows.get(name.as_str()).cloned().unwrap_or_default(),
             };
@@ -457,7 +455,7 @@ fn build_function_table(
             for (idx, section) in module.sections.iter().enumerate() {
                 if let Some(&Addr::Code(at)) = layout.sections.get(&idx) {
                     let info = FunctionInfo {
-                        pc: at / 8,
+                        pc: at / INSN_SIZE,
                         size: section.size,
                         borrows: Vec::new(),
                     };

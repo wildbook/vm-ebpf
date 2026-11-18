@@ -9,6 +9,7 @@ use constelf::sections::ElfSections;
 use hashbrown::HashMap;
 
 use crate::error::Result;
+use crate::image::INSN_SIZE;
 use crate::section::{section_kind_from_name, Section, SectionKind};
 use crate::symbol::{Export, Symbol};
 
@@ -74,50 +75,41 @@ impl Module {
 
     /// Collect the loadable sections and the raw BTF and BTF.ext blobs.
     fn parse_sections(&mut self, elf_sections: ElfSections<'_>) -> Result<()> {
-        for (idx, header) in elf_sections.headers().iter().enumerate() {
-            let name = elf_sections.name(header)?.to_string_lossy();
+        for (idx, sect) in elf_sections.iter().enumerate() {
+            let name = sect.name()?.to_string_lossy();
 
-            let kind = if (header.sh_flags & shf::EXECINSTR as u64) != 0 {
+            let btf = match &*name {
+                ".BTF" => Some(&mut self.btf_data),
+                ".BTF.ext" => Some(&mut self.btf_ext_data),
+                _ => None,
+            };
+            if let Some(btf) = btf {
+                *btf = sect.bytes().ok().map(<[u8]>::to_vec);
+                continue;
+            }
+
+            let kind = if (sect.sh_flags & shf::EXECINSTR as u64) != 0 {
                 SectionKind::Code
             } else {
                 section_kind_from_name(&name)
             };
-
-            match &*name {
-                ".BTF" => {
-                    if let Some(sect) = elf_sections.by_index(idx) {
-                        self.btf_data = sect.bytes().ok().map(|b| b.to_vec());
-                    }
-                    continue;
-                }
-                ".BTF.ext" => {
-                    if let Some(sect) = elf_sections.by_index(idx) {
-                        self.btf_ext_data = sect.bytes().ok().map(|b| b.to_vec());
-                    }
-                    continue;
-                }
-                _ => {}
-            }
-
             // clang emits `.jumptables` without SHF_ALLOC
-            if (header.sh_flags & shf::ALLOC as u64) == 0 && kind != SectionKind::JumpTable {
+            if (sect.sh_flags & shf::ALLOC as u64) == 0 && kind != SectionKind::JumpTable {
                 continue;
             }
 
-            let data = if header.sh_type == sht::NOBITS {
+            let data = if sect.sh_type == sht::NOBITS {
                 Vec::new() // .bss has no data
-            } else if let Some(sect) = elf_sections.by_index(idx) {
-                sect.bytes()?.to_vec()
             } else {
-                Vec::new()
+                sect.bytes()?.to_vec()
             };
 
             self.sections.push(Section {
                 name: name.into_owned(),
                 kind,
                 data,
-                size: header.sh_size,
-                align: header.sh_addralign.max(1),
+                size: sect.sh_size,
+                align: sect.sh_addralign.max(1),
                 elf_index: idx,
             });
         }
@@ -158,7 +150,7 @@ impl Module {
             let section_idx = if sym.st_shndx == 0 {
                 None
             } else {
-                self.sections.iter().position(|s| s.elf_index == sym.st_shndx as usize)
+                self.section_of(sym.st_shndx as usize)
             };
 
             match (is_global, section_idx) {
@@ -189,8 +181,7 @@ impl Module {
     /// Collect relocations against loaded sections, decoding REL addends from the bytes they patch.
     fn parse_relocations(&mut self, elf: ElfFile<'_>) -> Result<()> {
         for chunk in elf.relocs().iter()? {
-            let target_elf_idx = chunk.target_idx();
-            let Some(section_idx) = self.sections.iter().position(|s| s.elf_index == target_elf_idx) else {
+            let Some(section_idx) = self.section_of(chunk.target_idx()) else {
                 continue; // relocations for sections that aren't loaded
             };
 
@@ -224,12 +215,17 @@ impl Module {
         Ok(())
     }
 
-    /// Get a symbol by name.
+    /// Index in `sections` of the loaded section with ELF section index `elf_index`.
+    fn section_of(&self, elf_index: usize) -> Option<usize> {
+        self.sections.iter().position(|s| s.elf_index == elf_index)
+    }
+
+    /// The first symbol called `name`.
     pub fn symbol(&self, name: &str) -> Option<&Symbol> {
         self.symbols.iter().find(|s| s.name == name)
     }
 
-    /// Get a symbol by index.
+    /// The symbol at `idx` in the ELF symbol table.
     pub fn symbol_by_idx(&self, idx: usize) -> Option<&Symbol> {
         self.symbols.get(idx)
     }
@@ -243,7 +239,7 @@ fn rel_implicit_addend(data: &[u8], offset: u64, typ: u32) -> Option<i64> {
         // LD_IMM64: imm is a byte offset from the symbol.
         reloc::bpf::BPF_64_64 => i64::from(u32::from_le_bytes(imm()?)),
         // Call: target = sym + (imm + 1) instructions (named functions use imm = -1).
-        reloc::bpf::BPF_64_32 => (i64::from(i32::from_le_bytes(imm()?)) + 1) * 8,
+        reloc::bpf::BPF_64_32 => (i64::from(i32::from_le_bytes(imm()?)) + 1) * INSN_SIZE as i64,
         // A pointer in data: the stored 8 bytes are the offset from the symbol.
         reloc::bpf::BPF_64_ABS64 => i64::from_le_bytes(*data.get(at..)?.first_chunk::<8>()?),
         _ => 0,

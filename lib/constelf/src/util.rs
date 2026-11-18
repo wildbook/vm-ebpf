@@ -3,7 +3,7 @@ use std::mem;
 
 use crate::err::ElfError;
 use crate::raw::{Elf64Ehdr, Elf64Rel, Elf64Rela, Elf64Shdr, Elf64Sym};
-use crate::{tryopt, ElfResult};
+use crate::{const_for, tryopt, ElfResult};
 
 /// Types that `cast_slice` may produce: `repr(C, packed)` integer structs, valid for every bit pattern.
 ///
@@ -54,14 +54,11 @@ pub const fn slice_eq(lhs: &[u8], rhs: &[u8]) -> bool {
         return false;
     }
 
-    let mut i = 0;
-    while i < lhs.len() {
+    const_for!(i in 0..lhs.len() => {
         if lhs[i] != rhs[i] {
             return false;
         }
-
-        i += 1;
-    }
+    });
 
     true
 }

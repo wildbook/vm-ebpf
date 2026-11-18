@@ -41,8 +41,7 @@ pub fn patch_instruction(insns: &mut [[u8; 8]], relo: &CoreRelo, res: &ResolvedR
                 return Err(CoreReloError::UnpatchableInstruction(relo.insn_off));
             }
             if res.poison {
-                insns[idx] = POISON;
-                return Ok(true);
+                return Ok(poison(&mut insns[idx]));
             }
             check_orig(relo, res, i64::from(imm(&insn) as i32) as u64)?;
             set_imm(&mut insns[idx], res.new_val as u32);
@@ -50,8 +49,7 @@ pub fn patch_instruction(insns: &mut [[u8; 8]], relo: &CoreRelo, res: &ResolvedR
         }
         LDX | ST | STX => {
             if res.poison {
-                insns[idx] = POISON;
-                return Ok(true);
+                return Ok(poison(&mut insns[idx]));
             }
             check_orig(relo, res, i64::from(i16::from_le_bytes([insn[2], insn[3]])) as u64)?;
             if res.new_val > i16::MAX as u64 {
@@ -61,8 +59,7 @@ pub fn patch_instruction(insns: &mut [[u8; 8]], relo: &CoreRelo, res: &ResolvedR
                 });
             }
             if res.fail_memsz_adjust {
-                insns[idx] = POISON;
-                return Ok(true);
+                return Ok(poison(&mut insns[idx]));
             }
             let insn = &mut insns[idx];
             insn[2..4].copy_from_slice(&(res.new_val as u16).to_le_bytes());
@@ -118,6 +115,12 @@ fn check_orig(relo: &CoreRelo, res: &ResolvedRelo, found: u64) -> Result<(), Cor
     Ok(())
 }
 
+/// Overwrite `insn` with [`POISON`]. Returns `true` for the caller's poisoned flag.
+fn poison(insn: &mut [u8; 8]) -> bool {
+    *insn = POISON;
+    true
+}
+
 fn imm(insn: &[u8; 8]) -> u32 {
     let [.., a, b, c, d] = *insn;
     u32::from_le_bytes([a, b, c, d])
@@ -127,22 +130,14 @@ fn set_imm(insn: &mut [u8; 8], imm: u32) {
     insn[4..].copy_from_slice(&imm.to_le_bytes());
 }
 
+/// The load/store size field (`opcode & 0x18`) and the access width in bytes it encodes.
+const MEM_SIZES: [(u8, u32); 4] = [(0x18, 8), (0x00, 4), (0x08, 2), (0x10, 1)];
+
 fn mem_size_bytes(opcode: u8) -> Option<u32> {
-    match opcode & 0x18 {
-        0x18 => Some(8),
-        0x00 => Some(4),
-        0x08 => Some(2),
-        0x10 => Some(1),
-        _ => None,
-    }
+    let field = opcode & 0x18;
+    MEM_SIZES.iter().find(|&&(f, _)| f == field).map(|&(_, b)| b)
 }
 
 fn bytes_to_mem_size(bytes: u32) -> Option<u8> {
-    match bytes {
-        8 => Some(0x18),
-        4 => Some(0x00),
-        2 => Some(0x08),
-        1 => Some(0x10),
-        _ => None,
-    }
+    MEM_SIZES.iter().find(|&&(_, b)| b == bytes).map(|&(f, _)| f)
 }

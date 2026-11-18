@@ -3,87 +3,98 @@
 //! Keys and values come from guest pointers, read with the guest's own permissions, so a helper reads no memory the
 //! program couldn't load from itself.
 
+use super::Maps;
 use crate::helper::{HelperContext, HelperRegistry};
 use crate::memory::Perms;
-use crate::std_helpers::{BPF_FUNC_MAP_DELETE_ELEM, BPF_FUNC_MAP_LOOKUP_ELEM, BPF_FUNC_MAP_UPDATE_ELEM};
+use crate::std_helpers::{BPF_FUNC_MAP_DELETE_ELEM, BPF_FUNC_MAP_LOOKUP_ELEM, BPF_FUNC_MAP_UPDATE_ELEM, EINVAL};
 
 pub const ENOENT: i64 = 2;
 pub const E2BIG: i64 = 7;
 pub const EEXIST: i64 = 17;
-pub const EINVAL: i64 = 22;
 
 /// Bind helpers 1 to 3 to the built-in map implementation unless the host registered its own under those IDs.
 pub fn register_helpers(helpers: &mut HelperRegistry) {
-    // one closure type per helper, so each slot calls its body directly
+    // each fn item has its own type, so each slot calls its body directly
     if helpers.slot_of_id(BPF_FUNC_MAP_LOOKUP_ELEM).is_none() {
-        helpers.register_helper_raw(BPF_FUNC_MAP_LOOKUP_ELEM, |ctx: &mut HelperContext| lookup_elem(ctx));
+        helpers.register_helper_raw(BPF_FUNC_MAP_LOOKUP_ELEM, lookup_elem);
     }
     if helpers.slot_of_id(BPF_FUNC_MAP_UPDATE_ELEM).is_none() {
-        helpers.register_helper_raw(BPF_FUNC_MAP_UPDATE_ELEM, |ctx: &mut HelperContext| update_elem(ctx));
+        helpers.register_helper_raw(BPF_FUNC_MAP_UPDATE_ELEM, update_elem);
     }
     if helpers.slot_of_id(BPF_FUNC_MAP_DELETE_ELEM).is_none() {
-        helpers.register_helper_raw(BPF_FUNC_MAP_DELETE_ELEM, |ctx: &mut HelperContext| delete_elem(ctx));
+        helpers.register_helper_raw(BPF_FUNC_MAP_DELETE_ELEM, delete_elem);
     }
 }
 
 fn lookup_elem(ctx: &mut HelperContext) -> i64 {
-    let Some(maps) = ctx.maps.as_deref() else {
+    let Some(map) = MapArg::new(ctx.maps.as_deref_mut(), ctx.args.r1) else {
         return 0;
     };
-    let handle = ctx.args.r1 as u32;
-    let Some(def) = maps.def(handle) else {
+    let Ok(key) = ctx.memory.slice(ctx.args.r2, map.key_size, Perms::R) else {
         return 0;
     };
-    let Ok(key) = ctx.memory.slice(ctx.args.r2, def.key_size as usize, Perms::R) else {
-        return 0;
-    };
-    maps.lookup(handle, key).unwrap_or(0) as i64
+    map.maps.lookup(map.handle, key).unwrap_or(0) as i64
 }
 
 fn update_elem(ctx: &mut HelperContext) -> i64 {
-    let Some(maps) = ctx.maps.as_deref_mut() else {
+    let Some(map) = MapArg::new(ctx.maps.as_deref_mut(), ctx.args.r1) else {
         return -EINVAL;
     };
-    let handle = ctx.args.r1 as u32;
-    let Some(def) = maps.def(handle) else {
-        return -EINVAL;
-    };
-    let (key_size, value_size) = (def.key_size as usize, def.value_size as usize);
 
     // check the value before inserting the key, so a bad pointer changes nothing
-    if ctx.memory.slice(ctx.args.r3, value_size, Perms::R).is_err() {
+    if ctx.memory.slice(ctx.args.r3, map.value_size, Perms::R).is_err() {
         return -EINVAL;
     }
-    let Ok(key) = ctx.memory.slice(ctx.args.r2, key_size, Perms::R) else {
+    let Ok(key) = ctx.memory.slice(ctx.args.r2, map.key_size, Perms::R) else {
         return -EINVAL;
     };
-    let addr = match maps.upsert(handle, key, ctx.args.r4) {
+    let addr = match map.maps.upsert(map.handle, key, ctx.args.r4) {
         Ok(addr) => addr,
         Err(e) => return -e.errno(),
     };
     ctx.memory
-        .copy(ctx.args.r3, addr, value_size)
+        .copy(ctx.args.r3, addr, map.value_size)
         .expect("value checked above");
     0
 }
 
 fn delete_elem(ctx: &mut HelperContext) -> i64 {
-    let Some(maps) = ctx.maps.as_deref_mut() else {
+    let Some(map) = MapArg::new(ctx.maps.as_deref_mut(), ctx.args.r1) else {
         return -EINVAL;
     };
-    let handle = ctx.args.r1 as u32;
-    let Some(def) = maps.def(handle) else {
+    let Ok(key) = ctx.memory.slice(ctx.args.r2, map.key_size, Perms::R) else {
         return -EINVAL;
     };
-    let value_size = def.value_size as usize;
-    let Ok(key) = ctx.memory.slice(ctx.args.r2, def.key_size as usize, Perms::R) else {
-        return -EINVAL;
-    };
-    match maps.remove(handle, key) {
+    match map.maps.remove(map.handle, key) {
         Ok(addr) => {
-            ctx.memory.zero(addr, value_size).expect("map slots are mapped");
+            ctx.memory.zero(addr, map.value_size).expect("map slots are mapped");
             0
         }
         Err(e) => -e.errno(),
+    }
+}
+
+/// The map a helper call names by its handle in r1.
+struct MapArg<'a> {
+    maps: &'a mut Maps,
+    handle: u32,
+    key_size: usize,
+    value_size: usize,
+}
+
+impl<'a> MapArg<'a> {
+    /// The map with handle `r1` among the calling program's `maps`, if it has one.
+    #[inline]
+    fn new(maps: Option<&'a mut Maps>, r1: u64) -> Option<Self> {
+        let maps = maps?;
+        let handle = r1 as u32;
+        let def = maps.def(handle)?;
+        let (key_size, value_size) = (def.key_size as usize, def.value_size as usize);
+        Some(Self {
+            maps,
+            handle,
+            key_size,
+            value_size,
+        })
     }
 }

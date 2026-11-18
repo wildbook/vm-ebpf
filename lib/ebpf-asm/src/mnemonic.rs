@@ -22,7 +22,7 @@ macro_rules! mnemonics {
         }
 
         impl Mnemonic {
-            /// Get the mnemonic name as a string.
+            /// Assembly name of the mnemonic.
             pub const fn name(self) -> &'static str {
                 match self {
                     $( Mnemonic::$variant => $name, )+

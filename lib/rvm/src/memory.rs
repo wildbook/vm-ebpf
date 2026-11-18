@@ -1,7 +1,7 @@
 //! Guest memory for the eBPF VM.
 //!
 //! Guest addresses are split into a region index (bits 32..) and an offset (bits 0..32):
-//! `addr = (region << 32) | offset`. Each of the [`MAX_REGIONS`] slots maps a byte range with its own permissions.
+//! `addr = (region << 32) | offset`. Each of the [`MAX_REGIONS`] regions maps a byte range with its own permissions.
 //! Region 0 is never mapped, so null pointers (and small offsets from them) fault.
 //!
 //! A guest load or store costs one table index and one bounds check: each region keeps a readable and a writable
@@ -19,14 +19,11 @@ use rvm_core::{AtomicOp, Memory, Window};
 use crate::error::{MemoryError, VmError};
 use crate::layout::{BORROW_FIRST_REGION, FIRST_FREE_REGION};
 
-/// Number of region slots in a [`VmMemory`].
+/// Number of regions in a [`VmMemory`].
 pub const MAX_REGIONS: usize = 64;
 
 /// Bit position of the region index in a guest address.
 pub const REGION_SHIFT: u32 = 32;
-
-// address splits take the offset as `addr as u32`
-const _: () = assert!(REGION_SHIFT == 32);
 
 /// Largest region (offsets are 32 bits).
 pub const MAX_REGION_LEN: usize = 1 << REGION_SHIFT;
@@ -34,6 +31,11 @@ pub const MAX_REGION_LEN: usize = 1 << REGION_SHIFT;
 /// Guest base address of region `idx`.
 pub const fn region_base(idx: usize) -> u64 {
     (idx as u64) << REGION_SHIFT
+}
+
+/// Region index and offset of guest address `addr`. The offset is below [`MAX_REGION_LEN`].
+pub const fn split_addr(addr: u64) -> (usize, usize) {
+    ((addr >> REGION_SHIFT) as usize, (addr & (MAX_REGION_LEN as u64 - 1)) as usize)
 }
 
 /// Access permissions of a region.
@@ -56,7 +58,7 @@ impl Perms {
     }
 }
 
-// The owned-region bitmask has one bit per slot.
+// The owned-region bitmask has one bit per region.
 const _: () = assert!(MAX_REGIONS <= 64);
 
 /// Region-mapped guest memory.
@@ -170,9 +172,8 @@ impl VmMemory {
         let ptr = if len == 0 {
             NonNull::dangling()
         } else {
-            // SAFETY: non-zero size, align 8.
-            let raw = unsafe { alloc_zeroed(Self::layout(len)) };
-            NonNull::new(raw).unwrap_or_else(|| std::alloc::handle_alloc_error(Self::layout(len)))
+            // SAFETY: non-zero size.
+            unsafe { allocate_zeroed(Self::layout(len)) }
         };
         self.set(idx, ptr, len, perms, true)
     }
@@ -253,9 +254,8 @@ impl VmMemory {
     /// Resolve `addr..addr+len` to a host pointer if region perms include `need`.
     #[inline(always)]
     fn resolve(&self, addr: u64, len: usize, need: Perms) -> Option<NonNull<u8>> {
-        let idx = (addr >> REGION_SHIFT) as usize;
+        let (idx, off) = split_addr(addr);
         let region_len = *self.lens.get(idx)?;
-        let off = addr as u32 as usize;
         (self.perms[idx].allows(need) && len <= region_len && off <= region_len - len)
             // SAFETY: in bounds of the region's allocation.
             .then(|| unsafe { self.ptrs[idx].add(off) })
@@ -264,9 +264,8 @@ impl VmMemory {
     /// Resolve a guest access of `size` bytes, 1 to 8, against `ends`, which is `read_end` or `write_end`.
     #[inline(always)]
     fn guest_ptr(&self, addr: u64, size: usize, ends: &[usize; MAX_REGIONS]) -> Option<NonNull<u8>> {
-        let idx = (addr >> REGION_SHIFT) as usize;
+        let (idx, off) = split_addr(addr);
         let end = *ends.get(idx)?;
-        let off = addr as u32 as usize;
         // `off` is below 2^32, so the sum can't overflow
         (off + size <= end)
             // SAFETY: `end` never exceeds the region's length, so the access lies inside its allocation.
@@ -304,7 +303,7 @@ impl VmMemory {
 
     /// Fail unless `addr..addr+len` lies outside the regions mapped with `map_shared`.
     fn check_unshared(&self, addr: u64, len: usize) -> Result<(), MemoryError> {
-        match self.shared.get((addr >> REGION_SHIFT) as usize) {
+        match self.shared.get(split_addr(addr).0) {
             Some(Some(_)) => Err(MemoryError { addr, size: len }),
             _ => Ok(()),
         }
@@ -346,10 +345,7 @@ impl VmMemory {
 
     /// Read a little-endian scalar at guest address `addr` (host access).
     pub fn read<T: Scalar>(&self, addr: u64) -> Result<T, MemoryError> {
-        let mut bytes = [0; 8];
-        let bytes = &mut bytes[..T::SIZE];
-        self.read_bytes(addr, bytes)?;
-        Ok(T::read_le(bytes))
+        read_scalar(|bytes| self.read_bytes(addr, bytes))
     }
 
     /// Copy the `V` at guest address `addr` out (host access).
@@ -362,10 +358,7 @@ impl VmMemory {
 
     /// Write a little-endian scalar at guest address `addr` (host access).
     pub fn write<T: Scalar>(&mut self, addr: u64, value: T) -> Result<(), MemoryError> {
-        let mut bytes = [0; 8];
-        let bytes = &mut bytes[..T::SIZE];
-        value.write_le(bytes);
-        self.write_bytes(addr, bytes)
+        write_scalar(value, |bytes| self.write_bytes(addr, bytes))
     }
 }
 
@@ -379,6 +372,17 @@ fn check_host_region(idx: usize, len: usize) -> crate::Result<()> {
         return Err(VmError::InvalidArgument(format!("region length {len} exceeds {MAX_REGION_LEN}")));
     }
     Ok(())
+}
+
+/// Allocate zeroed memory for `layout`, or abort if the allocator fails.
+///
+/// # Safety
+///
+/// `layout` must have a non-zero size.
+unsafe fn allocate_zeroed(layout: Layout) -> NonNull<u8> {
+    // SAFETY: the caller's contract.
+    let raw = unsafe { alloc_zeroed(layout) };
+    NonNull::new(raw).unwrap_or_else(|| std::alloc::handle_alloc_error(layout))
 }
 
 impl Drop for VmMemory {
@@ -437,18 +441,12 @@ impl<'a> GuestMemory<'a> {
 
     /// Read a little-endian scalar at guest address `addr`.
     pub fn read<T: Scalar>(&self, addr: u64) -> Result<T, MemoryError> {
-        let mut bytes = [0; 8];
-        let bytes = &mut bytes[..T::SIZE];
-        self.read_bytes(addr, bytes)?;
-        Ok(T::read_le(bytes))
+        read_scalar(|bytes| self.read_bytes(addr, bytes))
     }
 
     /// Write a little-endian scalar at guest address `addr`.
     pub fn write<T: Scalar>(&mut self, addr: u64, value: T) -> Result<(), MemoryError> {
-        let mut bytes = [0; 8];
-        let bytes = &mut bytes[..T::SIZE];
-        value.write_le(bytes);
-        self.write_bytes(addr, bytes)
+        write_scalar(value, |bytes| self.write_bytes(addr, bytes))
     }
 }
 
@@ -473,8 +471,7 @@ impl SharedBuffer {
         assert!(len != 0, "empty shared buffer");
         let layout = Self::layout(len);
         // SAFETY: non-zero size.
-        let raw = unsafe { alloc_zeroed(layout) };
-        let ptr = NonNull::new(raw).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+        let ptr = unsafe { allocate_zeroed(layout) };
         Self { ptr, len }
     }
 
@@ -516,6 +513,17 @@ macro_rules! fetch_op {
     };
 }
 
+/// The `$atomic` at `$ptr`, or `None` if `$ptr` is misaligned for it. `$ptr` must come from a bounds check of
+/// `size_of::<$atomic>()` bytes inside a live region.
+macro_rules! atomic_cell {
+    ($ptr:expr, $atomic:ident) => {{
+        let ptr = $ptr.cast::<$atomic>();
+        // SAFETY: the bounds check keeps `ptr` inside a live region, and the alignment is checked. Other threads reach
+        // the memory only through atomics or under the `map_host` and `Vm::share_region` contracts.
+        ptr.is_aligned().then(|| unsafe { ptr.as_ref() })
+    }};
+}
+
 /// Host atomic on a shared region, coherent with guest atomics on other threads. Misaligned offsets fail, as they do
 /// for guests.
 macro_rules! region_atomic {
@@ -523,15 +531,11 @@ macro_rules! region_atomic {
         /// Apply `op` atomically to the value at `offset` and return the old value.
         pub fn $name(&mut self, offset: usize, op: AtomicOp<$ty>) -> Result<$ty, MemoryError> {
             let ptr = self.ptr(offset, size_of::<$ty>())?;
-            if !ptr.cast::<$ty>().is_aligned() {
-                return Err(MemoryError {
-                    addr: self.base() + offset as u64,
-                    size: size_of::<$ty>(),
-                });
-            }
-            // SAFETY: in bounds and aligned; other threads reach this memory through guest atomics or under the
-            // `Vm::share_region` contract.
-            let cell = unsafe { $atomic::from_ptr(ptr.as_ptr().cast()) };
+            let misaligned = || MemoryError {
+                addr: self.base() + offset as u64,
+                size: size_of::<$ty>(),
+            };
+            let cell = atomic_cell!(ptr, $atomic).ok_or_else(misaligned)?;
             Ok(fetch_op!(cell, op))
         }
     };
@@ -599,18 +603,12 @@ impl SharedRegion {
 
     /// Read a little-endian scalar at `offset`.
     pub fn read<T: Scalar>(&self, offset: usize) -> Result<T, MemoryError> {
-        let mut bytes = [0; 8];
-        let bytes = &mut bytes[..T::SIZE];
-        self.read_bytes(offset, bytes)?;
-        Ok(T::read_le(bytes))
+        read_scalar(|bytes| self.read_bytes(offset, bytes))
     }
 
     /// Write a little-endian scalar at `offset`.
     pub fn write<T: Scalar>(&mut self, offset: usize, value: T) -> Result<(), MemoryError> {
-        let mut bytes = [0; 8];
-        let bytes = &mut bytes[..T::SIZE];
-        value.write_le(bytes);
-        self.write_bytes(offset, bytes)
+        write_scalar(value, |bytes| self.write_bytes(offset, bytes))
     }
 
     region_atomic!(atomic_u32, u32, AtomicU32);
@@ -660,12 +658,7 @@ macro_rules! guest_atomic {
         #[inline(always)]
         fn $name(&mut self, addr: u64, op: AtomicOp<$ty>) -> Result<$ty, u64> {
             let ptr = self.resolve(addr, size_of::<$ty>(), Perms::RW).ok_or(addr)?;
-            if !ptr.cast::<$ty>().is_aligned() {
-                return Err(addr);
-            }
-            // SAFETY: in bounds and aligned; other threads only reach this memory through atomics or under the
-            // `map_host` contract.
-            let cell = unsafe { $atomic::from_ptr(ptr.as_ptr().cast()) };
+            let cell = atomic_cell!(ptr, $atomic).ok_or(addr)?;
             Ok(fetch_op!(cell, op))
         }
     };
@@ -680,11 +673,7 @@ macro_rules! guest_ordered {
             let ptr = self
                 .guest_ptr(addr, size_of::<$ty>(), &self.read_end)
                 .ok_or(addr)?;
-            if !ptr.cast::<$ty>().is_aligned() {
-                return Err(addr);
-            }
-            // SAFETY: as `guest_atomic`.
-            let cell = unsafe { $atomic::from_ptr(ptr.as_ptr().cast()) };
+            let cell = atomic_cell!(ptr, $atomic).ok_or(addr)?;
             Ok(<$ty>::from_le(cell.load(Acquire)))
         }
 
@@ -693,11 +682,7 @@ macro_rules! guest_ordered {
             let ptr = self
                 .guest_ptr(addr, size_of::<$ty>(), &self.write_end)
                 .ok_or(addr)?;
-            if !ptr.cast::<$ty>().is_aligned() {
-                return Err(addr);
-            }
-            // SAFETY: as `guest_atomic`.
-            let cell = unsafe { $atomic::from_ptr(ptr.as_ptr().cast()) };
+            let cell = atomic_cell!(ptr, $atomic).ok_or(addr)?;
             cell.store(value.to_le(), Release);
             Ok(())
         }
@@ -722,7 +707,7 @@ unsafe impl Memory for VmMemory {
     guest_ordered!(load_acquire_u64, store_release_u64, u64, AtomicU64);
 
     fn window(&self, addr: u64) -> Window {
-        let idx = (addr >> REGION_SHIFT) as usize;
+        let (idx, _) = split_addr(addr);
         if idx >= MAX_REGIONS {
             return Window::NONE;
         }
@@ -763,6 +748,22 @@ macro_rules! scalar {
 }
 
 scalar!(u8, u16, u32, u64, i8, i16, i32, i64);
+
+/// Decode a little-endian `T` from the bytes `read` copies into the buffer it gets.
+fn read_scalar<T: Scalar>(read: impl FnOnce(&mut [u8]) -> Result<(), MemoryError>) -> Result<T, MemoryError> {
+    let mut bytes = [0; 8];
+    let bytes = &mut bytes[..T::SIZE];
+    read(bytes)?;
+    Ok(T::read_le(bytes))
+}
+
+/// Encode `value` as little-endian bytes and pass them to `write`.
+fn write_scalar<T: Scalar>(value: T, write: impl FnOnce(&[u8]) -> Result<(), MemoryError>) -> Result<(), MemoryError> {
+    let mut bytes = [0; 8];
+    let bytes = &mut bytes[..T::SIZE];
+    value.write_le(bytes);
+    write(bytes)
+}
 
 /// Plain data: a type whose value is exactly its bytes, for reading and writing map keys and values as Rust types.
 ///
@@ -1004,8 +1005,8 @@ mod tests {
 
     /// The perms test and overflow-safe bounds check the folded ends must agree with.
     fn reference(table: &Table, addr: u64, len: usize, need: Perms) -> Option<NonNull<u8>> {
-        let &(ptr, region_len, perms) = table.get((addr >> REGION_SHIFT) as usize)?;
-        let off = addr as u32 as usize;
+        let (idx, off) = split_addr(addr);
+        let &(ptr, region_len, perms) = table.get(idx)?;
         let ok = perms.0 & need.0 == need.0 && len <= region_len && off <= region_len - len;
         ok.then(|| NonNull::new(ptr.as_ptr().wrapping_add(off)).unwrap())
     }

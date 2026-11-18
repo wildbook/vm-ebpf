@@ -63,61 +63,62 @@ impl RawInstruction {
         Self(imm | off | src | dst | opc)
     }
 
-    /// Get the opcode byte.
+    /// Opcode byte.
     #[inline]
     pub const fn opcode(self) -> u8 {
         (self.0 & 0xFF) as u8
     }
 
-    /// Get the instruction class (opcode bits 0-2), one of the [`class`] constants.
+    /// Instruction class (opcode bits 0-2), one of the [`class`] constants.
     #[inline]
     pub const fn class(self) -> u8 {
         self.opcode() & 0x07
     }
 
-    /// Get the memory access size (opcode bits 3-4) of a load or store, one of the [`size`] constants.
+    /// Memory access size (opcode bits 3-4) of a load or store, one of the [`size`] constants.
     #[inline]
     pub const fn size(self) -> u8 {
         self.opcode() & 0x18
     }
 
-    /// Get the addressing mode (opcode bits 5-7) of a load or store, one of the [`mode`] constants.
+    /// Addressing mode (opcode bits 5-7) of a load or store, one of the [`mode`] constants.
     #[inline]
     pub const fn mode(self) -> u8 {
         self.opcode() & 0xE0
     }
 
-    /// Get the operation (opcode bits 4-7) of an ALU or jump instruction, one of the [`alu`] or [`jmp`] constants.
+    /// Operation (opcode bits 4-7) of an ALU or jump instruction, one of the [`alu`] or
+    /// [`jmp`] constants.
     #[inline]
     pub const fn op(self) -> u8 {
         self.opcode() & 0xF0
     }
 
-    /// Get the destination register (4 bits).
+    /// Destination register (4 bits).
     #[inline]
     pub const fn dst(self) -> u8 {
         ((self.0 >> 8) & 0xF) as u8
     }
 
-    /// Get the source register (4 bits).
+    /// Source register (4 bits).
     #[inline]
     pub const fn src(self) -> u8 {
         ((self.0 >> 12) & 0xF) as u8
     }
 
-    /// Get the offset (signed 16-bit).
+    /// Signed 16-bit offset.
     #[inline]
     pub const fn offset(self) -> i16 {
         ((self.0 >> 16) & 0xFFFF) as i16
     }
 
-    /// Get the immediate value (signed 32-bit).
+    /// Signed 32-bit immediate.
     #[inline]
     pub const fn imm(self) -> i32 {
         ((self.0 >> 32) & 0xFFFFFFFF) as i32
     }
 
-    /// Get the raw u64 value.
+    /// Raw u64 encoding.
     #[inline]
     pub const fn value(self) -> u64 {
         self.0

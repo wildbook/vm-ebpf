@@ -49,6 +49,7 @@
 //!
 //! - `link` (default): ELF parsing, CO-RE and the linker (`Module`, `HostTypes`, `Vm::prepare`, `Vm::load_elf` and
 //!   friends). Without it, rvm loads prepared images only.
+//! - `fuel` (default): `VmConfig::instruction_limit`. Without it, the interpreter doesn't count instructions.
 //! - `maps` (default): guest maps, with the map helpers (IDs 1 to 3), `Program::map` and `Vm::share_map`. Without it,
 //!   an image that declares maps fails to load.
 //! - `fixed-hash-seed`: guest hash maps use a fixed hash seed, for reproducible benchmarks.
@@ -73,7 +74,6 @@ mod memory;
 mod module;
 mod plugin;
 mod program;
-mod published;
 #[cfg(feature = "link")]
 mod section;
 mod std_helpers;
@@ -92,7 +92,7 @@ pub use helper::{FromArgs, IntoReturn};
 pub use host_type::__host_field_type;
 #[cfg(feature = "link")]
 pub use host_type::{HostType, HostTypes};
-pub use image::{Image, Import};
+pub use image::{Image, Import, INSN_SIZE};
 pub use layout::{
     BORROW_FIRST_REGION, BORROW_REGIONS, CODE_REGION, DATA_REGION, FIRST_FREE_REGION, MAPS_REGION, RODATA_REGION,
     SHARED_MAPS_FIRST_REGION, STACK_REGION,

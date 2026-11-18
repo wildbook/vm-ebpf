@@ -6,6 +6,7 @@ use rvm_core::{run, CallStack, Code, Context, Flow, Host};
 
 use crate::error::{ExecError, HelperError, MemoryError, Result, VmError};
 use crate::helper::{HelperArgs, HelperContext, HelperRegistry};
+use crate::image::INSN_SIZE;
 use crate::layout::CODE_REGION;
 #[cfg(feature = "maps")]
 use crate::maps::Maps;
@@ -18,6 +19,9 @@ pub const DEFAULT_FRAME_SIZE: u64 = 512;
 /// Helper ID of the call the linker plants for a CO-RE relocation the host can't resolve (`btf::CORE_POISON_HELPER`).
 pub const CORE_POISON_HELPER: u32 = 0xbad2310;
 
+/// Argument registers of a call into a guest function, r1 to r5.
+pub const MAX_ARGS: usize = 5;
+
 /// Runs the functions of one program, with BPF-to-BPF calls on their own stack frames.
 ///
 /// Each call borrows the code and the memory, so the memory survives errors. Code is a separate instruction slice, so
@@ -25,18 +29,17 @@ pub const CORE_POISON_HELPER: u32 = 0xbad2310;
 /// next: the extern table, the maps, the frame size and the r10 window.
 pub struct Executor {
     /// The frames of the local calls in progress, and the frame size, r10 window and host.
-    calls: CallStack<Helpers, u64>,
+    calls: CallStack<HostCalls, u64>,
     /// Initial r10.
     stack_top: u64,
-    /// Maximum instructions to execute, at most `i64::MAX`.
-    #[cfg(feature = "fuel")]
+    /// Maximum instructions to execute, at most `i64::MAX`. Without the `fuel` feature, nothing counts them.
     instruction_limit: u64,
 }
 
 impl Executor {
     /// An executor whose calls start with r10 at `stack_top`, with the frame size and instruction limit of `config`.
     pub fn new(helpers: HelperRegistry, stack_top: u64, config: &VmConfig) -> Self {
-        let helpers = Helpers {
+        let helpers = HostCalls {
             registry: helpers,
             #[cfg(feature = "maps")]
             maps: Maps::default(),
@@ -45,12 +48,7 @@ impl Executor {
         Self {
             calls: CallStack::new(config.frame_size, helpers),
             stack_top,
-            // `VmConfig` says 0 for no limit, and `run` takes at most `i64::MAX`
-            #[cfg(feature = "fuel")]
-            instruction_limit: match config.instruction_limit {
-                0 => i64::MAX as u64,
-                limit => limit.min(i64::MAX as u64),
-            },
+            instruction_limit: instruction_limit(config),
         }
     }
 
@@ -68,7 +66,7 @@ impl Executor {
     /// Call the function at `pc` (instruction index) of `code` with `args` in r1-r5; returns r0. More than 5 arguments
     /// fail with [`VmError::TooManyArgs`].
     pub fn call(&mut self, code: &Code, memory: &mut VmMemory, pc: u64, args: &[u64]) -> Result<u64> {
-        if args.len() > 5 {
+        if args.len() > MAX_ARGS {
             return Err(VmError::TooManyArgs(args.len()));
         }
 
@@ -78,8 +76,8 @@ impl Executor {
         // carries over: `run` writes `stop` before reading it and drops the r10 window when the memory has moved to
         // another epoch, and the executor takes the host's error whenever a host call set one.
         let mut ctx = Context::new(memory);
-        // at most 5 stores; `copy_from_slice` calls memcpy
-        for (i, &arg) in args.iter().take(5).enumerate() {
+        // at most `MAX_ARGS` stores; `copy_from_slice` calls memcpy
+        for (i, &arg) in args.iter().take(MAX_ARGS).enumerate() {
             ctx.regs[i + 1] = arg;
         }
         ctx.regs[10] = self.stack_top;
@@ -87,19 +85,12 @@ impl Executor {
         calls.clear();
 
         let mut pc = pc;
-        #[cfg(feature = "fuel")]
         let mut fuel = self.instruction_limit;
-        #[cfg(feature = "fuel")]
-        let flow = run(&mut ctx, code, &mut pc, &mut fuel, calls);
-        #[cfg(not(feature = "fuel"))]
-        let flow = run(&mut ctx, code, &mut pc, calls);
+        let flow = run_metered(&mut ctx, code, &mut pc, &mut fuel, calls);
         if let Flow::Exit = flow {
             return Ok(ctx.regs[0]);
         }
-        #[cfg(feature = "fuel")]
-        return run_on(flow, pc, code, &mut ctx, calls, fuel, self.instruction_limit);
-        #[cfg(not(feature = "fuel"))]
-        return run_on(flow, pc, code, &mut ctx, calls);
+        run_on(flow, pc, code, &mut ctx, calls, fuel, self.instruction_limit)
     }
 }
 
@@ -125,21 +116,13 @@ fn run_on(
     mut pc: u64,
     code: &Code,
     ctx: &mut Context<&mut VmMemory>,
-    calls: &mut CallStack<Helpers, u64>,
-    #[cfg(feature = "fuel")] mut fuel: u64,
-    #[cfg(feature = "fuel")] limit: u64,
+    calls: &mut CallStack<HostCalls, u64>,
+    mut fuel: u64,
+    limit: u64,
 ) -> Result<u64> {
     loop {
-        #[cfg(feature = "fuel")]
-        {
-            pc = resume(flow, pc, code, ctx, calls, limit)?;
-            flow = run(ctx, code, &mut pc, &mut fuel, calls);
-        }
-        #[cfg(not(feature = "fuel"))]
-        {
-            pc = resume(flow, pc, code, ctx, calls)?;
-            flow = run(ctx, code, &mut pc, calls);
-        }
+        pc = resume(flow, pc, code, ctx, calls, limit)?;
+        flow = run_metered(ctx, code, &mut pc, &mut fuel, calls);
         if let Flow::Exit = flow {
             return Ok(ctx.regs[0]);
         }
@@ -154,15 +137,14 @@ fn resume(
     pc: u64,
     code: &Code,
     ctx: &mut Context<&mut VmMemory>,
-    calls: &mut CallStack<Helpers, u64>,
-    #[cfg(feature = "fuel")] limit: u64,
+    calls: &mut CallStack<HostCalls, u64>,
+    limit: u64,
 ) -> Result<u64> {
     match flow {
         Flow::StackOverflow => Err(ExecError::StackOverflow { pc }.into()),
         // a call the linker planted for an unresolved CO-RE relocation
         Flow::CallHelper(CORE_POISON_HELPER) => Err(ExecError::UnresolvedCoreRelo { pc }.into()),
         Flow::CallHelper(_) | Flow::CallKfunc(_) => Err(calls.host.take_error().into()),
-        #[cfg(feature = "fuel")]
         Flow::OutOfFuel => Err(ExecError::InstructionLimit(limit).into()),
         Flow::BadPc => Err(ExecError::InvalidPc(pc).into()),
         Flow::FailCpu => Err(ExecError::CpuFault { pc }.into()),
@@ -172,13 +154,11 @@ fn resume(
         Flow::JumpIndirect(target) => jump_indirect(target, pc, code),
         // `run` handles these internally, and the executor `Exit`
         Flow::Exit | Flow::Next | Flow::Jump(_) | Flow::Call(_) => unreachable!(),
-        #[cfg(not(feature = "fuel"))]
-        Flow::OutOfFuel => unreachable!(),
     }
 }
 
 /// The extern table and maps that helper and kfunc calls reach from inside [`run`].
-struct Helpers {
+struct HostCalls {
     registry: HelperRegistry,
     #[cfg(feature = "maps")]
     maps: Maps,
@@ -186,7 +166,7 @@ struct Helpers {
     error: Option<HelperError>,
 }
 
-impl Helpers {
+impl HostCalls {
     /// Call the extern table entry at `slot` with the arguments in `ctx.regs[1..=5]`.
     #[inline]
     fn call_slot(&mut self, ctx: &mut Context<&mut VmMemory>, slot: u32) -> std::result::Result<u64, HelperError> {
@@ -206,7 +186,7 @@ impl Helpers {
     }
 }
 
-impl Host<&mut VmMemory> for Helpers {
+impl Host<&mut VmMemory> for HostCalls {
     // Raw bytecode calls helpers by ID; linked programs call slots only, except for calls the linker planted for
     // unresolved CO-RE relocations, which the executor reports.
     #[inline]
@@ -240,7 +220,7 @@ fn call_indirect(
     pc: u64,
     code: &Code,
     ctx: &mut Context<&mut VmMemory>,
-    calls: &mut CallStack<Helpers, u64>,
+    calls: &mut CallStack<HostCalls, u64>,
 ) -> Result<u64> {
     if let Some(callee) = code_index(target, code) {
         if !calls.push(&mut ctx.regs, pc) {
@@ -278,7 +258,37 @@ fn jump_indirect(target: u64, pc: u64, code: &Code) -> Result<u64> {
 /// Instruction index of the guest code address `addr`, if it is an instruction boundary inside `code`.
 fn code_index(addr: u64, code: &Code) -> Option<u64> {
     let offset = addr.checked_sub(region_base(CODE_REGION))?;
-    (offset % 8 == 0 && offset / 8 < code.len() as u64).then_some(offset / 8)
+    (offset % INSN_SIZE == 0 && offset / INSN_SIZE < code.len() as u64).then_some(offset / INSN_SIZE)
+}
+
+/// The instruction budget of a call under `config`: `VmConfig` says 0 for no limit, and `run` takes at most
+/// `i64::MAX`.
+#[cfg(feature = "fuel")]
+fn instruction_limit(config: &VmConfig) -> u64 {
+    match config.instruction_limit {
+        0 => i64::MAX as u64,
+        limit => limit.min(i64::MAX as u64),
+    }
+}
+
+#[cfg(not(feature = "fuel"))]
+fn instruction_limit(_: &VmConfig) -> u64 {
+    i64::MAX as u64
+}
+
+/// [`run`] with the budget `fuel`.
+#[inline(always)]
+fn run_metered(
+    ctx: &mut Context<&mut VmMemory>,
+    code: &Code,
+    pc: &mut u64,
+    #[cfg_attr(not(feature = "fuel"), expect(unused_variables))] fuel: &mut u64,
+    calls: &mut CallStack<HostCalls, u64>,
+) -> Flow<u64> {
+    #[cfg(feature = "fuel")]
+    return run(ctx, code, pc, fuel, calls);
+    #[cfg(not(feature = "fuel"))]
+    return run(ctx, code, pc, calls);
 }
 
 #[cfg(test)]
@@ -450,7 +460,7 @@ mod tests {
 
             let mut code = asm.assemble().unwrap();
             let (insns, _) = code.as_chunks_mut::<8>();
-            let call = insns.iter_mut().find(|insn| insn[0] == crate::image::CALL).unwrap();
+            let call = insns.iter_mut().find(|insn| insn[0] == rvm_core::opcode::CALL).unwrap();
             crate::image::set_slot_call(call, helpers.slot_of_name("bump").unwrap());
 
             let mut memory = VmMemory::new();

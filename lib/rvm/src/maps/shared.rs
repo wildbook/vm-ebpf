@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::hash::HashIndex;
-use super::{MapDef, MapKind, CACHE_LINE};
+use super::{MapDef, MapKind, CACHE_LINE, VALUE_ALIGN};
 use crate::error::{LinkError, Result};
 use crate::memory::{SharedBuffer, MAX_REGIONS};
 use crate::sync::lock;
@@ -16,8 +16,7 @@ pub struct SharedMaps {
 
 #[derive(Debug, Default)]
 struct SharedState {
-    // name, pad values to a cache line
-    declared: Vec<(String, bool)>,
+    declared: Vec<Declared>,
     bound: Vec<Arc<SharedMap>>,
     next_region: usize,
 }
@@ -36,9 +35,12 @@ impl SharedMaps {
     /// Make maps called `name` shared by every program linked afterwards.
     pub fn declare(&self, name: &str, pad_values: bool) {
         let mut state = lock(&self.state);
-        match state.declared.iter_mut().find(|e| e.0 == name) {
-            Some(e) => e.1 = pad_values,
-            None => state.declared.push((name.to_string(), pad_values)),
+        match state.declared.iter_mut().find(|d| d.name == name) {
+            Some(d) => d.pad_values = pad_values,
+            None => state.declared.push(Declared {
+                name: name.to_string(),
+                pad_values,
+            }),
         }
     }
 
@@ -54,7 +56,7 @@ impl SharedMaps {
             }
             return Ok(Some(map.clone()));
         }
-        let Some(&(_, pad_values)) = state.declared.iter().find(|e| e.0 == def.name) else {
+        let Some(&Declared { pad_values, .. }) = state.declared.iter().find(|d| d.name == def.name) else {
             return Ok(None);
         };
 
@@ -62,7 +64,7 @@ impl SharedMaps {
         if region >= MAX_REGIONS {
             return Err(LinkError::InvalidMap(format!("too many shared maps for {}", def.name)).into());
         }
-        let stride = u64::from(def.value_size).next_multiple_of(if pad_values { CACHE_LINE } else { 8 });
+        let stride = u64::from(def.value_size).next_multiple_of(if pad_values { CACHE_LINE } else { VALUE_ALIGN });
         let map = Arc::new(SharedMap {
             def: def.clone(),
             region,
@@ -74,4 +76,12 @@ impl SharedMaps {
         state.bound.push(map.clone());
         Ok(Some(map))
     }
+}
+
+/// A map name that [`SharedMaps::declare`] made shared.
+#[derive(Debug)]
+struct Declared {
+    name: String,
+    // pad values to a cache line
+    pad_values: bool,
 }

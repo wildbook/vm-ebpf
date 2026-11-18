@@ -89,7 +89,7 @@ pub struct AssembledProgram {
 }
 
 impl AssembledProgram {
-    /// Get the bytecode as u64 instruction words.
+    /// Bytecode as u64 instruction words.
     pub fn instructions(&self) -> Vec<u64> {
         let (words, _) = self.bytecode.as_chunks::<8>();
         words.iter().map(|w| u64::from_le_bytes(*w)).collect()
@@ -403,8 +403,6 @@ impl Assembler {
         Ok(code)
     }
 
-    // ==================== CO-RE Relocation Methods ====================
-
     /// Mark the last emitted instruction with a CO-RE relocation.
     ///
     /// # Panics
@@ -457,8 +455,6 @@ impl Assembler {
 
         Ok(AssembledProgram { bytecode, relocations })
     }
-
-    // ==================== ALU Instructions ====================
 
     /// `neg64 dst`: 64-bit negation.
     pub fn neg64(&mut self, dst: Register) -> &mut Self {
@@ -516,13 +512,9 @@ impl Assembler {
         movsx3264 = ALU64, 32;
     );
 
-    // ==================== Endianness Instructions ====================
-
     endian_family!(ALU32, SRC_IMM; le16 = 16, le32 = 32, le64 = 64);
     endian_family!(ALU32, SRC_REG; be16 = 16, be32 = 32, be64 = 64);
     endian_family!(ALU64, SRC_IMM; bswap16 = 16, bswap32 = 32, bswap64 = 64);
-
-    // ==================== Memory Load Instructions ====================
 
     ldx_family!(
         ldxdw = DW, MEM;
@@ -545,12 +537,8 @@ impl Assembler {
         self
     }
 
-    // ==================== Memory Store Instructions ====================
-
     stx_family!(stxdw = DW; stxw = W; stxh = H; stxb = B);
     st_family!(stdw = DW; stw = W; sth = H; stb = B);
-
-    // ==================== Atomic Instructions ====================
 
     atomic_family!(DW;
         atomic_add64, atomic_fetch_add64 = ADD, "add64", "fadd64";
@@ -601,8 +589,6 @@ impl Assembler {
         load_acquire16, store_release16 = H;
         load_acquire8, store_release8 = B;
     );
-
-    // ==================== Jump Instructions with Labels ====================
 
     /// `ja label`: unconditional jump to a label.
     pub fn ja(&mut self, label: &Label) -> &mut Self {
@@ -670,8 +656,6 @@ impl Assembler {
         jslt32, jslt32_imm = JSLT;
         jsle32, jsle32_imm = JSLE;
     );
-
-    // ==================== Call / Exit ====================
 
     /// `call imm`: call a helper function by ID.
     pub fn call(&mut self, func_id: i32) -> &mut Self {

@@ -588,6 +588,16 @@ struct Half {
     mem: Option<(u32, u32)>,
 }
 
+impl Half {
+    fn new(val: u64, validate: bool) -> Self {
+        Self {
+            val,
+            validate,
+            mem: None,
+        }
+    }
+}
+
 fn calc_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<Half, CoreReloError> {
     if kind.is_field_relo() {
         calc_field_half(kind, spec, btf)
@@ -600,11 +610,7 @@ fn calc_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<Half, Cor
 
 fn calc_field_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<Half, CoreReloError> {
     if kind == CoreReloKind::FieldExists {
-        return Ok(Half {
-            val: 1,
-            validate: true,
-            mem: None,
-        });
+        return Ok(Half::new(1, true));
     }
 
     let acc = spec
@@ -612,7 +618,7 @@ fn calc_field_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<Hal
         .last()
         .expect("a field spec always has at least its root accessor");
 
-    let Some(_) = &acc.name else {
+    if acc.name.is_none() {
         return match kind {
             CoreReloKind::FieldByteOffset => {
                 let elem_id = unwrap_arrays(btf, acc.type_id)?;
@@ -623,14 +629,10 @@ fn calc_field_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<Hal
                     mem: Some((sz, elem_id)),
                 })
             }
-            CoreReloKind::FieldByteSize => Ok(Half {
-                val: resolve_size(btf, acc.type_id)?,
-                validate: true,
-                mem: None,
-            }),
+            CoreReloKind::FieldByteSize => Ok(Half::new(resolve_size(btf, acc.type_id)?, true)),
             _ => Err(CoreReloError::UnsupportedRelo(kind)),
         };
-    };
+    }
 
     let owner = btf
         .type_by_id(acc.type_id)
@@ -646,15 +648,8 @@ fn calc_field_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<Hal
     let is_bitfield = m.bitfield_size > 0;
     let (byte_sz, byte_off, bit_sz) = if is_bitfield {
         let size = field_t.size().filter(|&size| size != 0);
-        let mut byte_sz = u64::from(size.ok_or(CoreReloError::InvalidTypeId(field_type_id))?);
-        let mut byte_off = bit_off / 8 / byte_sz * byte_sz;
-        while bit_off - byte_off * 8 + u64::from(m.bitfield_size) > byte_sz * 8 {
-            if byte_sz >= 8 {
-                return Err(CoreReloError::BitfieldTooWide);
-            }
-            byte_sz *= 2;
-            byte_off = bit_off / 8 / byte_sz * byte_sz;
-        }
+        let size = u64::from(size.ok_or(CoreReloError::InvalidTypeId(field_type_id))?);
+        let (byte_sz, byte_off) = bitfield_load(bit_off, u64::from(m.bitfield_size), size)?;
         (byte_sz as u32, byte_off, u64::from(m.bitfield_size))
     } else {
         let sz = resolve_size(btf, field_type_id)? as u32;
@@ -675,36 +670,35 @@ fn calc_field_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<Hal
                 mem,
             })
         }
-        CoreReloKind::FieldByteSize => Ok(Half {
-            val: u64::from(byte_sz),
-            validate,
-            mem: None,
-        }),
+        CoreReloKind::FieldByteSize => Ok(Half::new(u64::from(byte_sz), validate)),
         CoreReloKind::FieldSigned => {
             let signed = match field_t {
                 BtfTypeInfo::Enum { is_signed, .. } => *is_signed,
                 BtfTypeInfo::Int { encoding, .. } => encoding & BTF_INT_SIGNED != 0,
                 _ => false,
             };
-            Ok(Half {
-                val: u64::from(signed),
-                validate: true,
-                mem: None,
-            })
+            Ok(Half::new(u64::from(signed), true))
         }
         // Unsigned wraparound for fields wider than 64 bits, as in libbpf.
-        CoreReloKind::FieldLShiftU64 => Ok(Half {
-            val: 64u64.wrapping_sub(bit_off - byte_off * 8 + bit_sz),
-            validate,
-            mem: None,
-        }),
-        CoreReloKind::FieldRShiftU64 => Ok(Half {
-            val: 64u64.wrapping_sub(bit_sz),
-            validate: true,
-            mem: None,
-        }),
+        CoreReloKind::FieldLShiftU64 => Ok(Half::new(64u64.wrapping_sub(bit_off - byte_off * 8 + bit_sz), validate)),
+        CoreReloKind::FieldRShiftU64 => Ok(Half::new(64u64.wrapping_sub(bit_sz), true)),
         _ => unreachable!("FieldExists handled above; the rest are filtered by is_field_relo"),
     }
+}
+
+/// The smallest naturally aligned load, starting at `size` bytes and doubling up to 8, that covers the `bit_sz`-bit
+/// bitfield at `bit_off`. Returns its byte size and byte offset.
+fn bitfield_load(bit_off: u64, bit_sz: u64, size: u64) -> Result<(u64, u64), CoreReloError> {
+    let mut byte_sz = size;
+    let mut byte_off = bit_off / 8 / byte_sz * byte_sz;
+    while bit_off - byte_off * 8 + bit_sz > byte_sz * 8 {
+        if byte_sz >= 8 {
+            return Err(CoreReloError::BitfieldTooWide);
+        }
+        byte_sz *= 2;
+        byte_off = bit_off / 8 / byte_sz * byte_sz;
+    }
+    Ok((byte_sz, byte_off))
 }
 
 fn calc_type_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<Half, CoreReloError> {
@@ -712,33 +706,17 @@ fn calc_type_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<Half
         CoreReloKind::TypeIdTarget => {
             // The type ID embedded in the instruction can change again during linking, so it's never validated against
             // what's already there.
-            Ok(Half {
-                val: u64::from(spec.root_type_id),
-                validate: false,
-                mem: None,
-            })
+            Ok(Half::new(u64::from(spec.root_type_id), false))
         }
-        CoreReloKind::TypeExists | CoreReloKind::TypeMatches => Ok(Half {
-            val: 1,
-            validate: true,
-            mem: None,
-        }),
-        CoreReloKind::TypeSize => Ok(Half {
-            val: resolve_size(btf, spec.root_type_id)?,
-            validate: true,
-            mem: None,
-        }),
+        CoreReloKind::TypeExists | CoreReloKind::TypeMatches => Ok(Half::new(1, true)),
+        CoreReloKind::TypeSize => Ok(Half::new(resolve_size(btf, spec.root_type_id)?, true)),
         _ => unreachable!("TypeIdLocal is resolved before candidate search"),
     }
 }
 
 fn calc_enumval_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<Half, CoreReloError> {
     match kind {
-        CoreReloKind::EnumvalExists => Ok(Half {
-            val: 1,
-            validate: true,
-            mem: None,
-        }),
+        CoreReloKind::EnumvalExists => Ok(Half::new(1, true)),
         CoreReloKind::EnumvalValue => {
             let acc = &spec.accessors[0];
             let t = btf
@@ -749,11 +727,7 @@ fn calc_enumval_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<H
                 _ => None,
             }
             .ok_or(CoreReloError::InvalidTypeId(acc.type_id))?;
-            Ok(Half {
-                val,
-                validate: true,
-                mem: None,
-            })
+            Ok(Half::new(val, true))
         }
         _ => unreachable!("only enum-based kinds reach here"),
     }

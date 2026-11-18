@@ -15,7 +15,7 @@
 //! program.
 
 use std::ops::Range;
-use std::sync::{Arc, RwLockReadGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 use hashbrown::{hash_table, HashMap};
 
@@ -23,6 +23,7 @@ use crate::error::{LinkError, Result};
 use crate::layout::MAPS_REGION;
 use crate::map_def::{check_def, MapDef, MapKind, CACHE_LINE};
 use crate::memory::{region_base, Perms, Pod, VmMemory, MAX_REGION_LEN};
+use crate::std_helpers::EINVAL;
 use crate::sync::{read, write};
 
 mod hash;
@@ -39,6 +40,9 @@ pub const BPF_ANY: u64 = 0;
 pub const BPF_NOEXIST: u64 = 1;
 /// `map_update_elem` flag: replace the value only if the key is present.
 pub const BPF_EXIST: u64 = 2;
+
+/// Alignment of map values in guest memory.
+const VALUE_ALIGN: u64 = 8;
 
 /// Why a map access failed. Guest helpers return these as negative errno.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,7 +66,7 @@ impl MapError {
             Self::NotFound => helpers::ENOENT,
             Self::Exists => helpers::EEXIST,
             Self::Full => helpers::E2BIG,
-            Self::Invalid | Self::Shared => helpers::EINVAL,
+            Self::Invalid | Self::Shared => EINVAL,
         }
     }
 }
@@ -113,6 +117,12 @@ enum Index {
     Shared(Arc<SharedMap>),
 }
 
+/// A map's hash index, from [`Map::hash_index`].
+enum HashRef<'a> {
+    Private(&'a HashIndex),
+    Shared(&'a RwLock<HashIndex>),
+}
+
 impl Maps {
     /// Lay out `defs`, binding those declared shared to the VM-wide instance, and return the maps and the size of the
     /// private region they need.
@@ -127,7 +137,7 @@ impl Maps {
             let (base, stride, index) = match shared.bind(&def)? {
                 Some(map) => (region_base(map.region), map.stride, Index::Shared(map)),
                 None => {
-                    let stride = u64::from(def.value_size).next_multiple_of(8);
+                    let stride = u64::from(def.value_size).next_multiple_of(VALUE_ALIGN);
                     let base = region_base(MAPS_REGION) + len;
                     len = (len + stride * u64::from(def.max_entries)).next_multiple_of(CACHE_LINE);
                     if len > MAX_REGION_LEN as u64 {
@@ -268,13 +278,10 @@ impl<'a> MapRef<'a> {
     /// The map's entries, for [`Entries::iter`] or [`Entries::iter_as`].
     pub fn entries(&self) -> Entries<'_> {
         let map = &self.maps.maps[self.handle as usize];
-        let index = match &map.index {
-            Index::Array => EntriesIndex::Array,
-            Index::Hash(index) => EntriesIndex::Hash(index),
-            Index::Shared(shared) => match &shared.index {
-                None => EntriesIndex::Array,
-                Some(index) => EntriesIndex::Shared(read(index)),
-            },
+        let index = match map.hash_index() {
+            None => EntriesIndex::Array,
+            Some(HashRef::Private(index)) => EntriesIndex::Hash(index),
+            Some(HashRef::Shared(index)) => EntriesIndex::Shared(read(index)),
         };
         Entries {
             map,
@@ -398,6 +405,16 @@ impl Map {
         self.base + u64::from(slot) * self.stride
     }
 
+    /// The hash index, private or shared; `None` for array maps.
+    #[inline]
+    fn hash_index(&self) -> Option<HashRef<'_>> {
+        match &self.index {
+            Index::Array => None,
+            Index::Hash(index) => Some(HashRef::Private(index)),
+            Index::Shared(shared) => shared.index.as_ref().map(HashRef::Shared),
+        }
+    }
+
     /// Run `f` on the hash index, private or shared; `None` for array maps.
     fn with_hash<R>(&mut self, f: impl FnOnce(&mut HashIndex) -> R) -> Option<R> {
         match &mut self.index {
@@ -409,13 +426,10 @@ impl Map {
 
     #[inline]
     fn slot(&self, key: &[u8]) -> Option<u32> {
-        match &self.index {
-            Index::Array => self.array_slot(key).ok(),
-            Index::Hash(index) => index.get(key),
-            Index::Shared(shared) => match &shared.index {
-                None => self.array_slot(key).ok(),
-                Some(index) => read(index).get(key),
-            },
+        match self.hash_index() {
+            None => self.array_slot(key).ok(),
+            Some(HashRef::Private(index)) => index.get(key),
+            Some(HashRef::Shared(index)) => read(index).get(key),
         }
     }
 

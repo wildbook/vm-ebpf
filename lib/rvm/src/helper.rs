@@ -9,8 +9,7 @@ use crate::error::HelperError;
 #[cfg(feature = "maps")]
 use crate::maps::Maps;
 use crate::memory::{GuestMemory, VmMemory};
-use crate::published::Published;
-use crate::sync::lock;
+use crate::sync::{lock, Published};
 
 /// Registers r1-r5 at the time of a helper call.
 #[derive(Debug, Clone, Copy)]
@@ -23,7 +22,6 @@ pub struct HelperArgs {
 }
 
 impl HelperArgs {
-    /// Create from a register array.
     pub fn from_regs(regs: &[u64; 16]) -> Self {
         Self {
             r1: regs[1],
@@ -37,9 +35,7 @@ impl HelperArgs {
 
 /// What a raw host function sees: the argument registers, the calling program's memory and its maps.
 pub struct HelperContext<'a> {
-    /// Helper arguments (r1-r5).
     pub args: HelperArgs,
-    /// Memory access.
     pub memory: &'a mut VmMemory,
     /// The calling program's maps (if it has any).
     #[cfg(feature = "maps")]
@@ -132,7 +128,7 @@ impl<T: IntoReturn, E: Into<HelperError>> IntoReturn for Result<T, E> {
 
 /// A registered function, called directly through `call` with `data` as its closure.
 #[derive(Clone)]
-struct Slot {
+struct HostFn {
     call: unsafe fn(*const (), &mut HelperContext) -> Result<u64, HelperError>,
     data: *const (),
     // keeps `data` alive; the call path never touches it
@@ -143,11 +139,11 @@ struct Slot {
     arity: Option<u8>,
 }
 
-// SAFETY: `data` points into `_owner`, which is `Send + Sync` and lives as long as the slot.
-unsafe impl Send for Slot {}
-unsafe impl Sync for Slot {}
+// SAFETY: `data` points into `_owner`, which is `Send + Sync` and lives as long as the `HostFn`.
+unsafe impl Send for HostFn {}
+unsafe impl Sync for HostFn {}
 
-impl Slot {
+impl HostFn {
     fn new<F>(func: F, arity: Option<u8>) -> Self
     where
         F: Fn(&mut HelperContext) -> Result<u64, HelperError> + Send + Sync + 'static,
@@ -202,7 +198,7 @@ impl Slot {
 /// (hot reload).
 #[derive(Default, Clone)]
 pub struct HelperRegistry {
-    slots: Vec<Slot>,
+    slots: Vec<HostFn>,
     by_id: Vec<(u32, u32)>, // (helper ID, slot)
     by_name: HashMap<String, u32>,
 }
@@ -215,7 +211,7 @@ impl HelperRegistry {
         A: FromArgs + 'static,
         R: IntoReturn + 'static,
     {
-        self.put_id(id, Slot::typed(func));
+        self.put_id(id, HostFn::typed(func));
     }
 
     /// Register a helper function by ID that reads its arguments and memory from the context.
@@ -224,7 +220,7 @@ impl HelperRegistry {
         F: Fn(&mut HelperContext) -> R + Send + Sync + 'static,
         R: IntoReturn + 'static,
     {
-        self.put_id(id, Slot::new(move |ctx| func(ctx).into_return(), None));
+        self.put_id(id, HostFn::new(move |ctx| func(ctx).into_return(), None));
     }
 
     /// Register an extern function by name, with typed arguments.
@@ -234,7 +230,7 @@ impl HelperRegistry {
         A: FromArgs + 'static,
         R: IntoReturn + 'static,
     {
-        self.put_name(name.into(), Slot::typed(func));
+        self.put_name(name.into(), HostFn::typed(func));
     }
 
     /// Register an extern function by name that reads or writes the calling program's memory through [`GuestMemory`],
@@ -245,7 +241,7 @@ impl HelperRegistry {
         A: FromArgs + 'static,
         R: IntoReturn + 'static,
     {
-        self.put_name(name.into(), Slot::with_memory(func));
+        self.put_name(name.into(), HostFn::with_memory(func));
     }
 
     /// Register a raw extern function by name, called directly with the context.
@@ -253,11 +249,11 @@ impl HelperRegistry {
     where
         F: Fn(&mut HelperContext) -> Result<u64, HelperError> + Send + Sync + 'static,
     {
-        self.put_name(name.into(), Slot::new(func, None));
+        self.put_name(name.into(), HostFn::new(func, None));
     }
 
     /// Replace the function registered under `id`, or append a new slot.
-    fn put_id(&mut self, id: u32, helper: Slot) {
+    fn put_id(&mut self, id: u32, helper: HostFn) {
         let found = self.slot_of_id(id);
         let slot = self.put(found, helper);
         if found.is_none() {
@@ -266,14 +262,14 @@ impl HelperRegistry {
     }
 
     /// Replace the function registered under `name`, or append a new slot.
-    fn put_name(&mut self, name: String, helper: Slot) {
+    fn put_name(&mut self, name: String, helper: HostFn) {
         let slot = self.by_name.get(&name).copied();
         let slot = self.put(slot, helper);
         self.by_name.insert(name, slot);
     }
 
     /// Replace the function in `slot`, or append a new slot.
-    fn put(&mut self, slot: Option<u32>, helper: Slot) -> u32 {
+    fn put(&mut self, slot: Option<u32>, helper: HostFn) -> u32 {
         match slot {
             Some(slot) => {
                 self.slots[slot as usize] = helper;
@@ -309,7 +305,7 @@ impl HelperRegistry {
         let Some(helper) = self.slots.get(slot as usize) else {
             return Err(HelperError::UnknownSlot(slot));
         };
-        // SAFETY: `Slot::new` paired `call` with a `data` pointer of the type it expects.
+        // SAFETY: `HostFn::new` paired `call` with a `data` pointer of the type it expects.
         unsafe { (helper.call)(helper.data, ctx) }
     }
 }
@@ -360,11 +356,21 @@ impl SharedHelpers {
         self.current.get()
     }
 
-    /// A copy of the current table and a version no newer than it.
-    pub fn snapshot(&self) -> (HelperRegistry, u64) {
+    /// A copy of the current table.
+    pub fn snapshot(&self) -> Snapshot {
         // the table is published before the version moves, so reading the version first never pairs it with an older
         // table
         let version = self.version();
-        (HelperRegistry::clone(&self.current.get()), version)
+        Snapshot {
+            table: HelperRegistry::clone(&self.current.get()),
+            version,
+        }
     }
+}
+
+/// A copy of the extern table a [`SharedHelpers`] held.
+pub struct Snapshot {
+    pub table: HelperRegistry,
+    /// A version no newer than `table`, so comparing it against [`SharedHelpers::version`] never misses a change.
+    pub version: u64,
 }

@@ -7,7 +7,7 @@ use super::ElfResult;
 use crate::err::{self, ElfError};
 use crate::raw::{self, Elf64Ehdr, Elf64Shdr};
 use crate::symtab::ElfSymTab;
-use crate::{ensure, tryopt, tryres, util};
+use crate::{const_for, ensure, tryopt, tryres, util};
 
 #[derive(Copy, Clone)]
 pub struct ElfSections<'a> {
@@ -88,12 +88,8 @@ impl<'a> ElfSections<'a> {
 
     pub const fn symtab(self) -> ElfResult<ElfSymTab<'a>> {
         let headers = self.headers();
-
-        let mut i = 0;
-        while i < headers.len() {
+        const_for!(i in 0..headers.len() => {
             let header = &headers[i];
-            i += 1;
-
             if header.sh_type == raw::sht::SYMTAB {
                 let bytes = tryres!(self.bytes(header));
                 let Some(raw) = util::cast_slice(bytes) else {
@@ -102,7 +98,7 @@ impl<'a> ElfSections<'a> {
 
                 return Ok(ElfSymTab { raw });
             }
-        }
+        });
 
         Err(err::ElfError::SectionMissing)
     }
@@ -132,12 +128,8 @@ impl<'a> ElfSections<'a> {
     /// Get the symbol string table (.strtab section).
     pub const fn sym_strtab(self) -> ElfResult<&'a [u8]> {
         let headers = self.headers();
-
-        let mut i = 0;
-        while i < headers.len() {
+        const_for!(i in 0..headers.len() => {
             let header = &headers[i];
-            i += 1;
-
             if header.sh_type == raw::sht::STRTAB {
                 if let Ok(name) = self.name(header) {
                     if util::slice_eq(name.to_bytes(), b".strtab") {
@@ -145,7 +137,7 @@ impl<'a> ElfSections<'a> {
                     }
                 }
             }
-        }
+        });
 
         Err(err::ElfError::SectionMissing)
     }

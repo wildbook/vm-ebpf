@@ -112,7 +112,7 @@ fn stack_top(program: &Program) -> u64 {
 fn run_and_report(program: &mut Program, name: &str, args: &[u64]) -> Result<u64> {
     if let Some(info) = program.function(name) {
         let pc = info.pc;
-        let byte_offset = pc * 8;
+        let byte_offset = pc * rvm::INSN_SIZE;
         println!("Entry PC: {pc} (byte offset: 0x{byte_offset:x})");
     }
     println!("Stack pointer (r10): 0x{:x}", stack_top(program));

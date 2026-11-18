@@ -23,6 +23,9 @@ pub const BPF_FUNC_TRACE_PRINTK: u32 = 6;
 /// `u32 bpf_get_prandom_u32(void)`
 pub const BPF_FUNC_GET_PRANDOM_U32: u32 = 7;
 
+/// `EINVAL`, which helpers return negated when an argument is invalid.
+pub const EINVAL: i64 = 22;
+
 /// Name of a standard helper ID, for error messages.
 pub fn helper_name(id: u32) -> Option<&'static str> {
     Some(match id {
@@ -69,7 +72,6 @@ pub fn register_random(helpers: &mut HelperRegistry) {
 /// arguments are read with the guest's permissions.
 pub fn register_print(helpers: &mut HelperRegistry, sink: impl Fn(&str) + Send + Sync + 'static) {
     helpers.register_helper_raw(BPF_FUNC_TRACE_PRINTK, move |ctx: &mut HelperContext| -> i64 {
-        const EINVAL: i64 = 22;
         let mem = GuestMemory::new(ctx.memory);
         let Ok(fmt) = mem.read_vec(ctx.args.r1, ctx.args.r2 as usize) else {
             return -EINVAL;

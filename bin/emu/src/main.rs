@@ -13,6 +13,7 @@ fn main() -> ExitCode {
             println!("res: {res}");
             ExitCode::SUCCESS
         }
+        // printing the error would link in the `Display` text of every rvm error
         Err(_) => {
             eprintln!("emu: bpf_main failed to load or run");
             ExitCode::FAILURE
