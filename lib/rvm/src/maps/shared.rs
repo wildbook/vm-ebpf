@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use super::hash::HashIndex;
 use super::{MapDef, MapKind, CACHE_LINE, VALUE_ALIGN};
 use crate::error::{LinkError, Result};
-use crate::memory::{SharedBuffer, MAX_REGIONS};
+use crate::memory::{MemoryBudget, SharedBuffer, MAX_REGIONS};
 use crate::sync::lock;
 
 /// Maps that every program linked by one VM shares by name.
@@ -44,9 +44,9 @@ impl SharedMaps {
         }
     }
 
-    /// The shared instance for `def`, created by the first program that declares it. `None` if maps with this name
-    /// aren't shared.
-    pub fn bind(&self, def: &MapDef) -> Result<Option<Arc<SharedMap>>> {
+    /// The shared instance for `def`, created by the first program that declares it, which pays for it from `budget`.
+    /// `None` if maps with this name aren't shared.
+    pub fn bind(&self, def: &MapDef, budget: &mut MemoryBudget) -> Result<Option<Arc<SharedMap>>> {
         use crate::layout::SHARED_MAPS_FIRST_REGION;
 
         let mut state = lock(&self.state);
@@ -65,12 +65,19 @@ impl SharedMaps {
             return Err(LinkError::InvalidMap(format!("too many shared maps for {}", def.name)).into());
         }
         let stride = u64::from(def.value_size).next_multiple_of(if pad_values { CACHE_LINE } else { VALUE_ALIGN });
+        let values = stride * u64::from(def.max_entries);
+        budget.take(values)?;
+        let storage = Arc::new(SharedBuffer::new(values as usize)?);
+        let index = match def.kind {
+            MapKind::Array => None,
+            MapKind::Hash => Some(RwLock::new(HashIndex::new(def.key_size, def.max_entries, budget)?)),
+        };
         let map = Arc::new(SharedMap {
             def: def.clone(),
             region,
             stride,
-            storage: Arc::new(SharedBuffer::new((stride * u64::from(def.max_entries)) as usize)),
-            index: (def.kind == MapKind::Hash).then(|| RwLock::new(HashIndex::new(def.key_size, def.max_entries))),
+            storage,
+            index,
         });
         state.next_region += 1;
         state.bound.push(map.clone());

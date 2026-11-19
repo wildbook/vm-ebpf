@@ -3,9 +3,11 @@
 use std::hash::BuildHasher;
 
 use hashbrown::hash_table::{self, Entry};
-use hashbrown::HashTable;
+use hashbrown::{HashTable, TryReserveError};
 
 use super::{MapError, BPF_EXIST, BPF_NOEXIST};
+use crate::error::{Result, VmError};
+use crate::memory::MemoryBudget;
 
 // The default seed comes from address-space layout, which Windows randomizes per executable per boot, so two builds of
 // the same source probe differently and time differently. Benchmarks fix it; a fixed seed lets guest code choose
@@ -27,15 +29,35 @@ pub struct HashIndex {
 }
 
 impl HashIndex {
-    pub fn new(key_size: u32, max_entries: u32) -> Self {
-        let key_size = key_size as usize;
-        Self {
-            table: HashTable::with_capacity(max_entries as usize),
-            keys: vec![0; key_size * max_entries as usize].into(),
+    /// An empty index for `max_entries` keys of `key_size` bytes. Takes its memory from `budget` before allocating.
+    pub fn new(key_size: u32, max_entries: u32, budget: &mut MemoryBudget) -> Result<Self> {
+        // the free list and the table take at most 16 bytes per entry
+        budget.take((u64::from(key_size) + 16) * u64::from(max_entries))?;
+
+        let (key_size, entries) = (key_size as usize, max_entries as usize);
+        let key_bytes = key_size * entries;
+        let mut table = HashTable::new();
+        let mut keys = Vec::new();
+        let mut free = Vec::new();
+        table.try_reserve(entries, |_| 0).map_err(|e| match e {
+            TryReserveError::AllocError { layout } => VmError::OutOfMemory(layout.size()),
+            TryReserveError::CapacityOverflow => VmError::OutOfMemory(usize::MAX),
+        })?;
+        keys.try_reserve_exact(key_bytes)
+            .map_err(|_| VmError::OutOfMemory(key_bytes))?;
+        let free_bytes = entries * size_of::<u32>();
+        free.try_reserve_exact(entries)
+            .map_err(|_| VmError::OutOfMemory(free_bytes))?;
+        keys.resize(key_bytes, 0);
+        free.extend((0..max_entries).rev());
+
+        Ok(Self {
+            table,
+            keys: keys.into_boxed_slice(),
             key_size,
-            free: (0..max_entries).rev().collect(),
+            free,
             hasher: Default::default(),
-        }
+        })
     }
 
     fn key_at(keys: &[u8], key_size: usize, slot: u32) -> &[u8] {

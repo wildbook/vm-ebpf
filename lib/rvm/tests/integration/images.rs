@@ -1,8 +1,8 @@
 //! Prepared images: they run like programs linked from ELF, plugins load from them, and malformed ones fail to load.
 
 use rvm::{
-    region_base, FunctionInfo, Image, Import, LinkError, Module, Plugin, Program, Vm, VmError, FIRST_FREE_REGION,
-    MAX_REGION_LEN,
+    region_base, Borrow, FunctionInfo, Image, Import, LinkError, MapDef, MapKind, Module, Plugin, Program, Vm,
+    VmConfig, VmError, DEFAULT_MEMORY_LIMIT, FIRST_FREE_REGION, MAX_REGION_LEN,
 };
 use rvm_core::opcode::CALL;
 
@@ -139,6 +139,16 @@ fn malformed_images_fail_to_load() {
     image.functions[0].1.pc = insns.into();
     assert!(is_invalid(load(&image)));
 
+    // a borrow's length can't be another borrow's pointer, which the call rewrites first
+    let mut image = good.clone();
+    let borrow = |arg, len_arg| Borrow {
+        arg,
+        len_arg,
+        writable: true,
+    };
+    image.functions[0].1.borrows = vec![borrow(0, 1), borrow(1, 0)];
+    assert!(is_invalid(load(&image)));
+
     let mut image = good.clone();
     image.maps[0].max_entries = u32::MAX;
     let err = load(&image).unwrap_err();
@@ -147,4 +157,42 @@ fn malformed_images_fail_to_load() {
     let mut image = good.clone();
     image.data_len = MAX_REGION_LEN + 1;
     assert!(matches!(load(&image), Err(VmError::ProgramTooLarge("data"))));
+}
+
+/// Images that ask for more memory than the limit fail before allocating it, whether one region or map asks or
+/// several add up.
+#[test]
+fn oversized_images_fail_to_load() {
+    let vm = Vm::new();
+    let good = vm.prepare(&object("tests/maps.o")).unwrap();
+    let over_limit = |vm: &Vm, image: &Image| match vm.load_image(&image.to_bytes()) {
+        Err(VmError::MemoryLimit(limit)) => limit,
+        other => panic!("{other:?}"),
+    };
+
+    let mut image = good.clone();
+    image.rodata_len = MAX_REGION_LEN;
+    assert_eq!(over_limit(&vm, &image), DEFAULT_MEMORY_LIMIT);
+
+    // one 4 GiB key in 64 bytes of values
+    let mut image = good.clone();
+    let map = |name: &str, key_size, max_entries| MapDef {
+        name: name.into(),
+        kind: MapKind::Hash,
+        key_size,
+        value_size: 8,
+        max_entries,
+    };
+    image.maps = vec![map("big_key", u32::MAX, 1)];
+    assert_eq!(over_limit(&vm, &image), DEFAULT_MEMORY_LIMIT);
+
+    // each map fits the limit, together they don't
+    let small = Vm::with_config(VmConfig {
+        memory_limit: 1 << 20,
+        ..VmConfig::default()
+    });
+    image.maps = (0..3).map(|i| map(&format!("m{i}"), 1024, 400)).collect();
+    assert_eq!(over_limit(&small, &image), 1 << 20);
+    image.maps.pop();
+    small.load_image(&image.to_bytes()).unwrap();
 }

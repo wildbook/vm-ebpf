@@ -101,9 +101,9 @@ pub use memory::{
     region_base, GuestMemory, Perms, Pod, Scalar, SharedRegion, VmMemory, MAX_REGIONS, MAX_REGION_LEN, REGION_SHIFT,
 };
 #[cfg(feature = "link")]
-pub use module::Module;
+pub use module::{Module, Relocation};
 pub use plugin::{Plugin, PluginFunc, WeakPlugin};
-pub use program::{Borrow, Func, FunctionInfo, Program};
+pub use program::{Borrow, Func, FunctionInfo, Program, ProgramMemory};
 pub use rvm_core::{AtomicOp, MAX_CALL_DEPTH};
 #[cfg(feature = "link")]
 pub use section::{Section, SectionKind};
@@ -116,4 +116,4 @@ pub use symbol::{Export, Symbol};
 pub use sync::TryLockGuard;
 #[cfg(feature = "fuel")]
 pub use vm::DEFAULT_INSTRUCTION_LIMIT;
-pub use vm::{Vm, VmConfig};
+pub use vm::{Vm, VmConfig, DEFAULT_MEMORY_LIMIT};

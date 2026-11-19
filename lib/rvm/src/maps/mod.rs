@@ -15,14 +15,14 @@
 //! program.
 
 use std::ops::Range;
-use std::sync::{Arc, RwLock, RwLockReadGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use hashbrown::{hash_table, HashMap};
 
 use crate::error::{LinkError, Result};
 use crate::layout::MAPS_REGION;
 use crate::map_def::{check_def, MapDef, MapKind, CACHE_LINE};
-use crate::memory::{region_base, Perms, Pod, VmMemory, MAX_REGION_LEN};
+use crate::memory::{region_base, MemoryBudget, Perms, Pod, VmMemory, MAX_REGION_LEN};
 use crate::std_helpers::EINVAL;
 use crate::sync::{read, write};
 
@@ -125,8 +125,8 @@ enum HashRef<'a> {
 
 impl Maps {
     /// Lay out `defs`, binding those declared shared to the VM-wide instance, and return the maps and the size of the
-    /// private region they need.
-    pub fn new(defs: Vec<MapDef>, shared: &SharedMaps) -> Result<(Self, usize)> {
+    /// private region they need. Takes the memory of the values and indexes from `budget` before allocating.
+    pub fn new(defs: Vec<MapDef>, shared: &SharedMaps, budget: &mut MemoryBudget) -> Result<(Self, usize)> {
         let mut maps = Self::default();
         let mut len = 0;
         for def in defs {
@@ -134,19 +134,21 @@ impl Maps {
             if maps.by_name.insert(def.name.clone(), maps.maps.len() as u32).is_some() {
                 return Err(LinkError::InvalidMap(format!("map {}: declared twice", def.name)).into());
             }
-            let (base, stride, index) = match shared.bind(&def)? {
+            let (base, stride, index) = match shared.bind(&def, budget)? {
                 Some(map) => (region_base(map.region), map.stride, Index::Shared(map)),
                 None => {
                     let stride = u64::from(def.value_size).next_multiple_of(VALUE_ALIGN);
                     let base = region_base(MAPS_REGION) + len;
-                    len = (len + stride * u64::from(def.max_entries)).next_multiple_of(CACHE_LINE);
-                    if len > MAX_REGION_LEN as u64 {
+                    let end = (len + stride * u64::from(def.max_entries)).next_multiple_of(CACHE_LINE);
+                    if end > MAX_REGION_LEN as u64 {
                         let msg = format!("map {}: maps exceed {MAX_REGION_LEN} bytes", def.name);
                         return Err(LinkError::InvalidMap(msg).into());
                     }
+                    budget.take(end - len)?;
+                    len = end;
                     let index = match def.kind {
                         MapKind::Array => Index::Array,
-                        MapKind::Hash => Index::Hash(HashIndex::new(def.key_size, def.max_entries)),
+                        MapKind::Hash => Index::Hash(HashIndex::new(def.key_size, def.max_entries, budget)?),
                     };
                     (base, stride, index)
                 }
@@ -192,23 +194,30 @@ impl Maps {
         map.slot(key).map(|slot| map.addr(slot))
     }
 
-    /// Find or create the slot for `key` and return its guest address; the caller writes the value. `flags` is
-    /// `BPF_ANY`, `BPF_NOEXIST` or `BPF_EXIST`.
-    pub fn upsert(&mut self, handle: u32, key: &[u8], flags: u64) -> std::result::Result<u64, MapError> {
+    /// Find or create the slot for `key`; the caller writes the value before dropping the slot. `flags` is `BPF_ANY`,
+    /// `BPF_NOEXIST` or `BPF_EXIST`.
+    pub fn upsert(&mut self, handle: u32, key: &[u8], flags: u64) -> std::result::Result<Slot<'_>, MapError> {
         let map = self.maps.get_mut(handle as usize).ok_or(MapError::Invalid)?;
         if flags > BPF_EXIST {
             return Err(MapError::Invalid);
         }
-        let slot = map.upsert(key, flags)?;
-        Ok(map.addr(slot))
+        map.upsert(key, flags)
     }
 
-    /// Remove `key` and return the guest address of its freed value. Array maps don't support deletion.
-    pub fn remove(&mut self, handle: u32, key: &[u8]) -> std::result::Result<u64, MapError> {
+    /// Remove `key` and return its freed slot; the caller zeroes the value before dropping the slot. Array maps don't
+    /// support deletion.
+    pub fn remove(&mut self, handle: u32, key: &[u8]) -> std::result::Result<Slot<'_>, MapError> {
         let map = self.maps.get_mut(handle as usize).ok_or(MapError::Invalid)?;
-        let slot = map.with_hash(|index| index.remove(key)).ok_or(MapError::Invalid)??;
-        Ok(map.addr(slot))
+        map.hash_slot(|index| index.remove(key)).ok_or(MapError::Invalid)?
     }
+}
+
+/// A value slot from [`Maps::upsert`] or [`Maps::remove`]. For a shared hash map it holds the key index locked, so no
+/// other program reuses the slot before the caller has written or zeroed the value.
+pub struct Slot<'a> {
+    /// Guest address of the value.
+    pub addr: u64,
+    _index: Option<RwLockWriteGuard<'a, HashIndex>>,
 }
 
 impl<'a> MapRef<'a> {
@@ -247,16 +256,16 @@ impl<'a> MapRef<'a> {
         {
             return Err(MapError::Invalid);
         }
-        let addr = self.maps.upsert(self.handle, key, flags)?;
-        self.memory.write_bytes(addr, value).expect("map slots are mapped");
+        let slot = self.maps.upsert(self.handle, key, flags)?;
+        self.memory.write_bytes(slot.addr, value).expect("map slots are mapped");
         Ok(())
     }
 
     /// Remove `key` and zero its value.
     pub fn delete(&mut self, key: &[u8]) -> std::result::Result<(), MapError> {
-        let addr = self.maps.remove(self.handle, key)?;
         let len = self.def().value_size as usize;
-        self.memory.zero(addr, len).expect("map slots are mapped");
+        let slot = self.maps.remove(self.handle, key)?;
+        self.memory.zero(slot.addr, len).expect("map slots are mapped");
         Ok(())
     }
 
@@ -415,12 +424,27 @@ impl Map {
         }
     }
 
-    /// Run `f` on the hash index, private or shared; `None` for array maps.
-    fn with_hash<R>(&mut self, f: impl FnOnce(&mut HashIndex) -> R) -> Option<R> {
+    /// Run `op` on the hash index, private or shared, and return the slot it picks; `None` for array maps. A shared
+    /// index stays locked until the slot is dropped.
+    fn hash_slot(
+        &mut self,
+        op: impl FnOnce(&mut HashIndex) -> std::result::Result<u32, MapError>,
+    ) -> Option<std::result::Result<Slot<'_>, MapError>> {
+        let (base, stride) = (self.base, self.stride);
+        let addr = |slot: u32| base + u64::from(slot) * stride;
         match &mut self.index {
             Index::Array => None,
-            Index::Hash(index) => Some(f(index)),
-            Index::Shared(shared) => shared.index.as_ref().map(|index| f(&mut write(index))),
+            Index::Hash(index) => Some(op(index).map(|slot| Slot {
+                addr: addr(slot),
+                _index: None,
+            })),
+            Index::Shared(shared) => {
+                let mut index = write(shared.index.as_ref()?);
+                Some(op(&mut index).map(|slot| Slot {
+                    addr: addr(slot),
+                    _index: Some(index),
+                }))
+            }
         }
     }
 
@@ -433,17 +457,21 @@ impl Map {
         }
     }
 
-    fn upsert(&mut self, key: &[u8], flags: u64) -> std::result::Result<u32, MapError> {
+    fn upsert(&mut self, key: &[u8], flags: u64) -> std::result::Result<Slot<'_>, MapError> {
         if self.def.kind == MapKind::Array {
             if flags == BPF_NOEXIST {
                 return Err(MapError::Exists); // every array index always exists
             }
-            return self.array_slot(key);
+            let slot = self.array_slot(key)?;
+            return Ok(Slot {
+                addr: self.addr(slot),
+                _index: None,
+            });
         }
         if key.len() != self.def.key_size as usize {
             return Err(MapError::Invalid);
         }
-        self.with_hash(|index| index.upsert(key, flags))
+        self.hash_slot(|index| index.upsert(key, flags))
             .expect("hash map has an index")
     }
 
@@ -478,9 +506,9 @@ mod tests {
             max_entries: 3,
         };
         let defs = vec![def("hash", MapKind::Hash, 8, 8), def("array", MapKind::Array, 4, 16)];
-        let (mut maps, len) = Maps::new(defs, &SharedMaps::default()).unwrap();
+        let (mut maps, len) = Maps::new(defs, &SharedMaps::default(), &mut MemoryBudget::new(1 << 20)).unwrap();
         let mut memory = VmMemory::new();
-        memory.map_any(MAPS_REGION, len, Perms::RW);
+        memory.map_any(MAPS_REGION, len, Perms::RW).unwrap();
 
         let mut hash = MapRef::new(&mut maps, &mut memory, 0);
         assert_eq!(hash.entries().iter().len(), 0);

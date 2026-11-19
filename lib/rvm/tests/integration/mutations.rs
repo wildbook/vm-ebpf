@@ -2,8 +2,8 @@
 //! must return `Ok` or `Err`; a panic, an overflow or an allocation over [`ALLOC_CAP`] fails the test. The allocator
 //! cap applies to the whole test binary.
 //!
-//! Inputs that ask for a large region or map are valid, so a case whose parsed sizes exceed [`REGION_CAP`] stops before
-//! the allocation.
+//! Inputs that ask for a large region or map are valid, so the VM runs with a memory limit of [`MEMORY_LIMIT`], and
+//! linking and loading must reject them before they allocate.
 //!
 //! `RVM_FUZZ_ITERS` sets the cases per fixture. A failure prints its fixture and seed; `RVM_FUZZ_SEED=<seed>` runs only
 //! that case for every fixture.
@@ -15,22 +15,30 @@ use std::ops::Range;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Once;
 
-use rvm::{Image, MapKind, Module, SectionKind, Vm};
+use rvm::{Image, Module, VmConfig};
 
-use crate::common::{host_vm, object};
+use crate::common::{host_vm_with, object};
 
-/// Largest region or map storage a case may allocate.
-const REGION_CAP: u64 = 64 << 20;
+/// Most memory one case's program may take.
+const MEMORY_LIMIT: usize = 64 << 20;
 
-/// The allocator refuses anything larger, which fails the case: no single allocation of a capped load comes close.
-const ALLOC_CAP: usize = 2 * REGION_CAP as usize;
+/// The allocator refuses anything larger, which fails the case: no single allocation of a load within the limit comes
+/// close.
+const ALLOC_CAP: usize = 2 * MEMORY_LIMIT;
 
 /// Cases per fixture and loader, about a second in a debug build.
 const DEFAULT_ITERS: u64 = 1000;
 
+fn limited_vm() -> rvm::Vm {
+    host_vm_with(VmConfig {
+        memory_limit: MEMORY_LIMIT,
+        ..VmConfig::default()
+    })
+}
+
 #[test]
 fn mutated_images_load_or_fail() {
-    let vm = host_vm();
+    let vm = limited_vm();
     let images: Vec<(String, Vec<u8>)> = fixtures()
         .into_iter()
         .filter_map(|(name, elf)| Some((name, vm.prepare(&elf).ok()?.to_bytes())))
@@ -41,10 +49,10 @@ fn mutated_images_load_or_fail() {
     for (fixture, image) in &images {
         let regions = image_regions(image);
         fuzz.run(fixture, image, &regions, |bytes| {
-            let Ok(parsed) = Image::from_bytes(bytes) else {
+            if Image::from_bytes(bytes).is_err() {
                 return Outcome::Rejected;
-            };
-            load_capped(&vm, &parsed, bytes)
+            }
+            outcome(vm.load_image(bytes))
         });
     }
     fuzz.finish();
@@ -52,7 +60,7 @@ fn mutated_images_load_or_fail() {
 
 #[test]
 fn mutated_elf_files_load_or_fail() {
-    let vm = host_vm();
+    let vm = limited_vm();
     let mut fuzz = Fuzz::new("elf");
     for (fixture, elf) in &fixtures() {
         let regions = elf_regions(elf);
@@ -60,13 +68,10 @@ fn mutated_elf_files_load_or_fail() {
             let Ok(module) = Module::from_elf("main", bytes) else {
                 return Outcome::Rejected;
             };
-            if layout_size(&module) > REGION_CAP {
-                return Outcome::Skipped;
-            }
             let Ok(image) = vm.prepare_modules(&[&module]) else {
                 return Outcome::Rejected;
             };
-            load_capped(&vm, &image, &image.to_bytes())
+            outcome(vm.load_image(&image.to_bytes()))
         });
     }
     fuzz.finish();
@@ -93,38 +98,11 @@ fn fixtures() -> Vec<(String, Vec<u8>)> {
     names.into_iter().map(|name| (name.clone(), object(&name))).collect()
 }
 
-fn load_capped(vm: &Vm, image: &Image, bytes: &[u8]) -> Outcome {
-    if image_size(image) > REGION_CAP {
-        return Outcome::Skipped;
-    }
-    match vm.load_image(bytes) {
+fn outcome(loaded: rvm::Result<rvm::Program>) -> Outcome {
+    match loaded {
         Ok(_) => Outcome::Loaded,
         Err(_) => Outcome::Rejected,
     }
-}
-
-/// Upper bound on the bytes linking lays out for `module`'s code and data.
-fn layout_size(module: &Module) -> u64 {
-    let placed = |s: &&rvm::Section| {
-        matches!(s.kind, SectionKind::Code | SectionKind::RoData | SectionKind::Data | SectionKind::Bss)
-    };
-    let sizes = module.sections.iter().filter(placed);
-    sizes.fold(0u64, |total, s| total.saturating_add(s.size).saturating_add(s.align))
-}
-
-/// Upper bound on the largest allocation loading `image` makes.
-fn image_size(image: &Image) -> u64 {
-    let maps = image.maps.iter().map(|def| {
-        let entries = u64::from(def.max_entries);
-        let values = u64::from(def.value_size).next_multiple_of(64).saturating_mul(entries);
-        let index = match def.kind {
-            MapKind::Array => 0,
-            MapKind::Hash => (u64::from(def.key_size) + 32) * entries,
-        };
-        values.saturating_add(index)
-    });
-    let maps = maps.fold(0, u64::saturating_add);
-    maps.max(image.rodata_len as u64).max(image.data_len as u64)
 }
 
 /// The image header and each length-prefixed section, so edits land in every section as often as in the code.
@@ -166,13 +144,11 @@ fn elf_regions(elf: &[u8]) -> Vec<Range<usize>> {
 enum Outcome {
     Loaded,
     Rejected,
-    /// The input asks for more than [`REGION_CAP`].
-    Skipped,
 }
 
 struct Fuzz {
     loader: &'static str,
-    counts: [u64; 3],
+    counts: [u64; 2],
     failures: Vec<String>,
 }
 
@@ -181,7 +157,7 @@ impl Fuzz {
         install_hooks();
         Self {
             loader,
-            counts: [0; 3],
+            counts: [0; 2],
             failures: Vec::new(),
         }
     }
@@ -216,9 +192,9 @@ impl Fuzz {
     }
 
     fn finish(self) {
-        let [loaded, rejected, skipped] = self.counts;
+        let [loaded, rejected] = self.counts;
         let failed = self.failures.len();
-        println!("{}: {loaded} loaded, {rejected} rejected, {skipped} skipped, {failed} failed", self.loader);
+        println!("{}: {loaded} loaded, {rejected} rejected, {failed} failed", self.loader);
         assert!(failed == 0, "{failed} {} cases failed:\n{}", self.loader, self.failures.join("\n"));
     }
 }

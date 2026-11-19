@@ -19,10 +19,10 @@ use crate::helper::HelperRegistry;
 use crate::image::{set_imm, set_slot_call, Image, Import, INSN_SIZE};
 use crate::layout::{CODE_REGION, DATA_REGION, RODATA_REGION};
 use crate::map_def::map_defs;
-use crate::memory::{region_base, split_addr, MAX_REGION_LEN};
+use crate::memory::{region_base, split_addr, MemoryBudget, MAX_REGION_LEN};
 use crate::module::{Module, Relocation};
 use crate::program::{Borrow, FunctionInfo};
-use crate::section::{Section, SectionKind};
+use crate::section::SectionKind;
 
 const _: () = assert!(CORE_POISON_HELPER == btf::CORE_POISON_HELPER);
 
@@ -36,8 +36,8 @@ enum Addr {
 }
 
 impl Addr {
-    /// The address `by` bytes on. A symbol value or relocation offset past the end of its section wraps here and fails
-    /// where the address is used.
+    /// The address `by` bytes on. Nothing checks `by` against the section's size: a symbol value past the end names an
+    /// address in a later section, or one the guest faults on.
     fn offset(self, by: u64) -> Self {
         match self {
             Self::Code(a) => Self::Code(a.wrapping_add(by)),
@@ -94,8 +94,14 @@ impl Image {
     }
 }
 
-/// Link modules into an image, binding extern calls against `helpers` and CO-RE relocations against `types`.
-pub fn link<'m>(helpers: &HelperRegistry, types: &BtfBuilder, modules: &[&'m Module]) -> Result<Image> {
+/// Link modules into an image, binding extern calls against `helpers` and CO-RE relocations against `types`. Fails
+/// with [`VmError::MemoryLimit`] before the image's code and data grow past `memory_limit` bytes.
+pub fn link<'m>(
+    helpers: &HelperRegistry,
+    types: &BtfBuilder,
+    modules: &[&'m Module],
+    memory_limit: usize,
+) -> Result<Image> {
     if modules.is_empty() {
         return Err(VmError::InvalidArgument("no modules to link".to_string()));
     }
@@ -111,11 +117,7 @@ pub fn link<'m>(helpers: &HelperRegistry, types: &BtfBuilder, modules: &[&'m Mod
     let target_bytes = types.encode();
     let target = Btf::parse(&target_bytes)?;
 
-    let (mut image, layouts) = lay_out(modules)?;
-    let regions = [("code", &image.code), ("rodata", &image.rodata), ("data", &image.data)];
-    if let Some((region, _)) = regions.iter().find(|(_, b)| b.len() > MAX_REGION_LEN) {
-        return Err(VmError::ProgramTooLarge(region));
-    }
+    let (mut image, layouts) = lay_out(modules, &mut MemoryBudget::new(memory_limit))?;
     let global_symbols = build_symbol_table(modules, &layouts)?;
     check_extern_signatures(helpers, &btfs)?;
 
@@ -139,64 +141,77 @@ pub fn link<'m>(helpers: &HelperRegistry, types: &BtfBuilder, modules: &[&'m Mod
 
     image.functions = build_function_table(modules, &layouts, &btfs)?.into_iter().collect();
     image.functions.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    image.rodata_len = trim_zeros(&mut image.rodata);
-    image.data_len = trim_zeros(&mut image.data);
+    trim_zeros(&mut image.rodata);
+    trim_zeros(&mut image.data);
     Ok(image)
 }
 
-/// Drop trailing zero bytes, which loading restores, and return the original length.
-fn trim_zeros(bytes: &mut Vec<u8>) -> usize {
-    let len = bytes.len();
+/// Drop trailing zero bytes, which loading restores.
+fn trim_zeros(bytes: &mut Vec<u8>) {
     bytes.truncate(bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1));
-    len
 }
 
-/// Place every allocatable section and copy its contents into the image.
-fn lay_out(modules: &[&Module]) -> Result<(Image, Vec<ModuleLayout>)> {
-    // Checks the size before growing `buf`, so a section header can't ask for more than a region holds.
-    fn place(buf: &mut Vec<u8>, region: &'static str, section: &Section, align: usize) -> Result<u64> {
-        let align = section.align.max(align as u64);
-        let end = (buf.len() as u64)
-            .checked_next_multiple_of(align)
-            .and_then(|at| Some((at, at.checked_add(section.size)?)))
-            .filter(|&(_, end)| end <= MAX_REGION_LEN as u64);
-        let Some((at, end)) = end else {
-            return Err(VmError::ProgramTooLarge(region));
-        };
-        buf.resize(at as usize, 0);
-        buf.extend_from_slice(&section.data);
-        buf.resize(end as usize, 0); // .bss has size but no data
-        Ok(at)
-    }
-
+/// Place every allocatable section and copy its contents into the image. Rodata and data keep their zero tails
+/// unmaterialised: `Image::rodata_len` and `Image::data_len` count them, the byte vectors don't.
+fn lay_out(modules: &[&Module], budget: &mut MemoryBudget) -> Result<(Image, Vec<ModuleLayout>)> {
     let mut image = Image::default();
+    let mut code_len = 0;
     let layouts = modules
         .iter()
         .map(|module| {
             let mut layout = ModuleLayout::default();
             for (idx, section) in module.sections.iter().enumerate() {
-                let addr = match section.kind {
-                    SectionKind::Code => Addr::Code(place(&mut image.code, "code", section, INSN_SIZE as usize)?),
-                    SectionKind::RoData => {
-                        Addr::Data(region_base(RODATA_REGION) + place(&mut image.rodata, "rodata", section, 1)?)
-                    }
-                    SectionKind::Data | SectionKind::Bss => {
-                        Addr::Data(region_base(DATA_REGION) + place(&mut image.data, "data", section, 1)?)
-                    }
+                let (region, bytes, len, align) = match section.kind {
+                    SectionKind::Code => ("code", &mut image.code, &mut code_len, INSN_SIZE),
+                    SectionKind::RoData => ("rodata", &mut image.rodata, &mut image.rodata_len, 1),
+                    SectionKind::Data | SectionKind::Bss => ("data", &mut image.data, &mut image.data_len, 1),
                     _ => continue,
+                };
+                let at = grow(len, region, section.align.max(align), section.size, budget)?;
+                let init = &section.data[..section.data.len().min(section.size as usize)];
+                if !init.is_empty() {
+                    bytes.resize(at, 0);
+                    bytes.extend_from_slice(init);
+                }
+                let addr = match section.kind {
+                    SectionKind::Code => Addr::Code(at as u64),
+                    SectionKind::RoData => Addr::Data(region_base(RODATA_REGION) + at as u64),
+                    _ => Addr::Data(region_base(DATA_REGION) + at as u64),
                 };
                 layout.sections.insert(idx, addr);
             }
-            lay_out_jump_tables(module, &mut layout, &mut image.rodata);
+            lay_out_jump_tables(module, &mut layout, &mut image, budget)?;
             Ok(layout)
         })
         .collect::<Result<_>>()?;
+    // relocations patch code anywhere in a section, so code is materialised whole
+    image.code.resize(code_len, 0);
     Ok((image, layouts))
 }
 
-/// Copy each jump table section that `module`'s code loads into `rodata`, once per code section that loads it. Entries
+/// Reserve `size` bytes at the next multiple of `align` in the region of length `*len`, and return their offset.
+/// Fails before anything grows if the region would exceed [`MAX_REGION_LEN`] or the program its memory budget.
+fn grow(len: &mut usize, region: &'static str, align: u64, size: u64, budget: &mut MemoryBudget) -> Result<usize> {
+    let range = (*len as u64)
+        .checked_next_multiple_of(align)
+        .and_then(|at| Some((at, at.checked_add(size)?)))
+        .filter(|&(_, end)| end <= MAX_REGION_LEN as u64);
+    let Some((at, end)) = range else {
+        return Err(VmError::ProgramTooLarge(region));
+    };
+    budget.take(end - *len as u64)?;
+    *len = end as usize;
+    Ok(at as usize)
+}
+
+/// Copy each jump table section that `module`'s code loads into rodata, once per code section that loads it. Entries
 /// are byte offsets into that code section; the copy holds guest code addresses, which `gotox` takes.
-fn lay_out_jump_tables(module: &Module, layout: &mut ModuleLayout, rodata: &mut Vec<u8>) {
+fn lay_out_jump_tables(
+    module: &Module,
+    layout: &mut ModuleLayout,
+    image: &mut Image,
+    budget: &mut MemoryBudget,
+) -> Result<()> {
     for reloc in &module.relocations {
         let Some(&Addr::Code(code)) = layout.sections.get(&reloc.section_idx) else {
             continue;
@@ -213,16 +228,19 @@ fn lay_out_jump_tables(module: &Module, layout: &mut ModuleLayout, rodata: &mut 
             continue;
         }
 
-        let at = rodata.len().next_multiple_of(8);
-        rodata.resize(at, 0);
-        for entry in table.data.as_chunks::<8>().0 {
+        let entries = table.data.as_chunks::<8>().0;
+        let size = entries.len() as u64 * 8;
+        let at = grow(&mut image.rodata_len, "rodata", 8, size, budget)?;
+        image.rodata.resize(at, 0);
+        for entry in entries {
             let target = Addr::Code(code.wrapping_add(u64::from_le_bytes(*entry)));
-            rodata.extend_from_slice(&target.guest().to_le_bytes());
+            image.rodata.extend_from_slice(&target.guest().to_le_bytes());
         }
         layout
             .jump_tables
             .insert(key, Addr::Data(region_base(RODATA_REGION) + at as u64));
     }
+    Ok(())
 }
 
 /// Compare each host-bound extern's BTF prototype with the registered function's argument count. Modules without BTF
@@ -295,6 +313,18 @@ fn apply_relocation(
     let Some(&patch) = layout.sections.get(&reloc.section_idx) else {
         return Ok(());
     };
+    // an `lddw` spans two instruction slots; every other patch is at most 8 bytes
+    let width = match (reloc.rel_type, patch) {
+        (reloc::bpf::BPF_64_64, Addr::Code(_)) => 2 * INSN_SIZE,
+        _ => 8,
+    };
+    let size = module.sections[reloc.section_idx].size;
+    let inside = reloc.offset.checked_add(width).is_some_and(|end| end <= size);
+    let aligned = matches!(patch, Addr::Data(_)) || reloc.offset.is_multiple_of(INSN_SIZE);
+    if !inside || !aligned {
+        let msg = format!("relocation at {:#x} in a {size} byte section", reloc.offset);
+        return Err(LinkError::InvalidReference(msg).into());
+    }
     let patch = patch.offset(reloc.offset);
 
     let symbol = module.symbol_by_idx(reloc.symbol_idx).ok_or_else(|| {

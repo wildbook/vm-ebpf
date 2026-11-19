@@ -17,7 +17,8 @@ typedef struct rvm_program rvm_program;
 
 typedef enum rvm_status {
     RVM_OK = 0,
-    // a malformed image, or one written by another rvm version
+    // a malformed image, one written by another rvm version, or one that needs more memory than rvm's
+    // DEFAULT_MEMORY_LIMIT
     RVM_ERR_IMAGE = 1,
     // the image imports a helper or host function that the runtime doesn't have, or declares maps
     RVM_ERR_LINK = 2,
@@ -27,7 +28,8 @@ typedef enum rvm_status {
     RVM_ERR_ARGUMENT = 4,
     // the call ran more instructions than the limit, rvm's DEFAULT_INSTRUCTION_LIMIT
     RVM_ERR_LIMIT = 5,
-    // an invalid instruction or memory access, or a call stack overflow
+    // an invalid instruction or memory access, or a call stack overflow; also an rvm_read or rvm_write of bytes the
+    // guest may not read or write
     RVM_ERR_FAULT = 6,
     // a helper failed
     RVM_ERR_HELPER = 7,
@@ -43,6 +45,17 @@ void rvm_free(rvm_program *program);
 // Maps len zeroed read-write bytes as host region `region`, counted from 0, and stores the region's guest address in
 // *addr. A region that is already mapped is replaced.
 rvm_status rvm_map(rvm_program *program, size_t region, size_t len, uint64_t *addr);
+
+// Unmaps host region `region`, counted from 0 as rvm_map counts it. A region that isn't mapped stays unmapped.
+rvm_status rvm_unmap(rvm_program *program, size_t region);
+
+// Copies len bytes at guest address addr into buf. The guest must be allowed to read them. buf may be NULL when len
+// is 0.
+rvm_status rvm_read(const rvm_program *program, uint64_t addr, uint8_t *buf, size_t len);
+
+// Copies len bytes from buf to guest address addr. The guest must be allowed to write them. buf may be NULL when len
+// is 0.
+rvm_status rvm_write(rvm_program *program, uint64_t addr, const uint8_t *buf, size_t len);
 
 // Calls the function `name` with args in r1 to r5 and stores its r0 in *ret. name and args may be NULL when their
 // length is 0.

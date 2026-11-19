@@ -16,35 +16,31 @@ pub type Result<T> = std::result::Result<T, VmError>;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum VmError {
-    /// ELF parsing error.
     #[cfg(feature = "link")]
     Elf(constelf::err::ElfError),
 
-    /// BTF parsing error.
     #[cfg(feature = "link")]
     Btf(btf::BtfError),
 
     /// A malformed image, or one written by another rvm version.
     InvalidImage(String),
 
-    /// Linking error.
     Link(LinkError),
 
-    /// Execution error.
     Exec(ExecError),
 
-    /// Helper function error.
     Helper(HelperError),
 
-    /// Memory access error.
     Memory(MemoryError),
 
-    /// Map access error.
     #[cfg(feature = "maps")]
     Map(MapError),
 
     /// No function `func`, in the plugin `plugin` if the lookup went through one.
-    FunctionNotFound { plugin: Option<String>, func: String },
+    FunctionNotFound {
+        plugin: Option<String>,
+        func: String,
+    },
 
     /// No map with this name.
     #[cfg(feature = "maps")]
@@ -56,8 +52,14 @@ pub enum VmError {
     /// A call with more arguments than the 5 that eBPF functions take.
     TooManyArgs(usize),
 
-    /// Invalid argument.
     InvalidArgument(String),
+
+    /// The program needs more memory than [`VmConfig::memory_limit`](crate::VmConfig::memory_limit), the value,
+    /// allows.
+    MemoryLimit(usize),
+
+    /// The allocator refused this many bytes.
+    OutOfMemory(usize),
 
     /// The program's code, rodata or data (named) exceeds [`MAX_REGION_LEN`](crate::MAX_REGION_LEN) bytes.
     ProgramTooLarge(&'static str),
@@ -97,6 +99,10 @@ impl fmt::Display for VmError {
             Self::ForeignFunc => write!(f, "function handle belongs to another program; look the function up again"),
             Self::TooManyArgs(count) => write!(f, "{count} arguments, but eBPF functions take at most {MAX_ARGS}"),
             Self::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
+            Self::MemoryLimit(limit) => {
+                write!(f, "program needs more than {limit} bytes of memory; raise VmConfig::memory_limit to allow it")
+            }
+            Self::OutOfMemory(bytes) => write!(f, "failed to allocate {bytes} bytes"),
             Self::ProgramTooLarge(region) => {
                 write!(f, "program {region} exceeds {} bytes", crate::memory::MAX_REGION_LEN)
             }
@@ -155,11 +161,10 @@ impl From<MapError> for VmError {
     }
 }
 
-/// Linking errors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LinkError {
-    /// Unresolved symbol.
+    /// No module defines the symbol, and the VM has no extern of that name.
     UnresolvedSymbol(String),
     /// A call to a helper ID that isn't registered.
     UnknownHelper(u32),
@@ -168,9 +173,9 @@ pub enum LinkError {
     /// A program declares a shared map with a different layout than the existing one.
     #[cfg(feature = "maps")]
     MapMismatch(String),
-    /// Duplicate symbol.
+    /// Two different definitions of one symbol or map name.
     DuplicateSymbol(String),
-    /// Invalid reference.
+    /// A relocation, symbol or tag that points outside its module or section, or at something it can't refer to.
     InvalidReference(String),
     /// A map definition no program can use, maps that don't fit in guest memory, or any map when rvm is built without
     /// the `maps` feature.
@@ -208,17 +213,18 @@ impl std::error::Error for LinkError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ExecError {
-    /// Invalid instruction.
+    /// An invalid or reserved instruction.
     CpuFault { pc: u64 },
     /// A load or store outside the mapped regions or their permissions.
     MemoryFault { pc: u64, error: MemoryError },
-    /// Unimplemented instruction.
+    /// A valid instruction that rvm doesn't implement.
     Unimplemented { pc: u64 },
     /// The call ran the instruction limit (the value) without finishing.
     InstructionLimit(u64),
-    /// The call at `pc` exceeds [`MAX_CALL_DEPTH`](crate::MAX_CALL_DEPTH) nested calls.
+    /// The call at `pc` exceeds [`MAX_CALL_DEPTH`](crate::MAX_CALL_DEPTH) nested calls, or finds `r10` lower than
+    /// [`VmConfig::frame_size`](crate::VmConfig::frame_size).
     StackOverflow { pc: u64 },
-    /// Invalid program counter.
+    /// Execution reached an instruction index outside the code.
     InvalidPc(u64),
     /// Ran an instruction whose CO-RE relocation the host couldn't resolve.
     UnresolvedCoreRelo { pc: u64 },
@@ -256,6 +262,10 @@ pub enum HelperError {
     UnknownHelper(u32),
     /// Unknown extern table slot.
     UnknownSlot(u32),
+    /// A host function asks for the caller's remaining instructions; the executor calls it again with them in
+    /// `HelperContext::host`. Never returned from a call.
+    #[doc(hidden)]
+    FuelWanted,
     /// A host function returned `Err`. Host functions that want the guest to see an error code return it as `i64`
     /// instead.
     Host(Box<dyn std::error::Error + Send + Sync>),
@@ -272,6 +282,7 @@ impl fmt::Display for HelperError {
         match self {
             Self::UnknownHelper(id) => write!(f, "unknown helper: {id}"),
             Self::UnknownSlot(slot) => write!(f, "unknown extern slot: {slot}"),
+            Self::FuelWanted => write!(f, "host function wants the caller's fuel"),
             Self::Host(e) => write!(f, "host function failed: {e}"),
             Self::Plugin { plugin, func, error } => write!(f, "{plugin}::{func}: {error}"),
         }

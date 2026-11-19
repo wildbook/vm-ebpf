@@ -1,6 +1,6 @@
 //! Fixture loading and the host setup shared by the integration tests.
 
-use rvm::{HostTypes, Module, Perms, Vm, FIRST_FREE_REGION};
+use rvm::{HostTypes, Module, Perms, Vm, VmConfig, FIRST_FREE_REGION};
 
 /// Read a compiled fixture by its path under `bpf/prebuilt/`.
 pub fn object(name: &str) -> Vec<u8> {
@@ -19,7 +19,12 @@ pub fn describe_bits(types: &mut HostTypes) {
 /// A VM with every extern, helper and host type the fixtures use, so most of them link and their CO-RE relocations have
 /// candidates to match.
 pub fn host_vm() -> Vm {
-    let vm = Vm::new();
+    host_vm_with(VmConfig::default())
+}
+
+/// [`host_vm`] with `config`.
+pub fn host_vm_with(config: VmConfig) -> Vm {
+    let vm = Vm::with_config(config);
     let host = Module::from_elf("host_event", &object("tests/host_event.o")).unwrap();
     vm.with_types(|types| {
         types.append_btf(host.btf_data.as_ref().unwrap()).unwrap();

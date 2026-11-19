@@ -24,7 +24,7 @@ use crate::layout::{DATA_REGION, RODATA_REGION, STACK_REGION};
 use crate::map_def::{MapDef, MapKind};
 #[cfg(feature = "maps")]
 use crate::maps::Maps;
-use crate::memory::{Perms, VmMemory, MAX_REGION_LEN};
+use crate::memory::{MemoryBudget, Perms, VmMemory, MAX_REGION_LEN};
 use crate::program::{Borrow, FunctionInfo, Functions, Program};
 use crate::vm::{Shared, VmConfig};
 
@@ -89,19 +89,7 @@ impl Image {
     /// Each `call <helper id>` in the code, as its instruction index and the helper ID. Linking records these as
     /// [`Import::Helper`] externs.
     pub fn helper_calls(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
-        let insns = self.code.as_chunks::<8>().0;
-        let mut i = 0;
-        std::iter::from_fn(move || {
-            while let Some(insn) = insns.get(i) {
-                let at = i as u32;
-                // the second slot of an `lddw` holds immediate bits, not an instruction
-                i += if insn[0] == LD_IMM64 { 2 } else { 1 };
-                if insn[0] == CALL && Instruction(u64::from_le_bytes(*insn)).src_reg() == 0 {
-                    return Some((at, imm(insn)));
-                }
-            }
-            None
-        })
+        helper_calls(&self.code)
     }
 
     /// Serialize the image for [`crate::Vm::load_image`].
@@ -310,23 +298,28 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
     }
 
     check_lengths(&s)?;
+    let stack_len = stack_len(config)?;
+    let mut budget = MemoryBudget::new(config.memory_limit);
+    for len in [s.code.len() as u64, stack_len, s.rodata_len as u64, s.data_len as u64] {
+        budget.take(len)?;
+    }
+    #[cfg(feature = "maps")]
+    let (maps, maps_len) = Maps::new(s.maps, &shared.maps, &mut budget)?;
+
     let mut insns = decode_instructions(s.code);
     // Bind against one version of the table; the program refreshes from there.
     let snapshot = helpers.snapshot();
+    bind_helper_calls(&mut insns, s.code, &snapshot.table);
     bind_externs(&mut insns, &s.externs, &snapshot.table)?;
     let functions = check_functions(s.functions, insns.len() as u64)?;
-    let stack_len = stack_len(config)?;
-
-    #[cfg(feature = "maps")]
-    let (maps, maps_len) = Maps::new(s.maps, &shared.maps)?;
 
     let mut memory = VmMemory::new();
-    let stack_top = memory.map_any(STACK_REGION, stack_len as usize, Perms::RW) + stack_len;
-    memory.map_bytes_any(RODATA_REGION, s.rodata, s.rodata_len, Perms::R);
-    memory.map_bytes_any(DATA_REGION, s.data, s.data_len, Perms::RW);
+    let stack_top = memory.map_any(STACK_REGION, stack_len as usize, Perms::RW)? + stack_len;
+    memory.map_bytes_any(RODATA_REGION, s.rodata, s.rodata_len, Perms::R)?;
+    memory.map_bytes_any(DATA_REGION, s.data, s.data_len, Perms::RW)?;
     #[cfg(feature = "maps")]
     if maps_len != 0 {
-        memory.map_any(MAPS_REGION, maps_len, Perms::RW);
+        memory.map_any(MAPS_REGION, maps_len, Perms::RW)?;
     }
     // SAFETY: the callers of `Vm::share_map`/`Vm::share_region` accepted the `Vm::share_region` contract.
     unsafe {
@@ -364,6 +357,19 @@ fn check_lengths(s: &Sections<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Turn each `call <helper id>` in `code` whose helper `table` has into a call to its slot, as linking does, so the
+/// call skips the lookup by ID. Calls to IDs the table lacks keep looking the helper up when they run.
+fn bind_helper_calls(insns: &mut [Instruction], code: &[u8], table: &HelperRegistry) {
+    for (at, id) in helper_calls(code) {
+        if let Some(slot) = table.slot_of_id(id) {
+            let insn = &mut insns[at as usize];
+            let mut bytes = insn.0.to_le_bytes();
+            set_slot_call(&mut bytes, slot);
+            insn.0 = u64::from_le_bytes(bytes);
+        }
+    }
+}
+
 /// Turn each extern call in `insns` into a call to the slot of its import in `table`.
 fn bind_externs(insns: &mut [Instruction], externs: &[(u32, Import)], table: &HelperRegistry) -> Result<()> {
     for (at, import) in externs {
@@ -387,13 +393,15 @@ fn bind_externs(insns: &mut [Instruction], externs: &[(u32, Import)], table: &He
 /// The function table of `functions`, in code of `insn_count` instructions.
 fn check_functions(functions: Vec<(String, FunctionInfo)>, insn_count: u64) -> Result<Functions> {
     for (name, info) in &functions {
-        // each borrow maps its own region, so the pointer parameters must differ
+        // Each borrow maps its own region, so the pointer parameters must differ. A call rewrites each pointer
+        // parameter as it maps it, so none may also hold a length.
         let borrows = &info.borrows;
         let distinct = borrows
             .iter()
             .enumerate()
             .all(|(i, b)| borrows[..i].iter().all(|o| o.arg != b.arg));
-        if info.pc >= insn_count || !borrows.iter().all(Borrow::in_range) || !distinct {
+        let lengths_apart = borrows.iter().all(|b| borrows.iter().all(|o| o.arg != b.len_arg));
+        if info.pc >= insn_count || !borrows.iter().all(Borrow::in_range) || !distinct || !lengths_apart {
             return Err(invalid(format!("function {name}: entry or borrows out of range")));
         }
     }
@@ -411,6 +419,23 @@ fn stack_len(config: &VmConfig) -> Result<u64> {
             let msg = format!("frame size {frame_size} makes the stack larger than {MAX_REGION_LEN} bytes");
             VmError::InvalidArgument(msg)
         })
+}
+
+/// Each `call <helper id>` in `code`, as its instruction index and the helper ID.
+fn helper_calls(code: &[u8]) -> impl Iterator<Item = (u32, u32)> + '_ {
+    let insns = code.as_chunks::<8>().0;
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        while let Some(insn) = insns.get(i) {
+            let at = i as u32;
+            // the second slot of an `lddw` holds immediate bits, not an instruction
+            i += if insn[0] == LD_IMM64 { 2 } else { 1 };
+            if insn[0] == CALL && Instruction(u64::from_le_bytes(*insn)).src_reg() == 0 {
+                return Some((at, imm(insn)));
+            }
+        }
+        None
+    })
 }
 
 /// Turn a call instruction into a call to extern-table `slot`.

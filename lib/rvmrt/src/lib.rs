@@ -1,4 +1,4 @@
-//! rvm as a C library: load a prepared image, map guest memory and call functions by name.
+//! rvm as a C library: load a prepared image, map guest memory, copy bytes in and out, and call functions by name.
 //!
 //! `include/rvmrt.h` declares these functions for C. Images come from `rvm::Vm::prepare` and `rvm::Image::to_bytes`;
 //! the runtime has no helpers and no maps, and its instruction limit is `rvm::DEFAULT_INSTRUCTION_LIMIT`.
@@ -11,7 +11,7 @@ use rvm::{ExecError, Perms, Program, Vm, VmError, FIRST_FREE_REGION};
 #[repr(C)]
 pub enum Status {
     Ok = 0,
-    /// A malformed image, or one written by another rvm version.
+    /// A malformed image, one written by another rvm version, or one that needs more memory than the limit.
     Image = 1,
     /// The image imports a helper or host function that the runtime doesn't have, or declares maps.
     Link = 2,
@@ -21,7 +21,8 @@ pub enum Status {
     Argument = 4,
     /// The call ran more instructions than the limit.
     Limit = 5,
-    /// The guest faulted: an invalid instruction or memory access, or a call stack overflow.
+    /// The guest faulted: an invalid instruction or memory access, or a call stack overflow. Also a read or write of
+    /// bytes the guest may not read or write.
     Fault = 6,
     /// A helper failed.
     Helper = 7,
@@ -32,7 +33,7 @@ pub enum Status {
 impl Status {
     fn of(error: &VmError) -> Self {
         match error {
-            VmError::InvalidImage(_) | VmError::ProgramTooLarge(_) => Self::Image,
+            VmError::InvalidImage(_) | VmError::ProgramTooLarge(_) | VmError::MemoryLimit(_) => Self::Image,
             VmError::Link(_) => Self::Link,
             VmError::FunctionNotFound { .. } => Self::NotFound,
             VmError::TooManyArgs(_) | VmError::InvalidArgument(_) => Self::Argument,
@@ -79,6 +80,59 @@ pub unsafe extern "C" fn rvm_map(program: *mut Program, region: usize, len: usiz
     let program = unsafe { &mut *program };
     let idx = FIRST_FREE_REGION.saturating_add(region);
     unsafe { finish(program.memory_mut().map(idx, len, Perms::RW), addr) }
+}
+
+/// Unmaps host region `region`, counted from 0, as [`rvm_map`] numbers it. Unmapping a region that isn't mapped does
+/// nothing.
+///
+/// # Safety
+///
+/// `program` must be a live program from [`rvm_load`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rvm_unmap(program: *mut Program, region: usize) -> Status {
+    let program = unsafe { &mut *program };
+    let idx = FIRST_FREE_REGION.saturating_add(region);
+    unsafe { finish(program.memory_mut().unmap(idx), &mut ()) }
+}
+
+/// Copies `len` bytes at guest address `addr` into `buf`. The guest must be allowed to read them, as for its own loads.
+///
+/// # Safety
+///
+/// `program` must be a live program from [`rvm_load`], and `buf` must point to `len` writable bytes. `buf` may be null
+/// when `len` is 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rvm_read(program: *const Program, addr: u64, buf: *mut u8, len: usize) -> Status {
+    let program = unsafe { &*program };
+    if len == 0 {
+        return Status::Ok;
+    }
+    let copied = program.memory().host_ptr(addr, len, Perms::R).map(|src| {
+        // SAFETY: `host_ptr` checked that the range lies in a live region; `buf` is the caller's own memory.
+        unsafe { std::ptr::copy(src.as_ptr(), buf, len) }
+    });
+    unsafe { finish(copied.map_err(VmError::Memory), &mut ()) }
+}
+
+/// Copies `len` bytes from `buf` to guest address `addr`. The guest must be allowed to write them, as for its own
+/// stores.
+///
+/// # Safety
+///
+/// `program` must be a live program from [`rvm_load`], and `buf` must point to `len` readable bytes. `buf` may be null
+/// when `len` is 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rvm_write(program: *mut Program, addr: u64, buf: *const u8, len: usize) -> Status {
+    let program = unsafe { &mut *program };
+    if len == 0 {
+        return Status::Ok;
+    }
+    let memory = program.memory_mut();
+    let copied = memory.host_ptr(addr, len, Perms::W).map(|dst| {
+        // SAFETY: as in `rvm_read`, and `memory` borrows the program mutably.
+        unsafe { std::ptr::copy(buf, dst.as_ptr(), len) }
+    });
+    unsafe { finish(copied.map_err(VmError::Memory), &mut ()) }
 }
 
 /// Calls the function `name` with `args` in r1 to r5 and stores its r0 in `*ret`.
@@ -223,6 +277,22 @@ unsafe fn str_or_none<'a>(ptr: *const u8, len: usize) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::Status;
+
+    /// Every function this library exports, with the C name it exports, has a declaration in the header.
+    #[test]
+    fn header_declares_every_function() {
+        let header = include_str!("../include/rvmrt.h");
+        let source = include_str!("lib.rs");
+        let exported: Vec<&str> = source
+            .split("pub unsafe extern \"C\" fn ")
+            .skip(1)
+            .map(|rest| rest.split('(').next().unwrap())
+            .collect();
+        assert!(exported.len() >= 11, "{exported:?}");
+        for name in exported {
+            assert!(header.contains(&format!(" {name}(")), "{name} is not declared in rvmrt.h");
+        }
+    }
 
     #[test]
     fn status_matches_rvmrt_h() {

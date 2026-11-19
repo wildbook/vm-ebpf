@@ -73,7 +73,7 @@ fn bpf_main_globals_do_not_clobber_code() {
     };
     let mut output = Output::default();
     let mut program = example();
-    let mem = program.memory_mut();
+    let mut mem = program.memory_mut();
     // SAFETY: both structs outlive the mappings (unmapped below) and aren't touched meanwhile.
     let (ctx, out) = unsafe {
         (

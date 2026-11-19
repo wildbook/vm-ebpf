@@ -139,13 +139,16 @@ images declare none, as `bin/emu` does (see
 [`lib/rvmrt/Cargo.toml`](lib/rvmrt/Cargo.toml) selects, as `rvmrt.dll` and a
 static `rvmrt.lib`. `lib/rvmrt/include/rvmrt.h` declares its
 functions: `rvm_load` loads a prepared image, `rvm_map` maps zeroed guest
-memory, `rvm_call` calls a function by name, and `rvm_free` frees the program.
+memory and `rvm_unmap` unmaps it, `rvm_write` and `rvm_read` copy bytes into
+and out of guest memory where the guest itself may write or read them,
+`rvm_call` calls a function by name, and `rvm_free` frees the program.
 Functions also have indices, in name order: `rvm_function_count` and
 `rvm_function_name` list them, `rvm_func` finds a name's index once, and
 `rvm_call_func` calls by index without the name lookup, which saves about 15 ns
-per call. Errors come back as `rvm_status` codes. The runtime has no helpers and
-its instruction limit is `rvm::DEFAULT_INSTRUCTION_LIMIT`; an image that
-declares maps fails with `RVM_ERR_LINK`.
+per call. Errors come back as `rvm_status` codes. The runtime has no helpers,
+its instruction limit is `rvm::DEFAULT_INSTRUCTION_LIMIT` and its memory limit
+`rvm::DEFAULT_MEMORY_LIMIT`; an image that declares maps fails with
+`RVM_ERR_LINK`.
 
 ```bash
 cd lib/rvmrt

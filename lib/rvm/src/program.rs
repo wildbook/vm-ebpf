@@ -2,18 +2,20 @@
 //!
 //! A `Program` is a loaded [`crate::Image`]: the executable code, data, maps and function table.
 
+use std::ops::Deref;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use hashbrown::HashMap;
 use rvm_core::Code;
 
-use crate::error::{Result, VmError};
+use crate::error::{MemoryError, Result, VmError};
 use crate::executor::{Executor, MAX_ARGS};
 use crate::helper::{SharedHelpers, Snapshot};
 #[cfg(feature = "maps")]
 use crate::maps::{MapRef, Maps};
-use crate::memory::VmMemory;
+use crate::memory::{Perms, Scalar, VmMemory};
 use crate::plugin::not_found;
 use crate::vm::VmConfig;
 
@@ -29,7 +31,8 @@ pub struct FunctionInfo {
 }
 
 /// A pointer parameter tagged `borrow:N` (writable) or `borrow_ro:N` in BTF, where parameter `N` holds the buffer's
-/// length in bytes.
+/// length in bytes. The callee sees the buffer at offset 0 of its own region, and a callee atomic at offset `o` counts
+/// as aligned when the caller's address plus `o` is, since both name the same bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Borrow {
     /// Index of the pointer parameter, 0 for r1.
@@ -117,8 +120,13 @@ impl Program {
         &self.memory
     }
 
-    /// [`memory`](Self::memory), mutably.
-    pub fn memory_mut(&mut self) -> &mut VmMemory {
+    /// The program's guest memory, mutably, through accessors that leave the regions the program reserves alone.
+    pub fn memory_mut(&mut self) -> ProgramMemory<'_> {
+        ProgramMemory(&mut self.memory)
+    }
+
+    /// All of the program's guest memory, the reserved regions included.
+    pub(crate) fn memory_any(&mut self) -> &mut VmMemory {
         &mut self.memory
     }
 
@@ -211,6 +219,34 @@ impl Program {
         self.call_pc(func.pc, args)
     }
 
+    /// [`call_func`](Self::call_func) with an instruction limit of its own instead of
+    /// [`VmConfig::instruction_limit`], 0 for none. Returns the result and the instructions the call ran, those it ran
+    /// in other plugins through their exports included.
+    #[cfg(feature = "fuel")]
+    pub fn call_with_limit(&mut self, func: Func, args: &[u64], limit: u64) -> (Result<u64>, u64) {
+        if !self.owns(func) {
+            return (Err(VmError::ForeignFunc), 0);
+        }
+        let start = crate::executor::fuel_for(limit);
+        let mut fuel = start;
+        let result = self.call_pc_fueled(func.pc, args, &mut fuel);
+        (result, start - fuel)
+    }
+
+    /// [`call_func`](Self::call_func) for a host function that runs inside another call, which has `fuel` left: the
+    /// call runs at most that and this program's limit, and takes what it ran from `fuel`.
+    #[inline]
+    pub(crate) fn call_func_charged(&mut self, func: Func, args: &[u64], fuel: &mut u64) -> Result<u64> {
+        if !self.owns(func) {
+            return Err(VmError::ForeignFunc);
+        }
+        let start = (*fuel).min(self.executor.instruction_limit());
+        let mut left = start;
+        let result = self.call_pc_fueled(func.pc, args, &mut left);
+        *fuel -= start - left;
+        result
+    }
+
     // Out of line: the executor and interpreter compile once, in this crate, behind one call. Inlined into the
     // embedder's crate, this either calls the executor separately or compiles another copy of the interpreter, which
     // measured slower.
@@ -225,12 +261,81 @@ impl Program {
         self.executor.call(&self.code, &mut self.memory, pc, args)
     }
 
+    /// [`call_pc`](Self::call_pc) with `*fuel` instructions, leaving what is left there. A function of its own, so that
+    /// `call_pc` starts from the instruction limit and reports nothing back.
+    #[inline(never)]
+    fn call_pc_fueled(&mut self, pc: u64, args: &[u64], fuel: &mut u64) -> Result<u64> {
+        if self.shared_helpers.version() != self.helpers_version {
+            self.refresh_helpers();
+        }
+        self.executor.call_fueled(&self.code, &mut self.memory, pc, args, fuel)
+    }
+
     #[cold]
     #[inline(never)]
     fn refresh_helpers(&mut self) {
         let Snapshot { table, version } = self.shared_helpers.snapshot();
         self.executor.set_helpers(table);
         self.helpers_version = version;
+    }
+}
+
+/// A program's guest memory from [`Program::memory_mut`]. It reads like a [`VmMemory`], and maps and writes as one
+/// except that it can't replace the memory or remap the regions the program reserves, which its maps and stack need.
+pub struct ProgramMemory<'a>(&'a mut VmMemory);
+
+impl ProgramMemory<'_> {
+    /// [`VmMemory::map`].
+    pub fn map(&mut self, idx: usize, len: usize, perms: Perms) -> Result<u64> {
+        self.0.map(idx, len, perms)
+    }
+
+    /// [`VmMemory::map_bytes`].
+    pub fn map_bytes(&mut self, idx: usize, init: &[u8], len: usize, perms: Perms) -> Result<u64> {
+        self.0.map_bytes(idx, init, len, perms)
+    }
+
+    /// [`VmMemory::map_host`].
+    ///
+    /// # Safety
+    ///
+    /// As [`VmMemory::map_host`].
+    pub unsafe fn map_host(&mut self, idx: usize, ptr: NonNull<u8>, len: usize, perms: Perms) -> Result<u64> {
+        // SAFETY: the caller's contract.
+        unsafe { self.0.map_host(idx, ptr, len, perms) }
+    }
+
+    /// [`VmMemory::unmap`].
+    pub fn unmap(&mut self, idx: usize) -> Result<()> {
+        self.0.unmap(idx)
+    }
+
+    /// [`VmMemory::bytes_mut`].
+    pub fn bytes_mut(&mut self, addr: u64, len: usize) -> std::result::Result<&mut [u8], MemoryError> {
+        self.0.bytes_mut(addr, len)
+    }
+
+    /// [`VmMemory::write_bytes`].
+    pub fn write_bytes(&mut self, addr: u64, data: &[u8]) -> std::result::Result<(), MemoryError> {
+        self.0.write_bytes(addr, data)
+    }
+
+    /// [`VmMemory::write`].
+    pub fn write<T: Scalar>(&mut self, addr: u64, value: T) -> std::result::Result<(), MemoryError> {
+        self.0.write(addr, value)
+    }
+
+    /// [`VmMemory::copy`].
+    pub fn copy(&mut self, src: u64, dst: u64, len: usize) -> std::result::Result<(), MemoryError> {
+        self.0.copy(src, dst, len)
+    }
+}
+
+impl Deref for ProgramMemory<'_> {
+    type Target = VmMemory;
+
+    fn deref(&self) -> &VmMemory {
+        self.0
     }
 }
 
@@ -292,7 +397,7 @@ impl FuncSlot {
         let Some(func) = self.get(program, |_| ()) else {
             return Err(not_found(plugin, &self.name));
         };
-        program.call_pc(func.pc, args)
+        program.call_func(func, args)
     }
 
     /// The function in `program`, looked up again if the slot holds a function of another program; after such a

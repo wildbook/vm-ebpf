@@ -29,16 +29,23 @@ use crate::sync::{lock, Published};
 #[cfg(feature = "fuel")]
 pub const DEFAULT_INSTRUCTION_LIMIT: u64 = 1_000_000;
 
+/// [`VmConfig::memory_limit`] in [`VmConfig::default`].
+pub const DEFAULT_MEMORY_LIMIT: usize = 256 << 20;
+
 /// Configuration for the VM.
 #[derive(Debug, Clone)]
 pub struct VmConfig {
-    /// Maximum number of instructions to execute, with 0 for no limit. Limits above `i64::MAX`, and no limit, count
-    /// as `i64::MAX`.
+    /// Maximum number of instructions one call into a program may execute, with 0 for no limit. Instructions that
+    /// plugins run for it through their exports count too, so the limit covers the whole call tree; a plugin's own
+    /// limit still caps the calls into it. Limits above `i64::MAX`, and no limit, count as `i64::MAX`.
     #[cfg(feature = "fuel")]
     pub instruction_limit: u64,
     /// Stack bytes reserved per call frame. Loading fails with [`VmError::InvalidArgument`] if the stack for
     /// [`MAX_CALL_DEPTH`](crate::MAX_CALL_DEPTH) nested calls exceeds [`MAX_REGION_LEN`] bytes.
     pub frame_size: u64,
+    /// Most bytes one program may allocate: its code, stack, data, map values and hash map keys, the shared maps it
+    /// creates included. Linking and loading check it before they allocate and fail with [`VmError::MemoryLimit`].
+    pub memory_limit: usize,
 }
 
 impl Default for VmConfig {
@@ -47,6 +54,7 @@ impl Default for VmConfig {
             #[cfg(feature = "fuel")]
             instruction_limit: DEFAULT_INSTRUCTION_LIMIT,
             frame_size: DEFAULT_FRAME_SIZE,
+            memory_limit: DEFAULT_MEMORY_LIMIT,
         }
     }
 }
@@ -95,7 +103,8 @@ impl Vm {
     // Helper registration: changes reach programs linked earlier at their next call. Replacing a function keeps its
     // slot, so linked call sites stay valid.
 
-    /// Register a helper function with type-safe argument extraction.
+    /// Register a helper function with type-safe argument extraction. With the `maps` feature, IDs 1 to 3 replace the
+    /// built-in map helpers.
     ///
     /// # Example
     ///
@@ -268,7 +277,7 @@ impl Vm {
     pub fn prepare_modules(&self, modules: &[&Module]) -> Result<Image> {
         let types = self.types.lock();
         let types = types.try_borrow().map_err(|_| VmError::TypesBusy)?;
-        linker::link(&self.helpers.read(), &types, modules)
+        linker::link(&self.helpers.read(), &types, modules, self.config.memory_limit)
     }
 
     /// Link modules into an executable program: [`Vm::prepare_modules`], then load.
@@ -353,7 +362,7 @@ impl SharedRegions {
         if len == 0 || len > MAX_REGION_LEN {
             return invalid(format!("region length {len} is not in 1..={MAX_REGION_LEN}"));
         }
-        let buffer = Arc::new(SharedBuffer::new(len));
+        let buffer = Arc::new(SharedBuffer::new(len)?);
         let mapping = Mapping {
             region,
             perms,

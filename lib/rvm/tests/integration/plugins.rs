@@ -4,9 +4,56 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rvm::{HelperError, LinkError, Program, Vm, VmError, WeakPlugin};
+use rvm::{HelperError, Image, Import, LinkError, Program, Vm, VmError, WeakPlugin};
 
 use crate::common::object;
+
+/// The instruction limit covers a whole call tree: what an export runs counts against the program that called it.
+#[cfg(feature = "fuel")]
+#[test]
+fn instruction_limit_covers_plugin_calls() {
+    use ebpf_asm::{Assembler, R0, R1, R6};
+    use rvm::{ExecError, Plugin, DEFAULT_INSTRUCTION_LIMIT};
+
+    const SPINS: i32 = 200_000;
+    const CALLS: i32 = 50;
+
+    // spin(n): count n down to 0, 2 n + 2 instructions
+    let mut asm = Assembler::new();
+    let spin = asm.create_label();
+    asm.set_label(&spin).unwrap();
+    asm.sub64_imm(R1, 1).jne_imm(R1, 0, &spin);
+    asm.mov64_imm(R0, 1).exit();
+    let vm = Vm::new();
+    let callee = Plugin::new("callee", vm.load(Image::from_code(asm.assemble().unwrap())).unwrap());
+    vm.export(&callee, "main").unwrap();
+
+    // main: call main(SPINS) in the callee CALLS times, 4 CALLS + 3 instructions of its own
+    let mut asm = Assembler::new();
+    let again = asm.create_label();
+    asm.mov64_imm(R6, CALLS);
+    asm.set_label(&again).unwrap();
+    asm.mov64_imm(R1, SPINS).call(0).sub64_imm(R6, 1).jne_imm(R6, 0, &again);
+    asm.mov64_imm(R0, 0).exit();
+    let mut image = Image::from_code(asm.assemble().unwrap());
+    image.externs.push((2, Import::Name("main".into())));
+    let mut caller = vm.load(image).unwrap();
+
+    // the third call into the callee runs out of what the first two left
+    let err = caller.call("main", &[]).unwrap_err();
+    let VmError::Helper(HelperError::Plugin { error, .. }) = &err else {
+        panic!("{err}")
+    };
+    assert!(matches!(**error, VmError::Exec(ExecError::InstructionLimit(_))), "{err}");
+
+    let main = caller.func("main").unwrap();
+    let (result, used) = caller.call_with_limit(main, &[], 0);
+    let total = (4 * CALLS + 3 + CALLS * (2 * SPINS + 2)) as u64;
+    assert_eq!((result.unwrap(), used), (0, total));
+    let (result, used) = caller.call_with_limit(main, &[], DEFAULT_INSTRUCTION_LIMIT);
+    assert!(result.is_err());
+    assert_eq!(used, DEFAULT_INSTRUCTION_LIMIT);
+}
 
 #[test]
 fn plugin_calls_export_and_survives_reload() {
@@ -216,6 +263,18 @@ fn borrowed_buffers() {
     assert!(err.contains("callee::poke") && err.contains("memory fault"), "{err}");
     let slot = rvm::region_base(rvm::BORROW_FIRST_REGION);
     assert!(callee.lock().unwrap().memory().bytes(slot, 1).is_err());
+
+    // an empty buffer may be null, as C passes it: sum(NULL, 0)
+    #[rustfmt::skip]
+    let code = [
+        0xb7, 0x01, 0, 0, 0, 0, 0, 0, // r1 = 0
+        0xb7, 0x02, 0, 0, 0, 0, 0, 0, // r2 = 0
+        0x85, 0x00, 0, 0, 0, 0, 0, 0, // call sum
+        0x95, 0x00, 0, 0, 0, 0, 0, 0, // exit
+    ];
+    let mut image = Image::from_code(code.to_vec());
+    image.externs.push((2, Import::Name("sum".into())));
+    assert_eq!(vm.load(image).unwrap().call("main", &[]).unwrap(), 0);
 }
 
 /// A host function that panics during a call with a borrowed buffer leaves the buffer unmapped and both plugins

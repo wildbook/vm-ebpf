@@ -10,6 +10,7 @@
 //! call into a plugin that is already running, from the host or through a chain of plugin calls, fails with
 //! [`VmError::PluginBusy`] instead of deadlocking. So does [`Plugin::replace`] while the plugin runs.
 
+use std::ptr::NonNull;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Weak};
@@ -100,6 +101,15 @@ fn call_export(
     slot: &ExportSlot,
     ctx: &mut HelperContext,
 ) -> std::result::Result<u64, HelperError> {
+    // The caller's remaining instructions bound the callee and pay for what it runs. Asking for them stops the caller,
+    // which only a call into another plugin pays for.
+    #[cfg(feature = "fuel")]
+    let Some(fuel) = ctx.host.fuel.as_mut() else {
+        return Err(HelperError::FuelWanted);
+    };
+    #[cfg(not(feature = "fuel"))]
+    let fuel = &mut 0;
+
     let failed = |error: VmError| HelperError::Plugin {
         plugin: name.to_string(),
         func: slot.func.name().to_string(),
@@ -116,18 +126,20 @@ fn call_export(
     let a = ctx.args;
     let args = [a.r1, a.r2, a.r3, a.r4, a.r5];
     if borrows.is_empty() {
-        return program.call_func(entry, &args).map_err(failed);
+        return program.call_func_charged(entry, &args, fuel).map_err(failed);
     }
-    call_with_borrows(&mut program, entry, args, borrows, ctx.memory).map_err(failed)
+    call_with_borrows(&mut program, entry, args, borrows, ctx.memory, fuel).map_err(failed)
 }
 
-/// Call `entry` in `callee` with the caller's buffers that `borrows` names mapped into the callee's borrow regions.
+/// Call `entry` in `callee` with the `caller`'s buffers that `borrows` names mapped into the callee's borrow regions,
+/// charging the call to `fuel`.
 fn call_with_borrows(
     callee: &mut Program,
     entry: Func,
     mut args: [u64; MAX_ARGS],
     borrows: Borrows,
     caller: &VmMemory,
+    fuel: &mut u64,
 ) -> Result<u64> {
     let callee = UnmapBorrows {
         program: callee,
@@ -137,14 +149,18 @@ fn call_with_borrows(
         let (addr, len) = (args[arg as usize], args[len_arg as usize] as usize);
         // the caller must itself be allowed what the callee gets
         let perms = if writable { Perms::RW } else { Perms::R };
-        let ptr = caller.host_ptr(addr, len, perms)?;
+        // an empty buffer, such as `(NULL, 0)` from C, maps an empty region whatever the pointer
+        let ptr = match len {
+            0 => NonNull::dangling(),
+            _ => caller.host_ptr(addr, len, perms)?,
+        };
         let region = borrow_region(arg);
         // SAFETY: the caller is blocked in this call, and `callee` unmaps the region before the call returns or
         // unwinds.
-        unsafe { callee.program.memory_mut().map_host_any(region, ptr, len, perms) };
+        unsafe { callee.program.memory_any().map_host_any(region, ptr, len, perms) };
         args[arg as usize] = region_base(region);
     }
-    callee.program.call_func(entry, &args)
+    callee.program.call_func_charged(entry, &args, fuel)
 }
 
 /// The borrow region of the pointer parameter `arg`.
@@ -163,7 +179,7 @@ impl Drop for UnmapBorrows<'_> {
     fn drop(&mut self) {
         for borrow in self.borrows {
             let region = borrow_region(borrow.arg);
-            self.program.memory_mut().unmap_any(region);
+            self.program.memory_any().unmap_any(region);
         }
     }
 }
@@ -263,6 +279,19 @@ impl PluginFunc {
     /// [`VmError::FunctionNotFound`] if that program lacks it.
     pub fn call(&self, args: &[u64]) -> Result<u64> {
         self.func.call(&mut *self.plugin.lock()?, &self.plugin.name, args)
+    }
+
+    /// [`call`](Self::call) with [`Program::call_with_limit`].
+    #[cfg(feature = "fuel")]
+    pub fn call_with_limit(&self, args: &[u64], limit: u64) -> (Result<u64>, u64) {
+        let mut program = match self.plugin.lock() {
+            Ok(program) => program,
+            Err(error) => return (Err(error), 0),
+        };
+        match self.func.get(&program, |_| ()) {
+            Some(func) => program.call_with_limit(func, args, limit),
+            None => (Err(not_found(&self.plugin.name, self.func.name())), 0),
+        }
     }
 }
 

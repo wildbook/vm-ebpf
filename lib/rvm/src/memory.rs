@@ -125,10 +125,11 @@ impl VmMemory {
     /// Map `len` zeroed bytes as region `idx`, replacing any previous mapping. Returns the region's guest base address.
     ///
     /// Fails with [`VmError::InvalidArgument`] unless `idx` is one of the regions the layout leaves to the host,
-    /// [`FIRST_FREE_REGION`]`..`[`BORROW_FIRST_REGION`], and `len` is at most [`MAX_REGION_LEN`].
+    /// [`FIRST_FREE_REGION`]`..`[`BORROW_FIRST_REGION`], and `len` is at most [`MAX_REGION_LEN`], and with
+    /// [`VmError::OutOfMemory`] if the allocator refuses `len` bytes.
     pub fn map(&mut self, idx: usize, len: usize, perms: Perms) -> crate::Result<u64> {
         check_host_region(idx, len)?;
-        Ok(self.map_any(idx, len, perms))
+        self.map_any(idx, len, perms)
     }
 
     /// Map region `idx` with `len` bytes, initialized from `init` (rest zeroed). Fails as [`map`](Self::map) does, and
@@ -139,10 +140,12 @@ impl VmMemory {
             let msg = format!("{} initial bytes in a {len} byte region", init.len());
             return Err(VmError::InvalidArgument(msg));
         }
-        Ok(self.map_bytes_any(idx, init, len, perms))
+        self.map_bytes_any(idx, init, len, perms)
     }
 
-    /// Expose host memory as region `idx`. Guest accesses go straight to `ptr`. Fails as [`map`](Self::map) does.
+    /// Expose host memory as region `idx`. Guest accesses go straight to `ptr`. Fails as [`map`](Self::map) does, and
+    /// with [`VmError::InvalidArgument`] unless `ptr` is 8-byte aligned, so guest atomics depend on guest addresses
+    /// only.
     ///
     /// # Safety
     ///
@@ -151,6 +154,9 @@ impl VmMemory {
     /// accesses while the VM runs, and must be usable from any thread that uses this memory.
     pub unsafe fn map_host(&mut self, idx: usize, ptr: NonNull<u8>, len: usize, perms: Perms) -> crate::Result<u64> {
         check_host_region(idx, len)?;
+        if !ptr.cast::<u64>().is_aligned() {
+            return Err(VmError::InvalidArgument(format!("host pointer {ptr:p} is not 8-byte aligned")));
+        }
         // SAFETY: the caller's contract.
         Ok(unsafe { self.map_host_any(idx, ptr, len, perms) })
     }
@@ -162,29 +168,30 @@ impl VmMemory {
         Ok(())
     }
 
-    /// [`map`](Self::map) for any region index, the ones the layout reserves included.
+    /// [`map`](Self::map) for any region index, the ones the layout reserves included. Fails only if the allocator
+    /// refuses.
     ///
     /// # Panics
     ///
     /// Panics if `idx` is 0 or out of range, or `len` exceeds [`MAX_REGION_LEN`].
-    pub(crate) fn map_any(&mut self, idx: usize, len: usize, perms: Perms) -> u64 {
+    pub(crate) fn map_any(&mut self, idx: usize, len: usize, perms: Perms) -> crate::Result<u64> {
         assert!(len <= MAX_REGION_LEN, "region too large: {len}");
         let ptr = if len == 0 {
             NonNull::dangling()
         } else {
             // SAFETY: non-zero size.
-            unsafe { allocate_zeroed(Self::layout(len)) }
+            unsafe { allocate_zeroed(Self::layout(len)) }?
         };
-        self.set(idx, ptr, len, perms, true)
+        Ok(self.set(idx, ptr, len, perms, true))
     }
 
-    /// [`map_bytes`](Self::map_bytes) for any region index; panics as [`map_any`](Self::map_any) does, and if `init` is
-    /// longer than `len`.
-    pub(crate) fn map_bytes_any(&mut self, idx: usize, init: &[u8], len: usize, perms: Perms) -> u64 {
+    /// [`map_bytes`](Self::map_bytes) for any region index; fails and panics as [`map_any`](Self::map_any) does, and
+    /// panics if `init` is longer than `len`.
+    pub(crate) fn map_bytes_any(&mut self, idx: usize, init: &[u8], len: usize, perms: Perms) -> crate::Result<u64> {
         assert!(init.len() <= len, "init ({}) larger than region ({len})", init.len());
-        let base = self.map_any(idx, len, perms);
+        let base = self.map_any(idx, len, perms)?;
         self.write_bytes(base, init).expect("freshly mapped region");
-        base
+        Ok(base)
     }
 
     /// [`map_host`](Self::map_host) for any region index; panics as [`map_any`](Self::map_any) does.
@@ -374,15 +381,37 @@ fn check_host_region(idx: usize, len: usize) -> crate::Result<()> {
     Ok(())
 }
 
-/// Allocate zeroed memory for `layout`, or abort if the allocator fails.
+/// Allocate zeroed memory for `layout`, failing with [`VmError::OutOfMemory`] if the allocator refuses.
 ///
 /// # Safety
 ///
 /// `layout` must have a non-zero size.
-unsafe fn allocate_zeroed(layout: Layout) -> NonNull<u8> {
+unsafe fn allocate_zeroed(layout: Layout) -> crate::Result<NonNull<u8>> {
     // SAFETY: the caller's contract.
     let raw = unsafe { alloc_zeroed(layout) };
-    NonNull::new(raw).unwrap_or_else(|| std::alloc::handle_alloc_error(layout))
+    NonNull::new(raw).ok_or(VmError::OutOfMemory(layout.size()))
+}
+
+/// The bytes a program may still allocate while it links or loads, from
+/// [`VmConfig::memory_limit`](crate::VmConfig::memory_limit).
+pub struct MemoryBudget {
+    limit: usize,
+    left: u64,
+}
+
+impl MemoryBudget {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            left: limit as u64,
+        }
+    }
+
+    /// Count `bytes` against the budget. Fails with [`VmError::MemoryLimit`] once the total exceeds the limit.
+    pub fn take(&mut self, bytes: u64) -> crate::Result<()> {
+        self.left = self.left.checked_sub(bytes).ok_or(VmError::MemoryLimit(self.limit))?;
+        Ok(())
+    }
 }
 
 impl Drop for VmMemory {
@@ -462,17 +491,17 @@ unsafe impl Send for SharedBuffer {}
 unsafe impl Sync for SharedBuffer {}
 
 impl SharedBuffer {
-    /// Allocate `len` zeroed bytes.
+    /// Allocate `len` zeroed bytes. Fails with [`VmError::OutOfMemory`] if the allocator refuses.
     ///
     /// # Panics
     ///
     /// Panics if `len` is 0.
-    pub fn new(len: usize) -> Self {
+    pub fn new(len: usize) -> crate::Result<Self> {
         assert!(len != 0, "empty shared buffer");
         let layout = Self::layout(len);
         // SAFETY: non-zero size.
-        let ptr = unsafe { allocate_zeroed(layout) };
-        Self { ptr, len }
+        let ptr = unsafe { allocate_zeroed(layout) }?;
+        Ok(Self { ptr, len })
     }
 
     /// Start of the buffer, valid until the buffer is dropped.
@@ -515,6 +544,10 @@ macro_rules! fetch_op {
 
 /// The `$atomic` at `$ptr`, or `None` if `$ptr` is misaligned for it. `$ptr` must come from a bounds check of
 /// `size_of::<$atomic>()` bytes inside a live region.
+///
+/// Every region but a borrow starts 8-byte aligned on the host (`map_host` requires it), so this tests the offset into
+/// the region, wherever the host placed it. A borrow starts at the caller's buffer, so there it tests the caller's
+/// guest address of the same byte.
 macro_rules! atomic_cell {
     ($ptr:expr, $atomic:ident) => {{
         let ptr = $ptr.cast::<$atomic>();
@@ -816,7 +849,7 @@ mod tests {
     #[test]
     fn null_region_and_bounds_fault() {
         let mut mem = VmMemory::new();
-        let base = mem.map_any(1, 16, Perms::RW);
+        let base = mem.map_any(1, 16, Perms::RW).unwrap();
         assert_eq!(mem.load_u8(0), Err(0));
         assert_eq!(mem.load_u8(7), Err(7));
         assert!(mem.load_u64(base + 8).is_ok());
@@ -831,13 +864,13 @@ mod tests {
     #[test]
     fn perms_apply_to_guest_not_host() {
         let mut mem = VmMemory::new();
-        let ro = mem.map_bytes_any(2, &[1, 2, 3, 4], 8, Perms::R);
+        let ro = mem.map_bytes_any(2, &[1, 2, 3, 4], 8, Perms::R).unwrap();
         assert_eq!(mem.load_u32(ro), Ok(0x0403_0201));
         assert_eq!(mem.store_u8(ro, 9), Err(ro));
         mem.write(ro, 9u8).unwrap(); // host may still patch read-only regions
         assert_eq!(mem.load_u8(ro), Ok(9));
 
-        let wo = mem.map_any(3, 8, Perms::W);
+        let wo = mem.map_any(3, 8, Perms::W).unwrap();
         assert!(mem.store_u64(wo, 1).is_ok());
         assert_eq!(mem.load_u64(wo), Err(wo));
     }
@@ -845,7 +878,7 @@ mod tests {
     #[test]
     fn unaligned_little_endian_access() {
         let mut mem = VmMemory::new();
-        let base = mem.map_any(1, 16, Perms::RW);
+        let base = mem.map_any(1, 16, Perms::RW).unwrap();
         mem.store_u64(base + 3, 0x1122_3344_5566_7788).unwrap();
         assert_eq!(mem.bytes(base + 3, 2).unwrap(), &[0x88, 0x77]);
         assert_eq!(mem.load_u16(base + 4), Ok(0x6677));
@@ -877,12 +910,15 @@ mod tests {
 
         let mut helpers = HelperRegistry::default();
         helpers.register_helper_raw(1, |ctx: &mut HelperContext| {
-            ctx.memory.map_bytes_any(FIRST_FREE_REGION, &[9], 8, Perms::RW);
+            ctx.memory.map_bytes_any(FIRST_FREE_REGION, &[9], 8, Perms::RW).unwrap();
         });
         let mut mem = VmMemory::new();
-        let base = mem.map_bytes_any(FIRST_FREE_REGION, &[7], 8, Perms::RW);
+        let base = mem.map_bytes_any(FIRST_FREE_REGION, &[7], 8, Perms::RW).unwrap();
         let config = VmConfig::default();
-        let stack_top = mem.map_any(STACK_REGION, config.frame_size as usize, Perms::RW) + config.frame_size;
+        let stack_top = mem
+            .map_any(STACK_REGION, config.frame_size as usize, Perms::RW)
+            .unwrap()
+            + config.frame_size;
 
         // r6 points into the region, r2 into the stack: region[0] + stack[-4] + remapped region[0] = 7 + 5 + 9
         let mut asm = Assembler::new();
@@ -902,9 +938,9 @@ mod tests {
     #[test]
     fn guest_memory_needs_guest_perms() {
         let mut mem = VmMemory::new();
-        let rw = mem.map_any(1, 16, Perms::RW);
-        let ro = mem.map_bytes_any(2, b"hi", 8, Perms::R);
-        let wo = mem.map_any(3, 8, Perms::W);
+        let rw = mem.map_any(1, 16, Perms::RW).unwrap();
+        let ro = mem.map_bytes_any(2, b"hi", 8, Perms::R).unwrap();
+        let wo = mem.map_any(3, 8, Perms::W).unwrap();
         let mut guest = GuestMemory::new(&mut mem);
         let fault = |addr, size| MemoryError { addr, size };
 
@@ -920,10 +956,32 @@ mod tests {
         assert_eq!(guest.read_vec(rw, usize::MAX).unwrap_err(), fault(rw, usize::MAX));
     }
 
+    // Whether a guest atomic is aligned depends on guest addresses only: the host maps only aligned memory, and a borrow
+    // goes by the caller's address of the same byte.
+    #[test]
+    fn atomics_follow_guest_addresses() {
+        let mut buf = [0u64; 3];
+        let aligned = NonNull::from(&mut buf).cast::<u8>();
+        let mut mem = VmMemory::new();
+        // SAFETY: `buf` outlives `mem` and is only accessed through it.
+        let misaligned = unsafe { mem.map_host(FIRST_FREE_REGION, aligned.add(1), 16, Perms::RW) };
+        assert!(matches!(misaligned, Err(VmError::InvalidArgument(_))));
+        // SAFETY: as above.
+        let base = unsafe { mem.map_host(FIRST_FREE_REGION, aligned, 16, Perms::RW) }.unwrap();
+        assert_eq!(mem.atomic_u64(base + 8, AtomicOp::Add(1)), Ok(0));
+        assert_eq!(mem.atomic_u64(base + 4, AtomicOp::Add(1)), Err(base + 4));
+
+        // a borrow of a buffer at an odd caller address: aligned in the caller is what counts
+        // SAFETY: as above.
+        let base = unsafe { mem.map_host_any(FIRST_FREE_REGION, aligned.add(1), 16, Perms::RW) };
+        assert_eq!(mem.atomic_u64(base + 7, AtomicOp::Add(1)), Ok(1));
+        assert_eq!(mem.atomic_u64(base, AtomicOp::Add(1)), Err(base));
+    }
+
     #[test]
     fn shared_region_bounds_and_alignment() {
         // SAFETY: the only handle over the buffer.
-        let mut region = unsafe { SharedRegion::new(5, Perms::R, Arc::new(SharedBuffer::new(16))) };
+        let mut region = unsafe { SharedRegion::new(5, Perms::R, Arc::new(SharedBuffer::new(16).unwrap())) };
         let base = region.base();
         let fault = |offset: u64, size| MemoryError {
             addr: base.wrapping_add(offset),
@@ -969,7 +1027,7 @@ mod tests {
 
         // replace owned regions with host ones of other perms, or unmap them
         for (idx, region) in table.iter_mut().enumerate().skip(1).take(MAPPED) {
-            mem.map_any(idx, 16, Perms::RW);
+            mem.map_any(idx, 16, Perms::RW).unwrap();
             if idx % 5 == 0 {
                 mem.unmap_any(idx);
                 *region = (NonNull::dangling(), 0, Perms::NONE);

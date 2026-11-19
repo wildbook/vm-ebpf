@@ -322,15 +322,15 @@ mod tests {
     struct NoHost;
 
     impl Host<NoMem> for NoHost {
-        fn helper(&mut self, _: &mut Context<NoMem>, _: u32, _: &mut u64) -> Option<u64> {
+        fn helper(&mut self, _: &mut Context<NoMem>, _: u32) -> Option<u64> {
             None
         }
 
-        fn kfunc(&mut self, _: &mut Context<NoMem>, _: u32, _: &mut u64) -> Option<u64> {
+        fn kfunc(&mut self, _: &mut Context<NoMem>, _: u32) -> Option<u64> {
             None
         }
 
-        fn callx(&mut self, _: &mut Context<NoMem>, _: u64, _: &mut u64) -> Option<Callee> {
+        fn callx(&mut self, _: &mut Context<NoMem>, _: u64) -> Option<Callee> {
             None
         }
     }

@@ -13,16 +13,16 @@ use crate::image::INSN_SIZE;
 use crate::section::{section_kind_from_name, Section, SectionKind, LEGACY_MAPS_SECTION, MAPS_SECTION};
 use crate::symbol::{Export, Symbol};
 
-/// Relocation entry for a module.
+/// A relocation in one of the module's sections.
 #[derive(Debug, Clone)]
 pub struct Relocation {
-    /// Section index being relocated.
+    /// Index into [`Module::sections`] of the section the relocation patches.
     pub section_idx: usize,
-    /// Offset within the section.
+    /// Byte offset of the patch within that section.
     pub offset: u64,
-    /// Symbol index this relocation references.
+    /// Index into [`Module::symbols`].
     pub symbol_idx: usize,
-    /// Relocation type.
+    /// `R_BPF_*` type.
     pub rel_type: u32,
     /// Byte offset added to the symbol address. For REL relocations this is decoded from the instruction's `imm` at
     /// parse time.
@@ -32,28 +32,27 @@ pub struct Relocation {
 /// A parsed eBPF ELF module.
 #[derive(Debug, Default)]
 pub struct Module {
-    /// Module name (user-provided or derived from file).
+    /// The name given to [`Module::from_elf`].
     pub name: String,
 
-    /// All sections in the module.
+    /// The allocated sections and `.jumptables`, in ELF order.
     pub sections: Vec<Section>,
 
-    /// All symbols in the module.
+    /// Indexed like the ELF symbol table.
     pub symbols: Vec<Symbol>,
 
-    /// Exports (defined global symbols).
+    /// Defined global symbols by name.
     pub exports: HashMap<String, Export>,
 
-    /// Imports (undefined global symbols).
+    /// Names of undefined global symbols.
     pub imports: Vec<String>,
 
-    /// Relocations.
     pub relocations: Vec<Relocation>,
 
-    /// BTF data (if present).
+    /// Contents of `.BTF`.
     pub btf_data: Option<Vec<u8>>,
 
-    /// BTF.ext data (if present).
+    /// Contents of `.BTF.ext`.
     pub btf_ext_data: Option<Vec<u8>>,
 }
 
@@ -84,7 +83,7 @@ impl Module {
                 _ => None,
             };
             if let Some(btf) = btf {
-                *btf = sect.bytes().ok().map(<[u8]>::to_vec);
+                *btf = Some(sect.bytes()?.to_vec());
                 continue;
             }
 

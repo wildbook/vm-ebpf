@@ -33,13 +33,22 @@ impl HelperArgs {
     }
 }
 
-/// What a raw host function sees: the argument registers, the calling program's memory and its maps.
+/// What a raw host function sees: the argument registers, the calling program's memory, and its maps and fuel.
 pub struct HelperContext<'a> {
     pub args: HelperArgs,
     pub memory: &'a mut VmMemory,
-    /// The calling program's maps (if it has any).
+    pub host: &'a mut HostState,
+}
+
+/// What host functions reach of the calling program besides its memory.
+#[derive(Debug, Default)]
+pub struct HostState {
     #[cfg(feature = "maps")]
-    pub maps: Option<&'a mut Maps>,
+    pub maps: Maps,
+    /// The instructions the caller has left. `None` until a host function asks for them by failing with
+    /// [`HelperError::FuelWanted`]: the executor then stops the caller, and calls the function again with the fuel
+    /// here, and the caller continues with what the function leaves.
+    pub fuel: Option<u64>,
 }
 
 /// Typed helper arguments, read from r1 onwards.
