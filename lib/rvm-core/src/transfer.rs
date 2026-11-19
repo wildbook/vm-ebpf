@@ -32,23 +32,17 @@ pub const FAR: u8 = 0xe8;
 /// both bytes as it does every byte with a handler of its own.
 pub fn bound(code: &mut Vec<Instruction>) {
     let len = code.len();
-    let lands = |pc: usize, displacement: i64| {
-        let target = pc as i64 + 1 + displacement;
-        (0..=len as i64).contains(&target)
-    };
 
     let mut far = Vec::new();
     for pc in 0..len {
         let slot = code[pc];
         if let Some(sup) = Super::with_byte(slot.byte()) {
             // the branch lies after `pc`, so this loop hasn't changed it yet
-            let last = pc + sup.len() - 1;
-            let fits = last < len && (!sup.branches() || lands(last, i64::from(code[last].offset())));
-            if !fits {
+            if !fits(sup, code, pc) {
                 code[pc] = sup.first_of(slot);
             }
         } else if let Some(displacement) = displacement(slot) {
-            if !lands(pc, displacement) {
+            if !lands(len, pc, displacement) {
                 far.push(slot.with_opcode(GUARD));
                 let at = u32::try_from(len + far.len()).expect("fewer than 2^31 slots");
                 let byte = slot.byte();
@@ -60,6 +54,19 @@ pub fn bound(code: &mut Vec<Instruction>) {
     code.reserve_exact(1 + far.len());
     code.push(Instruction(u64::from(GUARD)));
     code.extend(far);
+}
+
+/// Whether the superinstruction `sup` at `pc` continues only at pcs in `0..=code.len()`: its sequence lies in `code`,
+/// and so does the target of its branch if it has one.
+pub fn fits(sup: &Super, code: &[Instruction], pc: usize) -> bool {
+    let last = pc + sup.len() - 1;
+    last < code.len() && (!sup.branches() || lands(code.len(), last, code[last].offset().into()))
+}
+
+/// Whether the target `pc + 1 + displacement` lies in `0..=len`.
+fn lands(len: usize, pc: usize, displacement: i64) -> bool {
+    let target = pc as i64 + 1 + displacement;
+    (0..=len as i64).contains(&target)
 }
 
 /// A pointer to the slot of the instruction a handler runs, which handlers carry in place of its pc.

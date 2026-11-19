@@ -56,28 +56,22 @@ pub const CALL: u8 = OpCode::jmp64_from_parts(JmpOpc::Call, Source::Imm).0;
 #[rustfmt::skip]
 #[allow(clippy::unusual_byte_groupings)]
 impl OpCode {
-    #[inline(always)]
-    pub const fn alu_opc(self) -> AluOpc { AluOpc::from_u8(self.0 & 0b1111_0_000) }
-    #[inline(always)]
-    pub const fn alu_src(self) -> Source { Source::from_u8(self.0 & 0b0000_1_000) }
-    #[inline(always)]
-    pub const fn alu_end(self) -> AluEnd { AluEnd::from_u8(self.0 & 0b0000_1_000) }
+    #[inline(always)] pub const fn alu_opc(self) -> AluOpc { AluOpc::from_u8(self.0 & 0b1111_0_000) }
+    #[inline(always)] pub const fn alu_src(self) -> Source { Source::from_u8(self.0 & 0b0000_1_000) }
+    #[inline(always)] pub const fn alu_end(self) -> AluEnd { AluEnd::from_u8(self.0 & 0b0000_1_000) }
 }
 
 #[rustfmt::skip]
 #[allow(clippy::unusual_byte_groupings)]
 impl OpCode {
-    #[inline(always)]
-    pub const fn jmp_opc(self) -> JmpOpc { JmpOpc::from_u8(self.0 & 0b1111_0_000) }
+    #[inline(always)] pub const fn jmp_opc(self) -> JmpOpc { JmpOpc::from_u8(self.0 & 0b1111_0_000) }
 }
 
 #[rustfmt::skip]
 #[allow(clippy::unusual_byte_groupings)]
 impl OpCode {
-    #[inline(always)]
-    pub const fn mem_size(self) -> MemSize { MemSize::from_u8(self.0 & 0b000_11_000) }
-    #[inline(always)]
-    pub const fn mem_mode(self) -> MemMode { MemMode::from_u8(self.0 & 0b111_00_000) }
+    #[inline(always)] pub const fn mem_size(self) -> MemSize { MemSize::from_u8(self.0 & 0b000_11_000) }
+    #[inline(always)] pub const fn mem_mode(self) -> MemMode { MemMode::from_u8(self.0 & 0b111_00_000) }
 }
 
 /// Declares a `#[repr(u8)]` enum covering every value of `mask`, a `from_u8` decoder for it and a `from_name` lookup

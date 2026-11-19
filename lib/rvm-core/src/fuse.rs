@@ -1,7 +1,7 @@
 //! Superinstructions: common instruction sequences that [`run`](crate::run) executes with one dispatch.
 //!
 //! [`Code::new`] gives the first slot of each sequence it recognises the opcode byte of a superinstruction, one of the
-//! LD-class bytes that rvm doesn't run (see [`MISSING`]). The other slots keep their instructions, so a jump into the
+//! bytes that no slot holds once it ran (see [`canonical`]). The other slots keep their instructions, so a jump into the
 //! middle of a sequence runs them one by one. A superinstruction behaves exactly like its sequence:
 //! - it charges one unit of fuel per instruction, and runs only the first instruction when the fuel would run out
 //!   inside the sequence;
@@ -16,7 +16,7 @@ pub use supers::Super;
 use supers::{Encode, SUPERS};
 
 use crate::opcode::atomic::{CMPXCHG, FETCH, LOAD_ACQ};
-use crate::opcode::{AluOpc, Class, MemMode, MemSize, OpCode, Source, LD_IMM64};
+use crate::opcode::{AluEnd, AluOpc, Class, JmpOpc, MemMode, MemSize, OpCode, Source, LD_IMM64};
 use crate::transfer::{self, FAR, GUARD};
 use crate::{stack, Handler, Host, Instruction, Memory};
 
@@ -65,7 +65,7 @@ impl Code {
     #[cold]
     pub fn access_size(&self, pc: u64) -> Option<usize> {
         let byte = self.slots.get(usize::try_from(pc).ok()?)?.byte();
-        // the first slot of a superinstruction or r10 access holds a reserved byte in place of its opcode
+        // the first slot of a superinstruction or r10 access holds a free byte in place of its opcode
         let byte = match (STACK.iter().find(|s| s.0 == byte), Super::with_byte(byte)) {
             (Some(&(_, usual)), _) => usual,
             (None, Some(sup)) => sup.op(0),
@@ -84,31 +84,32 @@ impl Code {
     }
 }
 
-/// Give r10 writes and the bytes rvm doesn't run their failing bytes, and the sequences with a superinstruction and r10
-/// accesses theirs.
+/// Give the bytes that run as another theirs and r10 writes their failing byte, and the sequences with a
+/// superinstruction and r10 accesses theirs.
 fn fuse(code: &mut [Instruction]) {
     // Only the opcode byte changes, so the second slot of LD_IMM64 keeps its `imm`.
     for insn in code.iter_mut() {
         let writes = WRITES[usize::from(insn.byte())];
         // `&` and `|` don't branch, so only the rare rewrite and atomics do
         let r10 = (writes.dst & (insn.dst_reg() == 10)) | (writes.atomic && atomic_writes_r10(*insn));
-        if writes.reserved | r10 {
-            let byte = if writes.reserved { MISSING } else { INVALID };
-            *insn = insn.with_opcode(byte);
+        if writes.canonical.is_some() | r10 {
+            *insn = insn.with_opcode(writes.canonical.unwrap_or(INVALID));
         }
     }
 
     // A superinstruction or r10 access changes only the opcode byte of its first slot. So the code from slot `i` on is
     // still as loaded but for opcode bytes, and a handler, which reads the other fields of its sequence's slots, later
-    // reads the fields `encode` checked.
+    // reads the fields `encode` checked. A sequence whose branch leaves the code gives way to the next candidate, as
+    // `transfer::bound` would run it unfused.
     for i in 0..code.len() {
         // the slot after LD_IMM64 holds the upper half of its immediate
         if i > 0 && code[i - 1].byte() == LD_IMM64 {
             continue;
         }
         let window = &code[i..];
-        let found = candidates(window).iter().find_map(|&(_, _, encode)| encode(window));
-        debug_assert_eq!(found, SUPERS.iter().find_map(|&(_, _, encode)| encode(window)));
+        let fused = |(_, sup, encode): &(u8, Super, Encode)| encode(window).filter(|_| transfer::fits(sup, code, i));
+        let found = candidates(window).iter().find_map(fused);
+        debug_assert_eq!(found, SUPERS.iter().find_map(fused));
         if let Some(slot) = found {
             code[i] = slot;
         } else if let Some(byte) = stack_byte(code[i]) {
@@ -120,8 +121,8 @@ fn fuse(code: &mut [Instruction]) {
 /// What an instruction with a given opcode byte may write that the first pass of [`fuse`] rewrites.
 #[derive(Clone, Copy)]
 struct Writes {
-    /// The byte [`is_reserved`].
-    reserved: bool,
+    /// The [`canonical`] byte.
+    canonical: Option<u8>,
     /// `dst_reg`.
     dst: bool,
     /// The byte is an atomic's: [`atomic_writes_r10`] decides.
@@ -130,7 +131,7 @@ struct Writes {
 
 const WRITES: [Writes; 256] = {
     const NONE: Writes = Writes {
-        reserved: false,
+        canonical: None,
         dst: false,
         atomic: false,
     };
@@ -138,7 +139,10 @@ const WRITES: [Writes; 256] = {
     byte_table!(|byte| {
         let opc = OpCode(byte);
         match opc.class() {
-            _ if is_reserved(byte) => Writes { reserved: true, ..NONE },
+            _ if canonical(byte).is_some() => Writes {
+                canonical: canonical(byte),
+                ..NONE
+            },
             Class::Alu32 | Class::Alu64 | Class::LdReg => Writes { dst: true, ..NONE },
             Class::LdImm => Writes {
                 dst: byte == LD_IMM64,
@@ -172,17 +176,53 @@ fn stack_byte(insn: Instruction) -> Option<u8> {
     (base == 10).then_some(byte)
 }
 
-/// Every opcode byte of the LD class but LD_IMM64, the legacy packet loads among them, runs as the same unsupported
-/// instruction ([`Flow::Missing`](crate::Flow::Missing)). [`Code::new`] rewrites them all to this one, which frees
-/// the others for superinstructions and r10 accesses.
+/// The byte of every LD-class instruction but LD_IMM64, the legacy packet loads among them, which all run as the same
+/// unsupported instruction ([`Flow::Missing`](crate::Flow::Missing)).
 const MISSING: u8 = Class::LdImm as u8;
 
-/// An undefined ALU64 operation, which always fails with [`Flow::FailCpu`](crate::Flow::FailCpu); the byte of every
-/// instruction that would write r10.
+/// An undefined ALU64 operation: the byte of every instruction that always fails with
+/// [`Flow::FailCpu`](crate::Flow::FailCpu), and of every instruction that would write r10.
 const INVALID: u8 = OpCode::alu64_from_parts(AluOpc::UndefE, Source::Imm).0;
 
-const fn is_reserved(byte: u8) -> bool {
-    byte & 0b111 == Class::LdImm as u8 && byte != LD_IMM64 && byte != MISSING
+/// The byte [`Code::new`] gives an instruction with opcode byte `byte` in its place, if it gives it another: one that
+/// runs the same whatever the other fields hold. No slot holds `byte` afterwards, which frees it for a handler of its
+/// own.
+const fn canonical(byte: u8) -> Option<u8> {
+    match byte {
+        MISSING | LD_IMM64 | INVALID => None,
+        _ if byte & 0b111 == Class::LdImm as u8 => Some(MISSING),
+        _ if always_fails(OpCode(byte)) => Some(INVALID),
+        _ => None,
+    }
+}
+
+/// Whether every instruction with opcode `opc` fails with [`Flow::FailCpu`](crate::Flow::FailCpu), whatever its other
+/// fields hold, as [`ops`](crate::ops) and [`mem`](crate::mem) run it.
+const fn always_fails(opc: OpCode) -> bool {
+    let jmp32 = matches!(opc.class(), Class::Jmp32);
+    let imm = matches!(opc.alu_src(), Source::Imm);
+    match opc.class() {
+        Class::Alu32 | Class::Alu64 => match opc.alu_opc() {
+            AluOpc::UndefE | AluOpc::UndefF => true,
+            AluOpc::End => matches!((opc.class(), opc.alu_end()), (Class::Alu64, AluEnd::ToBE)),
+            _ => false,
+        },
+        Class::Jmp32 | Class::Jmp64 => match opc.jmp_opc() {
+            JmpOpc::Call => jmp32,
+            JmpOpc::Ja => jmp32 && !imm,
+            JmpOpc::Exit | JmpOpc::Jcond => jmp32 || !imm,
+            JmpOpc::UndefF => true,
+            _ => false,
+        },
+        Class::LdReg => match opc.mem_mode() {
+            MemMode::Mem => false,
+            MemMode::MemSX => matches!(opc.mem_size(), MemSize::DWord),
+            _ => true,
+        },
+        Class::StImm => !matches!(opc.mem_mode(), MemMode::Mem),
+        Class::StReg => !matches!(opc.mem_mode(), MemMode::Mem | MemMode::Atomic),
+        Class::LdImm => false,
+    }
 }
 
 macro_rules! stack_accesses {
@@ -218,10 +258,10 @@ const fn st(size: MemSize) -> u8 {
     OpCode::stimm_from_parts(size, MemMode::Mem).0
 }
 
-// Every superinstruction, r10 access and `transfer` byte is a reserved one and has one use.
+// Every superinstruction, r10 access and `transfer` byte is a free one and has one use.
 const _: () = {
     const fn claim(used: &mut [bool; 256], byte: u8) {
-        assert!(is_reserved(byte));
+        assert!(canonical(byte).is_some(), "a byte that slots hold");
         assert!(!used[byte as usize], "two uses of one opcode byte");
         used[byte as usize] = true;
     }

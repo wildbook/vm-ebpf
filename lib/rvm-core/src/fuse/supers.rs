@@ -43,7 +43,8 @@ superinstructions! {
     // rotate: t = x >> k | x << (32 - k), into x or y
     0xd0: mov32 t, x; rsh32 t, _; lsh32 x, _; mov32 y, x; or32 y, t;
     0xd8: mov32 t, x; rsh32 t, _; lsh32 x, _; or32 x, t;
-    // a = b + c, then a load, store or branch through a
+    // a = b + c, then a load, store or branch through a, or a byte load through a and a branch on the byte
+    0x9e: mov64 a, b; add64 a, c; ldxb a, [a + _]; jeq32 a, _, _;
     0x08: mov64 a, b; add64 a, c; ldxb _, [a + _];
     0x10: mov64 a, b; add64 a, c; ldxw _, [a + _];
     0x20: mov64 a, b; add64 a, c; stb [a + _], _;
@@ -60,10 +61,13 @@ superinstructions! {
     0x70: mov32 a, b; or32 a, c;
     0x78: mov32 a, b; lsh32 a, _;
     0x80: mov32 a, b; rsh32 a, _;
-    // loop counters: a += imm, then a branch on a
+    // two moves
+    0xf5: mov64 a, b; mov64 _, _;
+    // loop counters: a += imm, then a branch on a or another add
     0x88: add64 a, _; jlt a, c, _;
     0x90: add64 a, _; jne a, _, _;
     0x98: add64 a, _; jgt a, _, _;
+    0x86: add64 a, _; add64 _, _;
 }
 
 /// For each opcode byte, the index in [`SUPERS`] of its superinstruction: `u8::MAX` if it has none.
@@ -104,7 +108,7 @@ pub struct Super {
 pub const MAX_LEN: usize = 5;
 
 /// The most roles a superinstruction has.
-pub const MAX_ROLES: usize = 3;
+pub const MAX_ROLES: usize = 4;
 
 impl Super {
     /// The superinstruction that runs `insns`, each a mnemonic and its operands, and fails to compile one that

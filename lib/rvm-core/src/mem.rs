@@ -14,7 +14,7 @@ pub fn address(base: u64, insn: Instruction) -> u64 {
     base.wrapping_add_signed(i64::from(insn.offset()))
 }
 
-fn store_plain<M: Memory>(mem: &mut M, size: MemSize, addr: u64, value: u64) -> Result<(), M::Err> {
+pub fn store_plain<M: Memory>(mem: &mut M, size: MemSize, addr: u64, value: u64) -> Result<(), M::Err> {
     match size {
         MemSize::Byte => mem.store_u8(addr, value as u8),
         MemSize::Half => mem.store_u16(addr, value as u16),
@@ -23,7 +23,7 @@ fn store_plain<M: Memory>(mem: &mut M, size: MemSize, addr: u64, value: u64) -> 
     }
 }
 
-fn load_plain<M: Memory>(mem: &M, size: MemSize, addr: u64) -> Result<u64, M::Err> {
+pub fn load_plain<M: Memory>(mem: &M, size: MemSize, addr: u64) -> Result<u64, M::Err> {
     match size {
         MemSize::Byte => mem.load_u8(addr).map(u64::from),
         MemSize::Half => mem.load_u16(addr).map(u64::from),

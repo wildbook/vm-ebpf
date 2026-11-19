@@ -5,14 +5,16 @@
 //! [`install`] makes [`data_access`]. Both check the address against a [`Window`] that the memory reported and access
 //! the host memory directly: [`access`] against the window around r10, [`data_access`] against the window around the
 //! last address that missed and then, for pointers into the stack, the window around r10. An address outside the
-//! windows takes the usual handler of the instruction, so the access behaves exactly as it does there. Guest code
-//! can't write r10, so it stays in the stack, inside the window of the stack.
+//! windows takes the usual handler of the instruction, so the access behaves exactly as it does there. The 4 and 8
+//! byte accesses of superinstructions take the path of [`data_access`] through [`data_step`]. Guest code can't write
+//! r10, so it stays in the stack, inside the window of the stack.
 
 use std::ptr;
 
 use crate::opcode::{Class, MemMode, MemSize, OpCode};
+use crate::ops::Regs;
 use crate::transfer::Slot;
-use crate::{handler, mem, CallStack, Context, Handler, Host, Instruction, Memory, Table};
+use crate::{handler, mem, CallStack, Context, Flow, Handler, Host, Instruction, Memory, Table};
 
 /// Host memory that guest loads and stores near some address reach directly; see [`Memory::window`].
 #[derive(Clone, Copy, Debug)]
@@ -143,31 +145,41 @@ impl Cache {
     #[inline(always)]
     fn access<const OP: u8>(&self, regs: &mut [u64; 16], insn: Instruction, addr: u64) -> bool {
         let opc = OpCode(OP);
-        let kind = const { kind(OpCode(OP)) };
+        let value = match opc.class() {
+            Class::StReg => regs[usize::from(insn.src_reg())],
+            _ => i64::from(insn.imm()) as u64,
+        };
+        let Some(loaded) = self.run(opc, const { kind(OpCode(OP)) }, addr, value) else {
+            return false;
+        };
+        if let Class::LdReg = opc.class() {
+            regs[usize::from(insn.dst_reg())] = loaded;
+        }
+        true
+    }
 
+    /// Run the load or store `opc`, whose [`kind`] is `kind`, at `addr` on the host memory: the value it loads, or 0
+    /// once it stored `value`. `None` if it doesn't fit in the window.
+    #[inline(always)]
+    fn run(&self, opc: OpCode, kind: usize, addr: u64, value: u64) -> Option<u64> {
         let at = addr.wrapping_sub(self.base);
         if at >= self.fits[kind] {
-            return false;
+            return None;
         }
 
         // SAFETY: the access fits in the window at `at`, and the memory is at the window's epoch (see `Windows`), so
         // the host bytes there are the guest bytes and valid for the access
         let host = unsafe { self.ptr.add(at as usize) };
-        let value = match opc.class() {
-            Class::StReg => regs[usize::from(insn.src_reg())],
-            _ => i64::from(insn.imm()) as u64,
-        };
-        let dst = usize::from(insn.dst_reg());
         // SAFETY: as above
         unsafe {
             match (opc.class(), opc.mem_size()) {
-                (Class::LdReg, MemSize::Word) => regs[dst] = u32::from_le(host.cast::<u32>().read_unaligned()).into(),
-                (Class::LdReg, _) => regs[dst] = u64::from_le(host.cast::<u64>().read_unaligned()),
+                (Class::LdReg, MemSize::Word) => return Some(u32::from_le(host.cast::<u32>().read_unaligned()).into()),
+                (Class::LdReg, _) => return Some(u64::from_le(host.cast::<u64>().read_unaligned())),
                 (_, MemSize::Word) => host.cast::<u32>().write_unaligned((value as u32).to_le()),
                 (_, _) => host.cast::<u64>().write_unaligned(value.to_le()),
             }
         }
-        true
+        Some(0)
     }
 }
 
@@ -180,6 +192,66 @@ const fn kind(opc: OpCode) -> usize {
         MemSize::Byte | MemSize::Half => panic!("no window access of this size"),
     };
     2 * store as usize + size
+}
+
+/// Whether the opcode byte `op` is a 4 or 8 byte `ldx`, `stx` or `st`, which the windows run.
+pub const fn windowed(op: u8) -> bool {
+    let opc = OpCode(op);
+    let access = matches!(opc.class(), Class::LdReg | Class::StReg | Class::StImm);
+    access && matches!(opc.mem_mode(), MemMode::Mem) && matches!(opc.mem_size(), MemSize::Word | MemSize::DWord)
+}
+
+/// Runs the [`windowed`] load or store `insn` of a superinstruction on the registers `regs`, as [`data_access`] runs
+/// it: in the data window, else in the window around r10, else through the [`Memory`] methods once it took the data
+/// window around the address.
+#[inline(always)]
+pub fn data_step<M: Memory, R: Regs>(
+    windows: &mut Windows,
+    regs: &mut R,
+    memory: &mut M,
+    insn: Instruction,
+) -> Flow<M::Err> {
+    let opc = insn.opcode();
+    let (base, value) = match opc.class() {
+        Class::LdReg => (insn.src_reg(), 0),
+        Class::StReg => (insn.dst_reg(), regs.get(insn.src_reg())),
+        _ => (insn.dst_reg(), i64::from(insn.imm()) as u64),
+    };
+    let addr = mem::address(regs.get(base), insn);
+    let kind = kind(opc);
+    let loaded = match windows.data.run(opc, kind, addr, value) {
+        Some(loaded) => loaded,
+        None => match data_step_miss(windows, memory, opc, kind, addr, value) {
+            Ok(loaded) => loaded,
+            Err(err) => return Flow::FailMem(err),
+        },
+    };
+    if let Class::LdReg = opc.class() {
+        regs.set(insn.dst_reg(), loaded);
+    }
+    Flow::Next
+}
+
+/// [`data_step`] of an access that missed the data window: the value it loads, or 0 once it stored `value`.
+// out of line, so that the superinstruction's roles stay in registers
+#[cold]
+#[inline(never)]
+fn data_step_miss<M: Memory>(
+    windows: &mut Windows,
+    memory: &mut M,
+    opc: OpCode,
+    kind: usize,
+    addr: u64,
+    value: u64,
+) -> Result<u64, M::Err> {
+    if let Some(loaded) = windows.stack.run(opc, kind, addr, value) {
+        return Ok(loaded);
+    }
+    windows.take::<M, true>(memory, addr);
+    match opc.class() {
+        Class::LdReg => mem::load_plain(memory, opc.mem_size(), addr),
+        _ => mem::store_plain(memory, opc.mem_size(), addr, value).map(|()| 0),
+    }
 }
 
 /// Make [`data_access`] the handler of the 4 and 8 byte `ldx`, `stx` and `st`.

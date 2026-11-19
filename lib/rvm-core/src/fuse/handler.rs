@@ -5,7 +5,7 @@ use std::ops::ControlFlow;
 use super::supers::{Super, MAX_LEN, MAX_ROLES};
 use crate::ops::Regs;
 use crate::transfer::Slot;
-use crate::{charge, step, CallStack, Context, Flow, Handlers, Host, Instruction, Memory, Table};
+use crate::{charge, stack, step, CallStack, Context, Flow, Handlers, Host, Instruction, Memory, Table};
 
 /// The handler of superinstruction `S`. It runs the sequence as the handlers of its instructions would, one after
 /// another, but keeps each role in a variable of its own: it loads the roles the sequence reads before it writes them,
@@ -60,14 +60,18 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool
 
     // one block per instruction, so that each `step` sees a constant opcode and constant register indexes
     macro_rules! exec {
-        ($k:literal) => {
+        ($($k:literal),*) => {$(
             if $k < len {
                 if $k == sup.save_at as usize {
                     roles.save(registers, sup.writes);
                 }
                 let at = slot.offset($k);
                 let decoded = sup.decode($k, slot_of($k), ROLE_INDEXES, Some(FREE));
-                match step(&mut roles, &mut ctx.data, decoded) {
+                let flow = match const { stack::windowed(Super::of(S).op($k)) } {
+                    true => ControlFlow::Break(stack::data_step(&mut calls.windows, &mut roles, &mut ctx.data, decoded)),
+                    false => step(&mut roles, &mut ctx.data, decoded),
+                };
+                match flow {
                     ControlFlow::Break(Flow::Next) => {}
                     // only the last instruction branches, after `save_at`
                     ControlFlow::Break(Flow::Jump(offset)) if const { Super::of(S).branches_at($k) } => {
@@ -84,15 +88,11 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool
                     ControlFlow::Continue(_) => unreachable!(),
                 }
             }
-        };
+        )*};
     }
-    // one `exec!` per instruction a sequence may have
+    // one position per instruction a sequence may have
     const _: () = assert!(MAX_LEN == 5);
-    exec!(0);
-    exec!(1);
-    exec!(2);
-    exec!(3);
-    exec!(4);
+    exec!(0, 1, 2, 3, 4);
     if sup.save_at as usize == len {
         roles.save(registers, sup.writes);
     }
@@ -108,7 +108,7 @@ struct Roles<'a> {
 }
 
 /// The register indexes [`fused`] gives the roles.
-const ROLE_INDEXES: [u8; MAX_ROLES] = [0, 1, 2];
+const ROLE_INDEXES: [u8; MAX_ROLES] = [0, 1, 2, 3];
 
 /// The register index [`fused`] gives the register operand `_`.
 const FREE: u8 = 15;
