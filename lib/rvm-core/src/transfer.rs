@@ -7,7 +7,7 @@
 //! `callx` handler the pc [`Host::callx`] names, and the runtime the targets of `gotox`.
 
 use crate::fuse::Super;
-use crate::op::{Op, View};
+use crate::op::{Op, Shape, View};
 use crate::opcode::{Class, JmpOpc, OpCode, Source};
 use crate::ops::{self, BITS_32, BITS_64};
 use crate::{CallStack, Context, Flow, Handler, Host, Instruction, Memory, Table, BPF_PSEUDO_CALL};
@@ -127,17 +127,17 @@ impl Slot {
         unsafe { *self.0 }
     }
 
-    /// The fields of the op in the slot, as the handler of opcode byte `byte` reads them, which takes `held`, that op
-    /// in a register.
+    /// The fields of the op in the slot, as the handler of an opcode byte of shape `shape` reads them, which takes
+    /// `held`, that op in a register.
     ///
     /// # Safety
     ///
     /// As for [`Slot::get`] while the view is in use; `held` must be the op in the slot, and it must have the layout
-    /// of `byte` (see [`View::new`]).
+    /// of `shape` (see [`View::new`]).
     #[inline(always)]
-    pub unsafe fn view<'a>(self, held: Op, byte: u8) -> View<'a> {
+    pub unsafe fn view<'a>(self, held: Op, shape: Shape) -> View<'a> {
         // SAFETY: the caller's
-        unsafe { View::new(&*self.0, Some(held), byte) }
+        unsafe { View::new(&*self.0, Some(held), shape) }
     }
 
     /// The `n` slots from this one on, borrowed from `code`.

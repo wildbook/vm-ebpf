@@ -175,10 +175,7 @@ impl Program {
     #[inline]
     pub fn func(&self, name: &str) -> Result<Func> {
         let Some(Entry { pc, .. }) = self.functions.find(name) else {
-            return Err(VmError::FunctionNotFound {
-                plugin: None,
-                func: name.to_string(),
-            });
+            return Err(function_not_found(name));
         };
         Ok(Func { program: self.id, pc })
     }
@@ -459,3 +456,13 @@ struct Entry {
 }
 
 static NEXT_PROGRAM_ID: AtomicU64 = AtomicU64::new(0);
+
+// out of line, so that `Program::func` stays small enough to inline
+#[cold]
+#[inline(never)]
+fn function_not_found(name: &str) -> VmError {
+    VmError::FunctionNotFound {
+        plugin: None,
+        func: name.to_string(),
+    }
+}

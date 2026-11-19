@@ -120,9 +120,9 @@ pub unsafe trait Memory {
     }
 
     /// The host memory that loads and stores near `addr` may access directly. [`run`](crate::run) takes the window
-    /// around r10, and the window around the address of a 4 or 8 byte load or store through another register that falls
-    /// outside its windows. It runs the 4 and 8 byte loads and stores that fall inside these windows without calling
-    /// the methods above, until [`Memory::epoch`] changes, and uses a window only while the memory is at the window's
+    /// around r10, and the window around the address of a load or store through another register that falls outside
+    /// its windows. It runs the plain loads and stores that fall inside these windows without calling the methods
+    /// above, until [`Memory::epoch`] changes, and uses a window only while the memory is at the window's
     /// epoch. The default is [`Window::NONE`].
     fn window(&self, addr: u64) -> Window {
         let _ = addr;

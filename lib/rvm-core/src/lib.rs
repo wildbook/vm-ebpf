@@ -5,7 +5,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::ControlFlow;
 
-use op::{Fields, Op};
+use op::{Fields, Op, Shape};
 use opcode::{Class, OpCode, CALL, LD_IMM64};
 use transfer::Slot;
 
@@ -71,9 +71,12 @@ macro_rules! become_next {
         let slot = $slot.offset(1);
         // SAFETY: the slot after one below `len` lies in `0..=len`, as do the targets `transfer::bound` proves (see
         // `Slot`)
-        match unsafe { $crate::fetch::<M, H, FUEL>($table, slot, $fuel) } {
-            Some((next, op, fuel)) => become next($ctx, $code, slot, fuel, $calls, $table, op),
-            None => return $calls.stop.at(slot, 0, $crate::Flow::OutOfFuel),
+        let op = unsafe { slot.get() };
+        // the op is read first, so that the arguments of `out_of_fuel` are all in place
+        let left = $fuel.wrapping_sub(u64::from(FUEL));
+        match $crate::charge::<FUEL>($fuel) {
+            Some(fuel) => become $table.of(op)($ctx, $code, slot, fuel, $calls, $table, op),
+            None => become $crate::out_of_fuel::<M, H, FUEL>($ctx, $code, slot, left, $calls, $table, op),
         }
     }};
 }
@@ -216,7 +219,7 @@ struct Table<M: Memory, H>([Handler<M, H>; 256]);
 
 /// The [`Table`] of the handlers with and without `FUEL`. Each handler runs [`step`] with its opcode as a constant, so
 /// the class, operation, source, mode and size matches fold away; the bytes of superinstructions and r10 accesses get
-/// theirs from [`fuse::install`], and the 4 and 8 byte loads and stores theirs from [`stack::install`]. With `FUEL`, the
+/// theirs from [`fuse::install`], and the plain loads and stores theirs from [`stack::install`]. With `FUEL`, the
 /// handlers meter fuel; without it, they never read it.
 struct Handlers<M, H, const FUEL: bool>(PhantomData<(M, H)>);
 
@@ -266,7 +269,7 @@ extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, 
     op: Op,
 ) {
     // SAFETY: a handler's slot lies below `len`, and has the layout of its opcode (see `Handler`)
-    let insn = unsafe { slot.view(op, OP) };
+    let insn = unsafe { slot.view(op, const { Shape::of(OP) }) };
     // Only jump-class opcodes jump, call or exit. Without the guards, a handler whose `step` returns from an outlined
     // call (atomics) would test for those flows too.
     let jumps = matches!(OpCode(OP).class(), Class::Jmp32 | Class::Jmp64);
@@ -332,7 +335,7 @@ extern "rust-preserve-none" fn host_call<M: Memory, H: Host<M>, const FUEL: bool
     op: Op,
 ) {
     // SAFETY: as in the handler of `call`, which continues here
-    let id = unsafe { slot.view(op, CALL) }.imm() as u32;
+    let id = unsafe { slot.view(op, const { Shape::of(CALL) }) }.imm() as u32;
     let (r0, flow) = match KFUNC {
         true => (calls.host.kfunc(ctx, id), Flow::CallKfunc(id)),
         false => (calls.host.helper(ctx, id), Flow::CallHelper(id)),
@@ -360,7 +363,7 @@ extern "rust-preserve-none" fn indirect_call<M: Memory, H: Host<M>, const FUEL: 
 ) {
     const CALLX: u8 = OpCode::jmp64_from_parts(opcode::JmpOpc::Call, opcode::Source::Reg).0;
     // SAFETY: as in the handler of `callx`, which continues here
-    let target = ops::Regs::get(&ctx.regs, unsafe { slot.view(op, CALLX) }.dst_reg());
+    let target = ops::Regs::get(&ctx.regs, unsafe { slot.view(op, const { Shape::of(CALLX) }) }.dst_reg());
     let callee = calls.host.callx(ctx, target);
     calls.windows.revalidate(&ctx.data);
     match callee {
@@ -383,21 +386,20 @@ extern "rust-preserve-none" fn indirect_call<M: Memory, H: Host<M>, const FUEL: 
     }
 }
 
-/// The handler of the instruction in `slot`, its op and the fuel left once it is charged, or `None` if no fuel is left.
-///
-/// # Safety
-///
-/// `slot` must point into the slots of a [`Code`] that is still borrowed; [`Slot`] states which slots those are.
-#[inline(always)]
-unsafe fn fetch<M: Memory, H: Host<M>, const FUEL: bool>(
-    table: &Table<M, H>,
+/// Stops at `slot` with [`Flow::OutOfFuel`] and no fuel left: the dispatch to `slot` found none for its instruction.
+/// The dispatches jump here with their arguments in place, so that none of them needs code of its own to stop.
+#[cold]
+#[inline(never)]
+extern "rust-preserve-none" fn out_of_fuel<M: Memory, H: Host<M>, const FUEL: bool>(
+    _ctx: &mut Context<M>,
+    _code: &[Op],
     slot: Slot,
-    fuel: u64,
-) -> Option<(Handler<M, H>, Op, u64)> {
-    let left = charge::<FUEL>(fuel)?;
-    // SAFETY: the caller's
-    let op = unsafe { slot.get() };
-    Some((table.of(op), op, left))
+    _fuel: u64,
+    calls: &mut CallStack<H, M::Err>,
+    _table: &Table<M, H>,
+    _op: Op,
+) {
+    calls.stop.at(slot, 0, Flow::OutOfFuel)
 }
 
 /// The fuel left once an instruction is charged, or `None` if none is left. It takes at most `i64::MAX` units, the
@@ -409,7 +411,8 @@ fn charge<const FUEL: bool>(fuel: u64) -> Option<u64> {
     (!FUEL || left as i64 >= 0).then_some(left)
 }
 
-/// [`fetch`] at a pc no proof covers, with the slot at `pc`, or why it can't run.
+/// The handler, op and slot at `pc`, which no proof covers, and the fuel left once its instruction is charged, or why
+/// it can't run.
 #[inline(always)]
 fn fetch_checked<M: Memory, H: Host<M>, const FUEL: bool>(
     table: &Table<M, H>,

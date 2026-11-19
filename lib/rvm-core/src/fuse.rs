@@ -3,9 +3,10 @@
 //! [`Code::new`] gives the first slot of each sequence it recognises the opcode byte of a superinstruction, one of the
 //! bytes that no slot holds once it ran (see [`canonical`]). The other slots keep what they hold, so a jump into the
 //! middle of a sequence runs its instructions one by one. A superinstruction behaves exactly like its sequence:
-//! - it charges one unit of fuel per slot, as its instructions do, and runs only the first instruction when the fuel
-//!   would run out inside the sequence;
-//! - an instruction that faults stops execution at its own pc, with the effects of the instructions before it.
+//! - it charges one unit of fuel per slot, as its instructions do, and runs them one at a time when the fuel would run
+//!   out inside the sequence or before the instruction after it;
+//! - an instruction that faults stops execution at its own pc, with the effects of the instructions before it;
+//! - a load or store that misses its data window ([`stack::data_step`]) continues the sequence unfused from itself.
 //!
 //! The same bytes mark the loads and stores through r10 that [`stack::access`] runs.
 
@@ -133,19 +134,9 @@ fn fuse(code: &mut [Instruction]) {
     for i in 0..code.len() {
         let insn = code[i];
         let rewrite = REWRITES[usize::from(insn.byte())];
-        // `&` and `|` don't branch, so only the rare rewrite, atomics and LD_IMM64 do
-        let r10 = (rewrite.dst & (insn.dst_reg() == 10)) | (rewrite.atomic && atomic_writes_r10(insn));
-        let reserved = (insn.0 & rewrite.reserved != 0)
-            | (insn.byte() == CALL && call_reserved(insn))
-            | (insn.byte() == LD_IMM64 && code.get(i + 1).is_some_and(|second| second.0 as u32 != 0));
-        let nonzero = insn.0 & rewrite.nonzero != 0;
-        if rewrite.canonical.is_some() | r10 | reserved | nonzero {
-            let byte = match (rewrite.canonical, r10 | reserved) {
-                (Some(byte), _) => byte,
-                (None, true) => INVALID,
-                (None, false) => rewrite.nonzero_byte,
-            };
-            code[i] = insn.with_opcode(byte);
+        // most instructions pass both tests
+        if insn.0 & rewrite.screen != 0 || (rewrite.dst && insn.dst_reg() == 10) {
+            code[i] = rewrite.apply(insn, code.get(i + 1));
         }
     }
 
@@ -156,7 +147,14 @@ fn fuse(code: &mut [Instruction]) {
     // The second slot of each LD_IMM64 left holds the byte [`MISSING`], which starts no sequence.
     for i in 0..code.len() {
         let window = &code[i..];
-        let fused = |(_, sup, encode): &(u8, Super, Encode)| encode(window).filter(|_| transfer::fits(sup, code, i));
+        // most candidates differ from the code in their last opcode, which this tests without a call
+        let fused = |(_, sup, encode): &(u8, Super, Encode)| {
+            let last = sup.len() - 1;
+            let ends = window.get(last).is_some_and(|insn| insn.byte() == sup.op(last));
+            ends.then(|| encode(window))
+                .flatten()
+                .filter(|_| transfer::fits(sup, code, i))
+        };
         let found = candidates(window).iter().find_map(fused);
         debug_assert_eq!(found, SUPERS.iter().find_map(fused));
         if let Some(slot) = found {
@@ -184,6 +182,30 @@ struct Rewrite {
     /// The bits of the fields the verifier reserves (see [`Code::new`]), which give the instruction [`INVALID`] where
     /// they aren't 0.
     reserved: u64,
+    /// The bits of an instruction that send it to [`Rewrite::apply`] where they aren't 0: `nonzero` and `reserved`,
+    /// and the opcode byte if the byte has a `canonical` one, is an atomic's, `call` or LD_IMM64. No such byte is 0.
+    screen: u64,
+}
+
+impl Rewrite {
+    /// `insn`, whose opcode byte has this rewrite and which `next` follows, with the opcode byte the first pass of
+    /// [`fuse`] gives it.
+    #[cold]
+    #[inline(never)]
+    fn apply(self, insn: Instruction, next: Option<&Instruction>) -> Instruction {
+        let r10 = (self.dst && insn.dst_reg() == 10) || (self.atomic && atomic_writes_r10(insn));
+        let reserved = (insn.0 & self.reserved != 0)
+            || (insn.byte() == CALL && call_reserved(insn))
+            || (insn.byte() == LD_IMM64 && next.is_some_and(|second| second.0 as u32 != 0));
+        let byte = match (self.canonical, r10 || reserved) {
+            (Some(byte), _) => byte,
+            (None, true) => INVALID,
+            (None, false) if insn.0 & self.nonzero != 0 => self.nonzero_byte,
+            // an atomic, `call` or LD_IMM64 that needs no rewrite
+            (None, false) => return insn,
+        };
+        insn.with_opcode(byte)
+    }
 }
 
 /// The bits of each field of an [`Instruction`] but the opcode byte.
@@ -200,12 +222,13 @@ const REWRITES: [Rewrite; 256] = {
         nonzero: 0,
         nonzero_byte: 0,
         reserved: 0,
+        screen: 0,
     };
 
     byte_table!(|byte| {
         let opc = OpCode(byte);
         let reserved = reserved(opc);
-        match opc.class() {
+        let rewrite = match opc.class() {
             _ if canonical(byte).is_some() => Rewrite {
                 canonical: canonical(byte),
                 ..NONE
@@ -242,6 +265,12 @@ const REWRITES: [Rewrite; 256] = {
                 ..NONE
             },
             Class::LdImm | Class::StImm | Class::Jmp32 | Class::Jmp64 => Rewrite { reserved, ..NONE },
+        };
+        let always = rewrite.canonical.is_some() || rewrite.atomic || byte == CALL || byte == LD_IMM64;
+        assert!(!always || byte != 0, "a rewritten byte 0, which `screen` can't catch");
+        Rewrite {
+            screen: rewrite.nonzero | rewrite.reserved | if always { 0xFF } else { 0 },
+            ..rewrite
         }
     })
 };

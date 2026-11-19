@@ -33,7 +33,7 @@ pub enum Callee {
 pub const MAX_CALL_DEPTH: usize = 8;
 
 /// The BPF-to-BPF calls in progress, which [`run`](crate::run) pushes and pops, the record of where and why it stopped,
-/// the windows that 4 and 8 byte loads and stores use, and the [`Host`] that runs its helper, kfunc and `callx` calls.
+/// the windows that plain loads and stores use, and the [`Host`] that runs its helper, kfunc and `callx` calls.
 /// `E` is the error type of the memory, [`Memory::Err`].
 // `repr(C)` keeps the scalars ahead of the frames, so every handler reaches all of them but the last fields of the
 // windows with a one-byte displacement.

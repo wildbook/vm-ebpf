@@ -3,10 +3,10 @@
 use std::ops::ControlFlow;
 
 use super::supers::{Super, MAX_LEN, MAX_ROLES};
-use crate::op::{Fields, Op, Reg, View};
+use crate::op::{Fields, Op, Reg, Shape, View};
 use crate::ops::Regs;
 use crate::transfer::Slot;
-use crate::{charge, stack, step, step_ld64, CallStack, Context, Flow, Handlers, Host, Memory, Table};
+use crate::{stack, step, step_ld64, CallStack, Context, Flow, Handlers, Host, Memory, Table};
 
 /// The handler of superinstruction `S`. It runs the sequence as the handlers of its instructions would, one after
 /// another, but keeps each role in a variable of its own: it loads the roles the sequence reads before it writes them,
@@ -25,8 +25,9 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool
     let sup = const { Super::of(S) };
     let len = const { Super::of(S).len() };
 
-    // the fuel runs out inside the sequence, which takes one unit per slot
-    if FUEL && fuel < len as u64 - 1 {
+    // The sequence takes one unit per slot and the instruction after it one more. If the fuel runs out before then,
+    // the instructions run one at a time and stop where it runs out, as they would unfused.
+    if FUEL && fuel < len as u64 {
         let alone = const { Handlers::<M, H, FUEL>::TABLE.0[Super::of(S).op(0) as usize] };
         become alone(ctx, code, slot, fuel, calls, table, op)
     }
@@ -34,8 +35,20 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool
     // follows the code (see `Slot`)
     let window = unsafe { slot.window(code, len + 1) };
     // SAFETY: `encode` found the opcode of each instruction of the sequence in its first slot, and the bytes `Code::new`
-    // gives such a slot afterwards stand for the same opcode (see `usual`), so they have its layout
-    let slot_of = |k: usize| unsafe { View::new(&window[k], None, sup.op(k)) };
+    // gives such a slot afterwards stand for the same opcode (see `usual`), so they have its layout. Each slot's shape is
+    // a constant, so that the views fold for the constant `k` every caller passes.
+    let slot_of = |k: usize| {
+        macro_rules! view {
+            ($($k:literal),*) => {
+                match k {
+                    $($k => unsafe { View::new(&window[$k], None, const { Shape::of(Super::of(S).op($k)) }) },)*
+                    _ => unreachable!("a slot past `MAX_LEN`"),
+                }
+            };
+        }
+        const _: () = assert!(MAX_LEN == 5);
+        view!(0, 1, 2, 3, 4)
+    };
 
     let registers = sup.registers(slot_of);
     let free = sup.free_at.map_or(Reg::R0, |k| slot_of(usize::from(k)).dst_reg());
@@ -46,15 +59,13 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool
     };
     roles.load(registers, sup.loads);
 
-    // Continue at `$next`, whose op is `$op`, once the sequence is charged. A branch dispatches on each side, so that it
-    // stays a branch: a `cmov` of the next slot's address would make the next fetch wait for the registers the branch
-    // compares.
+    // Continue at `$next`, whose op is `$op`, charged for the sequence and for `$next`, which the test above leaves
+    // fuel for. A branch dispatches on each side, so that it stays a branch: a `cmov` of the next slot's address would
+    // make the next fetch wait for the registers the branch compares.
     macro_rules! dispatch {
         ($next:expr, $op:expr) => {{
             let next = $next;
-            let Some(left) = charge::<FUEL>(fuel - (len as u64 - 1) * u64::from(FUEL)) else {
-                return calls.stop.at(next, 0, Flow::OutOfFuel);
-            };
+            let left = fuel - len as u64 * u64::from(FUEL);
             let next_op = $op;
             become table.of(next_op)(ctx, code, next, left, calls, table, next_op)
         }};
@@ -70,7 +81,14 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool
                 let at = slot.offset($k);
                 let decoded = sup.decode($k, slot_of($k), ROLE_INDEXES, Some(FREE));
                 let flow = match const { stack::windowed(Super::of(S).op($k)) } {
-                    true => ControlFlow::Break(stack::data_step(&mut calls.windows, &mut roles, &mut ctx.data, decoded)),
+                    true if stack::data_step(&calls.windows, &mut roles, decoded) => ControlFlow::Break(Flow::Next),
+                    // the access missed the data window: the sequence continues unfused from it, as a jump into its
+                    // middle would, with the fuel charged up to it
+                    true => {
+                        roles.save(registers, sup.unsaved[$k]);
+                        let op = window[$k];
+                        become table.of(op)(ctx, code, at, fuel - $k * u64::from(FUEL), calls, table, op)
+                    }
                     false => step(&mut roles, &mut ctx.data, decoded),
                 };
                 match flow {

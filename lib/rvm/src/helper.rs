@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use hashbrown::HashMap;
+use rvm_core::Context;
 
 use crate::error::HelperError;
 #[cfg(feature = "maps")]
@@ -135,10 +136,16 @@ impl<T: IntoReturn, E: Into<HelperError>> IntoReturn for Result<T, E> {
     }
 }
 
+/// How [`HostFn::call`] reaches a host function: with its closure, the caller's context, its [`HostState`] and the
+/// place for the error of a failed call. It returns the new r0, or `None` once it stored the error. Four arguments, so
+/// that every one of them arrives in a register, and an `Option<u64>`, which returns in two.
+type Trampoline =
+    unsafe fn(*const (), &mut Context<&mut VmMemory>, &mut HostState, &mut Option<HelperError>) -> Option<u64>;
+
 /// A registered function, called directly through `call` with `data` as its closure.
 #[derive(Clone)]
 struct HostFn {
-    call: unsafe fn(*const (), &mut HelperContext) -> Result<u64, HelperError>,
+    call: Trampoline,
     data: *const (),
     // keeps `data` alive; the call path never touches it
     _owner: Arc<dyn Send + Sync>,
@@ -153,6 +160,17 @@ unsafe impl Send for HostFn {}
 unsafe impl Sync for HostFn {}
 
 impl HostFn {
+    /// `func` called through `call`, which must take `data` as a pointer to an `F`.
+    fn with_trampoline<F: Send + Sync + 'static>(func: F, call: Trampoline, arity: Option<u8>) -> Self {
+        let owner = Arc::new(func);
+        Self {
+            call,
+            data: Arc::as_ptr(&owner).cast(),
+            _owner: owner,
+            arity,
+        }
+    }
+
     fn new<F>(func: F, arity: Option<u8>) -> Self
     where
         F: Fn(&mut HelperContext) -> Result<u64, HelperError> + Send + Sync + 'static,
@@ -160,20 +178,24 @@ impl HostFn {
         /// # Safety
         ///
         /// `data` must point to a live `F`.
-        unsafe fn trampoline<F>(data: *const (), ctx: &mut HelperContext) -> Result<u64, HelperError>
+        unsafe fn trampoline<F>(
+            data: *const (),
+            ctx: &mut Context<&mut VmMemory>,
+            host: &mut HostState,
+            error: &mut Option<HelperError>,
+        ) -> Option<u64>
         where
             F: Fn(&mut HelperContext) -> Result<u64, HelperError>,
         {
-            unsafe { (*data.cast::<F>())(ctx) }
+            let mut helper_ctx = HelperContext {
+                args: HelperArgs::from_regs(&ctx.regs),
+                memory: &mut *ctx.data,
+                host,
+            };
+            finish(unsafe { (*data.cast::<F>())(&mut helper_ctx) }, error)
         }
 
-        let owner = Arc::new(func);
-        Self {
-            call: trampoline::<F>,
-            data: Arc::as_ptr(&owner).cast(),
-            _owner: owner,
-            arity,
-        }
+        Self::with_trampoline(func, trampoline::<F>, arity)
     }
 
     fn typed<F, A, R>(func: F) -> Self
@@ -182,7 +204,25 @@ impl HostFn {
         A: FromArgs,
         R: IntoReturn,
     {
-        Self::new(move |ctx| func(A::from_args(&ctx.args)).into_return(), Some(A::ARITY))
+        /// # Safety
+        ///
+        /// `data` must point to a live `F`.
+        unsafe fn trampoline<F, A, R>(
+            data: *const (),
+            ctx: &mut Context<&mut VmMemory>,
+            _host: &mut HostState,
+            error: &mut Option<HelperError>,
+        ) -> Option<u64>
+        where
+            F: Fn(A) -> R,
+            A: FromArgs,
+            R: IntoReturn,
+        {
+            let args = A::from_args(&HelperArgs::from_regs(&ctx.regs));
+            finish(unsafe { (*data.cast::<F>())(args) }.into_return(), error)
+        }
+
+        Self::with_trampoline(func, trampoline::<F, A, R>, Some(A::ARITY))
     }
 
     fn with_memory<F, A, R>(func: F) -> Self
@@ -191,11 +231,38 @@ impl HostFn {
         A: FromArgs,
         R: IntoReturn,
     {
-        let call = move |ctx: &mut HelperContext| {
-            let args = A::from_args(&ctx.args);
-            func(&mut GuestMemory::new(ctx.memory), args).into_return()
-        };
-        Self::new(call, Some(A::ARITY))
+        /// # Safety
+        ///
+        /// `data` must point to a live `F`.
+        unsafe fn trampoline<F, A, R>(
+            data: *const (),
+            ctx: &mut Context<&mut VmMemory>,
+            _host: &mut HostState,
+            error: &mut Option<HelperError>,
+        ) -> Option<u64>
+        where
+            F: Fn(&mut GuestMemory, A) -> R,
+            A: FromArgs,
+            R: IntoReturn,
+        {
+            let args = A::from_args(&HelperArgs::from_regs(&ctx.regs));
+            let result = unsafe { (*data.cast::<F>())(&mut GuestMemory::new(ctx.data), args) };
+            finish(result.into_return(), error)
+        }
+
+        Self::with_trampoline(func, trampoline::<F, A, R>, Some(A::ARITY))
+    }
+}
+
+/// The r0 of a host function call that returned `result`, or `None` once the error is in `error`.
+#[inline(always)]
+fn finish(result: Result<u64, HelperError>, error: &mut Option<HelperError>) -> Option<u64> {
+    match result {
+        Ok(r0) => Some(r0),
+        Err(err) => {
+            *error = Some(err);
+            None
+        }
     }
 }
 
@@ -307,15 +374,22 @@ impl HelperRegistry {
         self.by_name.get(name).copied()
     }
 
-    /// Call the function in `slot`.
+    /// Call the function in `slot` with the caller's context and host state: the new r0, or `None` once the error is in
+    /// `error`.
     #[inline]
-    pub fn call_slot(&self, slot: u32, ctx: &mut HelperContext) -> Result<u64, HelperError> {
-        // not `ok_or`, which builds and drops the error on every call
+    pub fn call_slot(
+        &self,
+        slot: u32,
+        ctx: &mut Context<&mut VmMemory>,
+        host: &mut HostState,
+        error: &mut Option<HelperError>,
+    ) -> Option<u64> {
         let Some(helper) = self.slots.get(slot as usize) else {
-            return Err(HelperError::UnknownSlot(slot));
+            *error = Some(HelperError::UnknownSlot(slot));
+            return None;
         };
-        // SAFETY: `HostFn::new` paired `call` with a `data` pointer of the type it expects.
-        unsafe { (helper.call)(helper.data, ctx) }
+        // SAFETY: `HostFn::with_trampoline` paired `call` with a `data` pointer of the type it expects.
+        unsafe { (helper.call)(helper.data, ctx, host, error) }
     }
 }
 

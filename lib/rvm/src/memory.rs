@@ -897,7 +897,7 @@ mod tests {
         assert_eq!(buf, [0, 0, 0, 0, 0xDD, 0xCC, 0xBB, 0xAA]);
     }
 
-    // 4 and 8 byte accesses through other registers than r10 run through windows of the memory; this is the lib test
+    // Accesses through other registers than r10 run through windows of the memory; this is the lib test
     // that takes Miri through them. A window kept past the host call that remaps its region would read freed memory.
     #[test]
     fn data_windows_follow_remaps() {

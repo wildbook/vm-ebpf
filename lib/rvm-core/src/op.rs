@@ -216,7 +216,7 @@ impl Op {
 impl Debug for Op {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         // SAFETY: the layout of an op's own byte is its layout
-        let view = unsafe { View::new(self, None, self.byte) };
+        let view = unsafe { View::new(self, None, Shape::of(self.byte)) };
         let layout = view.layout();
         let mut s = f.debug_struct("Op");
         s.field("opcode", &OpCode(self.byte))
@@ -232,33 +232,53 @@ impl Debug for Op {
     }
 }
 
-/// The fields of an [`Op`] as the handler of opcode byte `byte` reads them: from `held`, the op in a register, where
-/// one instruction extracts them, else from the slot (see the module docs).
+/// What a [`View`] reads of the opcode byte its handler runs: the layout, the opcode and whether `offset` is 0. Each
+/// handler passes the shape of its byte as a constant (`const { Shape::of(OP) }`), so the view's choices fold away
+/// without loads from the byte tables.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Shape {
+    layout: Layout,
+    opcode: u8,
+    offset_is_zero: bool,
+}
+
+impl Shape {
+    /// The shape of opcode byte `byte`: its [`LAYOUTS`] entry, [`fuse::usual`] opcode and [`fuse::offset_is_zero`].
+    pub const fn of(byte: u8) -> Self {
+        Self {
+            layout: LAYOUTS[byte as usize],
+            opcode: fuse::USUAL[byte as usize],
+            offset_is_zero: fuse::offset_is_zero(byte),
+        }
+    }
+}
+
+/// The fields of an [`Op`] as the handler of an opcode byte of shape `shape` reads them: from `held`, the op in a
+/// register, where one instruction extracts them, else from the slot (see the module docs).
 #[derive(Clone, Copy)]
 pub struct View<'a> {
     op: &'a Op,
     held: Option<Op>,
-    byte: u8,
+    shape: Shape,
 }
 
 impl<'a> View<'a> {
-    /// `held` is the op in `op` if it is in a register. `op` has offset 0 if [`fuse::offset_is_zero`] holds for
-    /// `byte`.
+    /// `held` is the op in `op` if it is in a register. `op` has offset 0 if `shape` says so.
     ///
     /// # Safety
     ///
-    /// `op` must have the layout of `byte`: `LAYOUTS[op.byte()] == LAYOUTS[byte]`.
+    /// `op` must have the layout of `shape`: `LAYOUTS[op.byte()] == shape.layout`.
     #[inline(always)]
-    pub unsafe fn new(op: &'a Op, held: Option<Op>, byte: u8) -> Self {
-        debug_assert_eq!(LAYOUTS[usize::from(op.byte)], LAYOUTS[usize::from(byte)]);
+    pub unsafe fn new(op: &'a Op, held: Option<Op>, shape: Shape) -> Self {
+        debug_assert_eq!(LAYOUTS[usize::from(op.byte)], shape.layout);
         debug_assert!(held.is_none_or(|held| held == *op));
-        debug_assert!(!fuse::offset_is_zero(byte) || op.offset == 0);
-        Self { op, held, byte }
+        debug_assert!(!shape.offset_is_zero || op.offset == 0);
+        Self { op, held, shape }
     }
 
     #[inline(always)]
     fn layout(self) -> Layout {
-        LAYOUTS[usize::from(self.byte)]
+        self.shape.layout
     }
 
     /// A register byte of [`Layout::Dst`] or [`Layout::DstSrc`].
@@ -283,7 +303,7 @@ impl<'a> View<'a> {
 impl Fields for View<'_> {
     #[inline(always)]
     fn opcode(self) -> OpCode {
-        OpCode(fuse::USUAL[usize::from(self.byte)])
+        OpCode(self.shape.opcode)
     }
 
     #[inline(always)]
@@ -299,14 +319,16 @@ impl Fields for View<'_> {
         match self.layout() {
             Layout::Raw => Reg::low(self.regs() >> 4),
             Layout::Dst => Reg::R0,
-            Layout::DstSrc => self.register(self.imm_bytes()[3]),
+            // a load from the slot, as many as a shift of `held`, which the handlers that read `dst_reg` from CH
+            // afterwards (LDX) would need to copy first
+            Layout::DstSrc => self.register(self.op.imm[3]),
         }
     }
 
     // a load from the slot; extracting it from `held` takes three instructions
     #[inline(always)]
     fn offset(self) -> i16 {
-        match fuse::offset_is_zero(self.byte) {
+        match self.shape.offset_is_zero {
             true => 0,
             false => self.op.offset,
         }

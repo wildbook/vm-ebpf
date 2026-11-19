@@ -5,7 +5,7 @@ use std::fmt;
 use rvm_core::{run, CallStack, Callee, Code, Context, Flow, Host};
 
 use crate::error::{ExecError, HelperError, MemoryError, Result, VmError};
-use crate::helper::{HelperArgs, HelperContext, HelperRegistry, HostState};
+use crate::helper::{HelperRegistry, HostState};
 use crate::image::INSN_SIZE;
 use crate::layout::CODE_REGION;
 #[cfg(feature = "maps")]
@@ -43,7 +43,6 @@ impl Executor {
             registry: helpers,
             state: HostState::default(),
             error: None,
-            fuel_wanted: None,
         };
         Self {
             calls: CallStack::new(config.frame_size, helpers),
@@ -119,13 +118,18 @@ impl Executor {
         calls.clear();
 
         let mut pc = pc;
+        // in a local, so that a call through `call`, whose budget ends with it, stores nothing back when it exits
         let start = *fuel;
-        let flow = run_metered(&mut ctx, code, &mut pc, fuel, calls);
+        let mut left = start;
+        let flow = run_metered(&mut ctx, code, &mut pc, &mut left, calls);
         if let Flow::Exit = flow {
+            *fuel = left;
             return Ok(ctx.regs[0]);
         }
         let limit = if LIMIT { self.instruction_limit } else { start };
-        run_on(flow, pc, code, &mut ctx, calls, fuel, limit)
+        let (result, left) = run_on(flow, pc, code, &mut ctx, calls, left, limit);
+        *fuel = left;
+        result
     }
 }
 
@@ -142,8 +146,10 @@ impl fmt::Debug for Executor {
     }
 }
 
-/// Continue a call after [`run`] stopped at `pc` with `flow`, which is not [`Flow::Exit`], until it returns or fails.
-// Out of line, so that the call's usual path keeps nothing across `run` that only resuming needs.
+/// Continue a call after [`run`] stopped at `pc` with `flow`, which is not [`Flow::Exit`], until it returns or fails,
+/// with `fuel` left; returns the result and the fuel left then.
+// Out of line, so that the call's usual path keeps nothing across `run` that only resuming needs. It takes the fuel by
+// value, so that the usual path keeps it in a register.
 #[cold]
 #[inline(never)]
 fn run_on(
@@ -152,19 +158,21 @@ fn run_on(
     code: &Code,
     ctx: &mut Context<&mut VmMemory>,
     calls: &mut CallStack<HostCalls, u64>,
-    fuel: &mut u64,
+    mut fuel: u64,
     limit: u64,
-) -> Result<u64> {
-    loop {
-        pc = match calls.host.fuel_wanted.take() {
-            Some(slot) => call_with_fuel(slot, pc, ctx, calls, fuel)?,
+) -> (Result<u64>, u64) {
+    let resume_all = || loop {
+        pc = match calls.host.take_fuel_wanted(&flow) {
+            Some(slot) => call_with_fuel(slot, pc, ctx, calls, &mut fuel)?,
             None => resume(flow, pc, code, calls, limit)?,
         };
-        flow = run_metered(ctx, code, &mut pc, fuel, calls);
+        flow = run_metered(ctx, code, &mut pc, &mut fuel, calls);
         if let Flow::Exit = flow {
             return Ok(ctx.regs[0]);
         }
-    }
+    };
+    let result = resume_all();
+    (result, fuel)
 }
 
 /// Call the host function in extern-table `slot`, which stopped the call at `pc` asking for the caller's `fuel`, again
@@ -180,9 +188,10 @@ fn call_with_fuel(
 ) -> Result<u64> {
     let host = &mut calls.host;
     host.state.fuel = Some(*fuel);
-    let r0 = host.call_slot(ctx, slot);
+    let mut error = None;
+    let r0 = host.registry.call_slot(slot, ctx, &mut host.state, &mut error);
     *fuel = host.state.fuel.take().expect("fuel stays while the function runs");
-    ctx.regs[0] = r0?;
+    ctx.regs[0] = r0.ok_or_else(|| error.expect("failed host call left no error"))?;
     Ok(pc + 1)
 }
 
@@ -215,37 +224,33 @@ fn resume(flow: Flow<u64>, pc: u64, code: &Code, calls: &mut CallStack<HostCalls
 struct HostCalls {
     registry: HelperRegistry,
     state: HostState,
-    /// Why the call that stopped [`run`] failed, until the executor takes it.
+    /// Why the call that stopped [`run`] failed, until the executor takes it. [`HelperError::FuelWanted`] asks for the
+    /// caller's fuel, and the executor calls the function again with it.
     error: Option<HelperError>,
-    /// The slot of the host function that stopped [`run`] with [`HelperError::FuelWanted`].
-    fuel_wanted: Option<u32>,
 }
 
 impl HostCalls {
-    /// Call the extern table entry at `slot` with the arguments in `ctx.regs[1..=5]`.
-    #[inline]
-    fn call_slot(&mut self, ctx: &mut Context<&mut VmMemory>, slot: u32) -> std::result::Result<u64, HelperError> {
-        let mut helper_ctx = HelperContext {
-            args: HelperArgs::from_regs(&ctx.regs),
-            memory: &mut *ctx.data,
-            host: &mut self.state,
-        };
-        self.registry.call_slot(slot, &mut helper_ctx)
-    }
-
     /// The error of the helper or kfunc call that stopped [`run`].
     #[cold]
     fn take_error(&mut self) -> HelperError {
         self.error.take().expect("failed host call left no error")
     }
 
+    /// The extern-table slot of the host function that stopped [`run`] with `flow` asking for the caller's fuel, if
+    /// it did; takes the request.
     #[cold]
-    #[inline(never)]
-    fn failed(&mut self, slot: u32, error: HelperError) {
-        match error {
-            HelperError::FuelWanted => self.fuel_wanted = Some(slot),
-            error => self.error = Some(error),
+    fn take_fuel_wanted(&mut self, flow: &Flow<u64>) -> Option<u32> {
+        if !matches!(self.error, Some(HelperError::FuelWanted)) {
+            return None;
         }
+        let slot = match *flow {
+            Flow::CallKfunc(slot) => Some(slot),
+            Flow::CallHelper(id) => self.registry.slot_of_id(id),
+            Flow::CallIndirect(target) => u32::try_from(target).ok().and_then(|id| self.registry.slot_of_id(id)),
+            _ => None,
+        }?;
+        self.error = None;
+        Some(slot)
     }
 }
 
@@ -266,13 +271,7 @@ impl Host<&mut VmMemory> for HostCalls {
 
     #[inline]
     fn kfunc(&mut self, ctx: &mut Context<&mut VmMemory>, slot: u32) -> Option<u64> {
-        match self.call_slot(ctx, slot) {
-            Ok(r0) => Some(r0),
-            Err(err) => {
-                self.failed(slot, err);
-                None
-            }
-        }
+        self.registry.call_slot(slot, ctx, &mut self.state, &mut self.error)
     }
 
     // A code address names a guest function, which `run` checks against the code. A helper's address is its ID, as in
@@ -357,6 +356,7 @@ mod tests {
 
     use super::*;
     use crate::error::MemoryError;
+    use crate::helper::HelperContext;
     use crate::layout::STACK_REGION;
     use crate::memory::{GuestMemory, Perms};
 
