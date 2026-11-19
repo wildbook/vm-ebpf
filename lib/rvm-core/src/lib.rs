@@ -8,36 +8,37 @@ use std::ops::ControlFlow;
 use opcode::{Class, OpCode, LD_IMM64};
 use transfer::Slot;
 
-/// `for $pat in $iter $body` in a const context, where `for` isn't allowed. `$iter` is a
+/// `for $pat in $iter { $body }` in a const context, where `for` isn't allowed. `$iter` is a
 /// [`Range`](std::ops::Range), whose values `$pat` takes in turn, or an array or slice, whose elements `$pat` takes by
-/// value, or by reference behind a leading `&`. `continue` and `break` work as in `for`.
+/// value, or by reference behind a leading `&`. `$body` is a block or a single expression. `continue` and `break` work
+/// as in `for`.
 macro_rules! const_for {
     // `$iter` is the tokens before `=>`, a range if a `..` stands among them
-    (@split $pat:tt [$($start:tt)*] .. $end:expr => $body:block) => {{
+    (@split $pat:tt [$($start:tt)*] .. $end:expr => $body:expr) => {{
         let std::ops::Range { start, end } = ($($start)*)..$end;
         let mut next = start;
         while next < end {
             let $pat = next;
             next += 1;
-            $body
+            $body;
         }
     }};
-    (@split $pat:tt [& $($items:tt)*] => $body:block) => {
+    (@split $pat:tt [& $($items:tt)*] => $body:expr) => {
         const_for!(@each $pat [&] ($($items)*) $body)
     };
-    (@split $pat:tt [$($items:tt)*] => $body:block) => {
+    (@split $pat:tt [$($items:tt)*] => $body:expr) => {
         const_for!(@each $pat [] ($($items)*) $body)
     };
     (@split $pat:tt [$($done:tt)*] $token:tt $($rest:tt)*) => {
         const_for!(@split $pat [$($done)* $token] $($rest)*)
     };
-    (@each $pat:tt [$($borrow:tt)?] ($items:expr) $body:block) => {{
+    (@each $pat:tt [$($borrow:tt)?] ($items:expr) $body:expr) => {{
         let items: &[_] = &$items;
         let mut next = 0;
         while next < items.len() {
             let $pat = $($borrow)? items[next];
             next += 1;
-            $body
+            $body;
         }
     }};
     ($pat:pat in $($rest:tt)*) => {
@@ -303,7 +304,7 @@ extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, 
             if FUEL {
                 fuel -= 1;
             }
-            step_ld64(ctx, first, second);
+            step_ld64(&mut ctx.regs, first, second);
         }
         ControlFlow::Break(flow) => return calls.stop.at(slot, fuel, flow),
     }
@@ -430,14 +431,15 @@ impl<M: Memory, H> Table<M, H> {
     }
 }
 
+/// Runs the LD_IMM64 `insn`, whose second slot holds `second`.
 #[inline(always)]
-fn step_ld64<M: Memory>(ctx: &mut Context<M>, insn: Instruction, second: Instruction) {
+fn step_ld64(regs: &mut impl ops::Regs, insn: Instruction, second: Instruction) {
     debug_assert!(insn.byte() == LD_IMM64 && insn.src_reg() == 0);
 
     // the first slot carries the low 32 bits, the second the high 32 bits
     let imm_lo = insn.imm() as u32 as u64;
     let imm_hi = second.imm() as u32 as u64;
-    ctx.regs[usize::from(insn.dst_reg())] = imm_lo | (imm_hi << 32);
+    regs.set(insn.dst_reg(), imm_lo | (imm_hi << 32));
 }
 
 /// Whether [`run`] meters fuel, chosen by the `fuel` feature.
