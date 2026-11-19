@@ -209,6 +209,48 @@ fn size_change_adjusts_or_poisons_memory_access() {
     assert_eq!(insns[0], insn(ALU64_ADD_K, 1, 0, 0, 0));
 }
 
+/// A field that becomes a bitfield poisons a load, as in libbpf, rather than failing the link.
+#[test]
+fn bitfield_change_poisons_memory_access() {
+    let mut local = BtfBuilder::new();
+    let u32_ty = local.int("unsigned int", 4, false);
+    let s = local.add_struct("opts", 8);
+    local.member(s, "len", 0, u32_ty);
+    local.member(s, "flags", 4, u32_ty);
+    let r = relo(&mut local, s, "0:1", CoreReloKind::FieldByteOffset);
+
+    let mut target = BtfBuilder::new();
+    let t_u32 = target.int("unsigned int", 4, false);
+    let t_s = target.add_struct("opts", 8);
+    target.member(t_s, "len", 0, t_u32);
+    target.bitfield_member(t_s, "flags", 32, 3, t_u32);
+
+    let mut insns = [insn(LDX_W, 0, 1, 4, 0)];
+    let unresolved = relocate(&local, &target, &r, &mut insns).unwrap();
+    let error = CoreReloError::IncompatibleFieldSize {
+        type_name: "opts".to_string(),
+        access_str: "0:1".to_string(),
+    };
+    assert_eq!(unresolved, vec![Unresolved { insn_off: 0, error }]);
+    assert_eq!(insns[0], insn(CALL, 0, 0, 0, CORE_POISON_HELPER as i32));
+}
+
+/// An access string longer than libbpf's limit fails before its elements are parsed.
+#[test]
+fn long_access_string_is_too_deep() {
+    let mut local = BtfBuilder::new();
+    let int_ty = local.int("int", 4, true);
+    let s = local.add_struct("deep", 4);
+    local.member(s, "v", 0, int_ty);
+    let r = relo(&mut local, s, &format!("{}x", "0:".repeat(64)), CoreReloKind::FieldByteOffset);
+    let r_max = relo(&mut local, s, &["0"; 64].join(":"), CoreReloKind::FieldByteOffset);
+
+    let target = BtfBuilder::new();
+    let mut insns = [insn(LDX_W, 0, 1, 0, 0)];
+    assert_eq!(relocate(&local, &target, &r, &mut insns), Err(CoreReloError::SpecTooDeep));
+    assert_ne!(relocate(&local, &target, &r_max, &mut insns), Err(CoreReloError::SpecTooDeep));
+}
+
 /// A target type with a `___flavor` suffix is still found by its essential name.
 #[test]
 fn flavor_suffix_matching() {

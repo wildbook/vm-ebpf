@@ -17,9 +17,9 @@ use supers::{Encode, SUPERS};
 
 use crate::op::Op;
 use crate::opcode::atomic::{CMPXCHG, FETCH, LOAD_ACQ};
-use crate::opcode::{AluEnd, AluOpc, Class, JmpOpc, MemMode, MemSize, OpCode, Source, LD_IMM64};
+use crate::opcode::{AluEnd, AluOpc, Class, JmpOpc, MemMode, MemSize, OpCode, Source, CALL, LD_IMM64};
 use crate::transfer::{self, FAR, GUARD};
-use crate::{stack, Handler, Host, Instruction, Memory};
+use crate::{stack, Handler, Host, Instruction, Memory, BPF_PSEUDO_CALL, BPF_PSEUDO_KFUNC_CALL};
 
 /// Bytecode prepared for [`run`](crate::run).
 #[derive(Debug)]
@@ -36,6 +36,20 @@ impl Code {
     /// ALU, ALU64 or LDX instruction, LD_IMM64 or a load-acquire with `dst_reg` 10, and an atomic that fetches into
     /// `src_reg` 10.
     ///
+    /// An instruction that sets a field the kernel verifier reserves also fails with `FailCpu`, as the verifier
+    /// rejects it (`check_insn_fields` and the LD_IMM64 check in `check_and_resolve_insns`, kernel/bpf/verifier.c):
+    /// - `src_reg` of ALU operations and conditional jumps with an immediate, END, ST, `ja`, `gotox`, `callx` and
+    ///   `exit`, and `dst_reg` of `ja`, `exit` and `call` with an immediate;
+    /// - `offset` of ALU operations but DIV, MOD and `mov` from a register, of `gotox`, `callx`, JMP32 `ja`,
+    ///   LD_IMM64, and `call` but a kfunc's;
+    /// - `imm` of ALU operations but END and of conditional jumps from a register, of LDX, STX, NEG, JMP `ja`,
+    ///   `gotox`, `callx` and `exit`;
+    /// - NEG from a register, `call` with a `src_reg` other than 0, 1 and 2, and LD_IMM64 whose second slot holds
+    ///   anything but the upper half of the immediate.
+    ///
+    /// The verifier accepts `exit` with `src_reg` 1, which unwinds; rvm fails it, as it does `may_goto` with that
+    /// `src_reg`.
+    ///
     /// The code keeps the allocation of `insns` if it has room for one more slot.
     ///
     /// # Panics
@@ -44,6 +58,7 @@ impl Code {
     pub fn new(insns: impl Into<Vec<Instruction>>) -> Self {
         let mut insns = insns.into();
         let len = insns.len();
+        i32::try_from(len).expect("fewer than 2^31 slots");
         fuse(&mut insns);
         transfer::bound(&mut insns);
         // in place, as `Op` and `Instruction` have the same size and alignment
@@ -68,11 +83,7 @@ impl Code {
     #[cold]
     pub fn access_size(&self, pc: u64) -> Option<usize> {
         let op = *self.slots.get(usize::try_from(pc).ok()?)?;
-        let byte = match op.byte() {
-            FAR => transfer::moved_byte(op),
-            byte => usual(byte),
-        };
-        let opc = OpCode(byte);
+        let opc = OpCode(usual(op.byte()));
         if !matches!(opc.class(), Class::LdReg | Class::StReg | Class::StImm) {
             return None;
         }
@@ -106,43 +117,44 @@ pub const fn usual(byte: u8) -> u8 {
 pub const USUAL: [u8; 256] = byte_table!(|byte| usual(byte));
 
 /// Whether [`Code::new`] leaves the opcode byte `byte` only where `offset` is 0: that of `mov` and `mov32`, which with
-/// an offset run as MOVSX or fail.
+/// an offset run as MOVSX or fail, and those whose `offset` the verifier reserves.
 #[inline(always)]
 pub const fn offset_is_zero(byte: u8) -> bool {
-    REWRITES[byte as usize].nonzero == OFFSET_BITS
+    let rewrite = REWRITES[byte as usize];
+    (rewrite.nonzero | rewrite.reserved) & OFFSET_BITS == OFFSET_BITS
 }
 
-/// Give the bytes that run as another theirs, r10 writes and `mov` of an immediate with an offset their failing byte,
+/// Give the bytes that run as another theirs, r10 writes and instructions with a reserved field their failing byte,
 /// `mov` from a register with an offset its MOVSX byte and pseudo LD_IMM64 its missing one, and the sequences with a
 /// superinstruction and r10 accesses theirs.
 fn fuse(code: &mut [Instruction]) {
-    // Only the opcode byte changes, so the second slot of LD_IMM64 keeps its `imm`.
-    for insn in code.iter_mut() {
+    // Only the opcode byte changes, so the second slot of LD_IMM64 keeps its `imm`. The loop rewrites only slot `i`,
+    // so it reads slot `i + 1` as loaded.
+    for i in 0..code.len() {
+        let insn = code[i];
         let rewrite = REWRITES[usize::from(insn.byte())];
-        // `&` and `|` don't branch, so only the rare rewrite and atomics do
-        let r10 = (rewrite.dst & (insn.dst_reg() == 10)) | (rewrite.atomic && atomic_writes_r10(*insn));
+        // `&` and `|` don't branch, so only the rare rewrite, atomics and LD_IMM64 do
+        let r10 = (rewrite.dst & (insn.dst_reg() == 10)) | (rewrite.atomic && atomic_writes_r10(insn));
+        let reserved = (insn.0 & rewrite.reserved != 0)
+            | (insn.byte() == CALL && call_reserved(insn))
+            | (insn.byte() == LD_IMM64 && code.get(i + 1).is_some_and(|second| second.0 as u32 != 0));
         let nonzero = insn.0 & rewrite.nonzero != 0;
-        if rewrite.canonical.is_some() | r10 | nonzero {
-            let byte = match (rewrite.canonical, r10) {
+        if rewrite.canonical.is_some() | r10 | reserved | nonzero {
+            let byte = match (rewrite.canonical, r10 | reserved) {
                 (Some(byte), _) => byte,
                 (None, true) => INVALID,
                 (None, false) => rewrite.nonzero_byte,
             };
-            *insn = insn.with_opcode(byte);
+            code[i] = insn.with_opcode(byte);
         }
     }
 
     // A superinstruction or r10 access changes only the opcode byte of its first slot. So the code from slot `i` on is
     // still as loaded but for opcode bytes, and a handler, which reads the other fields of its sequence's slots, later
-    // reads the fields `encode` checked, and the upper halves of LD_IMM64 that `transfer::fits` keeps as they are. A
+    // reads the fields `encode` checked, and the slots of its sequence that `transfer::fits` keeps as they are. A
     // sequence whose branch leaves the code gives way to the next candidate, as `transfer::bound` would run it unfused.
-    //
-    // `upper` says whether slot `i` holds the upper half of an LD_IMM64, from the byte of the slot before it as loaded
-    let mut upper = false;
+    // The second slot of each LD_IMM64 left holds the byte [`MISSING`], which starts no sequence.
     for i in 0..code.len() {
-        if std::mem::replace(&mut upper, code[i].byte() == LD_IMM64) {
-            continue;
-        }
         let window = &code[i..];
         let fused = |(_, sup, encode): &(u8, Super, Encode)| encode(window).filter(|_| transfer::fits(sup, code, i));
         let found = candidates(window).iter().find_map(fused);
@@ -165,14 +177,20 @@ struct Rewrite {
     /// The byte is an atomic's: [`atomic_writes_r10`] decides whether it writes r10.
     atomic: bool,
     /// The bits of the fields that give the instruction `nonzero_byte` where they aren't 0: `src_reg` of LD_IMM64, a
-    /// pseudo load, which runs as [`MISSING`] does, and `offset` of `mov`, which runs as MOVSX or fails.
+    /// pseudo load, which runs as [`MISSING`] does, and `offset` of `mov` from a register, which runs as MOVSX or
+    /// fails.
     nonzero: u64,
     nonzero_byte: u8,
+    /// The bits of the fields the verifier reserves (see [`Code::new`]), which give the instruction [`INVALID`] where
+    /// they aren't 0.
+    reserved: u64,
 }
 
-/// The bits of `src_reg` and `offset` in an [`Instruction`].
+/// The bits of each field of an [`Instruction`] but the opcode byte.
+const DST_BITS: u64 = 0xF00;
 const SRC_BITS: u64 = 0xF000;
 const OFFSET_BITS: u64 = 0xFFFF_0000;
+const IMM_BITS: u64 = 0xFFFF_FFFF_0000_0000;
 
 const REWRITES: [Rewrite; 256] = {
     const NONE: Rewrite = Rewrite {
@@ -181,45 +199,99 @@ const REWRITES: [Rewrite; 256] = {
         atomic: false,
         nonzero: 0,
         nonzero_byte: 0,
+        reserved: 0,
     };
-    const ALU: Rewrite = Rewrite { dst: true, ..NONE };
-    const fn with_offset(byte: u8) -> Rewrite {
-        Rewrite {
-            nonzero: OFFSET_BITS,
-            nonzero_byte: byte,
-            ..ALU
-        }
-    }
 
     byte_table!(|byte| {
         let opc = OpCode(byte);
+        let reserved = reserved(opc);
         match opc.class() {
             _ if canonical(byte).is_some() => Rewrite {
                 canonical: canonical(byte),
                 ..NONE
             },
-            Class::Alu32 | Class::Alu64 => match byte {
-                MOV32_REG => with_offset(MOVSX32),
-                MOV64_REG => with_offset(MOVSX64),
-                // `ops::math` runs MOV of an immediate only with offset 0
-                _ if matches!(opc.alu_opc(), AluOpc::Mov) => with_offset(INVALID),
-                _ => ALU,
+            Class::Alu32 | Class::Alu64 => {
+                let (nonzero, nonzero_byte) = match byte {
+                    MOV32_REG => (OFFSET_BITS, MOVSX32),
+                    MOV64_REG => (OFFSET_BITS, MOVSX64),
+                    _ => (0, 0),
+                };
+                Rewrite {
+                    dst: true,
+                    nonzero,
+                    nonzero_byte,
+                    reserved,
+                    ..NONE
+                }
+            }
+            Class::LdReg => Rewrite {
+                dst: true,
+                reserved,
+                ..NONE
             },
-            Class::LdReg => ALU,
             Class::LdImm if byte == LD_IMM64 => Rewrite {
                 dst: true,
                 nonzero: SRC_BITS,
                 nonzero_byte: MISSING,
+                reserved,
                 ..NONE
             },
             Class::StReg => Rewrite {
                 atomic: matches!(opc.mem_mode(), MemMode::Atomic),
+                reserved,
                 ..NONE
             },
-            Class::LdImm | Class::StImm | Class::Jmp32 | Class::Jmp64 => NONE,
+            Class::LdImm | Class::StImm | Class::Jmp32 | Class::Jmp64 => Rewrite { reserved, ..NONE },
         }
     })
 };
+
+/// The bits of the fields that the verifier reserves in every instruction with opcode `opc` that runs, as
+/// `check_insn_fields` checks them; [`call_reserved`] and [`fuse`] check those that depend on other fields.
+const fn reserved(opc: OpCode) -> u64 {
+    let reg = matches!(opc.alu_src(), Source::Reg);
+    // the field that doesn't name the source
+    let unused = if reg { IMM_BITS } else { SRC_BITS };
+    let jmp64 = matches!(opc.class(), Class::Jmp64);
+    match opc.class() {
+        Class::Alu32 | Class::Alu64 => match opc.alu_opc() {
+            // `INVALID`, which keeps every field
+            AluOpc::UndefE | AluOpc::UndefF => 0,
+            AluOpc::Neg => SRC_BITS | OFFSET_BITS | IMM_BITS,
+            AluOpc::End => SRC_BITS | OFFSET_BITS,
+            // the offset of DIV and MOD makes them signed, and that of `mov` from a register MOVSX
+            AluOpc::Div | AluOpc::Mod => unused,
+            AluOpc::Mov if reg => IMM_BITS,
+            _ => unused | OFFSET_BITS,
+        },
+        Class::Jmp32 | Class::Jmp64 => match opc.jmp_opc() {
+            // `gotox` and `callx`
+            JmpOpc::Ja | JmpOpc::Call if reg => SRC_BITS | OFFSET_BITS | IMM_BITS,
+            JmpOpc::Ja if jmp64 => SRC_BITS | DST_BITS | IMM_BITS,
+            JmpOpc::Ja => SRC_BITS | DST_BITS | OFFSET_BITS,
+            JmpOpc::Exit => SRC_BITS | DST_BITS | IMM_BITS,
+            JmpOpc::Call => DST_BITS,
+            // `ops::jump` checks the fields of `may_goto`
+            JmpOpc::Jcond => 0,
+            _ => unused,
+        },
+        Class::LdReg => IMM_BITS,
+        Class::StImm => SRC_BITS,
+        Class::StReg if matches!(opc.mem_mode(), MemMode::Mem) => IMM_BITS,
+        Class::LdImm if opc.0 == LD_IMM64 => OFFSET_BITS,
+        Class::StReg | Class::LdImm => 0,
+    }
+}
+
+/// Whether the `call` with an immediate `insn` sets a field that the verifier reserves where it depends on the kind of
+/// call in `src_reg`: a kind other than a helper, local or kfunc call, or an `offset` in a call that isn't a kfunc's.
+fn call_reserved(insn: Instruction) -> bool {
+    match insn.src_reg() {
+        0 | BPF_PSEUDO_CALL => insn.offset() != 0,
+        BPF_PSEUDO_KFUNC_CALL => false,
+        _ => true,
+    }
+}
 
 /// Whether the atomic `insn` writes r10.
 fn atomic_writes_r10(insn: Instruction) -> bool {
@@ -268,13 +340,15 @@ const fn canonical(byte: u8) -> Option<u8> {
 }
 
 /// Whether every instruction with opcode `opc` fails with [`Flow::FailCpu`](crate::Flow::FailCpu), whatever its other
-/// fields hold, as [`ops`](crate::ops) and [`mem`](crate::mem) run it.
+/// fields hold, as [`ops`](crate::ops) and [`mem`](crate::mem) run it or as the verifier rejects it (NEG from a
+/// register).
 const fn always_fails(opc: OpCode) -> bool {
     let jmp32 = matches!(opc.class(), Class::Jmp32);
     let imm = matches!(opc.alu_src(), Source::Imm);
     match opc.class() {
         Class::Alu32 | Class::Alu64 => match opc.alu_opc() {
             AluOpc::UndefE | AluOpc::UndefF => true,
+            AluOpc::Neg => !imm,
             AluOpc::End => matches!((opc.class(), opc.alu_end()), (Class::Alu64, AluEnd::ToBE)),
             _ => false,
         },
@@ -430,4 +504,41 @@ fn candidates(window: &[Instruction]) -> &'static [(u8, Super, Encode)] {
 pub const fn install<M: Memory, H: Host<M>, const FUEL: bool>(table: &mut [Handler<M, H>; 256]) {
     supers::install::<M, H, FUEL>(table);
     install_stack::<M, H, FUEL>(table);
+}
+
+/// Each kind of field the verifier reserves, set where it is reserved and where an instruction uses it.
+#[cfg(test)]
+#[test]
+fn reserved_fields() {
+    let insn = Instruction::from_parts;
+    let (alu, jmp) = (OpCode::alu64_from_parts, OpCode::jmp64_from_parts);
+    let exit = insn(jmp(JmpOpc::Exit, Source::Imm), 0, 0, 0, 0);
+    let fails = |slots: &[Instruction]| Code::new(slots).slots()[0].byte() == INVALID;
+    for (slot, reserved) in [
+        (insn(alu(AluOpc::Add, Source::Imm), 1, 2, 0, 1), true),
+        (insn(alu(AluOpc::Add, Source::Reg), 1, 2, 0, 1), true),
+        (insn(alu(AluOpc::Add, Source::Reg), 1, 2, 1, 0), true),
+        (insn(alu(AluOpc::Div, Source::Reg), 1, 2, 1, 0), false),
+        (insn(alu(AluOpc::Mov, Source::Reg), 1, 2, 8, 0), false),
+        (insn(alu(AluOpc::Mov, Source::Reg), 1, 2, 8, 1), true),
+        (insn(alu(AluOpc::Neg, Source::Reg), 1, 0, 0, 0), true),
+        (insn(alu(AluOpc::Neg, Source::Imm), 1, 0, 0, 1), true),
+        (insn(jmp(JmpOpc::Exit, Source::Imm), 0, 1, 0, 0), true),
+        (insn(jmp(JmpOpc::Ja, Source::Imm), 1, 0, 0, 0), true),
+        (insn(jmp(JmpOpc::Jeq, Source::Imm), 1, 2, 0, 0), true),
+        (insn(jmp(JmpOpc::Call, Source::Imm), 0, 0, 1, 1), true),
+        (insn(jmp(JmpOpc::Call, Source::Imm), 0, BPF_PSEUDO_KFUNC_CALL, 1, 1), false),
+        (insn(jmp(JmpOpc::Call, Source::Imm), 0, 3, 0, 1), true),
+        (insn(OpCode::ldreg_from_parts(MemSize::Word, MemMode::Mem), 1, 2, 0, 1), true),
+        (insn(OpCode::stimm_from_parts(MemSize::Word, MemMode::Mem), 1, 2, 0, 1), true),
+        (insn(OpCode(LD_IMM64), 1, 0, 1, 7), true),
+    ] {
+        assert_eq!(fails(&[slot, exit]), reserved, "{slot:?}");
+    }
+
+    // the second slot of LD_IMM64 holds the upper half of the immediate and nothing else
+    let lddw = insn(OpCode(LD_IMM64), 1, 0, 0, 7);
+    assert!(!fails(&[lddw, insn(OpCode(0), 0, 0, 0, 5)]));
+    assert!(fails(&[lddw, insn(OpCode(0), 1, 0, 0, 5)]));
+    assert!(fails(&[lddw, insn(OpCode(LD_IMM64), 0, 0, 0, 5)]));
 }

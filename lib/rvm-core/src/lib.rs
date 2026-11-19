@@ -298,12 +298,13 @@ extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, 
             if FUEL && fuel == 0 {
                 return calls.stop.at(slot, 1, Flow::OutOfFuel);
             }
-            slot = slot.offset(1);
             // SAFETY: this handler runs a slot below `len` (see `Slot`), so the next one lies in `0..=len`
-            let second = unsafe { slot.get() };
-            let Some(upper) = transfer::second_half(code, second) else {
-                return calls.stop.at(slot, fuel, Flow::BadPc);
+            let second = unsafe { slot.offset(1).get() };
+            let Some(upper) = transfer::second_half(second) else {
+                // the code ends inside LD_IMM64, which doesn't run and gets its unit back, as at the guard
+                return calls.stop.at(slot, fuel + u64::from(FUEL), Flow::BadPc);
             };
+            slot = slot.offset(1);
             if FUEL {
                 fuel -= 1;
             }
@@ -325,7 +326,7 @@ extern "rust-preserve-none" fn host_call<M: Memory, H: Host<M>, const FUEL: bool
     ctx: &mut Context<M>,
     code: &[Op],
     slot: Slot,
-    fuel: u64,
+    mut fuel: u64,
     calls: &mut CallStack<H, M::Err>,
     table: &Table<M, H>,
     op: Op,
@@ -333,8 +334,8 @@ extern "rust-preserve-none" fn host_call<M: Memory, H: Host<M>, const FUEL: bool
     // SAFETY: as in the handler of `call`, which continues here
     let id = unsafe { slot.view(op, CALL) }.imm() as u32;
     let (r0, flow) = match KFUNC {
-        true => (calls.host.kfunc(ctx, id), Flow::CallKfunc(id)),
-        false => (calls.host.helper(ctx, id), Flow::CallHelper(id)),
+        true => (calls.host.kfunc(ctx, id, &mut fuel), Flow::CallKfunc(id)),
+        false => (calls.host.helper(ctx, id, &mut fuel), Flow::CallHelper(id)),
     };
     let Some(r0) = r0 else {
         return calls.stop.at(slot, fuel, flow);
@@ -352,7 +353,7 @@ extern "rust-preserve-none" fn indirect_call<M: Memory, H: Host<M>, const FUEL: 
     ctx: &mut Context<M>,
     code: &[Op],
     slot: Slot,
-    fuel: u64,
+    mut fuel: u64,
     calls: &mut CallStack<H, M::Err>,
     table: &Table<M, H>,
     op: Op,
@@ -360,7 +361,7 @@ extern "rust-preserve-none" fn indirect_call<M: Memory, H: Host<M>, const FUEL: 
     const CALLX: u8 = OpCode::jmp64_from_parts(opcode::JmpOpc::Call, opcode::Source::Reg).0;
     // SAFETY: as in the handler of `callx`, which continues here
     let target = ops::Regs::get(&ctx.regs, unsafe { slot.view(op, CALLX) }.dst_reg());
-    let callee = calls.host.callx(ctx, target);
+    let callee = calls.host.callx(ctx, target, &mut fuel);
     calls.windows.revalidate(&ctx.data);
     match callee {
         Some(Callee::Local(pc)) => {

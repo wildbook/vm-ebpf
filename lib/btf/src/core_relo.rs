@@ -126,8 +126,9 @@ pub struct ResolvedRelo {
     /// The field, type, or enum value this relocation refers to doesn't exist in `target`, so the instruction is
     /// poisoned instead of patched.
     pub poison: bool,
-    /// The field's size changed in a way a memory access can't be adjusted for (libbpf's `fail_memsz_adjust`). Only a
-    /// load or store is poisoned for this; an instruction that only computes the offset is patched as usual.
+    /// The field's size changed in a way a memory access can't be adjusted for, or it became or stopped being a
+    /// bitfield (libbpf's `fail_memsz_adjust`). Only a load or store is poisoned for this; an instruction that only
+    /// computes the offset is patched as usual.
     pub fail_memsz_adjust: bool,
     /// Whether `orig_val` must match what's already encoded in the instruction.
     pub validate: bool,
@@ -202,6 +203,7 @@ fn resolve_relocation(local: &Btf<'_>, target: &Btf<'_>, relo: &CoreRelo) -> Res
         }
     }
 
+    let found = matched.is_some();
     let (new_val, poison, new_mem) = match matched {
         Some(half) => (half.val, false, half.mem),
         None => (0, poisons_on_missing(relo.kind), None),
@@ -210,9 +212,8 @@ fn resolve_relocation(local: &Btf<'_>, target: &Btf<'_>, relo: &CoreRelo) -> Res
     // A field that moved between an unsigned integer (or pointer) of a different size can be read with an adjusted
     // memory access size without changing its value; any other size change fails a load or store rather than risk
     // reading the wrong bytes or sign-extending wrongly.
-    let mut fail_memsz_adjust = false;
-    if let (Some((orig_sz, orig_tid)), Some((new_sz, new_tid))) = (orig.mem, new_mem) {
-        if orig_sz != new_sz {
+    let fail_memsz_adjust = match (orig.mem, new_mem) {
+        (Some((orig_sz, orig_tid)), Some((new_sz, new_tid))) if orig_sz != new_sz => {
             let orig_t = local
                 .type_by_id(orig_tid)
                 .ok_or(CoreReloError::InvalidTypeId(orig_tid))?;
@@ -221,9 +222,12 @@ fn resolve_relocation(local: &Btf<'_>, target: &Btf<'_>, relo: &CoreRelo) -> Res
                 .ok_or(CoreReloError::InvalidTypeId(new_tid))?;
             let safe_adjust = (matches!(orig_t, BtfTypeInfo::Ptr { .. }) && matches!(new_t, BtfTypeInfo::Ptr { .. }))
                 || (is_unsigned_int(orig_t) && is_unsigned_int(new_t));
-            fail_memsz_adjust = !safe_adjust;
+            !safe_adjust
         }
-    }
+        // the field became or stopped being a bitfield, which has no memory access size
+        (Some(_), None) | (None, Some(_)) => found,
+        _ => false,
+    };
 
     Ok(ResolvedRelo {
         orig_val: orig.val,
@@ -284,10 +288,16 @@ fn parse_spec(local: &Btf<'_>, relo: &CoreRelo, access_str: &str) -> Result<Spec
         });
     }
 
-    let raw: Vec<u32> = access_str
-        .split(':')
+    // libbpf stops at the same length; `splitn` leaves the rest of a longer string unread
+    let mut parts = access_str.splitn(MAX_SPEC_DEPTH + 1, ':');
+    let raw: Vec<u32> = parts
+        .by_ref()
+        .take(MAX_SPEC_DEPTH)
         .map(|s| s.parse::<u32>().map_err(|_| invalid_access(access_str)))
         .collect::<Result<_, _>>()?;
+    if parts.next().is_some() {
+        return Err(CoreReloError::SpecTooDeep);
+    }
 
     let (mut id, root_t) = local
         .resolve_type(relo.type_id)

@@ -39,8 +39,8 @@ macro_rules! operand {
 // registers. A sequence fuses where each role stands for one register throughout and different roles for different
 // registers. `_` stands for whatever its slot holds: an immediate, an offset, a jump target, or a register that no role
 // names, which only the last instruction may have. Every field a line doesn't mention is zero. `lddw` is LD_IMM64 with
-// `src_reg` 0, whose second slot may hold anything besides the upper half of its immediate. Longer sequences come first,
-// so that they win over their prefixes.
+// `src_reg` 0, whose second slot `Code::new` leaves only where it holds the upper half of the immediate and nothing
+// else. Longer sequences come first, so that they win over their prefixes.
 superinstructions! {
     // rotate: t = x >> k | x << (32 - k), into x or y
     0xd0: mov32 t, x; rsh32 t, _; lsh32 x, _; mov32 y, x; or32 y, t;
@@ -278,7 +278,7 @@ impl Super {
             }
         }
         for (k, &insn) in sequence.iter().enumerate() {
-            // `fused` reads only the `imm` of the second slot of LD_IMM64, which it may hold with any other fields
+            // the second slot of LD_IMM64 is no instruction, and `fuse` failed the LD_IMM64 if it holds more than `imm`
             if !self.is_data(k) && self.decode(k, insn, registers, None) != insn {
                 return None;
             }

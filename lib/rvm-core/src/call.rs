@@ -8,15 +8,17 @@ use crate::{stack, Context, Flow, Memory};
 ///
 /// Each method gets the arguments in `ctx.regs[1..=5]` and returns the new r0. It returns `None` to stop
 /// [`run`](crate::run) at the call with [`Flow::CallHelper`], [`Flow::CallKfunc`] or [`Flow::CallIndirect`], having
-/// recorded whatever its caller needs to handle that.
+/// recorded whatever its caller needs to handle that. `fuel` is what the caller has left, with the call charged; a host
+/// function that runs guest code takes what that code ran from it, and `run` continues with the rest. Without the
+/// `fuel` feature it means nothing.
 pub trait Host<M: Memory> {
     /// Call helper `id` (`src_reg = 0`).
-    fn helper(&mut self, ctx: &mut Context<M>, id: u32) -> Option<u64>;
+    fn helper(&mut self, ctx: &mut Context<M>, id: u32, fuel: &mut u64) -> Option<u64>;
     /// Call external function `id` (`src_reg = BPF_PSEUDO_KFUNC_CALL`).
-    fn kfunc(&mut self, ctx: &mut Context<M>, id: u32) -> Option<u64>;
+    fn kfunc(&mut self, ctx: &mut Context<M>, id: u32, fuel: &mut u64) -> Option<u64>;
     /// Call through `target`, the address in the `dst_reg` of a `callx`: name the guest function it addresses, or run
     /// the host function it addresses.
-    fn callx(&mut self, ctx: &mut Context<M>, target: u64) -> Option<Callee>;
+    fn callx(&mut self, ctx: &mut Context<M>, target: u64, fuel: &mut u64) -> Option<Callee>;
 }
 
 /// What a `callx` calls, as [`Host::callx`] resolves its target.
