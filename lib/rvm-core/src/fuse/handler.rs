@@ -3,9 +3,10 @@
 use std::ops::ControlFlow;
 
 use super::supers::{Super, MAX_LEN, MAX_ROLES};
+use crate::op::{Fields, Op, Reg, View};
 use crate::ops::Regs;
 use crate::transfer::Slot;
-use crate::{charge, stack, step, step_ld64, CallStack, Context, Flow, Handlers, Host, Instruction, Memory, Table};
+use crate::{charge, stack, step, step_ld64, CallStack, Context, Flow, Handlers, Host, Memory, Table};
 
 /// The handler of superinstruction `S`. It runs the sequence as the handlers of its instructions would, one after
 /// another, but keeps each role in a variable of its own: it loads the roles the sequence reads before it writes them,
@@ -14,12 +15,12 @@ use crate::{charge, stack, step, step_ld64, CallStack, Context, Flow, Handlers, 
 #[inline(never)]
 pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool, const S: u8>(
     ctx: &mut Context<M>,
-    insn: Instruction,
-    code: &[Instruction],
+    code: &[Op],
     slot: Slot,
     fuel: u64,
     calls: &mut CallStack<H, M::Err>,
     table: &Table<M, H>,
+    op: Op,
 ) {
     let sup = const { Super::of(S) };
     let len = const { Super::of(S).len() };
@@ -27,16 +28,17 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool
     // the fuel runs out inside the sequence, which takes one unit per slot
     if FUEL && fuel < len as u64 - 1 {
         let alone = const { Handlers::<M, H, FUEL>::TABLE.0[Super::of(S).op(0) as usize] };
-        become alone(ctx, sup.first_of(insn), code, slot, fuel, calls, table)
+        become alone(ctx, code, slot, fuel, calls, table, op)
     }
     // SAFETY: `transfer::bound` leaves a superinstruction only where its sequence lies in the code, and the guard slot
     // follows the code (see `Slot`)
     let window = unsafe { slot.window(code, len + 1) };
-    // the first slot is `insn`, which is already in a register
-    let slot_of = |k: usize| if k == 0 { insn } else { window[k] };
+    // SAFETY: `encode` found the opcode of each instruction of the sequence in its first slot, and the bytes `Code::new`
+    // gives such a slot afterwards stand for the same opcode (see `usual`), so they have its layout
+    let slot_of = |k: usize| unsafe { View::new(&window[k], None, sup.op(k)) };
 
     let registers = sup.registers(slot_of);
-    let free = sup.free_at.map_or(0, |k| slot_of(usize::from(k)).dst_reg());
+    let free = sup.free_at.map_or(Reg::R0, |k| slot_of(usize::from(k)).dst_reg());
     let mut roles = Roles {
         values: [0; MAX_ROLES],
         regs: &mut ctx.regs,
@@ -44,17 +46,17 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool
     };
     roles.load(registers, sup.loads);
 
-    // Continue at `$next` with the instruction `$insn` there, once the sequence is charged. A branch dispatches on each
-    // side, so that it stays a branch: a `cmov` of the next slot's address would make the next fetch wait for the
-    // registers the branch compares.
+    // Continue at `$next`, whose op is `$op`, once the sequence is charged. A branch dispatches on each side, so that it
+    // stays a branch: a `cmov` of the next slot's address would make the next fetch wait for the registers the branch
+    // compares.
     macro_rules! dispatch {
-        ($next:expr, $insn:expr) => {{
+        ($next:expr, $op:expr) => {{
             let next = $next;
             let Some(left) = charge::<FUEL>(fuel - (len as u64 - 1) * u64::from(FUEL)) else {
                 return calls.stop.at(next, 0, Flow::OutOfFuel);
             };
-            let insn = $insn;
-            become table.of(insn)(ctx, insn, code, next, left, calls, table)
+            let next_op = $op;
+            become table.of(next_op)(ctx, code, next, left, calls, table, next_op)
         }};
     }
 
@@ -84,7 +86,7 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool
                         roles.save(registers, sup.unsaved[$k]);
                         return calls.stop.at(at, fuel - $k * u64::from(FUEL), flow);
                     }
-                    ControlFlow::Continue(first) => step_ld64(&mut roles, first, slot_of($k + 1)),
+                    ControlFlow::Continue(()) => step_ld64(&mut roles, decoded, window[$k + 1].imm()),
                 }
             }
         )*};
@@ -103,32 +105,32 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool
 struct Roles<'a> {
     values: [u64; MAX_ROLES],
     regs: &'a mut [u64; 16],
-    free: u8,
+    free: Reg,
 }
 
 /// The register indexes [`fused`] gives the roles.
-const ROLE_INDEXES: [u8; MAX_ROLES] = [0, 1, 2, 3];
+const ROLE_INDEXES: [Reg; MAX_ROLES] = [Reg::low(0), Reg::low(1), Reg::low(2), Reg::low(3)];
 
 /// The register index [`fused`] gives the register operand `_`.
-const FREE: u8 = 15;
+const FREE: Reg = Reg::low(15);
 
 impl Roles<'_> {
     /// Load the roles in the bit set `roles` from their registers `registers`.
     #[inline(always)]
-    fn load(&mut self, registers: [u8; MAX_ROLES], roles: u8) {
+    fn load(&mut self, registers: [Reg; MAX_ROLES], roles: u8) {
         for role in 0..MAX_ROLES {
             if roles & 1 << role != 0 {
-                self.values[role] = self.regs[usize::from(registers[role])];
+                self.values[role] = self.regs.get(registers[role]);
             }
         }
     }
 
     /// Store the roles in the bit set `roles` to their registers `registers`.
     #[inline(always)]
-    fn save(&mut self, registers: [u8; MAX_ROLES], roles: u8) {
+    fn save(&mut self, registers: [Reg; MAX_ROLES], roles: u8) {
         for role in 0..MAX_ROLES {
             if roles & 1 << role != 0 {
-                self.regs[usize::from(registers[role])] = self.values[role];
+                self.regs.set(registers[role], self.values[role]);
             }
         }
     }
@@ -137,18 +139,18 @@ impl Roles<'_> {
 // The instructions name no fixed register: `Step::parse` makes no atomics, of which `CMPXCHG` names r0.
 impl Regs for Roles<'_> {
     #[inline(always)]
-    fn get(&self, reg: u8) -> u64 {
+    fn get(&self, reg: Reg) -> u64 {
         match reg {
-            FREE => self.regs[usize::from(self.free)],
-            role => self.values[usize::from(role)],
+            FREE => self.regs.get(self.free),
+            role => self.values[usize::from(role.get())],
         }
     }
 
     #[inline(always)]
-    fn set(&mut self, reg: u8, value: u64) {
+    fn set(&mut self, reg: Reg, value: u64) {
         match reg {
-            FREE => self.regs[usize::from(self.free)] = value,
-            role => self.values[usize::from(role)] = value,
+            FREE => self.regs.set(self.free, value),
+            role => self.values[usize::from(role.get())] = value,
         }
     }
 }

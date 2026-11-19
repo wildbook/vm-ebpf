@@ -1,6 +1,7 @@
 //! The superinstruction table, and the [`Super`] that the compiler derives from each of its lines.
 
 use super::handler::fused;
+use crate::op::{Fields, Reg};
 use crate::opcode::{AluOpc, Class, JmpOpc, MemMode, MemSize, OpCode, Source, LD_IMM64};
 use crate::{Handler, Host, Instruction, Memory};
 
@@ -89,9 +90,9 @@ pub struct Super {
     steps: [Step; MAX_LEN],
     len: u8,
     roles: u8,
-    /// For each role, the slot of the operand that names it first and the shift of that operand's register field,
-    /// where the code gives the role its register.
-    homes: [(u8, u8); MAX_ROLES],
+    /// For each role, the slot of the operand that names it first and whether that operand is `src_reg`, where the
+    /// code gives the role its register.
+    homes: [(u8, bool); MAX_ROLES],
 
     /// The roles the sequence reads before it writes them, one bit each.
     pub loads: u8,
@@ -123,7 +124,7 @@ impl Super {
             steps: [Step::NONE; MAX_LEN],
             len: 0,
             roles: 0,
-            homes: [(0, 0); MAX_ROLES],
+            homes: [(0, false); MAX_ROLES],
             loads: 0,
             writes: 0,
             save_at: 0,
@@ -180,15 +181,15 @@ impl Super {
         sup
     }
 
-    /// The slot of the operand that names `role` first, and the shift of its register field.
-    const fn home(self, role: u8) -> (u8, u8) {
+    /// The slot of the operand that names `role` first, and whether that operand is `src_reg`.
+    const fn home(self, role: u8) -> (u8, bool) {
         const_for!(k in 0..self.len() => {
             let step = self.steps[k];
             if step.dst.is(role) {
-                return (k as u8, DST);
+                return (k as u8, false);
             }
             if step.src.is(role) {
-                return (k as u8, SRC);
+                return (k as u8, true);
             }
         });
         unreachable!()
@@ -238,11 +239,12 @@ impl Super {
 
     /// The register of each role, from `slot(k)`, slot `k` of the sequence.
     #[inline(always)]
-    pub fn registers(self, slot: impl Fn(usize) -> Instruction) -> [u8; MAX_ROLES] {
-        let mut registers = [0; MAX_ROLES];
+    pub fn registers<F: Fields>(self, slot: impl Fn(usize) -> F) -> [Reg; MAX_ROLES] {
+        let mut registers = [Reg::R0; MAX_ROLES];
         for role in 0..self.roles as usize {
-            let (k, shift) = self.homes[role];
-            registers[role] = (slot(k as usize).0 >> shift) as u8 & 0xF;
+            let (k, src) = self.homes[role];
+            let slot = slot(k as usize);
+            registers[role] = if src { slot.src_reg() } else { slot.dst_reg() };
         }
         registers
     }
@@ -250,13 +252,13 @@ impl Super {
     /// The instruction whose first slot is slot `k` of the sequence, from that slot `slot`: the register of each role
     /// from `roles`, and the register operand `_` from `free`, else from `slot`.
     #[inline(always)]
-    pub fn decode(self, k: usize, slot: Instruction, roles: [u8; MAX_ROLES], free: Option<u8>) -> Instruction {
+    pub fn decode(self, k: usize, slot: impl Fields, roles: [Reg; MAX_ROLES], free: Option<Reg>) -> Instruction {
         let step = self.steps[k];
         let dst = step.dst.register(roles, free, slot.dst_reg());
         let src = step.src.register(roles, free, slot.src_reg());
         let off = if let Field::Any = step.off { slot.offset() } else { 0 };
         let imm = if let Field::Any = step.imm { slot.imm() } else { 0 };
-        Instruction::from_parts(OpCode(step.op), dst, src, off, imm)
+        Instruction::from_parts(OpCode(step.op), dst.get(), src.get(), off, imm)
     }
 
     /// The first slot of this superinstruction, with opcode byte `byte`, for the sequence at the start of `window`, if
@@ -305,10 +307,6 @@ fn encode_as<const S: u8>(window: &[Instruction]) -> Option<Instruction> {
     const { Super::of(S) }.encode(S, window)
 }
 
-/// The shifts of the `dst_reg` and `src_reg` fields in an instruction.
-const DST: u8 = 8;
-const SRC: u8 = 12;
-
 /// An instruction of a superinstruction's sequence.
 #[derive(Clone, Copy)]
 struct Step {
@@ -336,9 +334,9 @@ impl Field {
 
     /// The register of a register field: from `roles` for a role, else `free`, else the slot's `own`.
     #[inline(always)]
-    fn register(self, roles: [u8; MAX_ROLES], free: Option<u8>, own: u8) -> u8 {
+    fn register(self, roles: [Reg; MAX_ROLES], free: Option<Reg>, own: Reg) -> Reg {
         match self {
-            Field::Zero => 0,
+            Field::Zero => Reg::R0,
             Field::Role(role) => roles[role as usize],
             Field::Any => free.unwrap_or(own),
         }

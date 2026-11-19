@@ -1,5 +1,6 @@
 use std::ops::ControlFlow;
 
+use crate::op::{Fields, Reg};
 use crate::opcode::atomic::{ADD, AND, CMPXCHG, FETCH, LOAD_ACQ, OR, STORE_REL, XCHG, XOR};
 use crate::opcode::{MemMode, MemSize};
 use crate::ops::Regs;
@@ -10,7 +11,7 @@ pub const SOURCE_IMM: bool = false;
 
 /// The address `insn` accesses through the base register value `base`.
 #[inline(always)]
-pub fn address(base: u64, insn: Instruction) -> u64 {
+pub fn address(base: u64, insn: impl Fields) -> u64 {
     base.wrapping_add_signed(i64::from(insn.offset()))
 }
 
@@ -61,7 +62,7 @@ fn store_release<M: Memory>(mem: &mut M, size: MemSize, addr: u64, value: u64) -
 
 /// `ST` or, with [`SOURCE_REG`], `STX`.
 #[inline(always)]
-pub fn store<M: Memory, R: Regs, const SOURCE: bool>(regs: &mut R, mem: &mut M, insn: Instruction) -> Flow<M::Err> {
+pub fn store<M: Memory, R: Regs, const SOURCE: bool>(regs: &mut R, mem: &mut M, insn: impl Fields) -> Flow<M::Err> {
     let val = match SOURCE {
         SOURCE_REG => regs.get(insn.src_reg()),
         SOURCE_IMM => i64::from(insn.imm()) as u64,
@@ -74,7 +75,7 @@ pub fn store<M: Memory, R: Regs, const SOURCE: bool>(regs: &mut R, mem: &mut M, 
 
     let result = match mode {
         MemMode::Mem => store_plain(mem, size, addr, val),
-        MemMode::Atomic if SOURCE == SOURCE_REG => return atomic(regs, mem, insn, size, addr, val),
+        MemMode::Atomic if SOURCE == SOURCE_REG => return atomic(regs, mem, insn.instruction(), size, addr, val),
         // ABS and IND exist only in the LD class
         _ => return Flow::FailCpu,
     };
@@ -87,6 +88,8 @@ pub fn store<M: Memory, R: Regs, const SOURCE: bool>(regs: &mut R, mem: &mut M, 
 
 /// `STX | ATOMIC`: `imm` selects the operation. The read-modify-write operations take W and DW sizes only;
 /// [`ordered`] runs the rest.
+// takes `insn` as an `Instruction`, which atomics hold in their slot as it is, so that this function receives it in a
+// register when it isn't inlined
 fn atomic<M: Memory, R: Regs>(
     regs: &mut R,
     mem: &mut M,
@@ -95,7 +98,7 @@ fn atomic<M: Memory, R: Regs>(
     addr: u64,
     src: u64,
 ) -> Flow<M::Err> {
-    let src_reg = insn.src_reg();
+    let src_reg = Reg::low(insn.src_reg());
     let imm = insn.imm();
 
     // `CmpXchg` compares against r0 and writes the old value there instead of `src`.
@@ -105,7 +108,7 @@ fn atomic<M: Memory, R: Regs>(
             let op = match imm & !FETCH {
                 _ if imm == XCHG => AtomicOp::Xchg(v),
                 _ if imm == CMPXCHG => AtomicOp::CmpXchg {
-                    expected: regs.get(0) as $ty,
+                    expected: regs.get(Reg::R0) as $ty,
                     new: v,
                 },
                 ADD => AtomicOp::Add(v),
@@ -128,7 +131,7 @@ fn atomic<M: Memory, R: Regs>(
     };
 
     match imm {
-        CMPXCHG => regs.set(0, old),
+        CMPXCHG => regs.set(Reg::R0, old),
         _ if imm & FETCH != 0 => regs.set(src_reg, old),
         _ => {}
     }
@@ -142,14 +145,15 @@ fn atomic<M: Memory, R: Regs>(
 #[inline(never)]
 fn ordered<M: Memory, R: Regs>(regs: &mut R, mem: &mut M, insn: Instruction) -> Flow<M::Err> {
     let size = insn.opcode().mem_size();
+    let (dst, src) = (Reg::low(insn.dst_reg()), Reg::low(insn.src_reg()));
     let result = match insn.imm() {
         LOAD_ACQ => {
-            let addr = address(regs.get(insn.src_reg()), insn);
-            load_acquire(mem, size, addr).map(|val| regs.set(insn.dst_reg(), val))
+            let addr = address(regs.get(src), insn);
+            load_acquire(mem, size, addr).map(|val| regs.set(dst, val))
         }
         STORE_REL => {
-            let addr = address(regs.get(insn.dst_reg()), insn);
-            store_release(mem, size, addr, regs.get(insn.src_reg()))
+            let addr = address(regs.get(dst), insn);
+            store_release(mem, size, addr, regs.get(src))
         }
         _ => return Flow::FailCpu,
     };
@@ -161,7 +165,7 @@ fn ordered<M: Memory, R: Regs>(regs: &mut R, mem: &mut M, insn: Instruction) -> 
 
 /// `LDX`.
 #[inline(always)]
-pub fn load<M: Memory, R: Regs>(regs: &mut R, mem: &M, insn: Instruction) -> Flow<M::Err> {
+pub fn load<M: Memory, R: Regs>(regs: &mut R, mem: &M, insn: impl Fields) -> Flow<M::Err> {
     let addr = address(regs.get(insn.src_reg()), insn);
 
     let opc = insn.opcode();
@@ -186,13 +190,13 @@ pub fn load<M: Memory, R: Regs>(regs: &mut R, mem: &M, insn: Instruction) -> Flo
 /// Continues with LD_IMM64 that loads its immediate. The pseudo loads (`src_reg` other than 0) are [`Flow::Missing`]
 /// at their first slot.
 #[inline(always)]
-pub fn ld64<E>(insn: Instruction) -> ControlFlow<Flow<E>, Instruction> {
+pub fn ld64<E>(insn: impl Fields) -> ControlFlow<Flow<E>> {
     let opc = insn.opcode();
     let size = opc.mem_size();
     let mode = opc.mem_mode();
 
     match (mode, size) {
-        (MemMode::Imm, MemSize::DWord) if insn.src_reg() == 0 => ControlFlow::Continue(insn),
+        (MemMode::Imm, MemSize::DWord) if insn.src_reg() == Reg::R0 => ControlFlow::Continue(()),
         _ => ControlFlow::Break(Flow::Missing),
     }
 }

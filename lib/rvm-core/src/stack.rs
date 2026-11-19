@@ -11,10 +11,11 @@
 
 use std::ptr;
 
+use crate::op::{Fields, Op, Reg, View};
 use crate::opcode::{Class, MemMode, MemSize, OpCode};
 use crate::ops::Regs;
 use crate::transfer::Slot;
-use crate::{handler, mem, CallStack, Context, Flow, Handler, Host, Instruction, Memory, Table};
+use crate::{handler, mem, CallStack, Context, Flow, Handler, Host, Memory, Table};
 
 /// Host memory that guest loads and stores near some address reach directly; see [`Memory::window`].
 #[derive(Clone, Copy, Debug)]
@@ -143,17 +144,17 @@ impl Cache {
     /// Run the load or store `OP` of `insn` at `addr` on the host memory, or return false if it doesn't fit in the
     /// window.
     #[inline(always)]
-    fn access<const OP: u8>(&self, regs: &mut [u64; 16], insn: Instruction, addr: u64) -> bool {
+    fn access<const OP: u8>(&self, regs: &mut [u64; 16], insn: View, addr: u64) -> bool {
         let opc = OpCode(OP);
         let value = match opc.class() {
-            Class::StReg => regs[usize::from(insn.src_reg())],
+            Class::StReg => regs.get(insn.src_reg()),
             _ => i64::from(insn.imm()) as u64,
         };
         let Some(loaded) = self.run(opc, const { kind(OpCode(OP)) }, addr, value) else {
             return false;
         };
         if let Class::LdReg = opc.class() {
-            regs[usize::from(insn.dst_reg())] = loaded;
+            regs.set(insn.dst_reg(), loaded);
         }
         true
     }
@@ -209,7 +210,7 @@ pub fn data_step<M: Memory, R: Regs>(
     windows: &mut Windows,
     regs: &mut R,
     memory: &mut M,
-    insn: Instruction,
+    insn: impl Fields,
 ) -> Flow<M::Err> {
     let opc = insn.opcode();
     let (base, value) = match opc.class() {
@@ -275,16 +276,18 @@ pub const fn install<M: Memory, H: Host<M>, const FUEL: bool>(table: &mut [Handl
 #[inline(never)]
 pub extern "rust-preserve-none" fn access<M: Memory, H: Host<M>, const FUEL: bool, const OP: u8>(
     ctx: &mut Context<M>,
-    insn: Instruction,
-    code: &[Instruction],
+    code: &[Op],
     slot: Slot,
     fuel: u64,
     calls: &mut CallStack<H, M::Err>,
     table: &Table<M, H>,
+    op: Op,
 ) {
+    // SAFETY: a handler's slot lies below `len`, and an r10 access has the layout of its load or store
+    let insn = unsafe { slot.view(op, OP) };
     let addr = mem::address(ctx.regs[10], insn);
     if !calls.windows.stack.access::<OP>(&mut ctx.regs, insn, addr) {
-        become miss::<M, H, FUEL, OP, false>(ctx, insn, code, slot, fuel, calls, table)
+        become miss::<M, H, FUEL, OP, false>(ctx, code, slot, fuel, calls, table, op)
     }
     become_next!(ctx, code, slot, fuel, calls, table)
 }
@@ -293,16 +296,18 @@ pub extern "rust-preserve-none" fn access<M: Memory, H: Host<M>, const FUEL: boo
 #[inline(never)]
 pub extern "rust-preserve-none" fn data_access<M: Memory, H: Host<M>, const FUEL: bool, const OP: u8>(
     ctx: &mut Context<M>,
-    insn: Instruction,
-    code: &[Instruction],
+    code: &[Op],
     slot: Slot,
     fuel: u64,
     calls: &mut CallStack<H, M::Err>,
     table: &Table<M, H>,
+    op: Op,
 ) {
-    let addr = mem::address(ctx.regs[base_reg::<OP>(insn)], insn);
+    // SAFETY: as in `handler`
+    let insn = unsafe { slot.view(op, OP) };
+    let addr = mem::address(ctx.regs.get(base_reg::<OP>(insn)), insn);
     if !calls.windows.data.access::<OP>(&mut ctx.regs, insn, addr) {
-        become data_miss::<M, H, FUEL, OP>(ctx, insn, code, slot, fuel, calls, table)
+        become data_miss::<M, H, FUEL, OP>(ctx, code, slot, fuel, calls, table, op)
     }
     become_next!(ctx, code, slot, fuel, calls, table)
 }
@@ -313,16 +318,18 @@ pub extern "rust-preserve-none" fn data_access<M: Memory, H: Host<M>, const FUEL
 #[inline(never)]
 extern "rust-preserve-none" fn data_miss<M: Memory, H: Host<M>, const FUEL: bool, const OP: u8>(
     ctx: &mut Context<M>,
-    insn: Instruction,
-    code: &[Instruction],
+    code: &[Op],
     slot: Slot,
     fuel: u64,
     calls: &mut CallStack<H, M::Err>,
     table: &Table<M, H>,
+    op: Op,
 ) {
-    let addr = mem::address(ctx.regs[base_reg::<OP>(insn)], insn);
+    // SAFETY: as in `data_access`, which continues here
+    let insn = unsafe { slot.view(op, OP) };
+    let addr = mem::address(ctx.regs.get(base_reg::<OP>(insn)), insn);
     if !calls.windows.stack.access::<OP>(&mut ctx.regs, insn, addr) {
-        become miss::<M, H, FUEL, OP, true>(ctx, insn, code, slot, fuel, calls, table)
+        become miss::<M, H, FUEL, OP, true>(ctx, code, slot, fuel, calls, table, op)
     }
     become_next!(ctx, code, slot, fuel, calls, table)
 }
@@ -333,27 +340,29 @@ extern "rust-preserve-none" fn data_miss<M: Memory, H: Host<M>, const FUEL: bool
 #[inline(never)]
 extern "rust-preserve-none" fn miss<M: Memory, H: Host<M>, const FUEL: bool, const OP: u8, const DATA: bool>(
     ctx: &mut Context<M>,
-    insn: Instruction,
-    code: &[Instruction],
+    code: &[Op],
     slot: Slot,
     fuel: u64,
     calls: &mut CallStack<H, M::Err>,
     table: &Table<M, H>,
+    op: Op,
 ) {
+    // SAFETY: as in `access` and `data_access`, which continue here
+    let insn = unsafe { slot.view(op, OP) };
     let around = match DATA {
-        true => mem::address(ctx.regs[base_reg::<OP>(insn)], insn),
+        true => mem::address(ctx.regs.get(base_reg::<OP>(insn)), insn),
         // the frame is the bytes below r10
         false => ctx.regs[10].wrapping_sub(1),
     };
     calls.windows.take::<M, DATA>(&ctx.data, around);
-    become handler::<M, H, FUEL, OP>(ctx, insn, code, slot, fuel, calls, table)
+    become handler::<M, H, FUEL, OP>(ctx, code, slot, fuel, calls, table, op)
 }
 
 /// The register that holds the base address of the load or store `OP`.
 #[inline(always)]
-fn base_reg<const OP: u8>(insn: Instruction) -> usize {
-    usize::from(match OpCode(OP).class() {
+fn base_reg<const OP: u8>(insn: View) -> Reg {
+    match OpCode(OP).class() {
         Class::LdReg => insn.src_reg(),
         _ => insn.dst_reg(),
-    })
+    }
 }

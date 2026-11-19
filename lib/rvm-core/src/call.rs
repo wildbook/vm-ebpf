@@ -1,7 +1,8 @@
 use std::mem::MaybeUninit;
 
+use crate::op::Op;
 use crate::transfer::{self, Slot};
-use crate::{stack, Context, Flow, Instruction, Memory};
+use crate::{stack, Context, Flow, Memory};
 
 /// Host functions the `call` and `callx` handlers run without leaving [`run`](crate::run).
 ///
@@ -142,7 +143,7 @@ impl<E> Stop<E> {
 
     /// The pc it stopped at, in the slots `code` of the code it ran.
     #[inline(always)]
-    pub fn pc(&self, code: &[Instruction]) -> u64 {
+    pub fn pc(&self, code: &[Op]) -> u64 {
         match self.slot {
             0 => self.pc,
             slot => transfer::pc_at(slot, code),

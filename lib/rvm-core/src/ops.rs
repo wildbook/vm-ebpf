@@ -1,26 +1,31 @@
 use std::cmp::Ordering;
 
+use crate::op::{Fields, Reg};
 use crate::opcode::{AluEnd, AluOpc, JmpOpc, Source};
-use crate::{Flow, Instruction, BPF_PSEUDO_CALL, BPF_PSEUDO_KFUNC_CALL};
+use crate::{Flow, BPF_PSEUDO_CALL, BPF_PSEUDO_KFUNC_CALL};
 
 pub const BITS_32: bool = false;
 pub const BITS_64: bool = true;
 
 /// The registers an instruction reads and writes, by the number in its `dst_reg` or `src_reg` field.
 pub trait Regs {
-    fn get(&self, reg: u8) -> u64;
-    fn set(&mut self, reg: u8, value: u64);
+    fn get(&self, reg: Reg) -> u64;
+    fn set(&mut self, reg: Reg, value: u64);
 }
 
+// A pointer access, which unlike indexing or `get_unchecked` tells LLVM nothing about the range of `reg`: knowing it,
+// LLVM extracts a register byte from the op in RCX with a shift and a mask where a single `movzx` from CH does.
 impl Regs for [u64; 16] {
     #[inline(always)]
-    fn get(&self, reg: u8) -> u64 {
-        self[usize::from(reg)]
+    fn get(&self, reg: Reg) -> u64 {
+        // SAFETY: a `Reg` is below 16 (see `op::Reg`)
+        unsafe { *self.as_ptr().add(usize::from(reg.get())) }
     }
 
     #[inline(always)]
-    fn set(&mut self, reg: u8, value: u64) {
-        self[usize::from(reg)] = value;
+    fn set(&mut self, reg: Reg, value: u64) {
+        // SAFETY: a `Reg` is below 16 (see `op::Reg`)
+        unsafe { *self.as_mut_ptr().add(usize::from(reg.get())) = value }
     }
 }
 
@@ -40,7 +45,7 @@ macro_rules! signed_div_rem {
 }
 
 #[inline(always)]
-pub fn math<E, R: Regs, const BITS: bool>(regs: &mut R, insn: Instruction) -> Flow<E> {
+pub fn math<E, R: Regs, const BITS: bool>(regs: &mut R, insn: impl Fields) -> Flow<E> {
     let opc = insn.opcode();
     let alu_opc = opc.alu_opc();
     let alu_src = opc.alu_src();
@@ -121,13 +126,13 @@ pub fn math<E, R: Regs, const BITS: bool>(regs: &mut R, insn: Instruction) -> Fl
 }
 
 #[inline(always)]
-pub fn jump<E, R: Regs, const BITS: bool>(regs: &R, insn: Instruction) -> Flow<E> {
+pub fn jump<E, R: Regs, const BITS: bool>(regs: &R, insn: impl Fields) -> Flow<E> {
     let opc = insn.opcode();
     let jmp_opc = opc.jmp_opc();
     let jmp_src = opc.alu_src();
 
-    let src_reg = insn.src_reg();
-    let dst_reg = insn.dst_reg();
+    let src_reg = insn.src_reg().get();
+    let dst_reg = insn.dst_reg().get();
     let imm = insn.imm();
     let (d, s) = operands::<R, BITS>(regs, insn);
 
@@ -158,9 +163,9 @@ pub fn jump<E, R: Regs, const BITS: bool>(regs: &R, insn: Instruction) -> Flow<E
         JmpOpc::Jsle => signed_cmp::<BITS>(d, s).is_le(),
 
         JmpOpc::Call if jmp_src == Source::Reg => return Flow::CallIndirect(d),
-        JmpOpc::Call if insn.src_reg() == 0 => return Flow::CallHelper(imm as u32),
-        JmpOpc::Call if insn.src_reg() == BPF_PSEUDO_CALL => return Flow::Call(i64::from(imm)),
-        JmpOpc::Call if insn.src_reg() == BPF_PSEUDO_KFUNC_CALL => return Flow::CallKfunc(imm as u32),
+        JmpOpc::Call if src_reg == 0 => return Flow::CallHelper(imm as u32),
+        JmpOpc::Call if src_reg == BPF_PSEUDO_CALL => return Flow::Call(i64::from(imm)),
+        JmpOpc::Call if src_reg == BPF_PSEUDO_KFUNC_CALL => return Flow::CallKfunc(imm as u32),
         JmpOpc::Call => return Flow::Missing,
 
         JmpOpc::Exit => return Flow::Exit,
@@ -182,7 +187,7 @@ pub fn jump<E, R: Regs, const BITS: bool>(regs: &R, insn: Instruction) -> Flow<E
 /// The operands of the ALU or jump instruction `insn` on `BITS` bits: `dst_reg`, and `src_reg` or `imm` as its
 /// source bit selects, cut to `BITS` bits.
 #[inline(always)]
-fn operands<R: Regs, const BITS: bool>(regs: &R, insn: Instruction) -> (u64, u64) {
+fn operands<R: Regs, const BITS: bool>(regs: &R, insn: impl Fields) -> (u64, u64) {
     let d = truncate::<BITS>(regs.get(insn.dst_reg()));
     let s = match (insn.opcode().alu_src(), BITS) {
         (Source::Imm, BITS_64) => insn.imm() as i64 as u64,

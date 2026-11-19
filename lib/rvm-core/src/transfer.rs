@@ -6,17 +6,20 @@
 //! checked fetch would. [`run`](crate::run) checks the pc it starts at, the `exit` handler the pc it returns to, the
 //! `callx` handler the pc [`Host::callx`] names, and the runtime the targets of `gotox`.
 
-use crate::fuse::Super;
-use crate::opcode::{Class, JmpOpc, OpCode, Source};
+use crate::fuse::{self, Super};
+use crate::mem::{self, SOURCE_REG};
+use crate::op::{Layout, Op, View, LAYOUTS};
+use crate::opcode::{Class, JmpOpc, OpCode, Source, LD_IMM64};
 use crate::ops::{self, BITS_32, BITS_64};
 use crate::{CallStack, Context, Flow, Handler, Host, Instruction, Memory, Table, BPF_PSEUDO_CALL};
 
 /// The slot after the code, and every slot after it: there is no instruction here.
 pub const GUARD: u8 = 0xe0;
 
-/// A jump or local call whose target lies outside the code. Its `imm` is the index of a slot after the guard that
-/// holds the instruction with the opcode byte [`GUARD`], and its `dst_reg` and `src_reg` hold the low and high half of
-/// the opcode byte.
+/// An instruction that runs from a slot after the guard: a jump or local call whose target lies outside the code, or
+/// an instruction in [`Layout::DstSrc`] whose slot holds the upper half of an LD_IMM64, which that layout would
+/// overwrite. Its `imm` is the index of the slot after the guard that holds the instruction with the opcode byte
+/// [`GUARD`], and its `dst_reg` and `src_reg` hold the low and high half of the opcode byte.
 pub const FAR: u8 = 0xe8;
 
 /// Proves where handlers continue: afterwards, the slots from the original `code.len()` on all hold [`GUARD`], and
@@ -27,6 +30,9 @@ pub const FAR: u8 = 0xe8;
 ///   its first instruction alone instead;
 /// - LD_IMM64 continues after its second slot only if that slot isn't the guard; every other handler continues at
 ///   `pc + 1`.
+///
+/// It also moves each instruction in [`Layout::DstSrc`] that follows an LD_IMM64 behind the guard, so that the slot
+/// keeps the upper half of the immediate.
 ///
 /// No slot below `len` holds `GUARD`, and only this function gives one `FAR`: [`Code::new`](crate::Code::new) frees
 /// both bytes as it does every byte with a handler of its own.
@@ -41,13 +47,12 @@ pub fn bound(code: &mut Vec<Instruction>) {
             if !fits(sup, code, pc) {
                 code[pc] = sup.first_of(slot);
             }
-        } else if let Some(displacement) = displacement(slot) {
-            if !lands(len, pc, displacement) {
-                far.push(slot.with_opcode(GUARD));
-                let at = u32::try_from(len + far.len()).expect("fewer than 2^31 slots");
-                let byte = slot.byte();
-                code[pc] = Instruction::from_parts(OpCode(FAR), byte, byte >> 4, 0, at as i32);
-            }
+        } else if moves(code, pc) {
+            far.push(slot.with_opcode(GUARD));
+            let at = u32::try_from(len + far.len()).expect("fewer than 2^31 slots");
+            // a MOVSX byte runs as its `mov` from behind the guard
+            let byte = fuse::usual(slot.byte());
+            code[pc] = Instruction::from_parts(OpCode(FAR), byte, byte >> 4, 0, at as i32);
         }
     }
 
@@ -58,14 +63,34 @@ pub fn bound(code: &mut Vec<Instruction>) {
 
 /// Whether the superinstruction `sup` at `pc` continues only at pcs in `0..=code.len()`: its sequence lies in `code`,
 /// and so does the target of its branch if it has one. The superinstruction also reads the upper half of each LD_IMM64
-/// in its sequence, so `bound` must leave those slots as they are: none may hold a jump whose target lies outside.
+/// in its sequence, so `bound` must leave those slots as they are: none may hold a jump whose target lies outside or
+/// an instruction in [`Layout::DstSrc`].
 pub fn fits(sup: &Super, code: &[Instruction], pc: usize) -> bool {
     let len = code.len();
     let last = pc + sup.len() - 1;
-    let kept = |at: usize| displacement(code[at]).is_none_or(|displacement| lands(len, at, displacement));
+    let kept = |at: usize| !leaves(code, at) && keeps_imm(code[at].byte());
     last < len
         && (!sup.branches() || lands(len, last, code[last].offset().into()))
         && (1..sup.len()).all(|k| !sup.is_data(k) || kept(pc + k))
+}
+
+/// Whether `bound` moves the instruction in slot `pc` behind the guard.
+fn moves(code: &[Instruction], pc: usize) -> bool {
+    // `fuse` gives no slot after an LD_IMM64 the byte of a superinstruction or r10 access, which `bound` doesn't move
+    let upper = pc > 0 && code[pc - 1].byte() == LD_IMM64;
+    leaves(code, pc) || (upper && !keeps_imm(code[pc].byte()))
+}
+
+/// Whether the instruction in slot `pc` has a fixed target outside `0..=code.len()`.
+// inline, as `bound` asks it for every slot
+#[inline(always)]
+fn leaves(code: &[Instruction], pc: usize) -> bool {
+    displacement(code[pc]).is_some_and(|displacement| !lands(code.len(), pc, displacement))
+}
+
+/// Whether a slot with opcode byte `byte` keeps `imm`.
+fn keeps_imm(byte: u8) -> bool {
+    LAYOUTS[usize::from(byte)] != Layout::DstSrc
 }
 
 /// Whether the target `pc + 1 + displacement` lies in `0..=len`.
@@ -82,13 +107,13 @@ fn lands(len: usize, pc: usize, displacement: i64) -> bool {
 /// from `len` on all hold [`GUARD`], whose handler continues nowhere. So a handler reads its own slot, and the slot it
 /// continues at, without a check.
 #[derive(Clone, Copy)]
-pub struct Slot(*const Instruction);
+pub struct Slot(*const Op);
 
 impl Slot {
     /// The slot at `pc` in the slots `code`, which may lie outside them. The pointer comes from the whole slice, so it
     /// may reach every slot.
     #[inline(always)]
-    pub fn at(code: &[Instruction], pc: u64) -> Self {
+    pub fn at(code: &[Op], pc: u64) -> Self {
         Self(code.as_ptr().wrapping_add(pc as usize))
     }
 
@@ -100,7 +125,7 @@ impl Slot {
 
     /// The pc of the slot in the slots `code`, which it lies in.
     #[inline(always)]
-    pub fn pc(self, code: &[Instruction]) -> u64 {
+    pub fn pc(self, code: &[Op]) -> u64 {
         pc_at(self.addr(), code)
     }
 
@@ -109,15 +134,28 @@ impl Slot {
         self.0.addr()
     }
 
-    /// The instruction in the slot.
+    /// The op in the slot.
     ///
     /// # Safety
     ///
     /// The slot must lie in the slots of a [`Code`](crate::Code) that is still borrowed.
     #[inline(always)]
-    pub unsafe fn get(self) -> Instruction {
+    pub unsafe fn get(self) -> Op {
         // SAFETY: the caller's
         unsafe { *self.0 }
+    }
+
+    /// The fields of the op in the slot, as the handler of opcode byte `byte` reads them, which takes `held`, that op
+    /// in a register.
+    ///
+    /// # Safety
+    ///
+    /// As for [`Slot::get`] while the view is in use; `held` must be the op in the slot, and it must have the layout
+    /// of `byte` (see [`View::new`]).
+    #[inline(always)]
+    pub unsafe fn view<'a>(self, held: Op, byte: u8) -> View<'a> {
+        // SAFETY: the caller's
+        unsafe { View::new(&*self.0, Some(held), byte) }
     }
 
     /// The `n` slots from this one on, borrowed from `code`.
@@ -126,7 +164,7 @@ impl Slot {
     ///
     /// They must lie in `code`.
     #[inline(always)]
-    pub unsafe fn window(self, _code: &[Instruction], n: usize) -> &[Instruction] {
+    pub unsafe fn window(self, _code: &[Op], n: usize) -> &[Op] {
         // SAFETY: the caller's
         unsafe { std::slice::from_raw_parts(self.0, n) }
     }
@@ -134,12 +172,13 @@ impl Slot {
 
 /// The pc of the slot at address `addr` in the slots `code`, which it lies in.
 #[inline(always)]
-pub fn pc_at(addr: usize, code: &[Instruction]) -> u64 {
-    ((addr - code.as_ptr().addr()) / size_of::<Instruction>()) as u64
+pub fn pc_at(addr: usize, code: &[Op]) -> u64 {
+    ((addr - code.as_ptr().addr()) / size_of::<Op>()) as u64
 }
 
 /// The displacement of the fixed target the handler of `insn` may continue at, `pc + 1 + displacement`, as
-/// [`ops::jump`] computes it, or `None` if it continues only at `pc + 1` or a target it computes at run time.
+/// [`ops::jump`](crate::ops::jump) computes it, or `None` if it continues only at `pc + 1` or a target it computes at
+/// run time.
 fn displacement(insn: Instruction) -> Option<i64> {
     let target = TARGETS[usize::from(insn.byte())];
     if !target.fixed || (target.local_call && insn.src_reg() != BPF_PSEUDO_CALL) {
@@ -193,18 +232,26 @@ const TARGETS: [Target; 256] = {
     })
 };
 
-/// The second slot of the LD_IMM64 whose second slot holds `second`, or `None` if the code ends before it.
+/// The upper half of the immediate of the LD_IMM64 whose second slot holds `second`, or `None` if the code ends before
+/// it.
 #[inline(always)]
-pub fn second_half(code: &[Instruction], second: Instruction) -> Option<Instruction> {
+pub fn second_half(code: &[Op], second: Op) -> Option<i32> {
     match second.byte() {
         GUARD => None,
-        // a jump that `bound` moved: the instruction after the guard holds its `imm`
+        // an instruction that `bound` moved: the slot after the guard holds its `imm`
         FAR => {
             core::hint::cold_path();
-            Some(code[second.imm() as u32 as usize])
+            Some(code[second.imm() as u32 as usize].imm())
         }
-        _ => Some(second),
+        // `bound` moves every instruction whose layout doesn't keep `imm`
+        _ => Some(second.imm()),
     }
+}
+
+/// The opcode byte of the instruction that the [`FAR`] slot `far` runs.
+pub fn moved_byte(far: Op) -> u8 {
+    let far = far.instruction();
+    far.dst_reg() | far.src_reg() << 4
 }
 
 /// Give [`GUARD`] and [`FAR`] their handlers.
@@ -218,38 +265,34 @@ pub const fn install<M: Memory, H: Host<M>, const FUEL: bool>(table: &mut [Handl
 #[inline(never)]
 extern "rust-preserve-none" fn guard<M: Memory, H: Host<M>, const FUEL: bool>(
     _ctx: &mut Context<M>,
-    _insn: Instruction,
-    _code: &[Instruction],
+    _code: &[Op],
     slot: Slot,
     fuel: u64,
     calls: &mut CallStack<H, M::Err>,
     _table: &Table<M, H>,
+    _op: Op,
 ) {
     // the fetch charged the unit of an instruction that doesn't run
     calls.stop.at(slot, fuel + u64::from(FUEL), Flow::BadPc)
 }
 
-/// The handler of [`FAR`]: runs the jump or local call that `bound` moved behind the guard, and checks where it
-/// continues.
+/// The handler of [`FAR`]: runs the instruction that `bound` moved behind the guard, and checks where it continues.
 #[cold]
 #[inline(never)]
 extern "rust-preserve-none" fn far<M: Memory, H: Host<M>, const FUEL: bool>(
     ctx: &mut Context<M>,
-    insn: Instruction,
-    code: &[Instruction],
+    code: &[Op],
     slot: Slot,
     fuel: u64,
     calls: &mut CallStack<H, M::Err>,
     table: &Table<M, H>,
+    far: Op,
 ) {
-    let byte = insn.dst_reg() | insn.src_reg() << 4;
-    let jump = code[insn.imm() as u32 as usize].with_opcode(byte);
-    let flow = match jump.opcode().class() {
-        Class::Jmp32 => ops::jump::<_, _, BITS_32>(&ctx.regs, jump),
-        _ => ops::jump::<_, _, BITS_64>(&ctx.regs, jump),
-    };
+    let moved = code[far.imm() as u32 as usize]
+        .instruction()
+        .with_opcode(moved_byte(far));
     let mut pc = slot.pc(code);
-    match flow {
+    match run_moved(ctx, moved) {
         Flow::Next => {}
         Flow::Jump(offset) => pc = pc.wrapping_add_signed(offset),
         Flow::Call(offset) => {
@@ -258,11 +301,28 @@ extern "rust-preserve-none" fn far<M: Memory, H: Host<M>, const FUEL: bool>(
             }
             pc = pc.wrapping_add_signed(offset);
         }
-        // `bound` moves only jumps and local calls with a fixed target
+        // faults; `bound` moves no `exit` and no calls but local ones
         flow => return calls.stop.at(slot, fuel, flow),
     }
 
     become_at_pc!(ctx, code, pc.wrapping_add(1), fuel, calls, table)
+}
+
+/// Runs the instruction `insn` that `bound` moved behind the guard: a jump or local call, or an instruction in
+/// [`Layout::DstSrc`], which is an ALU operation, a conditional jump, a load or a store from a register.
+// out of line, so that the fuel and no-fuel handlers share it
+#[inline(never)]
+fn run_moved<M: Memory>(ctx: &mut Context<M>, insn: Instruction) -> Flow<M::Err> {
+    let (regs, memory) = (&mut ctx.regs, &mut ctx.data);
+    match insn.opcode().class() {
+        Class::Alu32 => ops::math::<_, _, BITS_32>(regs, insn),
+        Class::Alu64 => ops::math::<_, _, BITS_64>(regs, insn),
+        Class::Jmp32 => ops::jump::<_, _, BITS_32>(regs, insn),
+        Class::Jmp64 => ops::jump::<_, _, BITS_64>(regs, insn),
+        Class::LdReg => mem::load(regs, memory, insn),
+        Class::StReg => mem::store::<_, _, SOURCE_REG>(regs, memory, insn),
+        Class::LdImm | Class::StImm => unreachable!("`bound` moves no LD_IMM64 or ST"),
+    }
 }
 
 /// Every kind of fixed target at the edges `bound` decides, with ample fuel and with the fuel running out on the way.

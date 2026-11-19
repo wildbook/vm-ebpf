@@ -5,7 +5,8 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::ControlFlow;
 
-use opcode::{Class, OpCode, LD_IMM64};
+use op::{Fields, Op};
+use opcode::{Class, OpCode, CALL, LD_IMM64};
 use transfer::Slot;
 
 /// `for $pat in $iter { $body }` in a const context, where `for` isn't allowed. `$iter` is a
@@ -71,7 +72,7 @@ macro_rules! become_next {
         // SAFETY: the slot after one below `len` lies in `0..=len`, as do the targets `transfer::bound` proves (see
         // `Slot`)
         match unsafe { $crate::fetch::<M, H, FUEL>($table, slot, $fuel) } {
-            Some((next, insn, fuel)) => become next($ctx, insn, $code, slot, fuel, $calls, $table),
+            Some((next, op, fuel)) => become next($ctx, $code, slot, fuel, $calls, $table, op),
             None => return $calls.stop.at(slot, 0, $crate::Flow::OutOfFuel),
         }
     }};
@@ -84,7 +85,7 @@ macro_rules! become_at_pc {
     ($ctx:expr, $code:expr, $pc:expr, $fuel:expr, $calls:expr, $table:expr) => {{
         let pc = $pc;
         match $crate::fetch_checked::<M, H, FUEL>($table, $code, pc, $fuel) {
-            Ok((next, insn, slot, fuel)) => become next($ctx, insn, $code, slot, fuel, $calls, $table),
+            Ok((next, op, slot, fuel)) => become next($ctx, $code, slot, fuel, $calls, $table, op),
             Err(flow) => return $calls.stop.at_pc(pc, $fuel, flow),
         }
     }};
@@ -96,6 +97,7 @@ mod fuse;
 mod instruction;
 mod mem;
 mod memory;
+mod op;
 mod ops;
 mod stack;
 mod transfer;
@@ -169,11 +171,7 @@ impl<M: Memory> Context<M> {
 }
 
 #[inline(always)]
-fn step<M: Memory, R: ops::Regs>(
-    regs: &mut R,
-    mem: &mut M,
-    insn: Instruction,
-) -> ControlFlow<Flow<M::Err>, Instruction> {
+fn step<M: Memory, R: ops::Regs, I: Fields>(regs: &mut R, mem: &mut M, insn: I) -> ControlFlow<Flow<M::Err>> {
     use mem::{SOURCE_IMM, SOURCE_REG};
     use ops::{BITS_32, BITS_64};
 
@@ -192,22 +190,25 @@ fn step<M: Memory, R: ops::Regs>(
     }
 }
 
-/// Runs the instruction `insn` in `slot` of `code` and continues with the next one, until it stops in `calls.stop`. A
-/// metering handler receives `fuel` already charged for `insn`; the others pass it on as is. `table` is the [`Table`]
-/// the handler belongs to, which dispatch indexes from a register.
+/// Runs the instruction `op` in `slot` of `code` and continues with the next one, until it stops in `calls.stop`. A
+/// metering handler receives `fuel` already charged for the instruction; the others pass it on as is. `table` is the
+/// [`Table`] the handler belongs to, which dispatch indexes from a register.
+///
+/// The handler of opcode byte `OP` runs only slots in the layout of `OP` ([`op::LAYOUTS`]), and reads their fields
+/// with [`Slot::view`]: from `op` where one instruction extracts them, else from the slot.
 ///
 /// `preserve_none` passes all arguments in registers (the Windows x64 C convention has four) and saves no registers, so
-/// a tail call between handlers is a jump. It passes them in R12, R13, R14, R15, RDI, RSI, ... in order; `insn` comes
-/// before `code` because an address with base R13 needs a displacement, which makes LLVM split the `lea` of a slot
-/// address in two.
+/// a tail call between handlers is a jump. It passes them in R12, R13, R14, R15, RDI, RSI, RDX, RCX ... in order; `op`
+/// comes eighth, so that it lands in RCX: a single `movzx` reads its second byte from CH, and a shift by its `imm`
+/// takes the count from CL.
 type Handler<M, H> = extern "rust-preserve-none" fn(
     &mut Context<M>,
-    Instruction,
-    &[Instruction],
+    &[Op],
     Slot,
     u64,
     &mut CallStack<H, <M as Memory>::Err>,
     &Table<M, H>,
+    Op,
 );
 
 /// The handler of every opcode byte.
@@ -257,17 +258,19 @@ impl<M: Memory, H: Host<M>, const FUEL: bool> Handlers<M, H, FUEL> {
 #[inline(never)]
 extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, const OP: u8>(
     ctx: &mut Context<M>,
-    insn: Instruction,
-    code: &[Instruction],
+    code: &[Op],
     mut slot: Slot,
     mut fuel: u64,
     calls: &mut CallStack<H, M::Err>,
     table: &Table<M, H>,
+    op: Op,
 ) {
+    // SAFETY: a handler's slot lies below `len`, and has the layout of its opcode (see `Handler`)
+    let insn = unsafe { slot.view(op, OP) };
     // Only jump-class opcodes jump, call or exit. Without the guards, a handler whose `step` returns from an outlined
     // call (atomics) would test for those flows too.
     let jumps = matches!(OpCode(OP).class(), Class::Jmp32 | Class::Jmp64);
-    match step(&mut ctx.regs, &mut ctx.data, insn.with_opcode(OP)) {
+    match step(&mut ctx.regs, &mut ctx.data, insn) {
         ControlFlow::Break(Flow::Next) => {}
         ControlFlow::Break(Flow::Jump(offset)) if jumps => slot = slot.offset(offset),
         ControlFlow::Break(Flow::Call(offset)) if jumps => {
@@ -282,15 +285,15 @@ extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, 
             None => return calls.stop.at(slot, fuel, Flow::Exit),
         },
         ControlFlow::Break(Flow::CallHelper(_)) if jumps => {
-            become host_call::<M, H, FUEL, false>(ctx, insn, code, slot, fuel, calls, table)
+            become host_call::<M, H, FUEL, false>(ctx, code, slot, fuel, calls, table, op)
         }
         ControlFlow::Break(Flow::CallKfunc(_)) if jumps => {
-            become host_call::<M, H, FUEL, true>(ctx, insn, code, slot, fuel, calls, table)
+            become host_call::<M, H, FUEL, true>(ctx, code, slot, fuel, calls, table, op)
         }
         ControlFlow::Break(Flow::CallIndirect(_)) if jumps => {
-            become indirect_call::<M, H, FUEL>(ctx, insn, code, slot, fuel, calls, table)
+            become indirect_call::<M, H, FUEL>(ctx, code, slot, fuel, calls, table, op)
         }
-        ControlFlow::Continue(first) => {
+        ControlFlow::Continue(()) => {
             // without a unit for the second slot, LD_IMM64 doesn't run and gets its unit back
             if FUEL && fuel == 0 {
                 return calls.stop.at(slot, 1, Flow::OutOfFuel);
@@ -298,13 +301,13 @@ extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, 
             slot = slot.offset(1);
             // SAFETY: this handler runs a slot below `len` (see `Slot`), so the next one lies in `0..=len`
             let second = unsafe { slot.get() };
-            let Some(second) = transfer::second_half(code, second) else {
+            let Some(upper) = transfer::second_half(code, second) else {
                 return calls.stop.at(slot, fuel, Flow::BadPc);
             };
             if FUEL {
                 fuel -= 1;
             }
-            step_ld64(&mut ctx.regs, first, second);
+            step_ld64(&mut ctx.regs, insn, upper);
         }
         ControlFlow::Break(flow) => return calls.stop.at(slot, fuel, flow),
     }
@@ -320,14 +323,15 @@ extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, 
 #[inline(never)]
 extern "rust-preserve-none" fn host_call<M: Memory, H: Host<M>, const FUEL: bool, const KFUNC: bool>(
     ctx: &mut Context<M>,
-    insn: Instruction,
-    code: &[Instruction],
+    code: &[Op],
     slot: Slot,
     fuel: u64,
     calls: &mut CallStack<H, M::Err>,
     table: &Table<M, H>,
+    op: Op,
 ) {
-    let id = insn.imm() as u32;
+    // SAFETY: as in the handler of `call`, which continues here
+    let id = unsafe { slot.view(op, CALL) }.imm() as u32;
     let (r0, flow) = match KFUNC {
         true => (calls.host.kfunc(ctx, id), Flow::CallKfunc(id)),
         false => (calls.host.helper(ctx, id), Flow::CallHelper(id)),
@@ -346,14 +350,16 @@ extern "rust-preserve-none" fn host_call<M: Memory, H: Host<M>, const FUEL: bool
 #[inline(never)]
 extern "rust-preserve-none" fn indirect_call<M: Memory, H: Host<M>, const FUEL: bool>(
     ctx: &mut Context<M>,
-    insn: Instruction,
-    code: &[Instruction],
+    code: &[Op],
     slot: Slot,
     fuel: u64,
     calls: &mut CallStack<H, M::Err>,
     table: &Table<M, H>,
+    op: Op,
 ) {
-    let target = ctx.regs[usize::from(insn.dst_reg())];
+    const CALLX: u8 = OpCode::jmp64_from_parts(opcode::JmpOpc::Call, opcode::Source::Reg).0;
+    // SAFETY: as in the handler of `callx`, which continues here
+    let target = ops::Regs::get(&ctx.regs, unsafe { slot.view(op, CALLX) }.dst_reg());
     let callee = calls.host.callx(ctx, target);
     calls.windows.revalidate(&ctx.data);
     match callee {
@@ -376,7 +382,7 @@ extern "rust-preserve-none" fn indirect_call<M: Memory, H: Host<M>, const FUEL: 
     }
 }
 
-/// The instruction in `slot`, its handler and the fuel left once it is charged, or `None` if no fuel is left.
+/// The handler of the instruction in `slot`, its op and the fuel left once it is charged, or `None` if no fuel is left.
 ///
 /// # Safety
 ///
@@ -386,11 +392,11 @@ unsafe fn fetch<M: Memory, H: Host<M>, const FUEL: bool>(
     table: &Table<M, H>,
     slot: Slot,
     fuel: u64,
-) -> Option<(Handler<M, H>, Instruction, u64)> {
+) -> Option<(Handler<M, H>, Op, u64)> {
     let left = charge::<FUEL>(fuel)?;
     // SAFETY: the caller's
-    let insn = unsafe { slot.get() };
-    Some((table.of(insn), insn, left))
+    let op = unsafe { slot.get() };
+    Some((table.of(op), op, left))
 }
 
 /// The fuel left once an instruction is charged, or `None` if none is left. It takes at most `i64::MAX` units, the
@@ -406,7 +412,7 @@ fn charge<const FUEL: bool>(fuel: u64) -> Option<u64> {
 #[inline(always)]
 fn fetch_checked<M: Memory, H: Host<M>, const FUEL: bool>(
     table: &Table<M, H>,
-    code: &[Instruction],
+    code: &[Op],
     pc: u64,
     fuel: u64,
 ) -> Result<Checked<M, H>, Flow<M::Err>> {
@@ -416,29 +422,28 @@ fn fetch_checked<M: Memory, H: Host<M>, const FUEL: bool>(
     if pc >= code.len() as u64 {
         return Err(Flow::BadPc);
     }
-    let insn = code[pc as usize];
-    Ok((table.of(insn), insn, Slot::at(code, pc), left))
+    let op = code[pc as usize];
+    Ok((table.of(op), op, Slot::at(code, pc), left))
 }
 
-/// The handler, instruction and slot at the pc [`fetch_checked`] checked, and the fuel left once it is charged.
-type Checked<M, H> = (Handler<M, H>, Instruction, Slot, u64);
+/// The handler, op and slot at the pc [`fetch_checked`] checked, and the fuel left once it is charged.
+type Checked<M, H> = (Handler<M, H>, Op, Slot, u64);
 
 impl<M: Memory, H> Table<M, H> {
-    /// The handler of `insn`.
+    /// The handler of `op`.
     #[inline(always)]
-    fn of(&self, insn: Instruction) -> Handler<M, H> {
-        self.0[usize::from(insn.byte())]
+    fn of(&self, op: Op) -> Handler<M, H> {
+        self.0[usize::from(op.byte())]
     }
 }
 
-/// Runs the LD_IMM64 `insn`, whose second slot holds `second`.
+/// Runs the LD_IMM64 `insn`, whose second slot holds the upper half `upper` of its immediate.
 #[inline(always)]
-fn step_ld64(regs: &mut impl ops::Regs, insn: Instruction, second: Instruction) {
-    debug_assert!(insn.byte() == LD_IMM64 && insn.src_reg() == 0);
+fn step_ld64(regs: &mut impl ops::Regs, insn: impl Fields, upper: i32) {
+    debug_assert!(insn.opcode().0 == LD_IMM64 && insn.src_reg() == op::Reg::R0);
 
-    // the first slot carries the low 32 bits, the second the high 32 bits
     let imm_lo = insn.imm() as u32 as u64;
-    let imm_hi = second.imm() as u32 as u64;
+    let imm_hi = upper as u32 as u64;
     regs.set(insn.dst_reg(), imm_lo | (imm_hi << 32));
 }
 
@@ -470,11 +475,11 @@ pub fn run<M: Memory, H: Host<M>>(
     let slots = code.slots();
     let table = &Handlers::<M, H, METERED>::TABLE;
     calls.windows.revalidate(&ctx.data);
-    let (first, insn, slot, left) = match fetch_checked::<M, H, METERED>(table, slots, *pc, *fuel) {
+    let (first, op, slot, left) = match fetch_checked::<M, H, METERED>(table, slots, *pc, *fuel) {
         Ok(next) => next,
         Err(flow) => return flow,
     };
-    first(ctx, insn, slots, slot, left, calls, table);
+    first(ctx, slots, slot, left, calls, table, op);
     let stop = &mut calls.stop;
     (*pc, *fuel) = (stop.pc(code.slots()), stop.fuel);
     // Test the tag alone first: the handler stored the flow one field at a time, and a single load of the whole flow

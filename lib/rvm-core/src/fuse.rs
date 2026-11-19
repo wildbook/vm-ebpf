@@ -15,6 +15,7 @@ mod supers;
 pub use supers::Super;
 use supers::{Encode, SUPERS};
 
+use crate::op::Op;
 use crate::opcode::atomic::{CMPXCHG, FETCH, LOAD_ACQ};
 use crate::opcode::{AluEnd, AluOpc, Class, JmpOpc, MemMode, MemSize, OpCode, Source, LD_IMM64};
 use crate::transfer::{self, FAR, GUARD};
@@ -23,8 +24,8 @@ use crate::{stack, Handler, Host, Instruction, Memory};
 /// Bytecode prepared for [`run`](crate::run).
 #[derive(Debug)]
 pub struct Code {
-    /// The code, then the slots [`transfer::bound`] appends.
-    slots: Box<[Instruction]>,
+    /// The code, then the slots [`transfer::bound`] appends, in the [slot format](crate::op).
+    slots: Box<[Op]>,
     len: usize,
 }
 
@@ -41,10 +42,12 @@ impl Code {
     ///
     /// Panics if `insns` has 2^31 slots or more.
     pub fn new(insns: impl Into<Vec<Instruction>>) -> Self {
-        let mut slots = insns.into();
-        let len = slots.len();
-        fuse(&mut slots);
-        transfer::bound(&mut slots);
+        let mut insns = insns.into();
+        let len = insns.len();
+        fuse(&mut insns);
+        transfer::bound(&mut insns);
+        // in place, as `Op` and `Instruction` have the same size and alignment
+        let slots: Vec<Op> = insns.into_iter().map(Op::new).collect();
         Self {
             slots: slots.into_boxed_slice(),
             len,
@@ -64,12 +67,10 @@ impl Code {
     /// [`Flow::FailMem`](crate::Flow::FailMem) at `pc`.
     #[cold]
     pub fn access_size(&self, pc: u64) -> Option<usize> {
-        let byte = self.slots.get(usize::try_from(pc).ok()?)?.byte();
-        // the first slot of a superinstruction or r10 access holds a free byte in place of its opcode
-        let byte = match (STACK.iter().find(|s| s.0 == byte), Super::with_byte(byte)) {
-            (Some(&(_, usual)), _) => usual,
-            (None, Some(sup)) => sup.op(0),
-            (None, None) => byte,
+        let op = *self.slots.get(usize::try_from(pc).ok()?)?;
+        let byte = match op.byte() {
+            FAR => transfer::moved_byte(op),
+            byte => usual(byte),
         };
         let opc = OpCode(byte);
         if !matches!(opc.class(), Class::LdReg | Class::StReg | Class::StImm) {
@@ -79,21 +80,55 @@ impl Code {
     }
 
     /// The code and the slots after it, which all hold [`GUARD`].
-    pub(crate) fn slots(&self) -> &[Instruction] {
+    pub(crate) fn slots(&self) -> &[Op] {
         &self.slots
     }
 }
 
-/// Give the bytes that run as another theirs and r10 writes their failing byte, and the sequences with a
+/// The opcode that the instruction in a slot with opcode byte `byte` runs as: for the first slot of a superinstruction
+/// or r10 access, which holds a free byte in its place, the first instruction of the sequence or the load or store, and
+/// for a `mov` from a register with an offset, the `mov`.
+pub const fn usual(byte: u8) -> u8 {
+    const_for!((stack, op) in STACK => {
+        if stack == byte {
+            return op;
+        }
+    });
+    match (byte, Super::with_byte(byte)) {
+        (MOVSX32, _) => MOV32_REG,
+        (MOVSX64, _) => MOV64_REG,
+        (_, Some(sup)) => sup.op(0),
+        (_, None) => byte,
+    }
+}
+
+/// [`usual`] of each opcode byte.
+pub const USUAL: [u8; 256] = byte_table!(|byte| usual(byte));
+
+/// Whether [`Code::new`] leaves the opcode byte `byte` only where `offset` is 0: that of `mov` and `mov32`, which with
+/// an offset run as MOVSX or fail.
+#[inline(always)]
+pub const fn offset_is_zero(byte: u8) -> bool {
+    REWRITES[byte as usize].nonzero == OFFSET_BITS
+}
+
+/// Give the bytes that run as another theirs, r10 writes and `mov` of an immediate with an offset their failing byte,
+/// `mov` from a register with an offset its MOVSX byte and pseudo LD_IMM64 its missing one, and the sequences with a
 /// superinstruction and r10 accesses theirs.
 fn fuse(code: &mut [Instruction]) {
     // Only the opcode byte changes, so the second slot of LD_IMM64 keeps its `imm`.
     for insn in code.iter_mut() {
-        let writes = WRITES[usize::from(insn.byte())];
+        let rewrite = REWRITES[usize::from(insn.byte())];
         // `&` and `|` don't branch, so only the rare rewrite and atomics do
-        let r10 = (writes.dst & (insn.dst_reg() == 10)) | (writes.atomic && atomic_writes_r10(*insn));
-        if writes.canonical.is_some() | r10 {
-            *insn = insn.with_opcode(writes.canonical.unwrap_or(INVALID));
+        let r10 = (rewrite.dst & (insn.dst_reg() == 10)) | (rewrite.atomic && atomic_writes_r10(*insn));
+        let nonzero = insn.0 & rewrite.nonzero != 0;
+        if rewrite.canonical.is_some() | r10 | nonzero {
+            let byte = match (rewrite.canonical, r10) {
+                (Some(byte), _) => byte,
+                (None, true) => INVALID,
+                (None, false) => rewrite.nonzero_byte,
+            };
+            *insn = insn.with_opcode(byte);
         }
     }
 
@@ -120,41 +155,68 @@ fn fuse(code: &mut [Instruction]) {
     }
 }
 
-/// What an instruction with a given opcode byte may write that the first pass of [`fuse`] rewrites.
+/// Why the first pass of [`fuse`] may rewrite an instruction with a given opcode byte.
 #[derive(Clone, Copy)]
-struct Writes {
+struct Rewrite {
     /// The [`canonical`] byte.
     canonical: Option<u8>,
-    /// `dst_reg`.
+    /// The instruction writes `dst_reg`.
     dst: bool,
-    /// The byte is an atomic's: [`atomic_writes_r10`] decides.
+    /// The byte is an atomic's: [`atomic_writes_r10`] decides whether it writes r10.
     atomic: bool,
+    /// The bits of the fields that give the instruction `nonzero_byte` where they aren't 0: `src_reg` of LD_IMM64, a
+    /// pseudo load, which runs as [`MISSING`] does, and `offset` of `mov`, which runs as MOVSX or fails.
+    nonzero: u64,
+    nonzero_byte: u8,
 }
 
-const WRITES: [Writes; 256] = {
-    const NONE: Writes = Writes {
+/// The bits of `src_reg` and `offset` in an [`Instruction`].
+const SRC_BITS: u64 = 0xF000;
+const OFFSET_BITS: u64 = 0xFFFF_0000;
+
+const REWRITES: [Rewrite; 256] = {
+    const NONE: Rewrite = Rewrite {
         canonical: None,
         dst: false,
         atomic: false,
+        nonzero: 0,
+        nonzero_byte: 0,
     };
+    const ALU: Rewrite = Rewrite { dst: true, ..NONE };
+    const fn with_offset(byte: u8) -> Rewrite {
+        Rewrite {
+            nonzero: OFFSET_BITS,
+            nonzero_byte: byte,
+            ..ALU
+        }
+    }
 
     byte_table!(|byte| {
         let opc = OpCode(byte);
         match opc.class() {
-            _ if canonical(byte).is_some() => Writes {
+            _ if canonical(byte).is_some() => Rewrite {
                 canonical: canonical(byte),
                 ..NONE
             },
-            Class::Alu32 | Class::Alu64 | Class::LdReg => Writes { dst: true, ..NONE },
-            Class::LdImm => Writes {
-                dst: byte == LD_IMM64,
+            Class::Alu32 | Class::Alu64 => match byte {
+                MOV32_REG => with_offset(MOVSX32),
+                MOV64_REG => with_offset(MOVSX64),
+                // `ops::math` runs MOV of an immediate only with offset 0
+                _ if matches!(opc.alu_opc(), AluOpc::Mov) => with_offset(INVALID),
+                _ => ALU,
+            },
+            Class::LdReg => ALU,
+            Class::LdImm if byte == LD_IMM64 => Rewrite {
+                dst: true,
+                nonzero: SRC_BITS,
+                nonzero_byte: MISSING,
                 ..NONE
             },
-            Class::StReg => Writes {
+            Class::StReg => Rewrite {
                 atomic: matches!(opc.mem_mode(), MemMode::Atomic),
                 ..NONE
             },
-            Class::StImm | Class::Jmp32 | Class::Jmp64 => NONE,
+            Class::LdImm | Class::StImm | Class::Jmp32 | Class::Jmp64 => NONE,
         }
     })
 };
@@ -185,6 +247,13 @@ const MISSING: u8 = Class::LdImm as u8;
 /// An undefined ALU64 operation: the byte of every instruction that always fails with
 /// [`Flow::FailCpu`](crate::Flow::FailCpu), and of every instruction that would write r10.
 const INVALID: u8 = OpCode::alu64_from_parts(AluOpc::UndefE, Source::Imm).0;
+
+const MOV32_REG: u8 = OpCode::alu32_from_parts(AluOpc::Mov, Source::Reg).0;
+const MOV64_REG: u8 = OpCode::alu64_from_parts(AluOpc::Mov, Source::Reg).0;
+
+/// The bytes of `mov32` and `mov` from a register with an offset: MOVSX, or a reserved offset, which fails.
+const MOVSX32: u8 = 0xf0;
+const MOVSX64: u8 = 0xf8;
 
 /// The byte [`Code::new`] gives an instruction with opcode byte `byte` in its place, if it gives it another: one that
 /// runs the same whatever the other fields hold. No slot holds `byte` afterwards, which frees it for a handler of its
@@ -260,7 +329,7 @@ const fn st(size: MemSize) -> u8 {
     OpCode::stimm_from_parts(size, MemMode::Mem).0
 }
 
-// Every superinstruction, r10 access and `transfer` byte is a free one and has one use.
+// Every superinstruction, r10 access, MOVSX and `transfer` byte is a free one and has one use.
 const _: () = {
     const fn claim(used: &mut [bool; 256], byte: u8) {
         assert!(canonical(byte).is_some(), "a byte that slots hold");
@@ -273,6 +342,8 @@ const _: () = {
     const_for!((byte, _) in STACK => claim(&mut used, byte));
     claim(&mut used, GUARD);
     claim(&mut used, FAR);
+    claim(&mut used, MOVSX32);
+    claim(&mut used, MOVSX64);
 };
 
 /// For each opcode byte, the byte of the r10 access with that opcode, if there is one.
