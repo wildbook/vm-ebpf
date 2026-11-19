@@ -191,7 +191,8 @@ struct Table<M: Memory, H>([Handler<M, H>; 256]);
 
 /// The [`Table`] of the handlers with and without `FUEL`. Each handler runs [`step`] with its opcode as a constant, so
 /// the class, operation, source, mode and size matches fold away; the bytes of superinstructions and r10 accesses get
-/// theirs from [`fuse::install`]. With `FUEL`, the handlers meter fuel; without it, they never read it.
+/// theirs from [`fuse::install`], and the 4 and 8 byte loads and stores theirs from [`stack::install`]. With `FUEL`, the
+/// handlers meter fuel; without it, they never read it.
 struct Handlers<M, H, const FUEL: bool>(PhantomData<(M, H)>);
 
 impl<M: Memory, H: Host<M>, const FUEL: bool> Handlers<M, H, FUEL> {
@@ -222,6 +223,7 @@ impl<M: Memory, H: Host<M>, const FUEL: bool> Handlers<M, H, FUEL> {
         );
         fuse::install::<M, H, FUEL>(&mut table);
         transfer::install::<M, H, FUEL>(&mut table);
+        stack::install::<M, H, FUEL>(&mut table);
         Table(table)
     };
 }
@@ -309,7 +311,7 @@ extern "rust-preserve-none" fn host_call<M: Memory, H: Host<M>, const FUEL: bool
     let Some(r0) = r0 else {
         return calls.stop.at(slot, fuel, flow);
     };
-    calls.stack.revalidate(&ctx.data);
+    calls.windows.revalidate(&ctx.data);
     ctx.regs[0] = r0;
 
     become_next!(ctx, code, slot, fuel, calls, table)
@@ -329,7 +331,7 @@ extern "rust-preserve-none" fn indirect_call<M: Memory, H: Host<M>, const FUEL: 
 ) {
     let target = ctx.regs[usize::from(insn.dst_reg())];
     let callee = calls.host.callx(ctx, target);
-    calls.stack.revalidate(&ctx.data);
+    calls.windows.revalidate(&ctx.data);
     match callee {
         Some(Callee::Local(pc)) => {
             // the slots from `len` on all hold the guard, and no slot below it does
@@ -442,7 +444,7 @@ pub fn run<M: Memory, H: Host<M>>(
 
     let slots = code.slots();
     let table = &Handlers::<M, H, METERED>::TABLE;
-    calls.stack.revalidate(&ctx.data);
+    calls.windows.revalidate(&ctx.data);
     let (first, insn, slot, left) = match fetch_checked::<M, H, METERED>(table, slots, *pc, *fuel) {
         Ok(next) => next,
         Err(flow) => return flow,

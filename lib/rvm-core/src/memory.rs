@@ -9,8 +9,8 @@ use crate::Window;
 /// whenever the memory is at the window's epoch. So an implementation must give each change of the host memory behind
 /// its windows an epoch that no memory used before, and 0, the default, only to empty windows.
 ///
-/// [`run`] reads the epoch only when it starts and after a [`Host`] call, so no method of this trait may change what
-/// [`Memory::epoch`] returns. Change the epoch only outside [`run`] or inside a host call.
+/// [`run`] checks the windows it holds against the epoch only when it starts and after a [`Host`] call, so no method of
+/// this trait may change what [`Memory::epoch`] returns. Change the epoch only outside [`run`] or inside a host call.
 ///
 /// [`run`]: crate::run
 /// [`Host`]: crate::Host
@@ -120,8 +120,10 @@ pub unsafe trait Memory {
     }
 
     /// The host memory that loads and stores near `addr` may access directly. [`run`](crate::run) takes the window
-    /// around r10 and runs 4 and 8 byte loads and stores through r10 that fall inside it without calling the methods
-    /// above, until [`Memory::epoch`] changes. The default is [`Window::NONE`].
+    /// around r10, and the window around the address of a 4 or 8 byte load or store through another register that falls
+    /// outside its windows. It runs the 4 and 8 byte loads and stores that fall inside these windows without calling
+    /// the methods above, until [`Memory::epoch`] changes, and uses a window only while the memory is at the window's
+    /// epoch. The default is [`Window::NONE`].
     fn window(&self, addr: u64) -> Window {
         let _ = addr;
         Window::NONE

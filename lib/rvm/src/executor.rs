@@ -26,9 +26,9 @@ pub const MAX_ARGS: usize = 5;
 ///
 /// Each call borrows the code and the memory, so the memory survives errors. Code is a separate instruction slice, so
 /// the guest can neither read nor modify it through memory. The executor keeps what carries over from one call to the
-/// next: the extern table, the maps, the frame size and the r10 window.
+/// next: the extern table, the maps, the frame size and the memory windows.
 pub struct Executor {
-    /// The frames of the local calls in progress, and the frame size, r10 window and host.
+    /// The frames of the local calls in progress, and the frame size, memory windows and host.
     calls: CallStack<HostCalls, u64>,
     /// Initial r10.
     stack_top: u64,
@@ -73,7 +73,7 @@ impl Executor {
         // A call starts with fresh registers and no frames. Guest code can read and write all 16 registers, r11-r15
         // included, so each starts at a defined value: r1-r5 hold the arguments and 0 past `args.len()`, r10 the stack
         // top, the others 0. A call that failed inside a local call leaves its frames behind. The rest of `self.calls`
-        // carries over: `run` writes `stop` before reading it and drops the r10 window when the memory has moved to
+        // carries over: `run` writes `stop` before reading it and drops the memory windows when the memory has moved to
         // another epoch, and the executor takes the host's error whenever a host call set one.
         let mut ctx = Context::new(memory);
         // at most `MAX_ARGS` stores; `copy_from_slice` calls memcpy

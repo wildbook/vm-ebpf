@@ -864,6 +864,40 @@ mod tests {
         assert_eq!(buf, [0, 0, 0, 0, 0xDD, 0xCC, 0xBB, 0xAA]);
     }
 
+    // 4 and 8 byte accesses through other registers than r10 run through windows of the memory; this is the lib test
+    // that takes Miri through them. A window kept past the host call that remaps its region would read freed memory.
+    #[test]
+    fn data_windows_follow_remaps() {
+        use ebpf_asm::{Assembler, R0, R10, R2, R3, R6, R7};
+
+        use crate::executor::Executor;
+        use crate::helper::{HelperContext, HelperRegistry};
+        use crate::layout::{FIRST_FREE_REGION, STACK_REGION};
+        use crate::vm::VmConfig;
+
+        let mut helpers = HelperRegistry::default();
+        helpers.register_helper_raw(1, |ctx: &mut HelperContext| {
+            ctx.memory.map_bytes_any(FIRST_FREE_REGION, &[9], 8, Perms::RW);
+        });
+        let mut mem = VmMemory::new();
+        let base = mem.map_bytes_any(FIRST_FREE_REGION, &[7], 8, Perms::RW);
+        let config = VmConfig::default();
+        let stack_top = mem.map_any(STACK_REGION, config.frame_size as usize, Perms::RW) + config.frame_size;
+
+        // r6 points into the region, r2 into the stack: region[0] + stack[-4] + remapped region[0] = 7 + 5 + 9
+        let mut asm = Assembler::new();
+        asm.stdw(R10, -16, 0);
+        asm.lddw(R6, base as i64);
+        asm.mov64(R2, R10).add64_imm(R2, -8);
+        asm.ldxw(R7, R6, 0);
+        asm.stw(R2, 4, 5).ldxw(R3, R2, 4).add64(R7, R3);
+        asm.stxw(R6, 4, R7);
+        asm.call(1).ldxw(R0, R6, 0).add64(R0, R7).exit();
+        let code = rvm_core::instructions_from_bytes(&asm.assemble().unwrap());
+        let result = Executor::new(helpers, stack_top, &config).call(&code, &mut mem, 0, &[]);
+        assert_eq!(result.unwrap(), 21);
+    }
+
     // host functions reach guest memory only as far as the guest itself could
     #[test]
     fn guest_memory_needs_guest_perms() {
