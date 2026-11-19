@@ -87,9 +87,7 @@ impl<'a> ElfSections<'a> {
     }
 
     pub const fn symtab(self) -> ElfResult<ElfSymTab<'a>> {
-        let headers = self.headers();
-        const_for!(i in 0..headers.len() => {
-            let header = &headers[i];
+        const_for!(header in &self.headers() => {
             if header.sh_type == raw::sht::SYMTAB {
                 let bytes = tryres!(self.bytes(header));
                 let Some(raw) = util::cast_slice(bytes) else {
@@ -127,9 +125,7 @@ impl<'a> ElfSections<'a> {
 
     /// Get the symbol string table (.strtab section).
     pub const fn sym_strtab(self) -> ElfResult<&'a [u8]> {
-        let headers = self.headers();
-        const_for!(i in 0..headers.len() => {
-            let header = &headers[i];
+        const_for!(header in &self.headers() => {
             if header.sh_type == raw::sht::STRTAB {
                 if let Ok(name) = self.name(header) {
                     if util::slice_eq(name.to_bytes(), b".strtab") {

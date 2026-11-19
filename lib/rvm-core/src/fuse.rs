@@ -267,11 +267,11 @@ const _: () = {
     }
 
     let mut used = [false; 256];
-    const_for!(i in 0..SUPERS.len() => {
-        claim(&mut used, SUPERS[i].0);
+    const_for!((byte, ..) in SUPERS => {
+        claim(&mut used, byte);
     });
-    const_for!(i in 0..STACK.len() => {
-        claim(&mut used, STACK[i].0);
+    const_for!((byte, _) in STACK => {
+        claim(&mut used, byte);
     });
     claim(&mut used, GUARD);
     claim(&mut used, FAR);
@@ -280,8 +280,8 @@ const _: () = {
 /// For each opcode byte, the byte of the r10 access with that opcode, if there is one.
 const STACK_BYTES: [Option<u8>; 256] = {
     let mut table = [None; 256];
-    const_for!(i in 0..STACK.len() => {
-        table[STACK[i].1 as usize] = Some(STACK[i].0);
+    const_for!((byte, usual) in STACK => {
+        table[usual as usize] = Some(byte);
     });
     table
 };
@@ -318,8 +318,8 @@ const FIRSTS: usize = {
 const ROWS: [u8; 256] = {
     let mut rows = [0; 256];
     let mut row = 0;
-    const_for!(i in 0..BY_PAIR.len() => {
-        let first = BY_PAIR[i].1.op(0) as usize;
+    const_for!((_, sup, _) in BY_PAIR => {
+        let first = sup.op(0) as usize;
         if rows[first] == 0 {
             row += 1;
             rows[first] = row;
