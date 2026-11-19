@@ -5,7 +5,7 @@ use std::ops::ControlFlow;
 use super::supers::{Super, MAX_LEN, MAX_ROLES};
 use crate::ops::Regs;
 use crate::transfer::Slot;
-use crate::{charge, stack, step, CallStack, Context, Flow, Handlers, Host, Instruction, Memory, Table};
+use crate::{charge, stack, step, step_ld64, CallStack, Context, Flow, Handlers, Host, Instruction, Memory, Table};
 
 /// The handler of superinstruction `S`. It runs the sequence as the handlers of its instructions would, one after
 /// another, but keeps each role in a variable of its own: it loads the roles the sequence reads before it writes them,
@@ -24,7 +24,7 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool
     let sup = const { Super::of(S) };
     let len = const { Super::of(S).len() };
 
-    // the fuel runs out inside the sequence
+    // the fuel runs out inside the sequence, which takes one unit per slot
     if FUEL && fuel < len as u64 - 1 {
         let alone = const { Handlers::<M, H, FUEL>::TABLE.0[Super::of(S).op(0) as usize] };
         become alone(ctx, sup.first_of(insn), code, slot, fuel, calls, table)
@@ -61,7 +61,7 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool
     // one block per instruction, so that each `step` sees a constant opcode and constant register indexes
     macro_rules! exec {
         ($($k:literal),*) => {$(
-            if $k < len {
+            if $k < len && !const { Super::of(S).is_data($k) } {
                 if $k == sup.save_at as usize {
                     roles.save(registers, sup.writes);
                 }
@@ -84,13 +84,12 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool
                         roles.save(registers, sup.unsaved[$k]);
                         return calls.stop.at(at, fuel - $k * u64::from(FUEL), flow);
                     }
-                    // `Step::parse` makes no LD_IMM64
-                    ControlFlow::Continue(_) => unreachable!(),
+                    ControlFlow::Continue(first) => step_ld64(&mut roles, first, slot_of($k + 1)),
                 }
             }
         )*};
     }
-    // one position per instruction a sequence may have
+    // one block per slot a sequence may fill
     const _: () = assert!(MAX_LEN == 5);
     exec!(0, 1, 2, 3, 4);
     if sup.save_at as usize == len {

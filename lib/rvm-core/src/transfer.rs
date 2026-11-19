@@ -23,8 +23,8 @@ pub const FAR: u8 = 0xe8;
 /// the handler of each slot below it continues without a check only at a pc in `0..=len`:
 /// - a jump or local call at `pc` continues at `pc + 1` or at its target; one whose target lies outside gets [`FAR`],
 ///   which checks it;
-/// - a superinstruction continues after its sequence or at the target of its branch; one whose sequence runs past the
-///   code or whose branch target lies outside runs its first instruction alone instead;
+/// - a superinstruction continues after its sequence or at the target of its branch; one that [`fits`] rejects runs
+///   its first instruction alone instead;
 /// - LD_IMM64 continues after its second slot only if that slot isn't the guard; every other handler continues at
 ///   `pc + 1`.
 ///
@@ -57,10 +57,15 @@ pub fn bound(code: &mut Vec<Instruction>) {
 }
 
 /// Whether the superinstruction `sup` at `pc` continues only at pcs in `0..=code.len()`: its sequence lies in `code`,
-/// and so does the target of its branch if it has one.
+/// and so does the target of its branch if it has one. The superinstruction also reads the upper half of each LD_IMM64
+/// in its sequence, so `bound` must leave those slots as they are: none may hold a jump whose target lies outside.
 pub fn fits(sup: &Super, code: &[Instruction], pc: usize) -> bool {
+    let len = code.len();
     let last = pc + sup.len() - 1;
-    last < code.len() && (!sup.branches() || lands(code.len(), last, code[last].offset().into()))
+    let kept = |at: usize| displacement(code[at]).is_none_or(|displacement| lands(len, at, displacement));
+    last < len
+        && (!sup.branches() || lands(len, last, code[last].offset().into()))
+        && (1..sup.len()).all(|k| !sup.is_data(k) || kept(pc + k))
 }
 
 /// Whether the target `pc + 1 + displacement` lies in `0..=len`.
@@ -378,10 +383,26 @@ mod tests {
             expect(&[EXIT, lddw], 1, 1, ("OutOfFuel", 1, 1, 0));
         }
 
-        // a second slot that `bound` moves behind the guard still holds the upper half
+        // a second slot that `bound` moves behind the guard still holds the upper half, also where an LD_IMM64
+        // superinstruction would read it
         let hi = 1 << 20;
         let far = Instruction::from_parts(JA32, 0, 0, 0, hi);
-        expect(&[lddw, far, EXIT], 0, 10, ("Exit", 2, 7, (hi as u64) << 32 | 7));
+        let value = (hi as u64) << 32 | 7;
+        expect(&[lddw, far, EXIT], 0, 10, ("Exit", 2, 7, value));
         expect(&[lddw, far, EXIT], 1, 10, ("BadPc", 2 + hi as u64, 9, 0));
+        let add = Instruction::from_parts(OpCode::alu64_from_parts(AluOpc::Add, Source::Reg), 0, 2, 0, 0);
+        expect(&[lddw, far, add, EXIT], 0, 10, ("Exit", 3, 6, value + 5));
+
+        // `lddw r0; add64 r0, r2` fused, with the fuel running out in each slot and after it
+        let upper = Instruction::from_parts(OpCode(0), 0, 0, 0, hi);
+        let code = [lddw, upper, add, EXIT];
+        assert_ne!(Code::new(code).slots()[0].byte(), LD_IMM64);
+        expect(&code, 0, 10, ("Exit", 3, 6, value + 5));
+        if cfg!(feature = "fuel") {
+            expect(&code, 0, 0, ("OutOfFuel", 0, 0, 0));
+            expect(&code, 0, 1, ("OutOfFuel", 0, 1, 0));
+            expect(&code, 0, 2, ("OutOfFuel", 2, 0, value));
+            expect(&code, 0, 3, ("OutOfFuel", 3, 0, value + 5));
+        }
     }
 }

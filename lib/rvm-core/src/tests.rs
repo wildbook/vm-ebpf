@@ -54,7 +54,7 @@ fn exec(ctx: &mut Context<TestMem>, instruction: Instruction) -> Flow<()> {
 fn exec_ld64(ctx: &mut Context<TestMem>, first: Instruction, second: Instruction) -> Flow<()> {
     match step(&mut ctx.regs, &mut ctx.data, first) {
         ControlFlow::Continue(_) => {
-            step_ld64(ctx, first, second);
+            step_ld64(&mut ctx.regs, first, second);
             Flow::Next
         }
         ControlFlow::Break(flow) => flow,

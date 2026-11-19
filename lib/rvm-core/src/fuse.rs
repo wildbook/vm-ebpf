@@ -1,10 +1,10 @@
 //! Superinstructions: common instruction sequences that [`run`](crate::run) executes with one dispatch.
 //!
 //! [`Code::new`] gives the first slot of each sequence it recognises the opcode byte of a superinstruction, one of the
-//! bytes that no slot holds once it ran (see [`canonical`]). The other slots keep their instructions, so a jump into the
-//! middle of a sequence runs them one by one. A superinstruction behaves exactly like its sequence:
-//! - it charges one unit of fuel per instruction, and runs only the first instruction when the fuel would run out
-//!   inside the sequence;
+//! bytes that no slot holds once it ran (see [`canonical`]). The other slots keep what they hold, so a jump into the
+//! middle of a sequence runs its instructions one by one. A superinstruction behaves exactly like its sequence:
+//! - it charges one unit of fuel per slot, as its instructions do, and runs only the first instruction when the fuel
+//!   would run out inside the sequence;
 //! - an instruction that faults stops execution at its own pc, with the effects of the instructions before it.
 //!
 //! The same bytes mark the loads and stores through r10 that [`stack::access`] runs.
@@ -99,11 +99,13 @@ fn fuse(code: &mut [Instruction]) {
 
     // A superinstruction or r10 access changes only the opcode byte of its first slot. So the code from slot `i` on is
     // still as loaded but for opcode bytes, and a handler, which reads the other fields of its sequence's slots, later
-    // reads the fields `encode` checked. A sequence whose branch leaves the code gives way to the next candidate, as
-    // `transfer::bound` would run it unfused.
+    // reads the fields `encode` checked, and the upper halves of LD_IMM64 that `transfer::fits` keeps as they are. A
+    // sequence whose branch leaves the code gives way to the next candidate, as `transfer::bound` would run it unfused.
+    //
+    // `upper` says whether slot `i` holds the upper half of an LD_IMM64, from the byte of the slot before it as loaded
+    let mut upper = false;
     for i in 0..code.len() {
-        // the slot after LD_IMM64 holds the upper half of its immediate
-        if i > 0 && code[i - 1].byte() == LD_IMM64 {
+        if std::mem::replace(&mut upper, code[i].byte() == LD_IMM64) {
             continue;
         }
         let window = &code[i..];
@@ -267,12 +269,8 @@ const _: () = {
     }
 
     let mut used = [false; 256];
-    const_for!((byte, ..) in SUPERS => {
-        claim(&mut used, byte);
-    });
-    const_for!((byte, _) in STACK => {
-        claim(&mut used, byte);
-    });
+    const_for!((byte, ..) in SUPERS => claim(&mut used, byte));
+    const_for!((byte, _) in STACK => claim(&mut used, byte));
     claim(&mut used, GUARD);
     claim(&mut used, FAR);
 };
@@ -280,16 +278,14 @@ const _: () = {
 /// For each opcode byte, the byte of the r10 access with that opcode, if there is one.
 const STACK_BYTES: [Option<u8>; 256] = {
     let mut table = [None; 256];
-    const_for!((byte, usual) in STACK => {
-        table[usual as usize] = Some(byte);
-    });
+    const_for!((byte, usual) in STACK => table[usual as usize] = Some(byte));
     table
 };
 
 /// [`SUPERS`] grouped by their first two opcodes, each group in [`SUPERS`] order, so that the first match is the same.
 const BY_PAIR: [(u8, Super, Encode); SUPERS.len()] = {
     const fn pair(sup: Super) -> u16 {
-        (sup.op(0) as u16) << 8 | sup.op(1) as u16
+        (sup.op(0) as u16) << 8 | sup.second() as u16
     }
 
     // a stable insertion sort
@@ -308,9 +304,7 @@ const BY_PAIR: [(u8, Super, Encode); SUPERS.len()] = {
 /// The number of opcodes that start a superinstruction.
 const FIRSTS: usize = {
     let mut n = 1;
-    const_for!(i in 1..BY_PAIR.len() => {
-        n += (BY_PAIR[i].1.op(0) != BY_PAIR[i - 1].1.op(0)) as usize;
-    });
+    const_for!(i in 1..BY_PAIR.len() => n += (BY_PAIR[i].1.op(0) != BY_PAIR[i - 1].1.op(0)) as usize);
     n
 };
 
@@ -334,7 +328,7 @@ const GROUPS: [[(u8, u8); 256]; 1 + FIRSTS] = {
     let mut groups = [[(0, 0); 256]; 1 + FIRSTS];
     const_for!(i in 0..BY_PAIR.len() => {
         let sup = BY_PAIR[i].1;
-        let group = &mut groups[ROWS[sup.op(0) as usize] as usize][sup.op(1) as usize];
+        let group = &mut groups[ROWS[sup.op(0) as usize] as usize][sup.second() as usize];
         if group.1 == 0 {
             group.0 = i as u8;
         }
@@ -345,7 +339,7 @@ const GROUPS: [[(u8, u8); 256]; 1 + FIRSTS] = {
 
 /// The superinstructions that start with the first two opcodes of `window`, in the order [`Code::new`] tries them.
 fn candidates(window: &[Instruction]) -> &'static [(u8, Super, Encode)] {
-    let [first, second, ..] = window else {
+    let Some(first) = window.first() else {
         return &[];
     };
     let row = ROWS[usize::from(first.byte())];
@@ -353,6 +347,10 @@ fn candidates(window: &[Instruction]) -> &'static [(u8, Super, Encode)] {
     if row == 0 {
         return &[];
     }
+    // the second instruction follows the upper half of an LD_IMM64
+    let Some(second) = window.get(1 + usize::from(first.byte() == LD_IMM64)) else {
+        return &[];
+    };
     let (start, len) = GROUPS[row as usize][usize::from(second.byte())];
     &BY_PAIR[start as usize..][..len as usize]
 }
