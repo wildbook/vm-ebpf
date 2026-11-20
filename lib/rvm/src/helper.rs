@@ -47,10 +47,22 @@ pub struct HelperContext<'a> {
 pub struct HostState {
     #[cfg(feature = "maps")]
     pub maps: Maps,
-    /// The instructions the caller has left. `None` until a host function asks for them by stopping with
-    /// [`Stop::FuelWanted`]: the executor then stops the caller, and calls the function again with the fuel here, and
-    /// the caller continues with what the function leaves.
-    pub fuel: Option<u64>,
+    /// The instructions the calling program has left, for host functions that run guest code on its behalf.
+    pub fuel: CallerFuel,
+}
+
+/// What a guest call has left of its instruction limit, as the host functions it calls see it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CallerFuel {
+    /// The caller runs without a limit.
+    #[default]
+    Unmetered,
+    /// The caller runs with a limit and knows what it has left only once it stops. A host function that needs that
+    /// stops with [`Stop::FuelWanted`]: the executor then stops the caller and calls the function again with
+    /// [`CallerFuel::Left`].
+    Unknown,
+    /// The instructions the caller has left. It continues with what the function leaves here.
+    Left(u64),
 }
 
 /// Typed helper arguments, read from r1 onwards.
@@ -150,8 +162,8 @@ fn failed(error: impl Into<Box<dyn Error + Send + Sync>>) -> HostError {
 /// Why a host function call stops the guest call that made it.
 pub enum Stop {
     Failed(HostError),
-    /// The function asks for the caller's remaining instructions; the executor calls it again with them in
-    /// [`HostState::fuel`].
+    /// The function asks for the caller's remaining instructions while [`HostState::fuel`] is
+    /// [`CallerFuel::Unknown`]; the executor calls it again with them there.
     FuelWanted,
     /// A call to a helper ID that isn't registered.
     UnknownHelper(u32),
@@ -169,7 +181,7 @@ impl From<HostError> for Stop {
 /// How [`HostFn::call`] reaches a host function: with its closure, the caller's context, its [`HostState`] and the
 /// place for the reason of a stop. It returns the new r0, or `None` once it stored the reason. Four arguments, so that
 /// every one of them arrives in a register, and an `Option<u64>`, which returns in two.
-type Trampoline = unsafe fn(*const (), &mut Context<&mut VmMemory>, &mut HostState, &mut Option<Stop>) -> Option<u64>;
+type Trampoline = unsafe fn(*const (), &mut Context<VmMemory>, &mut HostState, &mut Option<Stop>) -> Option<u64>;
 
 /// A host function, called directly through `call` with `data` as its closure.
 #[derive(Clone)]
@@ -210,7 +222,7 @@ impl HostFn {
         /// `data` must point to a live `F`.
         unsafe fn trampoline<F>(
             data: *const (),
-            ctx: &mut Context<&mut VmMemory>,
+            ctx: &mut Context<VmMemory>,
             host: &mut HostState,
             stop: &mut Option<Stop>,
         ) -> Option<u64>
@@ -219,7 +231,7 @@ impl HostFn {
         {
             let mut helper_ctx = HelperContext {
                 args: HelperArgs::from_regs(&ctx.regs),
-                memory: &mut *ctx.data,
+                memory: &mut *ctx.memory,
                 host,
             };
             finish(unsafe { (*data.cast::<F>())(&mut helper_ctx) }, stop)
@@ -240,7 +252,7 @@ impl HostFn {
         /// `data` must point to a live `F`.
         unsafe fn trampoline<F, A, R>(
             data: *const (),
-            ctx: &mut Context<&mut VmMemory>,
+            ctx: &mut Context<VmMemory>,
             _host: &mut HostState,
             stop: &mut Option<Stop>,
         ) -> Option<u64>
@@ -268,7 +280,7 @@ impl HostFn {
         /// `data` must point to a live `F`.
         unsafe fn trampoline<F, A, R>(
             data: *const (),
-            ctx: &mut Context<&mut VmMemory>,
+            ctx: &mut Context<VmMemory>,
             _host: &mut HostState,
             stop: &mut Option<Stop>,
         ) -> Option<u64>
@@ -278,7 +290,7 @@ impl HostFn {
             R: IntoReturn,
         {
             let args = A::from_args(&HelperArgs::from_regs(&ctx.regs));
-            let result = unsafe { (*data.cast::<F>())(&mut GuestMemory::new(ctx.data), args) };
+            let result = unsafe { (*data.cast::<F>())(&mut GuestMemory::new(ctx.memory), args) };
             finish(result.into_return(), stop)
         }
 
@@ -364,7 +376,7 @@ impl HelperRegistry {
     pub fn call_slot(
         &self,
         slot: u32,
-        ctx: &mut Context<&mut VmMemory>,
+        ctx: &mut Context<VmMemory>,
         host: &mut HostState,
         stop: &mut Option<Stop>,
     ) -> Option<u64> {

@@ -17,7 +17,7 @@ use std::sync::{Arc, Weak};
 
 use crate::error::{HostError, Result, VmError};
 use crate::executor::MAX_ARGS;
-use crate::helper::{HelperContext, Stop};
+use crate::helper::{CallerFuel, HelperContext, Stop};
 use crate::layout::{BORROW_FIRST_REGION, BORROW_REGIONS};
 use crate::memory::{region_base, Perms, VmMemory};
 use crate::program::{Borrow, Func, FuncSlot, FunctionInfo, LimitedCall, Program};
@@ -116,13 +116,13 @@ fn call_export(
     slot: &ExportSlot,
     ctx: &mut HelperContext,
 ) -> std::result::Result<u64, Stop> {
-    // The caller's remaining instructions bound the callee and pay for what it runs. Asking for them stops the caller,
-    // which only a call into another plugin pays for. Without metering there is nothing to ask for.
-    let mut unmetered = 0;
-    let fuel = match ctx.host.fuel.as_mut() {
-        _ if !rvm_core::METERED => &mut unmetered,
-        Some(fuel) => fuel,
-        None => return Err(Stop::FuelWanted),
+    // A caller with a limit pays for what the callee runs, and its remaining instructions bound the callee. Asking for
+    // them stops the caller, which only a call into another plugin pays for. A caller without a limit leaves the
+    // callee its own.
+    let fuel = match &mut ctx.host.fuel {
+        CallerFuel::Unmetered => None,
+        CallerFuel::Left(fuel) => Some(fuel),
+        CallerFuel::Unknown => return Err(Stop::FuelWanted),
     };
 
     let failed = |error: VmError| {
@@ -149,14 +149,14 @@ fn call_export(
 }
 
 /// Call `entry` in `callee` with the `caller`'s buffers that `borrows` names mapped into the callee's borrow regions,
-/// charging the call to `fuel`.
+/// charging the call to `fuel` if the caller is metered.
 fn call_with_borrows(
     callee: &mut Program,
     entry: Func,
     mut args: [u64; MAX_ARGS],
     borrows: Borrows,
     caller: &VmMemory,
-    fuel: &mut u64,
+    fuel: Option<&mut u64>,
 ) -> Result<u64> {
     let callee = UnmapBorrows {
         program: callee,

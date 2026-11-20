@@ -1,9 +1,55 @@
-//! The fields of the opcode byte, as RFC 9669 lays them out.
+//! The opcode byte and its fields, as RFC 9669 lays them out, and the values of the other fields that select what an
+//! opcode does: the kind of a `call` ([`call`]) and the operation of an atomic ([`atomic`]).
+
+use std::fmt::{self, Debug, Formatter};
 
 /// An opcode byte. Its low 3 bits are the [`Class`], which decides how the other bits read: an operation and its
 /// [`Source`] for the ALU and jump classes, a [`MemSize`] and [`MemMode`] for the load and store classes.
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct OpCode(pub u8);
+
+impl OpCode {
+    pub const fn alu32(opc: AluOpc, src: Source) -> Self {
+        OpCode(Class::Alu32 as u8 | opc as u8 | src as u8)
+    }
+
+    pub const fn alu64(opc: AluOpc, src: Source) -> Self {
+        OpCode(Class::Alu64 as u8 | opc as u8 | src as u8)
+    }
+
+    /// The byte swap of the ALU32 class.
+    pub const fn end32(end: AluEnd) -> Self {
+        OpCode(Class::Alu32 as u8 | AluOpc::End as u8 | end as u8)
+    }
+
+    /// The byte swap of the ALU64 class.
+    pub const fn end64(end: AluEnd) -> Self {
+        OpCode(Class::Alu64 as u8 | AluOpc::End as u8 | end as u8)
+    }
+
+    pub const fn jmp32(opc: JmpOpc, src: Source) -> Self {
+        OpCode(Class::Jmp32 as u8 | opc as u8 | src as u8)
+    }
+
+    pub const fn jmp64(opc: JmpOpc, src: Source) -> Self {
+        OpCode(Class::Jmp64 as u8 | opc as u8 | src as u8)
+    }
+
+    /// A load into a register.
+    pub const fn ldx(size: MemSize, mode: MemMode) -> Self {
+        OpCode(Class::Ldx as u8 | size as u8 | mode as u8)
+    }
+
+    /// A store of an immediate.
+    pub const fn st(size: MemSize, mode: MemMode) -> Self {
+        OpCode(Class::St as u8 | size as u8 | mode as u8)
+    }
+
+    /// A store from a register.
+    pub const fn stx(size: MemSize, mode: MemMode) -> Self {
+        OpCode(Class::Stx as u8 | size as u8 | mode as u8)
+    }
+}
 
 #[rustfmt::skip]
 #[allow(clippy::unusual_byte_groupings)]
@@ -11,58 +57,66 @@ impl OpCode {
     #[inline(always)] pub const fn class(self) -> Class { Class::from_u8(self.0 & 0b00000_111) }
 
     #[inline(always)] pub const fn alu_opc(self) -> AluOpc { AluOpc::from_u8(self.0 & 0b1111_0_000) }
-    #[inline(always)] pub const fn alu_src(self) -> Source { Source::from_u8(self.0 & 0b0000_1_000) }
     #[inline(always)] pub const fn alu_end(self) -> AluEnd { AluEnd::from_u8(self.0 & 0b0000_1_000) }
 
     #[inline(always)] pub const fn jmp_opc(self) -> JmpOpc { JmpOpc::from_u8(self.0 & 0b1111_0_000) }
+
+    /// The source operand of an ALU or jump instruction.
+    #[inline(always)] pub const fn source(self) -> Source { Source::from_u8(self.0 & 0b0000_1_000) }
 
     #[inline(always)] pub const fn mem_size(self) -> MemSize { MemSize::from_u8(self.0 & 0b000_11_000) }
     #[inline(always)] pub const fn mem_mode(self) -> MemMode { MemMode::from_u8(self.0 & 0b111_00_000) }
 }
 
 impl OpCode {
-    pub const fn stimm_from_parts(size: MemSize, mode: MemMode) -> Self {
-        OpCode(Class::StImm as u8 | size as u8 | mode as u8)
+    /// Whether the opcode is of a jump class, which holds the jumps, the calls and `exit`.
+    #[inline(always)]
+    pub const fn is_jump(self) -> bool {
+        matches!(self.class(), Class::Jmp32 | Class::Jmp64)
     }
 
-    pub const fn streg_from_parts(size: MemSize, mode: MemMode) -> Self {
-        OpCode(Class::StReg as u8 | size as u8 | mode as u8)
-    }
-
-    pub const fn ldreg_from_parts(size: MemSize, mode: MemMode) -> Self {
-        OpCode(Class::LdReg as u8 | size as u8 | mode as u8)
-    }
-
-    pub const fn alu32_from_parts(opc: AluOpc, src: Source) -> Self {
-        OpCode(Class::Alu32 as u8 | opc as u8 | src as u8)
-    }
-
-    pub const fn alu64_from_parts(opc: AluOpc, src: Source) -> Self {
-        OpCode(Class::Alu64 as u8 | opc as u8 | src as u8)
-    }
-
-    pub const fn end32_from_parts(end: AluEnd) -> Self {
-        OpCode(Class::Alu32 as u8 | AluOpc::End as u8 | end as u8)
-    }
-
-    pub const fn end64_from_parts(end: AluEnd) -> Self {
-        OpCode(Class::Alu64 as u8 | AluOpc::End as u8 | end as u8)
-    }
-
-    pub const fn jmp32_from_parts(opc: JmpOpc, src: Source) -> Self {
-        OpCode(Class::Jmp32 as u8 | opc as u8 | src as u8)
-    }
-
-    pub const fn jmp64_from_parts(opc: JmpOpc, src: Source) -> Self {
-        OpCode(Class::Jmp64 as u8 | opc as u8 | src as u8)
+    /// Whether the opcode is of a class that loads from or stores to memory: LDX, ST or STX.
+    #[inline(always)]
+    pub const fn is_access(self) -> bool {
+        matches!(self.class(), Class::Ldx | Class::St | Class::Stx)
     }
 }
 
 /// The opcode byte of LD_IMM64, whose two slots load a 64-bit immediate.
-pub const LD_IMM64: u8 = OpCode(Class::LdImm as u8 | MemMode::Imm as u8 | MemSize::DWord as u8).0;
+pub const LD_IMM64: u8 = OpCode(Class::Ld as u8 | MemMode::Imm as u8 | MemSize::DWord as u8).0;
 
-/// The opcode byte of `call`: a helper, local or kfunc call, as `src_reg` selects.
-pub const CALL: u8 = OpCode::jmp64_from_parts(JmpOpc::Call, Source::Imm).0;
+/// The opcode byte of `call`: a helper, local or kfunc call, as `src_reg` selects ([`call`]).
+pub const CALL: u8 = OpCode::jmp64(JmpOpc::Call, Source::Imm).0;
+
+/// The opcode byte of `callx`: a call through the address in `dst_reg`.
+pub const CALLX: u8 = OpCode::jmp64(JmpOpc::Call, Source::Reg).0;
+
+/// The `src_reg` of a [`CALL`], which selects what it calls.
+pub mod call {
+    /// The helper with the ID in `imm`.
+    pub const HELPER: u8 = 0;
+    /// The function of the program at the offset in `imm` (`BPF_PSEUDO_CALL`).
+    pub const LOCAL: u8 = 1;
+    /// The external function with the ID in `imm` (`BPF_PSEUDO_KFUNC_CALL`).
+    pub const KFUNC: u8 = 2;
+}
+
+/// The `imm` of an `STX | ATOMIC` instruction, which selects its operation.
+pub mod atomic {
+    pub const ADD: i32 = 0x00;
+    pub const OR: i32 = 0x40;
+    pub const AND: i32 = 0x50;
+    pub const XOR: i32 = 0xa0;
+    pub const XCHG: i32 = 0xe0 | FETCH;
+    /// Compares with r0 and writes the old value there.
+    pub const CMPXCHG: i32 = 0xf0 | FETCH;
+    /// Set in a read-modify-write operation that writes the old value to `src_reg`.
+    pub const FETCH: i32 = 0x01;
+    /// Load-acquire, which reads through `src_reg` into `dst_reg`; any size.
+    pub const LOAD_ACQ: i32 = 0x100;
+    /// Store-release; any size.
+    pub const STORE_REL: i32 = 0x110;
+}
 
 /// Declares a `#[repr(u8)]` enum covering every value of `mask`, a `from_u8` decoder for it and a `from_name` lookup
 /// by mnemonic. `mask` documents which bits belong to the enum; `from_u8` asserts the input carries no other bits. A
@@ -105,10 +159,10 @@ macro_rules! bits_enum {
 
 bits_enum! {
     pub enum Class : 0b0000_0111 {
-        LdImm = 0x00, // 0b....'.'000
-        LdReg = 0x01, // 0b....'.'001
-        StImm = 0x02, // 0b....'.'010
-        StReg = 0x03, // 0b....'.'011
+        Ld = 0x00,    // 0b....'.'000
+        Ldx = 0x01,   // 0b....'.'001
+        St = 0x02,    // 0b....'.'010
+        Stx = 0x03,   // 0b....'.'011
         Alu32 = 0x04, // 0b....'.'100
         Jmp64 = 0x05, // 0b....'.'101
         Jmp32 = 0x06, // 0b....'.'110
@@ -206,19 +260,37 @@ bits_enum! {
     }
 }
 
-/// The `imm` of an `STX | ATOMIC` instruction, which selects its operation.
-pub mod atomic {
-    pub const ADD: i32 = 0x00;
-    pub const OR: i32 = 0x40;
-    pub const AND: i32 = 0x50;
-    pub const XOR: i32 = 0xa0;
-    pub const XCHG: i32 = 0xe0 | FETCH;
-    /// Compares with r0 and writes the old value there.
-    pub const CMPXCHG: i32 = 0xf0 | FETCH;
-    /// Set in a read-modify-write operation that writes the old value to `src_reg`.
-    pub const FETCH: i32 = 0x01;
-    /// Load-acquire, which reads through `src_reg` into `dst_reg`; any size.
-    pub const LOAD_ACQ: i32 = 0x100;
-    /// Store-release; any size.
-    pub const STORE_REL: i32 = 0x110;
+#[rustfmt::skip]
+impl Debug for OpCode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let mut dstr = f.debug_struct("OpCode");
+        dstr.field("class", &self.class());
+
+        match self.class() {
+            | Class::Ld
+            | Class::Ldx
+            | Class::St
+            | Class::Stx => {
+                dstr.field("size", &self.mem_size())
+                    .field("mode", &self.mem_mode());
+            },
+
+            | Class::Jmp64
+            | Class::Jmp32 => {
+                dstr.field("opc", &self.jmp_opc())
+                    .field("src", &self.source());
+            },
+
+            | Class::Alu32
+            | Class::Alu64 => {
+                dstr.field("opc", &self.alu_opc());
+                match self.alu_opc() == AluOpc::End {
+                    true => dstr.field("end", &self.alu_end()),
+                    false => dstr.field("src", &self.source()),
+                };
+            },
+        };
+
+        dstr.finish()
+    }
 }

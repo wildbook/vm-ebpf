@@ -1,64 +1,72 @@
-use crate::Window;
+//! What an embedder implements to give the guest its memory: [`Memory`], and the [`Window`]s through which the
+//! interpreter reaches host memory without calling it.
 
-/// The guest memory that [`run`] loads from and stores to.
+use std::ptr;
+
+/// The guest memory that loads and stores go to. Values are little-endian, and an address needs no alignment.
+///
+/// An implementation provides [`load_u8`](Self::load_u8) and [`store_u8`](Self::store_u8). The wider loads and stores,
+/// the atomics and the acquire and release accesses default to sequences of those, which is correct for memory that
+/// only one interpreter reaches; override them for speed, and for memory shared between threads. A memory that hands
+/// out [`Window`]s also provides [`window`](Self::window) and [`epoch`](Self::epoch).
 ///
 /// # Safety
 ///
-/// [`run`] accesses the host memory behind a [`Window`] from [`Memory::window`] without calling the other methods,
-/// for as long as [`Memory::epoch`] returns the window's epoch. Each window must meet the contract of [`Window::new`]
-/// whenever the memory is at the window's epoch. So an implementation must give each change of the host memory behind
-/// its windows an epoch that no memory used before, and 0, the default, only to empty windows.
+/// The interpreter accesses the host memory behind a [`Window`] from [`Memory::window`] without calling the other
+/// methods, for as long as [`Memory::epoch`] returns the window's epoch. Each window must meet the contract of
+/// [`Window::new`] whenever the memory is at the window's epoch. So an implementation must give each change of the
+/// host memory behind its windows an epoch that no memory used before, and 0, the default, only to empty windows.
 ///
-/// [`run`] checks the windows it holds against the epoch only when it starts and after a [`Host`] call, so no method of
-/// this trait may change what [`Memory::epoch`] returns. Change the epoch only outside [`run`] or inside a host call.
+/// The interpreter checks the windows it holds against the epoch only when a run starts and after a
+/// [`Host`](crate::Host) call, so no method of this trait may change what [`Memory::epoch`] returns. Change the epoch
+/// only between runs or inside a host call.
 ///
-/// [`run`]: crate::run
-/// [`Host`]: crate::Host
+/// An implementation that keeps the defaults of `window` and `epoch` meets all of this.
 pub unsafe trait Memory {
-    /// [`Flow::FailMem`](crate::Flow::FailMem) carries this, so keep it small, ideally 8 bytes or less.
-    type Err;
+    /// Why a load or store failed. [`Reason::MemoryFault`](crate::Reason::MemoryFault) carries it, so keep it small,
+    /// ideally 8 bytes or less.
+    type Error;
 
-    fn load_u8(&self, addr: u64) -> Result<u8, Self::Err>;
-    fn store_u8(&mut self, addr: u64, value: u8) -> Result<(), Self::Err>;
+    fn load_u8(&self, addr: u64) -> Result<u8, Self::Error>;
+    fn store_u8(&mut self, addr: u64, value: u8) -> Result<(), Self::Error>;
 
-    fn load_u16(&self, addr: u64) -> Result<u16, Self::Err> {
+    fn load_u16(&self, addr: u64) -> Result<u16, Self::Error> {
         let lo = self.load_u8(addr)? as u16;
         let hi = self.load_u8(addr.wrapping_add(1))? as u16;
         Ok(lo | hi << 8)
     }
 
-    fn load_u32(&self, addr: u64) -> Result<u32, Self::Err> {
+    fn load_u32(&self, addr: u64) -> Result<u32, Self::Error> {
         let lo = self.load_u16(addr)? as u32;
         let hi = self.load_u16(addr.wrapping_add(2))? as u32;
         Ok(lo | hi << 16)
     }
 
-    fn load_u64(&self, addr: u64) -> Result<u64, Self::Err> {
+    fn load_u64(&self, addr: u64) -> Result<u64, Self::Error> {
         let lo = self.load_u32(addr)? as u64;
         let hi = self.load_u32(addr.wrapping_add(4))? as u64;
         Ok(lo | hi << 32)
     }
 
-    fn store_u16(&mut self, addr: u64, value: u16) -> Result<(), Self::Err> {
+    fn store_u16(&mut self, addr: u64, value: u16) -> Result<(), Self::Error> {
         self.store_u8(addr, value as u8)?;
         self.store_u8(addr.wrapping_add(1), (value >> 8) as u8)
     }
 
-    fn store_u32(&mut self, addr: u64, value: u32) -> Result<(), Self::Err> {
+    fn store_u32(&mut self, addr: u64, value: u32) -> Result<(), Self::Error> {
         self.store_u16(addr, value as u16)?;
         self.store_u16(addr.wrapping_add(2), (value >> 16) as u16)
     }
 
-    fn store_u64(&mut self, addr: u64, value: u64) -> Result<(), Self::Err> {
+    fn store_u64(&mut self, addr: u64, value: u64) -> Result<(), Self::Error> {
         self.store_u32(addr, value as u32)?;
         self.store_u32(addr.wrapping_add(4), (value >> 32) as u32)
     }
 
     /// Apply `op` to the `u32` at `addr` and return the previous value.
     ///
-    /// The default is a load followed by a store, which is atomic for memory only this executor can reach. Override it
-    /// for memory shared with other threads.
-    fn atomic_u32(&mut self, addr: u64, op: AtomicOp<u32>) -> Result<u32, Self::Err> {
+    /// The default is a load followed by a store, which is atomic for memory that only one interpreter reaches.
+    fn atomic_u32(&mut self, addr: u64, op: AtomicOp<u32>) -> Result<u32, Self::Error> {
         let old = self.load_u32(addr)?;
         if let Some(new) = op.apply(old) {
             self.store_u32(addr, new)?;
@@ -67,7 +75,7 @@ pub unsafe trait Memory {
     }
 
     /// Apply `op` to the `u64` at `addr` and return the previous value. See [`Memory::atomic_u32`].
-    fn atomic_u64(&mut self, addr: u64, op: AtomicOp<u64>) -> Result<u64, Self::Err> {
+    fn atomic_u64(&mut self, addr: u64, op: AtomicOp<u64>) -> Result<u64, Self::Error> {
         let old = self.load_u64(addr)?;
         if let Some(new) = op.apply(old) {
             self.store_u64(addr, new)?;
@@ -77,53 +85,52 @@ pub unsafe trait Memory {
 
     /// Load the `u8` at `addr` with acquire ordering, for `load_acquire`.
     ///
-    /// The acquire loads and release stores default to the plain loads and stores, which are enough for memory only
-    /// this executor can reach. Like [`Memory::atomic_u32`], the defaults don't check alignment; an override for
-    /// memory shared with other threads should fail misaligned addresses as its atomics do.
-    fn load_acquire_u8(&self, addr: u64) -> Result<u8, Self::Err> {
+    /// The acquire loads and release stores default to the plain loads and stores. Like [`Memory::atomic_u32`], the
+    /// defaults don't check alignment; an override for memory shared between threads should fail misaligned addresses
+    /// as its atomics do.
+    fn load_acquire_u8(&self, addr: u64) -> Result<u8, Self::Error> {
         self.load_u8(addr)
     }
 
     /// See [`Memory::load_acquire_u8`].
-    fn load_acquire_u16(&self, addr: u64) -> Result<u16, Self::Err> {
+    fn load_acquire_u16(&self, addr: u64) -> Result<u16, Self::Error> {
         self.load_u16(addr)
     }
 
     /// See [`Memory::load_acquire_u8`].
-    fn load_acquire_u32(&self, addr: u64) -> Result<u32, Self::Err> {
+    fn load_acquire_u32(&self, addr: u64) -> Result<u32, Self::Error> {
         self.load_u32(addr)
     }
 
     /// See [`Memory::load_acquire_u8`].
-    fn load_acquire_u64(&self, addr: u64) -> Result<u64, Self::Err> {
+    fn load_acquire_u64(&self, addr: u64) -> Result<u64, Self::Error> {
         self.load_u64(addr)
     }
 
     /// Store `value` at `addr` with release ordering, for `store_release`. See [`Memory::load_acquire_u8`].
-    fn store_release_u8(&mut self, addr: u64, value: u8) -> Result<(), Self::Err> {
+    fn store_release_u8(&mut self, addr: u64, value: u8) -> Result<(), Self::Error> {
         self.store_u8(addr, value)
     }
 
     /// See [`Memory::store_release_u8`].
-    fn store_release_u16(&mut self, addr: u64, value: u16) -> Result<(), Self::Err> {
+    fn store_release_u16(&mut self, addr: u64, value: u16) -> Result<(), Self::Error> {
         self.store_u16(addr, value)
     }
 
     /// See [`Memory::store_release_u8`].
-    fn store_release_u32(&mut self, addr: u64, value: u32) -> Result<(), Self::Err> {
+    fn store_release_u32(&mut self, addr: u64, value: u32) -> Result<(), Self::Error> {
         self.store_u32(addr, value)
     }
 
     /// See [`Memory::store_release_u8`].
-    fn store_release_u64(&mut self, addr: u64, value: u64) -> Result<(), Self::Err> {
+    fn store_release_u64(&mut self, addr: u64, value: u64) -> Result<(), Self::Error> {
         self.store_u64(addr, value)
     }
 
-    /// The host memory that loads and stores near `addr` may access directly. [`run`](crate::run) takes the window
-    /// around r10, and the window around the address of a load or store through another register that falls outside
-    /// its windows. It runs the plain loads and stores that fall inside these windows without calling the methods
-    /// above, until [`Memory::epoch`] changes, and uses a window only while the memory is at the window's
-    /// epoch. The default is [`Window::NONE`].
+    /// The host memory that plain loads and stores near `addr` may access directly. The interpreter asks for the
+    /// window around r10, and for the window around the address of a load or store that falls outside the windows it
+    /// holds. It runs the plain loads and stores that fall inside its windows without calling the methods above, and
+    /// uses a window only while the memory is at the window's epoch. The default is [`Window::NONE`].
     fn window(&self, addr: u64) -> Window {
         let _ = addr;
         Window::NONE
@@ -171,68 +178,43 @@ macro_rules! atomic_op_apply {
 
 atomic_op_apply!(u32, u64);
 
-// SAFETY: every method forwards to `M`, so the windows and epochs are those of `M`
-unsafe impl<M: Memory + ?Sized> Memory for &mut M {
-    type Err = M::Err;
+/// Host memory that guest loads and stores near some address reach directly; see [`Memory::window`].
+#[derive(Clone, Copy, Debug)]
+pub struct Window {
+    pub(crate) base: u64,
+    pub(crate) ptr: *mut u8,
+    pub(crate) read_len: u64,
+    pub(crate) write_len: u64,
+    pub(crate) epoch: u64,
+}
 
-    fn load_u8(&self, addr: u64) -> Result<u8, Self::Err> {
-        (**self).load_u8(addr)
-    }
-    fn store_u8(&mut self, addr: u64, value: u8) -> Result<(), Self::Err> {
-        (**self).store_u8(addr, value)
-    }
-    fn load_u16(&self, addr: u64) -> Result<u16, Self::Err> {
-        (**self).load_u16(addr)
-    }
-    fn load_u32(&self, addr: u64) -> Result<u32, Self::Err> {
-        (**self).load_u32(addr)
-    }
-    fn load_u64(&self, addr: u64) -> Result<u64, Self::Err> {
-        (**self).load_u64(addr)
-    }
-    fn store_u16(&mut self, addr: u64, value: u16) -> Result<(), Self::Err> {
-        (**self).store_u16(addr, value)
-    }
-    fn store_u32(&mut self, addr: u64, value: u32) -> Result<(), Self::Err> {
-        (**self).store_u32(addr, value)
-    }
-    fn store_u64(&mut self, addr: u64, value: u64) -> Result<(), Self::Err> {
-        (**self).store_u64(addr, value)
-    }
-    fn atomic_u32(&mut self, addr: u64, op: AtomicOp<u32>) -> Result<u32, Self::Err> {
-        (**self).atomic_u32(addr, op)
-    }
-    fn atomic_u64(&mut self, addr: u64, op: AtomicOp<u64>) -> Result<u64, Self::Err> {
-        (**self).atomic_u64(addr, op)
-    }
-    fn load_acquire_u8(&self, addr: u64) -> Result<u8, Self::Err> {
-        (**self).load_acquire_u8(addr)
-    }
-    fn load_acquire_u16(&self, addr: u64) -> Result<u16, Self::Err> {
-        (**self).load_acquire_u16(addr)
-    }
-    fn load_acquire_u32(&self, addr: u64) -> Result<u32, Self::Err> {
-        (**self).load_acquire_u32(addr)
-    }
-    fn load_acquire_u64(&self, addr: u64) -> Result<u64, Self::Err> {
-        (**self).load_acquire_u64(addr)
-    }
-    fn store_release_u8(&mut self, addr: u64, value: u8) -> Result<(), Self::Err> {
-        (**self).store_release_u8(addr, value)
-    }
-    fn store_release_u16(&mut self, addr: u64, value: u16) -> Result<(), Self::Err> {
-        (**self).store_release_u16(addr, value)
-    }
-    fn store_release_u32(&mut self, addr: u64, value: u32) -> Result<(), Self::Err> {
-        (**self).store_release_u32(addr, value)
-    }
-    fn store_release_u64(&mut self, addr: u64, value: u64) -> Result<(), Self::Err> {
-        (**self).store_release_u64(addr, value)
-    }
-    fn window(&self, addr: u64) -> Window {
-        (**self).window(addr)
-    }
-    fn epoch(&self) -> u64 {
-        (**self).epoch()
+impl Window {
+    /// No window: every access goes through the [`Memory`] methods.
+    pub const NONE: Self = Self {
+        base: 0,
+        ptr: ptr::null_mut(),
+        read_len: 0,
+        write_len: 0,
+        epoch: 0,
+    };
+
+    /// The `read_len` readable and `write_len` writable bytes at guest address `base`, which are the host bytes at
+    /// `ptr`, valid while the memory's [`Memory::epoch`] is `epoch`.
+    ///
+    /// # Safety
+    ///
+    /// Whenever the memory that reports the window is at epoch `epoch`, `ptr` must be valid for reads of `read_len`
+    /// bytes and for writes of `write_len` bytes, and a guest load (store) of `n` bytes at `base + i` with
+    /// `i + n <= read_len` (`write_len`) on that memory must do nothing but read (write) the `n` bytes at `ptr + i`,
+    /// unaligned and little-endian. `ptr` must not come from a reference to the memory, which a call of a [`Memory`]
+    /// method would invalidate. [`Memory`] states the rules for epochs.
+    pub const unsafe fn new(base: u64, ptr: *mut u8, read_len: u64, write_len: u64, epoch: u64) -> Self {
+        Self {
+            base,
+            ptr,
+            read_len,
+            write_len,
+            epoch,
+        }
     }
 }

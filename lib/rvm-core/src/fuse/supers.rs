@@ -1,23 +1,32 @@
 //! The superinstruction table, and the [`Super`] that the compiler derives from each of its lines.
 
 use super::handler::fused;
-use crate::fuel::Fuel;
-use crate::op::{Fields, Reg};
+use crate::dispatch::Handler;
+use crate::fuel::{Fuel, Unmetered};
 use crate::opcode::{AluOpc, Class, JmpOpc, MemMode, MemSize, OpCode, Source, LD_IMM64};
-use crate::{Handler, Host, Instruction, Memory};
+use crate::slot::{Fields, Reg};
+use crate::{Host, Instruction, Memory};
 
 macro_rules! superinstructions {
     ($($byte:literal: $($op:ident $($operand:tt),*);+;)*) => {
-        /// Superinstructions by opcode byte, with their [`Encode`]; [`Code::new`](crate::Code::new) tries them in this
-        /// order.
-        pub const SUPERS: &[(u8, Super, Encode)] =
-            &[$(($byte, Super::new(&[$((stringify!($op), &[$(operand!($operand)),*])),+]), encode_as::<$byte>)),*];
+        /// Superinstructions by opcode byte; [`Code::new`](crate::Code::new) tries them in this order.
+        pub const SUPERS: &[(u8, Super)] =
+            &[$(($byte, Super::new(&[$((stringify!($op), &[$(operand!($operand)),*])),+]))),*];
 
         /// Give each superinstruction byte its handler.
         pub const fn install<M: Memory, H: Host<M>, F: Fuel>(table: &mut [Handler<M, H>; 256]) {
-            $(table[$byte] = fused::<M, H, F, $byte>;)*
+            $(table[$byte] = handler_of::<M, H, F, $byte>();)*
         }
     };
+}
+
+/// The handler of superinstruction `S` in the table of the runs that meter with `F`. A sequence that doesn't end its
+/// block has the same handler in every table.
+const fn handler_of<M: Memory, H: Host<M>, F: Fuel, const S: u8>() -> Handler<M, H> {
+    match Super::of(S).branches() {
+        true => fused::<M, H, F, S>,
+        false => fused::<M, H, Unmetered, S>,
+    }
 }
 
 /// An [`Operand`] as [`superinstructions!`] writes it.
@@ -87,13 +96,21 @@ const BY_BYTE: [u8; 256] = {
 /// and everything it records about an instruction it records at the instruction's first slot.
 #[derive(Clone, Copy)]
 pub struct Super {
-    /// One per slot; the second slot of an LD_IMM64 has [`Step::NONE`].
-    steps: [Step; MAX_LEN],
+    /// One per slot; the second slot of an LD_IMM64 has [`Part::NONE`].
+    parts: [Part; MAX_LEN],
     len: u8,
     roles: u8,
     /// For each role, the slot of the operand that names it first and whether that operand is `src_reg`, where the
     /// code gives the role its register.
     homes: [(u8, bool); MAX_ROLES],
+    /// For each slot, the bits that [`Super::encode`] compares with the opcode of its part: the opcode byte, and
+    /// `offset` and `imm` unless they are `_`. None in the second slot of an LD_IMM64.
+    masks: [u64; MAX_LEN],
+    /// For each role, a 1 in the low bit of each register field that names it, in the register bytes that
+    /// [`Super::encode`] packs: byte 1 of slot `k` at byte `k`.
+    spreads: [u64; MAX_ROLES],
+    /// The bits of the register fields that aren't `_`, in the register bytes.
+    register_bits: u64,
 
     /// The roles the sequence reads before it writes them, one bit each.
     pub loads: u8,
@@ -122,10 +139,13 @@ impl Super {
         assert!(insns.len() > 1, "a sequence of one instruction");
 
         let mut sup = Self {
-            steps: [Step::NONE; MAX_LEN],
+            parts: [Part::NONE; MAX_LEN],
             len: 0,
             roles: 0,
             homes: [(0, false); MAX_ROLES],
+            masks: [0; MAX_LEN],
+            spreads: [0; MAX_ROLES],
+            register_bits: 0,
             loads: 0,
             writes: 0,
             save_at: 0,
@@ -137,19 +157,19 @@ impl Super {
             len: 0,
         };
         const_for!((mnemonic, operands) in insns => {
-            let step = Step::parse(mnemonic, operands, &mut names);
-            assert!(sup.len() + step.slots() <= MAX_LEN, "a sequence of more than `MAX_LEN` slots");
-            sup.steps[sup.len()] = step;
-            sup.len += step.slots() as u8;
+            let part = Part::parse(mnemonic, operands, &mut names);
+            assert!(sup.len() + part.slots() <= MAX_LEN, "a sequence of more than `MAX_LEN` slots");
+            sup.parts[sup.len()] = part;
+            sup.len += part.slots() as u8;
         });
         let len = sup.len();
-        // `encode` matches the opcode of the last slot first
+        // `fuse` tests the opcode of the last slot first
         assert!(!sup.is_data(len - 1), "an LD_IMM64 at the end of a sequence");
 
         const_for!(k in 0..len => {
             // only the last instruction may branch, and it continues at `pc + 1` or a fixed target
             assert!(k == len - 1 || !sup.branches_at(k), "a branch before the end of a sequence");
-            if let Field::Any = sup.steps[k].dst {
+            if let Field::Any = sup.parts[k].dst {
                 assert!(k == len - 1, "a register `_` before the end of a sequence");
                 sup.free_at = Some(k as u8);
             }
@@ -157,18 +177,40 @@ impl Super {
 
         sup.roles = names.len;
         const_for!(role in 0..sup.roles => sup.homes[role as usize] = sup.home(role));
+        // what `encode` compares
+        const_for!(k in 0..len => {
+            // `rewrite` failed the LD_IMM64 whose second slot holds more than the upper half of `imm`
+            if sup.is_data(k) {
+                continue;
+            }
+            let part = sup.parts[k];
+            sup.masks[k] = Instruction::OPCODE;
+            const_for!((field, bits) in [(part.off, Instruction::OFFSET), (part.imm, Instruction::IMM)] => {
+                if !matches!(field, Field::Any) {
+                    sup.masks[k] |= bits;
+                }
+            });
+            const_for!((field, shift) in [(part.dst, 8 * k), (part.src, 8 * k + 4)] => {
+                if !matches!(field, Field::Any) {
+                    sup.register_bits |= 0xF << shift;
+                }
+                if let Field::Role(role) = field {
+                    sup.spreads[role as usize] |= 1 << shift;
+                }
+            });
+        });
 
         const_for!(k in 0..len => {
-            let step = sup.steps[k];
+            let part = sup.parts[k];
             const_for!(role in 0..sup.roles => {
-                if step.reads(role) && sup.writes & 1 << role == 0 {
+                if part.reads(role) && sup.writes & 1 << role == 0 {
                     sup.loads |= 1 << role;
                 }
             });
             sup.unsaved[k] = sup.writes;
-            if let Field::Role(role) = step.written() {
+            if let Field::Role(role) = part.written() {
                 sup.writes |= 1 << role;
-                sup.save_at = (k + step.slots()) as u8;
+                sup.save_at = (k + part.slots()) as u8;
             }
         });
         // the written roles are back in their registers from `save_at` on
@@ -185,11 +227,11 @@ impl Super {
     /// The slot of the operand that names `role` first, and whether that operand is `src_reg`.
     const fn home(self, role: u8) -> (u8, bool) {
         const_for!(k in 0..self.len() => {
-            let step = self.steps[k];
-            if step.dst.is(role) {
+            let part = self.parts[k];
+            if part.dst.is(role) {
                 return (k as u8, false);
             }
-            if step.src.is(role) {
+            if part.src.is(role) {
                 return (k as u8, true);
             }
         });
@@ -216,26 +258,27 @@ impl Super {
     }
 
     /// The opcode of the instruction whose first slot is slot `k` of the sequence.
+    // by reference, so that a `k` known only at run time indexes `parts` in place, not a copy on the stack
     #[inline(always)]
-    pub const fn op(self, k: usize) -> u8 {
-        self.steps[k].op
+    pub const fn opcode(&self, k: usize) -> u8 {
+        self.parts[k].op
     }
 
     /// Whether slot `k` of the sequence holds the upper half of an LD_IMM64's immediate, not an instruction.
     #[inline(always)]
     pub const fn is_data(self, k: usize) -> bool {
-        k > 0 && self.op(k - 1) == LD_IMM64
+        k > 0 && self.opcode(k - 1) == LD_IMM64
     }
 
     /// The opcode of the second instruction of the sequence.
     pub const fn second(self) -> u8 {
-        self.op(1 + self.is_data(1) as usize)
+        self.opcode(1 + self.is_data(1) as usize)
     }
 
     /// The first instruction of the sequence whose first slot holds `slot`.
     #[inline(always)]
     pub fn first_of(self, slot: Instruction) -> Instruction {
-        slot.with_opcode(self.op(0))
+        slot.with_byte(self.opcode(0))
     }
 
     /// The register of each role, from `slot(k)`, slot `k` of the sequence.
@@ -254,43 +297,47 @@ impl Super {
     /// from `roles`, and the register operand `_` from `free`, else from `slot`.
     #[inline(always)]
     pub fn decode(self, k: usize, slot: impl Fields, roles: [Reg; MAX_ROLES], free: Option<Reg>) -> Instruction {
-        let step = self.steps[k];
-        let dst = step.dst.register(roles, free, slot.dst_reg());
-        let src = step.src.register(roles, free, slot.src_reg());
-        let off = if let Field::Any = step.off { slot.offset() } else { 0 };
-        let imm = if let Field::Any = step.imm { slot.imm() } else { 0 };
-        Instruction::from_parts(OpCode(step.op), dst.get(), src.get(), off, imm)
+        let part = self.parts[k];
+        let dst = part.dst.register(roles, free, slot.dst_reg());
+        let src = part.src.register(roles, free, slot.src_reg());
+        let off = if let Field::Any = part.off { slot.offset() } else { 0 };
+        let imm = if let Field::Any = part.imm { slot.imm() } else { 0 };
+        Instruction::new(OpCode(part.op), dst.get(), src.get(), off, imm)
     }
 
     /// The first slot of this superinstruction, with opcode byte `byte`, for the sequence at the start of `window`, if
     /// it has one.
-    #[inline(always)]
-    fn encode(self, byte: u8, window: &[Instruction]) -> Option<Instruction> {
+    pub fn encode(&self, byte: u8, window: &[Instruction]) -> Option<Instruction> {
         let sequence = window.get(..self.len())?;
-        // `candidates` matched the first two opcodes, and the candidates that share those mostly differ in the last
-        if sequence[self.len() - 1].byte() != self.op(self.len() - 1) {
-            return None;
+        let mut differs = 0;
+        // byte 1 of slot `k`, which holds its register fields, at byte `k`
+        let mut registers = 0;
+        for (k, ((insn, part), mask)) in sequence.iter().zip(&self.parts).zip(&self.masks).enumerate() {
+            differs |= (insn.0 ^ u64::from(part.op)) & mask;
+            registers |= (insn.0 >> 8 & 0xFF) << (8 * k);
         }
-        let registers = self.registers(|k| sequence[k]);
-        // `fused` keeps each role in a variable of its own
-        for role in 1..self.roles as usize {
-            if registers[..role].contains(&registers[role]) {
+
+        // the register of each role, from its home, in every register field that names the role
+        let mut expected = 0;
+        let mut used = 0u16;
+        for (&(k, src), spread) in self.homes.iter().zip(&self.spreads).take(usize::from(self.roles)) {
+            let register = registers >> (8 * k + 4 * u8::from(src)) & 0xF;
+            // `fused` keeps each role in a variable of its own
+            if used & 1 << register != 0 {
                 return None;
             }
+            used |= 1 << register;
+            expected |= register * spread;
         }
-        for (k, &insn) in sequence.iter().enumerate() {
-            // the second slot of LD_IMM64 is no instruction, and `fuse` failed the LD_IMM64 if it holds more than `imm`
-            if !self.is_data(k) && self.decode(k, insn, registers, None) != insn {
-                return None;
-            }
-        }
-        Some(sequence[0].with_opcode(byte))
+
+        differs |= (registers ^ expected) & self.register_bits;
+        (differs == 0).then(|| sequence[0].with_byte(byte))
     }
 
     /// Whether the instruction at slot `k` of the sequence may branch.
     #[inline(always)]
     pub const fn branches_at(self, k: usize) -> bool {
-        matches!(OpCode(self.op(k)).class(), Class::Jmp32 | Class::Jmp64)
+        OpCode(self.opcode(k)).is_jump()
     }
 
     /// Whether the last instruction of the sequence may branch.
@@ -300,17 +347,9 @@ impl Super {
     }
 }
 
-/// [`Super::encode`] of one superinstruction.
-pub type Encode = fn(&[Instruction]) -> Option<Instruction>;
-
-/// [`Super::encode`] of the superinstruction with opcode byte `S`, compiled with its sequence constant.
-fn encode_as<const S: u8>(window: &[Instruction]) -> Option<Instruction> {
-    const { Super::of(S) }.encode(S, window)
-}
-
 /// An instruction of a superinstruction's sequence.
 #[derive(Clone, Copy)]
-struct Step {
+struct Part {
     op: u8,
     dst: Field,
     src: Field,
@@ -386,7 +425,7 @@ impl Names {
     }
 }
 
-impl Step {
+impl Part {
     const NONE: Self = Self {
         op: 0,
         dst: Field::Zero,
@@ -402,17 +441,17 @@ impl Step {
 
     /// The instruction `mnemonic operands`, whose roles `names` numbers.
     const fn parse(mnemonic: &str, operands: &[Operand], names: &mut Names) -> Self {
-        let mut step = Self::NONE;
+        let mut part = Self::NONE;
 
         // `lddw dst, _`: LD_IMM64 with `src_reg` 0, the only form that loads its immediate
         if let b"lddw" = mnemonic.as_bytes() {
             let &[dst, Operand::Any] = operands else {
                 panic!("`lddw` takes a register and an immediate")
             };
-            step.op = LD_IMM64;
-            step.dst = names.register(dst);
-            step.imm = Field::Any;
-            return step;
+            part.op = LD_IMM64;
+            part.dst = names.register(dst);
+            part.imm = Field::Any;
+            return part;
         }
 
         // loads and stores: `ldx dst, [base]`, `st [base], imm`, `stx [base], src`
@@ -434,29 +473,29 @@ impl Step {
                 panic!("a load or store without a memory operand")
             };
             let opc = match (load, register) {
-                (true, _) => OpCode::ldreg_from_parts(size, MemMode::Mem),
-                (false, Operand::Any) => OpCode::stimm_from_parts(size, MemMode::Mem),
-                (false, _) => OpCode::streg_from_parts(size, MemMode::Mem),
+                (true, _) => OpCode::ldx(size, MemMode::Mem),
+                (false, Operand::Any) => OpCode::st(size, MemMode::Mem),
+                (false, _) => OpCode::stx(size, MemMode::Mem),
             };
-            step.op = opc.0;
+            part.op = opc.0;
             if offset {
-                step.off = Field::Any;
+                part.off = Field::Any;
             }
             match opc.class() {
-                Class::LdReg => {
-                    step.dst = names.register(register);
-                    step.src = names.role(base);
+                Class::Ldx => {
+                    part.dst = names.register(register);
+                    part.src = names.role(base);
                 }
-                Class::StImm => {
-                    step.dst = names.role(base);
-                    step.imm = Field::Any;
+                Class::St => {
+                    part.dst = names.role(base);
+                    part.imm = Field::Any;
                 }
                 _ => {
-                    step.dst = names.role(base);
-                    step.src = names.register(register);
+                    part.dst = names.role(base);
+                    part.src = names.register(register);
                 }
             }
-            return step;
+            return part;
         }
 
         // ALU instructions and conditional jumps: `op dst, src` and `jcc dst, src, target`, where `src` is `_` for an
@@ -471,29 +510,29 @@ impl Step {
             [dst, src, target] => (dst, src, Some(target)),
             _ => panic!("an ALU instruction or jump takes two operands and a target"),
         };
-        step.dst = names.register(dst);
+        part.dst = names.register(dst);
         let source = match src {
             Operand::Any => {
-                step.imm = Field::Any;
+                part.imm = Field::Any;
                 Source::Imm
             }
             _ => {
-                step.src = names.register(src);
+                part.src = names.register(src);
                 Source::Reg
             }
         };
-        step.op = match (AluOpc::from_name(name), JmpOpc::from_name(name), width, target) {
+        part.op = match (AluOpc::from_name(name), JmpOpc::from_name(name), width, target) {
             (_, Some(JmpOpc::Ja | JmpOpc::Call | JmpOpc::Exit | JmpOpc::Jcond), ..) => panic!("not a conditional jump"),
-            (Some(alu), None, Some(32), None) => OpCode::alu32_from_parts(alu, source).0,
-            (Some(alu), None, Some(64), None) => OpCode::alu64_from_parts(alu, source).0,
-            (None, Some(jmp), Some(32), Some(Operand::Any)) => OpCode::jmp32_from_parts(jmp, source).0,
-            (None, Some(jmp), None | Some(64), Some(Operand::Any)) => OpCode::jmp64_from_parts(jmp, source).0,
+            (Some(alu), None, Some(32), None) => OpCode::alu32(alu, source).0,
+            (Some(alu), None, Some(64), None) => OpCode::alu64(alu, source).0,
+            (None, Some(jmp), Some(32), Some(Operand::Any)) => OpCode::jmp32(jmp, source).0,
+            (None, Some(jmp), None | Some(64), Some(Operand::Any)) => OpCode::jmp64(jmp, source).0,
             _ => panic!("unknown mnemonic, or a target that isn't `_`"),
         };
         if target.is_some() {
-            step.off = Field::Any;
+            part.off = Field::Any;
         }
-        step
+        part
     }
 
     /// Whether the instruction reads the register of `role`.
@@ -501,7 +540,7 @@ impl Step {
         let opc = OpCode(self.op);
         let dst = match opc.class() {
             Class::Alu32 | Class::Alu64 => !matches!(opc.alu_opc(), AluOpc::Mov),
-            Class::LdReg | Class::LdImm => false,
+            Class::Ldx | Class::Ld => false,
             _ => true,
         };
         // `src` names a register only where the instruction reads one
@@ -511,7 +550,7 @@ impl Step {
     /// The register field the instruction writes.
     const fn written(self) -> Field {
         match OpCode(self.op).class() {
-            Class::Alu32 | Class::Alu64 | Class::LdReg | Class::LdImm => self.dst,
+            Class::Alu32 | Class::Alu64 | Class::Ldx | Class::Ld => self.dst,
             _ => Field::Zero,
         }
     }

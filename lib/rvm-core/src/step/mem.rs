@@ -1,11 +1,12 @@
-use std::ops::ControlFlow;
+//! The load and store classes: LD, LDX, ST and STX, with the atomics.
 
-use crate::op::{Fields, Reg};
+use super::{Regs, Step};
 use crate::opcode::atomic::{ADD, AND, CMPXCHG, FETCH, LOAD_ACQ, OR, STORE_REL, XCHG, XOR};
 use crate::opcode::{MemMode, MemSize};
-use crate::ops::Regs;
-use crate::{AtomicOp, Flow, Instruction, Memory};
+use crate::slot::{Fields, Reg};
+use crate::{AtomicOp, Instruction, Memory, Reason};
 
+/// Where a store takes its value from, by class.
 pub const SOURCE_REG: bool = true;
 pub const SOURCE_IMM: bool = false;
 
@@ -15,7 +16,7 @@ pub fn address(base: u64, insn: impl Fields) -> u64 {
     base.wrapping_add_signed(i64::from(insn.offset()))
 }
 
-fn store_plain<M: Memory>(mem: &mut M, size: MemSize, addr: u64, value: u64) -> Result<(), M::Err> {
+fn store_plain<M: Memory>(mem: &mut M, size: MemSize, addr: u64, value: u64) -> Result<(), M::Error> {
     match size {
         MemSize::Byte => mem.store_u8(addr, value as u8),
         MemSize::Half => mem.store_u16(addr, value as u16),
@@ -24,7 +25,7 @@ fn store_plain<M: Memory>(mem: &mut M, size: MemSize, addr: u64, value: u64) -> 
     }
 }
 
-fn load_plain<M: Memory>(mem: &M, size: MemSize, addr: u64) -> Result<u64, M::Err> {
+fn load_plain<M: Memory>(mem: &M, size: MemSize, addr: u64) -> Result<u64, M::Error> {
     match size {
         MemSize::Byte => mem.load_u8(addr).map(u64::from),
         MemSize::Half => mem.load_u16(addr).map(u64::from),
@@ -33,7 +34,7 @@ fn load_plain<M: Memory>(mem: &M, size: MemSize, addr: u64) -> Result<u64, M::Er
     }
 }
 
-fn load_sx<M: Memory>(mem: &M, size: MemSize, addr: u64) -> Result<u64, M::Err> {
+fn load_sx<M: Memory>(mem: &M, size: MemSize, addr: u64) -> Result<u64, M::Error> {
     match size {
         MemSize::Byte => mem.load_u8(addr).map(|x| x as i8 as i64 as u64),
         MemSize::Half => mem.load_u16(addr).map(|x| x as i16 as i64 as u64),
@@ -42,7 +43,10 @@ fn load_sx<M: Memory>(mem: &M, size: MemSize, addr: u64) -> Result<u64, M::Err> 
     }
 }
 
-fn load_acquire<M: Memory>(mem: &M, size: MemSize, addr: u64) -> Result<u64, M::Err> {
+// `ordered` is out of line already, so its two helpers inline into it: left to LLVM, they stay out of line once the
+// methods of the memory inline into them, and each ordered access takes a second call.
+#[inline(always)]
+fn load_acquire<M: Memory>(mem: &M, size: MemSize, addr: u64) -> Result<u64, M::Error> {
     match size {
         MemSize::Byte => mem.load_acquire_u8(addr).map(u64::from),
         MemSize::Half => mem.load_acquire_u16(addr).map(u64::from),
@@ -51,7 +55,8 @@ fn load_acquire<M: Memory>(mem: &M, size: MemSize, addr: u64) -> Result<u64, M::
     }
 }
 
-fn store_release<M: Memory>(mem: &mut M, size: MemSize, addr: u64, value: u64) -> Result<(), M::Err> {
+#[inline(always)]
+fn store_release<M: Memory>(mem: &mut M, size: MemSize, addr: u64, value: u64) -> Result<(), M::Error> {
     match size {
         MemSize::Byte => mem.store_release_u8(addr, value as u8),
         MemSize::Half => mem.store_release_u16(addr, value as u16),
@@ -62,7 +67,11 @@ fn store_release<M: Memory>(mem: &mut M, size: MemSize, addr: u64, value: u64) -
 
 /// `ST` or, with [`SOURCE_REG`], `STX`.
 #[inline(always)]
-pub fn store<M: Memory, R: Regs, const SOURCE: bool>(regs: &mut R, mem: &mut M, insn: impl Fields) -> Flow<M::Err> {
+pub fn store<M: Memory, R: Regs, const SOURCE: bool>(
+    regs: &mut R,
+    mem: &mut M,
+    insn: impl Fields,
+) -> Result<(), Reason<M::Error>> {
     let val = match SOURCE {
         SOURCE_REG => regs.get(insn.src_reg()),
         SOURCE_IMM => i64::from(insn.imm()) as u64,
@@ -73,17 +82,12 @@ pub fn store<M: Memory, R: Regs, const SOURCE: bool>(regs: &mut R, mem: &mut M, 
     let size = opc.mem_size();
     let mode = opc.mem_mode();
 
-    let result = match mode {
-        MemMode::Mem => store_plain(mem, size, addr, val),
-        MemMode::Atomic if SOURCE == SOURCE_REG => return atomic(regs, mem, insn.instruction(), size, addr, val),
+    match mode {
+        MemMode::Mem => store_plain(mem, size, addr, val).map_err(Reason::MemoryFault),
+        MemMode::Atomic if SOURCE == SOURCE_REG => atomic(regs, mem, insn.instruction(), size, addr, val),
         // ABS and IND exist only in the LD class
-        _ => return Flow::FailCpu,
-    };
-    if let Err(err) = result {
-        return Flow::FailMem(err);
+        _ => Err(Reason::InvalidInstruction),
     }
-
-    Flow::Next
 }
 
 /// `STX | ATOMIC`: `imm` selects the operation. The read-modify-write operations take W and DW sizes only;
@@ -97,45 +101,43 @@ fn atomic<M: Memory, R: Regs>(
     size: MemSize,
     addr: u64,
     src: u64,
-) -> Flow<M::Err> {
-    let src_reg = Reg::low(insn.src_reg());
+) -> Result<(), Reason<M::Error>> {
     let imm = insn.imm();
-
-    // `CmpXchg` compares against r0 and writes the old value there instead of `src`.
-    macro_rules! run {
-        ($ty:ty, $method:ident) => {{
-            let v = src as $ty;
-            let op = match imm & !FETCH {
-                _ if imm == XCHG => AtomicOp::Xchg(v),
-                _ if imm == CMPXCHG => AtomicOp::CmpXchg {
-                    expected: regs.get(Reg::R0) as $ty,
-                    new: v,
-                },
-                ADD => AtomicOp::Add(v),
-                OR => AtomicOp::Or(v),
-                AND => AtomicOp::And(v),
-                XOR => AtomicOp::Xor(v),
-                _ => return ordered(regs, mem, insn),
-            };
-            match mem.$method(addr, op) {
-                Ok(old) => old as u64,
-                Err(err) => return Flow::FailMem(err),
-            }
-        }};
-    }
+    let r0 = regs.get(Reg::R0);
 
     let old = match size {
-        MemSize::Word => run!(u32, atomic_u32),
-        MemSize::DWord => run!(u64, atomic_u64),
-        MemSize::Byte | MemSize::Half => return ordered(regs, mem, insn),
+        MemSize::Word => {
+            read_modify_write(imm, src as u32, r0 as u32).map(|op| mem.atomic_u32(addr, op).map(u64::from))
+        }
+        MemSize::DWord => read_modify_write(imm, src, r0).map(|op| mem.atomic_u64(addr, op)),
+        MemSize::Byte | MemSize::Half => None,
     };
+    let Some(old) = old else {
+        return ordered(regs, mem, insn);
+    };
+    let old = old.map_err(Reason::MemoryFault)?;
 
     match imm {
         CMPXCHG => regs.set(Reg::R0, old),
-        _ if imm & FETCH != 0 => regs.set(src_reg, old),
+        _ if imm & FETCH != 0 => regs.set(Reg::low(insn.src_reg()), old),
         _ => {}
     }
-    Flow::Next
+    Ok(())
+}
+
+/// The read-modify-write operation that the `imm` of an atomic selects, on the value `src` of its `src_reg`, or `None`
+/// if it selects none. CMPXCHG compares with `r0`.
+#[inline(always)]
+fn read_modify_write<T>(imm: i32, src: T, r0: T) -> Option<AtomicOp<T>> {
+    Some(match imm & !FETCH {
+        _ if imm == XCHG => AtomicOp::Xchg(src),
+        _ if imm == CMPXCHG => AtomicOp::CmpXchg { expected: r0, new: src },
+        ADD => AtomicOp::Add(src),
+        OR => AtomicOp::Or(src),
+        AND => AtomicOp::And(src),
+        XOR => AtomicOp::Xor(src),
+        _ => return None,
+    })
 }
 
 /// `STX | ATOMIC` with an `imm` that names no read-modify-write operation: load-acquire and store-release, which
@@ -143,7 +145,7 @@ fn atomic<M: Memory, R: Regs>(
 // outlined to keep the read-modify-write path in `atomic` short; it takes only `insn` and reads the operands again,
 // so that the Windows x64 ABI passes every argument in a register
 #[inline(never)]
-fn ordered<M: Memory, R: Regs>(regs: &mut R, mem: &mut M, insn: Instruction) -> Flow<M::Err> {
+fn ordered<M: Memory, R: Regs>(regs: &mut R, mem: &mut M, insn: Instruction) -> Result<(), Reason<M::Error>> {
     let size = insn.opcode().mem_size();
     let (dst, src) = (Reg::low(insn.dst_reg()), Reg::low(insn.src_reg()));
     let result = match insn.imm() {
@@ -155,17 +157,14 @@ fn ordered<M: Memory, R: Regs>(regs: &mut R, mem: &mut M, insn: Instruction) -> 
             let addr = address(regs.get(dst), insn);
             store_release(mem, size, addr, regs.get(src))
         }
-        _ => return Flow::FailCpu,
+        _ => return Err(Reason::InvalidInstruction),
     };
-    match result {
-        Ok(()) => Flow::Next,
-        Err(err) => Flow::FailMem(err),
-    }
+    result.map_err(Reason::MemoryFault)
 }
 
 /// `LDX`.
 #[inline(always)]
-pub fn load<M: Memory, R: Regs>(regs: &mut R, mem: &M, insn: impl Fields) -> Flow<M::Err> {
+pub fn load<M: Memory, R: Regs>(regs: &mut R, mem: &M, insn: impl Fields) -> Result<(), Reason<M::Error>> {
     let addr = address(regs.get(insn.src_reg()), insn);
 
     let opc = insn.opcode();
@@ -177,26 +176,22 @@ pub fn load<M: Memory, R: Regs>(regs: &mut R, mem: &M, insn: impl Fields) -> Flo
         // RFC 9669 defines MEMSX for B, H and W only
         MemMode::MemSX if !matches!(size, MemSize::DWord) => load_sx(mem, size, addr),
         // ABS and IND exist only in the LD class
-        _ => return Flow::FailCpu,
+        _ => return Err(Reason::InvalidInstruction),
     };
-    match loaded {
-        Ok(val) => regs.set(insn.dst_reg(), val),
-        Err(err) => return Flow::FailMem(err),
-    }
-
-    Flow::Next
+    regs.set(insn.dst_reg(), loaded.map_err(Reason::MemoryFault)?);
+    Ok(())
 }
 
-/// Continues with LD_IMM64 that loads its immediate. The pseudo loads (`src_reg` other than 0) are [`Flow::Missing`]
-/// at their first slot.
+/// The LD class. LD_IMM64 loads its immediate once its handler has read the upper half ([`Step::LdImm64`]). The pseudo
+/// loads (`src_reg` other than 0) and the legacy packet loads are [`Reason::Unsupported`] at their first slot.
 #[inline(always)]
-pub fn ld64<E>(insn: impl Fields) -> ControlFlow<Flow<E>> {
+pub fn ld<E>(insn: impl Fields) -> Step<E> {
     let opc = insn.opcode();
     let size = opc.mem_size();
     let mode = opc.mem_mode();
 
     match (mode, size) {
-        (MemMode::Imm, MemSize::DWord) if insn.src_reg() == Reg::R0 => ControlFlow::Continue(()),
-        _ => ControlFlow::Break(Flow::Missing),
+        (MemMode::Imm, MemSize::DWord) if insn.src_reg() == Reg::R0 => Step::LdImm64,
+        _ => Step::Stop(Reason::Unsupported),
     }
 }

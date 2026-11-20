@@ -4,71 +4,34 @@
 //! and access the host memory directly. An address outside the windows takes the usual handler of the instruction, so
 //! the access behaves exactly as it does there.
 //!
-//! - [`access`] runs the 4 and 8 byte accesses with base register r10, which [`Code::new`](crate::Code::new) gives an
-//!   opcode byte of their own. It checks the window around r10. Guest code can't write r10, so it stays in the stack,
-//!   inside the window of the stack.
+//! - [`stack_access`] runs the 4 and 8 byte accesses with base register r10, which [`Code::new`](crate::Code::new)
+//!   gives an opcode byte of their own. It checks the window around r10. Guest code can't write r10, so it stays in
+//!   the stack, inside the window of the stack.
 //! - [`data_access`] runs the accesses through any other register, and those of 1 and 2 bytes through r10, which keep
 //!   their opcode byte ([`install`]). It checks the window around the last address of its size class that missed (1
 //!   and 2 byte accesses also the one before) and then, for pointers into the stack, the window around r10.
 //! - [`data_step`] runs the accesses of superinstructions in the data window of their size class. A superinstruction
 //!   continues unfused at an access that misses it.
 
+use std::num::NonZeroU8;
 use std::ptr;
 
-use crate::fuel::Fuel;
-use crate::op::{Fields, Op, Reg, Shape, View};
+use crate::code::Slots;
+use crate::context::FP;
+use crate::dispatch::{Handler, Table};
+use crate::handler::handler;
+use crate::memory::Window;
 use crate::opcode::{Class, MemMode, MemSize, OpCode};
-use crate::ops::Regs;
-use crate::transfer::Slot;
-use crate::{handler, mem, CallStack, Context, Handler, Host, Memory, Table};
+use crate::slot::{Fields, Reg, Shape, Slot, View};
+use crate::step::{self, Regs};
+use crate::transfer::Ip;
+use crate::{Context, Host, Instruction, Interpreter, Memory};
 
-/// Host memory that guest loads and stores near some address reach directly; see [`Memory::window`].
-#[derive(Clone, Copy, Debug)]
-pub struct Window {
-    base: u64,
-    ptr: *mut u8,
-    read_len: u64,
-    write_len: u64,
-    epoch: u64,
-}
-
-impl Window {
-    /// No window: every access goes through the [`Memory`] methods.
-    pub const NONE: Self = Self {
-        base: 0,
-        ptr: ptr::null_mut(),
-        read_len: 0,
-        write_len: 0,
-        epoch: 0,
-    };
-
-    /// The `read_len` readable and `write_len` writable bytes at guest address `base`, which are the host bytes at
-    /// `ptr`, valid while the memory's [`Memory::epoch`] is `epoch`.
-    ///
-    /// # Safety
-    ///
-    /// Whenever the memory that reports the window is at epoch `epoch`, `ptr` must be valid for reads of `read_len`
-    /// bytes and for writes of `write_len` bytes, and a guest load (store) of `n` bytes at `base + i` with
-    /// `i + n <= read_len` (`write_len`) on that memory must do nothing but read (write) the `n` bytes at `ptr + i`,
-    /// unaligned and little-endian. `ptr` must not come from a reference to the memory, which a call of a [`Memory`]
-    /// method would invalidate. [`Memory`] states the rules for epochs.
-    pub const unsafe fn new(base: u64, ptr: *mut u8, read_len: u64, write_len: u64, epoch: u64) -> Self {
-        Self {
-            base,
-            ptr,
-            read_len,
-            write_len,
-            epoch,
-        }
-    }
-}
-
-/// The windows that [`access`] and [`data_access`] check addresses against, kept in the [`CallStack`].
+/// The windows that [`stack_access`] and [`data_access`] check addresses against, kept in the [`Interpreter`].
 ///
-/// Each cache that isn't empty holds a window of epoch `epoch`, which [`Windows::take`] ensures. [`run`](crate::run)
-/// calls [`Windows::revalidate`] whenever code outside the handler chain may have changed the memory, and the methods
-/// of [`Memory`] leave its epoch alone, so inside the handler chain the memory is at `epoch` whenever a cache isn't
-/// empty.
+/// Each cache that isn't empty holds a window of epoch `epoch`, which [`Windows::take`] ensures. The interpreter calls
+/// [`Windows::revalidate`] whenever code outside the chain of handlers may have changed the memory, and the methods of
+/// [`Memory`] leave its epoch alone, so inside the chain the memory is at `epoch` whenever a cache isn't empty.
 pub struct Windows {
     /// The window around r10.
     stack: Cache,
@@ -90,9 +53,9 @@ struct Cache {
     fits: [u64; 8],
 }
 
-// SAFETY: the handlers dereference the pointers only through `&mut CallStack`, while the memory that `run` was given
-// is at `epoch`. Only one memory ever takes an epoch (see `Memory`), so the pointers are only used together with the
-// memory they point into, on whichever thread holds that memory.
+// SAFETY: the handlers dereference the pointers only through `&mut Interpreter`, while the memory that the run was
+// given is at `epoch`. Only one memory ever takes an epoch (see `Memory`), so the pointers are only used together with
+// the memory they point into, on whichever thread holds that memory.
 unsafe impl Send for Windows {}
 unsafe impl Sync for Windows {}
 
@@ -183,13 +146,13 @@ impl Cache {
     fn access<const OP: u8>(&self, regs: &mut [u64; 16], insn: View, addr: u64) -> bool {
         let opc = OpCode(OP);
         let value = match opc.class() {
-            Class::StReg => regs.get(insn.src_reg()),
+            Class::Stx => regs.get(insn.src_reg()),
             _ => i64::from(insn.imm()) as u64,
         };
         let Some(loaded) = self.run(opc, const { kind(OpCode(OP)) }, addr, value) else {
             return false;
         };
-        if let Class::LdReg = opc.class() {
+        if let Class::Ldx = opc.class() {
             regs.set(insn.dst_reg(), loaded);
         }
         true
@@ -210,10 +173,10 @@ impl Cache {
         // SAFETY: as above
         unsafe {
             match (opc.class(), opc.mem_size()) {
-                (Class::LdReg, MemSize::Byte) => return Some(host.read().into()),
-                (Class::LdReg, MemSize::Half) => return Some(u16::from_le(host.cast::<u16>().read_unaligned()).into()),
-                (Class::LdReg, MemSize::Word) => return Some(u32::from_le(host.cast::<u32>().read_unaligned()).into()),
-                (Class::LdReg, MemSize::DWord) => return Some(u64::from_le(host.cast::<u64>().read_unaligned())),
+                (Class::Ldx, MemSize::Byte) => return Some(host.read().into()),
+                (Class::Ldx, MemSize::Half) => return Some(u16::from_le(host.cast::<u16>().read_unaligned()).into()),
+                (Class::Ldx, MemSize::Word) => return Some(u32::from_le(host.cast::<u32>().read_unaligned()).into()),
+                (Class::Ldx, MemSize::DWord) => return Some(u64::from_le(host.cast::<u64>().read_unaligned())),
                 (_, MemSize::Byte) => host.write(value as u8),
                 (_, MemSize::Half) => host.cast::<u16>().write_unaligned((value as u16).to_le()),
                 (_, MemSize::Word) => host.cast::<u32>().write_unaligned((value as u32).to_le()),
@@ -226,7 +189,7 @@ impl Cache {
 
 /// The index into [`Cache::fits`] for the access `opc`.
 const fn kind(opc: OpCode) -> usize {
-    let store = !matches!(opc.class(), Class::LdReg);
+    let store = !matches!(opc.class(), Class::Ldx);
     let size = match opc.mem_size() {
         MemSize::Byte => 0,
         MemSize::Half => 1,
@@ -239,8 +202,7 @@ const fn kind(opc: OpCode) -> usize {
 /// Whether the opcode byte `op` is a plain `ldx`, `stx` or `st`, which the windows run.
 pub const fn windowed(op: u8) -> bool {
     let opc = OpCode(op);
-    let access = matches!(opc.class(), Class::LdReg | Class::StReg | Class::StImm);
-    access && matches!(opc.mem_mode(), MemMode::Mem)
+    opc.is_access() && matches!(opc.mem_mode(), MemMode::Mem)
 }
 
 /// Runs the [`windowed`] load or store `insn` of a superinstruction on the registers `regs` in the data window, as
@@ -250,142 +212,185 @@ pub const fn windowed(op: u8) -> bool {
 pub fn data_step<R: Regs>(windows: &Windows, regs: &mut R, insn: impl Fields) -> bool {
     let opc = insn.opcode();
     let (base, value) = match opc.class() {
-        Class::LdReg => (insn.src_reg(), 0),
-        Class::StReg => (insn.dst_reg(), regs.get(insn.src_reg())),
+        Class::Ldx => (insn.src_reg(), 0),
+        Class::Stx => (insn.dst_reg(), regs.get(insn.src_reg())),
         _ => (insn.dst_reg(), i64::from(insn.imm()) as u64),
     };
-    let addr = mem::address(regs.get(base), insn);
+    let addr = step::address(regs.get(base), insn);
     let Some(loaded) = windows.data_for(opc).run(opc, kind(opc), addr, value) else {
         return false;
     };
-    if let Class::LdReg = opc.class() {
+    if let Class::Ldx = opc.class() {
         regs.set(insn.dst_reg(), loaded);
     }
     true
 }
 
-/// Make [`data_access`] the handler of the plain `ldx`, `stx` and `st` of every size.
-pub const fn install<M: Memory, H: Host<M>, F: Fuel>(table: &mut [Handler<M, H>; 256]) {
+/// Make [`data_access`] the handler of the plain `ldx`, `stx` and `st` of every size, and [`stack_access`] that of
+/// the r10 access bytes.
+pub const fn install<M: Memory, H: Host<M>>(table: &mut [Handler<M, H>; 256]) {
+    install_stack(table);
     macro_rules! install {
         ($($op:expr),*) => {
-            $(table[$op as usize] = data_access::<M, H, F, { $op }>;)*
+            $(table[$op as usize] = data_access::<M, H, { $op }>;)*
         };
     }
     install!(
-        OpCode::ldreg_from_parts(MemSize::Byte, MemMode::Mem).0,
-        OpCode::ldreg_from_parts(MemSize::Half, MemMode::Mem).0,
-        OpCode::ldreg_from_parts(MemSize::Word, MemMode::Mem).0,
-        OpCode::ldreg_from_parts(MemSize::DWord, MemMode::Mem).0,
-        OpCode::streg_from_parts(MemSize::Byte, MemMode::Mem).0,
-        OpCode::streg_from_parts(MemSize::Half, MemMode::Mem).0,
-        OpCode::streg_from_parts(MemSize::Word, MemMode::Mem).0,
-        OpCode::streg_from_parts(MemSize::DWord, MemMode::Mem).0,
-        OpCode::stimm_from_parts(MemSize::Byte, MemMode::Mem).0,
-        OpCode::stimm_from_parts(MemSize::Half, MemMode::Mem).0,
-        OpCode::stimm_from_parts(MemSize::Word, MemMode::Mem).0,
-        OpCode::stimm_from_parts(MemSize::DWord, MemMode::Mem).0
+        OpCode::ldx(MemSize::Byte, MemMode::Mem).0,
+        OpCode::ldx(MemSize::Half, MemMode::Mem).0,
+        OpCode::ldx(MemSize::Word, MemMode::Mem).0,
+        OpCode::ldx(MemSize::DWord, MemMode::Mem).0,
+        OpCode::stx(MemSize::Byte, MemMode::Mem).0,
+        OpCode::stx(MemSize::Half, MemMode::Mem).0,
+        OpCode::stx(MemSize::Word, MemMode::Mem).0,
+        OpCode::stx(MemSize::DWord, MemMode::Mem).0,
+        OpCode::st(MemSize::Byte, MemMode::Mem).0,
+        OpCode::st(MemSize::Half, MemMode::Mem).0,
+        OpCode::st(MemSize::Word, MemMode::Mem).0,
+        OpCode::st(MemSize::DWord, MemMode::Mem).0
     );
+}
+
+macro_rules! stack_accesses {
+    ($($byte:literal: $opcode:expr;)*) => {
+        /// The opcode bytes of the loads and stores through r10 that [`stack_access`] runs, each with the opcode it
+        /// stands for.
+        pub const STACK_ACCESSES: &[(u8, u8)] = &[$(($byte, $opcode.0)),*];
+
+        /// Give each r10 access byte its handler.
+        const fn install_stack<M: Memory, H: Host<M>>(table: &mut [Handler<M, H>; 256]) {
+            $(table[$byte] = stack_access::<M, H, { $opcode.0 }>;)*
+        }
+    };
+}
+
+stack_accesses! {
+    0xa0: OpCode::ldx(MemSize::Word, MemMode::Mem);
+    0xa8: OpCode::ldx(MemSize::DWord, MemMode::Mem);
+    0xb0: OpCode::stx(MemSize::Word, MemMode::Mem);
+    0xb8: OpCode::stx(MemSize::DWord, MemMode::Mem);
+    0xc0: OpCode::st(MemSize::Word, MemMode::Mem);
+    0xc8: OpCode::st(MemSize::DWord, MemMode::Mem);
+}
+
+/// For each opcode byte, the byte of the r10 access with that opcode, if there is one.
+const STACK_BYTES: [Option<NonZeroU8>; 256] = {
+    let mut table = [None; 256];
+    const_for!((byte, opcode) in STACK_ACCESSES => table[opcode as usize] = NonZeroU8::new(byte));
+    table
+};
+
+/// The r10 access byte for `insn`, if it is a load or store through r10 that has one.
+pub fn stack_byte(insn: Instruction) -> Option<u8> {
+    let byte = STACK_BYTES[usize::from(insn.byte())]?;
+    let base = match insn.opcode().class() {
+        Class::Ldx => insn.src_reg(),
+        _ => insn.dst_reg(),
+    };
+    (usize::from(base) == FP).then_some(byte.get())
 }
 
 /// The handler of the r10 access that stands for the load or store `OP`.
 #[inline(never)]
-pub extern "rust-preserve-none" fn access<M: Memory, H: Host<M>, F: Fuel, const OP: u8>(
+pub extern "rust-preserve-none" fn stack_access<M: Memory, H: Host<M>, const OP: u8>(
     ctx: &mut Context<M>,
-    code: &[Op],
-    slot: Slot,
+    code: Slots,
+    ip: Ip,
     fuel: u64,
-    calls: &mut CallStack<H, M::Err>,
+    interp: &mut Interpreter<M, H>,
     table: &Table<M, H>,
-    op: Op,
+    slot: Slot,
 ) {
-    // SAFETY: a handler's slot lies below `len`, and an r10 access has the layout of its load or store
-    let insn = unsafe { slot.view(op, const { Shape::of(OP) }) };
-    let addr = mem::address(ctx.regs[10], insn);
-    if !calls.windows.stack.access::<OP>(&mut ctx.regs, insn, addr) {
-        become miss::<M, H, F, OP, false>(ctx, code, slot, fuel, calls, table, op)
+    // SAFETY: a handler's ip lies below `len`, and an r10 access has the layout of its load or store
+    let insn = unsafe { ip.view(slot, const { Shape::of(OP) }) };
+    let addr = step::address(ctx.regs[FP], insn);
+    if !interp.windows.stack.access::<OP>(&mut ctx.regs, insn, addr) {
+        become miss::<M, H, OP, false>(ctx, code, ip, fuel, interp, table, slot)
     }
-    become_next!(ctx, code, slot, fuel, calls, table)
+    become_next!(ctx, code, ip, fuel, interp, table)
 }
 
 /// The handler of the load or store `OP` through a register other than r10.
 #[inline(never)]
-pub extern "rust-preserve-none" fn data_access<M: Memory, H: Host<M>, F: Fuel, const OP: u8>(
+pub extern "rust-preserve-none" fn data_access<M: Memory, H: Host<M>, const OP: u8>(
     ctx: &mut Context<M>,
-    code: &[Op],
-    slot: Slot,
+    code: Slots,
+    ip: Ip,
     fuel: u64,
-    calls: &mut CallStack<H, M::Err>,
+    interp: &mut Interpreter<M, H>,
     table: &Table<M, H>,
-    op: Op,
+    slot: Slot,
 ) {
     // SAFETY: as in `handler`
-    let insn = unsafe { slot.view(op, const { Shape::of(OP) }) };
-    let addr = mem::address(ctx.regs.get(base_reg::<OP>(insn)), insn);
-    if calls
+    let insn = unsafe { ip.view(slot, const { Shape::of(OP) }) };
+    let addr = step::address(ctx.regs.get(base_reg::<OP>(insn)), insn);
+    if interp
         .windows
         .data_for(OpCode(OP))
         .access::<OP>(&mut ctx.regs, insn, addr)
     {
-        become_next!(ctx, code, slot, fuel, calls, table)
+        become_next!(ctx, code, ip, fuel, interp, table)
     }
     // a dispatch of its own, so that the hit above keeps its instructions
-    if small(OpCode(OP).mem_size()) && calls.windows.spare.access::<OP>(&mut ctx.regs, insn, addr) {
-        become_next!(ctx, code, slot, fuel, calls, table)
+    if small(OpCode(OP).mem_size()) && interp.windows.spare.access::<OP>(&mut ctx.regs, insn, addr) {
+        become_next!(ctx, code, ip, fuel, interp, table)
     }
-    become data_miss::<M, H, F, OP>(ctx, code, slot, fuel, calls, table, op)
+    become data_miss::<M, H, OP>(ctx, code, ip, fuel, interp, table, slot)
 }
 
 /// Runs a load or store that missed the data window through the window around r10 if it fits there, as one through
 /// a pointer into the stack does, and in [`miss`] otherwise.
 // out of line from `miss`, whose call of `Windows::take` needs a stack frame
 #[inline(never)]
-extern "rust-preserve-none" fn data_miss<M: Memory, H: Host<M>, F: Fuel, const OP: u8>(
+extern "rust-preserve-none" fn data_miss<M: Memory, H: Host<M>, const OP: u8>(
     ctx: &mut Context<M>,
-    code: &[Op],
-    slot: Slot,
+    code: Slots,
+    ip: Ip,
     fuel: u64,
-    calls: &mut CallStack<H, M::Err>,
+    interp: &mut Interpreter<M, H>,
     table: &Table<M, H>,
-    op: Op,
+    slot: Slot,
 ) {
     // SAFETY: as in `data_access`, which continues here
-    let insn = unsafe { slot.view(op, const { Shape::of(OP) }) };
-    let addr = mem::address(ctx.regs.get(base_reg::<OP>(insn)), insn);
-    if !calls.windows.stack.access::<OP>(&mut ctx.regs, insn, addr) {
-        become miss::<M, H, F, OP, true>(ctx, code, slot, fuel, calls, table, op)
+    let insn = unsafe { ip.view(slot, const { Shape::of(OP) }) };
+    let addr = step::address(ctx.regs.get(base_reg::<OP>(insn)), insn);
+    if !interp.windows.stack.access::<OP>(&mut ctx.regs, insn, addr) {
+        become miss::<M, H, OP, true>(ctx, code, ip, fuel, interp, table, slot)
     }
-    become_next!(ctx, code, slot, fuel, calls, table)
+    become_next!(ctx, code, ip, fuel, interp, table)
 }
 
 /// Takes the window around the address of the access, or without `DATA` around r10, and runs the access with its
 /// usual handler.
 #[cold]
 #[inline(never)]
-extern "rust-preserve-none" fn miss<M: Memory, H: Host<M>, F: Fuel, const OP: u8, const DATA: bool>(
+extern "rust-preserve-none" fn miss<M: Memory, H: Host<M>, const OP: u8, const DATA: bool>(
     ctx: &mut Context<M>,
-    code: &[Op],
-    slot: Slot,
+    code: Slots,
+    ip: Ip,
     fuel: u64,
-    calls: &mut CallStack<H, M::Err>,
+    interp: &mut Interpreter<M, H>,
     table: &Table<M, H>,
-    op: Op,
+    slot: Slot,
 ) {
-    // SAFETY: as in `access` and `data_access`, which continue here
-    let insn = unsafe { slot.view(op, const { Shape::of(OP) }) };
+    // SAFETY: as in `stack_access` and `data_access`, which continue here
+    let insn = unsafe { ip.view(slot, const { Shape::of(OP) }) };
     let around = match DATA {
-        true => mem::address(ctx.regs.get(base_reg::<OP>(insn)), insn),
+        true => step::address(ctx.regs.get(base_reg::<OP>(insn)), insn),
         // the frame is the bytes below r10
-        false => ctx.regs[10].wrapping_sub(1),
+        false => ctx.regs[FP].wrapping_sub(1),
     };
-    calls.windows.take::<M, DATA>(&ctx.data, around, OpCode(OP).mem_size());
-    become handler::<M, H, F, OP>(ctx, code, slot, fuel, calls, table, op)
+    interp
+        .windows
+        .take::<M, DATA>(ctx.memory, around, OpCode(OP).mem_size());
+    become handler::<M, H, OP>(ctx, code, ip, fuel, interp, table, slot)
 }
 
 /// The register that holds the base address of the load or store `OP`.
 #[inline(always)]
 fn base_reg<const OP: u8>(insn: View) -> Reg {
     match OpCode(OP).class() {
-        Class::LdReg => insn.src_reg(),
+        Class::Ldx => insn.src_reg(),
         _ => insn.dst_reg(),
     }
 }

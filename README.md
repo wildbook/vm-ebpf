@@ -29,12 +29,13 @@ and `cargo test` fails when they change without a rebuild.
 
 ## Crates
 
-- `lib/rvm-core`: the instruction set and interpreter (`run`) over a `Memory`
-  and a `Host` trait. `Code::new` prepares bytecode for it: it decodes each
-  instruction once and fuses common sequences into superinstructions. `run`
-  returns a `Flow` saying why execution stopped: exit, an indirect call or jump,
-  a declined host call, an invalid or unimplemented instruction, a memory fault,
-  a `pc` outside the code, a call stack overflow, or out of fuel.
+- `lib/rvm-core`: the instruction set and an `Interpreter` for it over a
+  `Memory` and a `Host` trait. `Code::new` prepares bytecode for it: it decodes
+  each instruction once and fuses common sequences into superinstructions. A
+  run returns a `Stop` whose `Reason` says why execution stopped: exit, an
+  indirect call or jump, a declined host call, an invalid or unsupported
+  instruction, a memory fault, a `pc` outside the code, a call stack overflow,
+  or out of fuel.
 - `lib/rvm`: the runtime: ELF loading, linking, guest memory, helpers, maps and
   plugins.
 - `lib/btf`: BTF parsing, `BtfBuilder` and CO-RE relocations.
@@ -56,9 +57,10 @@ With the `fuel` feature (on by default), a call that runs more than
 `Program::call_func_with_limit` gives one call a limit of its own and reports
 how many instructions it ran. The count is exact: the interpreter charges a
 basic block's instructions as it enters the block, and runs a block the fuel
-can't pay for one instruction at a time. In the benchmarks, guest code with the
-feature ran up to 9% more host instructions and took up to about 5% longer than
-without it.
+can't pay for one instruction at a time. A call without a limit counts nothing
+and runs the same code as in a build without the feature. In the benchmarks,
+guest code with a limit ran 1% to 8% more host instructions than without one
+and took up to about 5% longer; a workload of indirect calls took 11% longer.
 
 Without the feature the interpreter doesn't count instructions. The API is the
 same in both builds, but a non-zero limit in `Vm::with_config` or
@@ -294,10 +296,11 @@ The interpreter covers the ISA up to `-mcpu=v4`, with these details:
   through `.jumptables`; the linker copies each table into `.rodata` as code
   addresses, and `gotox` checks its target like `callx`.
 - `may_goto` (libbpf's `can_loop`, Linux 6.9) never jumps. The kernel jumps
-  once a loop's budget runs out; rvm bounds loops with fuel instead.
+  once a loop's budget runs out; rvm bounds loops with the instruction limit
+  instead.
 
 Not implemented: kfunc BTF ID resolution, and the legacy packet access modes
-`BPF_ABS` and `BPF_IND`, which return `Flow::Missing`.
+`BPF_ABS` and `BPF_IND`, which stop with `Reason::Unsupported`.
 
 ## Tests and benchmarks
 

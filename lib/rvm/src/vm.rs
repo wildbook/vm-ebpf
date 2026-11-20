@@ -36,10 +36,10 @@ pub const DEFAULT_MEMORY_LIMIT: usize = 256 << 20;
 pub struct VmConfig {
     /// Maximum number of instructions one call into a program may execute, with 0 (the default) for no limit.
     /// Instructions that plugins run for it through their exports count too, so the limit covers the whole call tree;
-    /// a plugin's own limit still caps the calls into it. Limits above `i64::MAX`, and no limit, count as `i64::MAX`.
-    /// The count is exact: the interpreter charges a basic block as it enters it, but stops at the instruction the
-    /// limit runs out at. Without the `fuel` feature the interpreter doesn't count instructions, and
-    /// [`Vm::with_config`] rejects any limit but 0.
+    /// a plugin's own limit still caps the calls into it. Limits above `i64::MAX` count as `i64::MAX`. The count is
+    /// exact: the interpreter charges a basic block as it enters it, but stops at the instruction the limit runs out
+    /// at. A call without a limit counts nothing, and the plugins it calls run under their own limits. Without the
+    /// `fuel` feature the interpreter doesn't count instructions, and [`Vm::with_config`] rejects any limit but 0.
     pub instruction_limit: u64,
     /// Stack bytes reserved per call frame. Loading fails with [`VmError::InvalidArgument`] if the stack for
     /// [`MAX_CALL_DEPTH`](crate::MAX_CALL_DEPTH) nested calls exceeds [`MAX_REGION_LEN`] bytes.

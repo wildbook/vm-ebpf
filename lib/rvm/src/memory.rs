@@ -725,7 +725,7 @@ macro_rules! guest_ordered {
 
 // SAFETY: `set` moves to a new epoch whenever a mapping changes, and the `Memory` methods leave the epoch alone
 unsafe impl Memory for VmMemory {
-    type Err = u64;
+    type Error = u64;
 
     guest_access!(load_u8, store_u8, u8);
     guest_access!(load_u16, store_u16, u16);
@@ -932,7 +932,7 @@ mod tests {
         asm.stw(R2, 4, 5).ldxw(R3, R2, 4).add64(R7, R3);
         asm.stxw(R6, 4, R7);
         asm.call(1).ldxw(R0, R6, 0).add64(R0, R7).exit();
-        let code = rvm_core::Code::new(rvm_core::decode_instructions(&asm.assemble().unwrap()));
+        let code = rvm_core::Code::new(rvm_core::Instruction::decode(&asm.assemble().unwrap()));
         let result = Executor::new(helpers, stack_top, &config).call(&code, &mut mem, 0, &[]);
         assert_eq!(result.unwrap(), 21);
     }

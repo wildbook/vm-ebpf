@@ -2,10 +2,10 @@
 
 use std::fmt;
 
-use rvm_core::{run, CallStack, Callee, Code, Context, Flow, Host, METERED};
+use rvm_core::{Callee, Code, Context, Host, Interpreter, Reason, METERED};
 
 use crate::error::{ExecError, MemoryError, Result, VmError};
-use crate::helper::{HelperRegistry, HostState, Stop};
+use crate::helper::{CallerFuel, HelperRegistry, HostState, Stop};
 use crate::image::INSN_SIZE;
 use crate::layout::CODE_REGION;
 #[cfg(feature = "maps")]
@@ -26,14 +26,12 @@ pub const MAX_ARGS: usize = 5;
 ///
 /// Each call borrows the code and the memory, so the memory survives errors. Code is a separate instruction slice, so
 /// the guest can neither read nor modify it through memory. The executor keeps what carries over from one call to the
-/// next: the extern table, the maps, the frame size and the memory windows.
+/// next: the extern table, the maps, the frame size, the instruction limit and the memory windows.
 pub struct Executor {
-    /// The frames of the local calls in progress, and the frame size, memory windows and host.
-    calls: CallStack<HostCalls, u64>,
+    /// The frames of the local calls in progress, and the frame size, instruction limit, memory windows and host.
+    interp: Interpreter<VmMemory, HostCalls>,
     /// Initial r10.
     stack_top: u64,
-    /// Maximum instructions to execute, at most `i64::MAX`. Without the `fuel` feature, nothing counts them.
-    instruction_limit: u64,
 }
 
 impl Executor {
@@ -44,183 +42,216 @@ impl Executor {
             state: HostState::default(),
             stop: None,
         };
-        Self {
-            calls: CallStack::new(config.frame_size, host),
+        #[cfg_attr(not(feature = "fuel"), expect(unused_mut))]
+        let mut executor = Self {
+            interp: Interpreter::new(config.frame_size, host),
             stack_top,
-            instruction_limit: fuel_for(config.instruction_limit),
+        };
+        // 0 is no limit, and without the `fuel` feature `Vm::with_config` refuses any other
+        #[cfg(feature = "fuel")]
+        if config.instruction_limit != 0 {
+            executor.set_limit(Some(config.instruction_limit));
         }
+        executor
     }
 
     /// Replace the extern table that helper and kfunc calls use.
     pub fn set_helpers(&mut self, helpers: HelperRegistry) {
-        self.calls.host.registry = helpers;
+        self.interp.host.registry = helpers;
     }
 
     /// The maps passed to helpers through [`HostState::maps`].
     #[cfg(feature = "maps")]
     pub fn maps_mut(&mut self) -> &mut Maps {
-        &mut self.calls.host.state.maps
+        &mut self.interp.host.state.maps
     }
 
-    /// The instruction budget of a call under this executor's [`VmConfig::instruction_limit`].
+    /// The instruction limit of [`call`](Self::call), at most `i64::MAX`, if it has one.
     #[inline]
-    pub fn instruction_limit(&self) -> u64 {
-        self.instruction_limit
+    pub fn instruction_limit(&self) -> Option<u64> {
+        self.interp.limit()
     }
 
     /// Call the function at `pc` (instruction index) of `code` with `args` in r1-r5 under the instruction limit;
     /// returns r0. More than 5 arguments fail with [`VmError::TooManyArgs`].
     #[inline(always)]
     pub fn call(&mut self, code: &Code, memory: &mut VmMemory, pc: u64, args: &[u64]) -> Result<u64> {
-        let mut fuel = self.instruction_limit;
-        self.run_call::<true>(code, memory, pc, args, &mut fuel)
-    }
-
-    /// [`call`](Self::call) that runs at most `*fuel` instructions, the ones it runs in other plugins through their
-    /// exports included, and leaves what is left in `*fuel`.
-    #[inline(always)]
-    pub fn call_fueled(
-        &mut self,
-        code: &Code,
-        memory: &mut VmMemory,
-        pc: u64,
-        args: &[u64],
-        fuel: &mut u64,
-    ) -> Result<u64> {
-        self.run_call::<false>(code, memory, pc, args, fuel)
-    }
-
-    /// The body of [`call`](Self::call) and [`call_fueled`](Self::call_fueled). With `LIMIT`, `*fuel` starts at the
-    /// instruction limit, which errors then report without keeping the start alive across the call.
-    #[inline(always)]
-    fn run_call<const LIMIT: bool>(
-        &mut self,
-        code: &Code,
-        memory: &mut VmMemory,
-        pc: u64,
-        args: &[u64],
-        fuel: &mut u64,
-    ) -> Result<u64> {
         if args.len() > MAX_ARGS {
             return Err(VmError::TooManyArgs(args.len()));
         }
 
-        // A call starts with fresh registers and no frames. Guest code can read and write all 16 registers, r11-r15
-        // included, so each starts at a defined value: r1-r5 hold the arguments and 0 past `args.len()`, r10 the stack
-        // top, the others 0. A call that failed inside a local call leaves its frames behind.
+        // A call starts with fresh registers in the entry frame. Guest code can read and write all 16 registers,
+        // r11-r15 included, so each starts at a defined value: r1-r5 hold the arguments and 0 past `args.len()`, r10
+        // the stack top, the others 0.
         let mut ctx = Context::new(memory);
         // at most `MAX_ARGS` stores; `copy_from_slice` calls memcpy
         for (i, &arg) in args.iter().take(MAX_ARGS).enumerate() {
             ctx.regs[i + 1] = arg;
         }
         ctx.regs[10] = self.stack_top;
-        let calls = &mut self.calls;
-        calls.clear();
 
-        let mut pc = pc;
-        // in a local, so that a call through `call`, whose budget ends with it, stores nothing back when it exits
-        let start = *fuel;
-        let mut left = start;
-        let flow = run(&mut ctx, code, &mut pc, &mut left, calls);
-        if let Flow::Exit = flow {
-            *fuel = left;
+        let stop = self.interp.run(&mut ctx, code, pc);
+        if let Reason::Exit = stop.reason {
             return Ok(ctx.regs[0]);
         }
-        let limit = if LIMIT { self.instruction_limit } else { start };
-        let (result, left) = run_on(flow, pc, code, &mut ctx, calls, left, limit);
-        *fuel = left;
-        result
+        run_on(stop.reason, stop.pc, code, &mut ctx, &mut self.interp)
+    }
+
+    /// [`call`](Self::call) that runs at most `*fuel` instructions, the ones it runs in other plugins through their
+    /// exports included, and leaves what is left in `*fuel`. Without the `fuel` feature nothing counts them, and
+    /// `*fuel` stays as it is.
+    pub fn call_fueled(
+        &mut self,
+        code: &Code,
+        memory: &mut VmMemory,
+        pc: u64,
+        args: &[u64],
+        #[cfg_attr(not(feature = "fuel"), expect(unused_variables))] fuel: &mut u64,
+    ) -> Result<u64> {
+        #[cfg(feature = "fuel")]
+        {
+            // before the budget, so that a call that runs nothing leaves `*fuel`
+            if args.len() > MAX_ARGS {
+                return Err(VmError::TooManyArgs(args.len()));
+            }
+            let budget = Budget::new(self, *fuel);
+            let result = budget.executor.call(code, memory, pc, args);
+            *fuel = budget.executor.interp.fuel().expect("a budget meters the call");
+            result
+        }
+        #[cfg(not(feature = "fuel"))]
+        self.call(code, memory, pc, args)
+    }
+
+    /// Meter the calls from now on with `limit`, or not at all, and tell the host functions whether their caller is
+    /// metered.
+    #[cfg(feature = "fuel")]
+    fn set_limit(&mut self, limit: Option<u64>) {
+        self.interp.set_limit(limit);
+        self.interp.host.state.fuel = match limit {
+            Some(_) => CallerFuel::Unknown,
+            None => CallerFuel::Unmetered,
+        };
     }
 }
 
 impl fmt::Debug for Executor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("Executor");
-        s.field("helpers", &self.calls.host.registry);
+        s.field("helpers", &self.interp.host.registry);
         #[cfg(feature = "maps")]
-        s.field("maps", &self.calls.host.state.maps);
+        s.field("maps", &self.interp.host.state.maps);
         s.field("stack_top", &self.stack_top);
         if METERED {
-            s.field("instruction_limit", &self.instruction_limit);
+            s.field("instruction_limit", &self.interp.limit());
         }
         s.finish_non_exhaustive()
     }
 }
 
-/// Continue a call after [`run`] stopped at `pc` with `flow`, which is not [`Flow::Exit`], until it returns or fails,
-/// with `fuel` left; returns the result and the fuel left then.
-// Out of line, so that the call's usual path keeps nothing across `run` that only resuming needs. It takes the fuel by
-// value, so that the usual path keeps it in a register.
+/// The executor with a limit of its own for one call. It restores the executor's limit when dropped, also when a host
+/// function panics during the call.
+#[cfg(feature = "fuel")]
+struct Budget<'a> {
+    executor: &'a mut Executor,
+    /// The executor's limit.
+    own: Option<u64>,
+}
+
+#[cfg(feature = "fuel")]
+impl<'a> Budget<'a> {
+    /// `executor` with a limit of `fuel`.
+    fn new(executor: &'a mut Executor, fuel: u64) -> Self {
+        let own = executor.interp.limit();
+        executor.set_limit(Some(fuel));
+        Self { executor, own }
+    }
+}
+
+#[cfg(feature = "fuel")]
+impl Drop for Budget<'_> {
+    fn drop(&mut self) {
+        self.executor.set_limit(self.own);
+    }
+}
+
+/// Continue a call after [`Interpreter::run`] stopped at `pc` with `reason`, which is not [`Reason::Exit`], until it
+/// returns or fails.
+// Out of line, so that the call's usual path keeps nothing across `run` that only resuming needs.
 #[cold]
 #[inline(never)]
 fn run_on(
-    mut flow: Flow<u64>,
+    mut reason: Reason<u64>,
     mut pc: u64,
     code: &Code,
-    ctx: &mut Context<&mut VmMemory>,
-    calls: &mut CallStack<HostCalls, u64>,
-    mut fuel: u64,
-    limit: u64,
-) -> (Result<u64>, u64) {
-    let resume_all = || loop {
-        pc = match calls.host.take_fuel_wanted(&flow) {
-            Some(slot) => call_with_fuel(slot, pc, ctx, calls, &mut fuel)?,
-            None => resume(flow, pc, code, calls, limit)?,
+    ctx: &mut Context<VmMemory>,
+    interp: &mut Interpreter<VmMemory, HostCalls>,
+) -> Result<u64> {
+    loop {
+        pc = match interp.host.take_fuel_wanted(reason) {
+            Some(slot) => call_with_fuel(slot, pc, ctx, interp)?,
+            None => resume_at(reason, pc, code, interp)?,
         };
-        flow = run(ctx, code, &mut pc, &mut fuel, calls);
-        if let Flow::Exit = flow {
+        let stop = interp.resume(ctx, code, pc);
+        (reason, pc) = (stop.reason, stop.pc);
+        if let Reason::Exit = reason {
             return Ok(ctx.regs[0]);
         }
-    };
-    let result = resume_all();
-    (result, fuel)
+    }
 }
 
-/// Call the host function in extern-table `slot`, which stopped the call at `pc` asking for the caller's `fuel`, again
-/// with that fuel, and return where the caller continues. The function leaves what it didn't use in `fuel`.
+/// Call the host function in extern-table `slot`, which stopped the call at `pc` asking for the caller's fuel, again
+/// with the fuel the caller has left, and return where the caller continues. The caller continues with the fuel the
+/// function leaves.
 #[cold]
 #[inline(never)]
 fn call_with_fuel(
     slot: u32,
     pc: u64,
-    ctx: &mut Context<&mut VmMemory>,
-    calls: &mut CallStack<HostCalls, u64>,
-    fuel: &mut u64,
+    ctx: &mut Context<VmMemory>,
+    interp: &mut Interpreter<VmMemory, HostCalls>,
 ) -> Result<u64> {
-    let host = &mut calls.host;
-    host.state.fuel = Some(*fuel);
+    let fuel = interp.fuel().expect("only a metered caller asks for its fuel");
+    let host = &mut interp.host;
+    host.state.fuel = CallerFuel::Left(fuel);
     let mut stop = None;
     let r0 = host.registry.call_slot(slot, ctx, &mut host.state, &mut stop);
-    *fuel = host.state.fuel.take().expect("fuel stays while the function runs");
+    let CallerFuel::Left(left) = std::mem::replace(&mut host.state.fuel, CallerFuel::Unknown) else {
+        unreachable!("the fuel stays while the function runs")
+    };
+    interp.set_fuel(left);
     ctx.regs[0] = r0.ok_or_else(|| failure(stop.expect("stopped host call left no reason"), pc))?;
     Ok(pc + 1)
 }
 
-/// Where to continue after [`run`] stopped at `pc` with `flow`, which is not [`Flow::Exit`], or why the call fails.
+/// Where to continue after [`Interpreter::run`] stopped at `pc` with `reason`, which is not [`Reason::Exit`], or why
+/// the call fails.
 #[cold]
 #[inline(never)]
-fn resume(flow: Flow<u64>, pc: u64, code: &Code, calls: &mut CallStack<HostCalls, u64>, limit: u64) -> Result<u64> {
-    match flow {
-        Flow::StackOverflow => Err(ExecError::StackOverflow { pc }.into()),
+fn resume_at(reason: Reason<u64>, pc: u64, code: &Code, interp: &mut Interpreter<VmMemory, HostCalls>) -> Result<u64> {
+    match reason {
+        Reason::StackOverflow => Err(ExecError::StackOverflow { pc }.into()),
         // a call the linker planted for an unresolved CO-RE relocation
-        Flow::CallHelper(CORE_POISON_HELPER) => Err(ExecError::UnresolvedCoreRelo { pc }.into()),
-        Flow::CallHelper(_) | Flow::CallKfunc(_) => {
-            let stop = calls.host.stop.take().expect("stopped host call left no reason");
+        Reason::CallHelper(CORE_POISON_HELPER) => Err(ExecError::UnresolvedCoreRelo { pc }.into()),
+        Reason::CallHelper(_) | Reason::CallKfunc(_) => {
+            let stop = interp.host.stop.take().expect("stopped host call left no reason");
             Err(failure(stop, pc))
         }
-        Flow::OutOfFuel => Err(ExecError::InstructionLimit { limit }.into()),
-        Flow::BadPc => Err(ExecError::InvalidPc { pc }.into()),
-        Flow::FailCpu => Err(ExecError::InvalidInstruction { pc }.into()),
-        Flow::FailMem(addr) => Err(memory_fault(pc, addr, code)),
-        Flow::Missing => Err(ExecError::Unimplemented { pc }.into()),
-        // a host call `HostCalls::callx` ran failed, or the target addresses neither a function nor a helper
-        Flow::CallIndirect(target) => match calls.host.stop.take() {
+        Reason::OutOfFuel => {
+            let limit = interp.limit().expect("only a metered call runs out of fuel");
+            Err(ExecError::InstructionLimit { limit }.into())
+        }
+        Reason::BadPc => Err(ExecError::InvalidPc { pc }.into()),
+        Reason::InvalidInstruction => Err(ExecError::InvalidInstruction { pc }.into()),
+        Reason::MemoryFault(addr) => Err(memory_fault(pc, addr, code)),
+        Reason::Unsupported => Err(ExecError::Unimplemented { pc }.into()),
+        // a host call `HostCalls::call_indirect` ran failed, or the target addresses neither a function nor a helper
+        Reason::CallIndirect(target) => match interp.host.stop.take() {
             Some(stop) => Err(failure(stop, pc)),
             None => Err(ExecError::BadCodeAddress { pc, target }.into()),
         },
-        Flow::JumpIndirect(target) => jump_indirect(target, pc, code),
-        // `run` handles these internally, and the executor `Exit`
-        Flow::Exit | Flow::Next | Flow::Jump(_) | Flow::Call(_) => unreachable!(),
+        Reason::JumpIndirect(target) => jump_indirect(target, pc, code),
+        Reason::Exit => unreachable!("the executor returns at `exit`"),
     }
 }
 
@@ -234,26 +265,26 @@ fn failure(stop: Stop, pc: u64) -> VmError {
     }
 }
 
-/// The extern table and the state that helper, kfunc and `callx` calls reach from inside [`run`].
+/// The extern table and the state that helper, kfunc and `callx` calls reach from inside [`Interpreter::run`].
 struct HostCalls {
     registry: HelperRegistry,
     state: HostState,
-    /// Why the host call that stopped [`run`] did, until the executor takes it.
+    /// Why the host call that stopped the run did, until the executor takes it.
     stop: Option<Stop>,
 }
 
 impl HostCalls {
-    /// The extern-table slot of the host function that stopped [`run`] with `flow` asking for the caller's fuel, if
+    /// The extern-table slot of the host function that stopped the run with `reason` asking for the caller's fuel, if
     /// it did; takes the request.
     #[cold]
-    fn take_fuel_wanted(&mut self, flow: &Flow<u64>) -> Option<u32> {
+    fn take_fuel_wanted(&mut self, reason: Reason<u64>) -> Option<u32> {
         if !matches!(self.stop, Some(Stop::FuelWanted)) {
             return None;
         }
-        let slot = match *flow {
-            Flow::CallKfunc(slot) => Some(slot),
-            Flow::CallHelper(id) => self.registry.slot_of_id(id),
-            Flow::CallIndirect(target) => u32::try_from(target).ok().and_then(|id| self.registry.slot_of_id(id)),
+        let slot = match reason {
+            Reason::CallKfunc(slot) => Some(slot),
+            Reason::CallHelper(id) => self.registry.slot_of_id(id),
+            Reason::CallIndirect(target) => u32::try_from(target).ok().and_then(|id| self.registry.slot_of_id(id)),
             _ => None,
         }?;
         self.stop = None;
@@ -261,11 +292,11 @@ impl HostCalls {
     }
 }
 
-impl Host<&mut VmMemory> for HostCalls {
+impl Host<VmMemory> for HostCalls {
     // Raw bytecode calls helpers by ID; linked programs call slots only, except for calls the linker planted for
     // unresolved CO-RE relocations, which the executor reports.
     #[inline]
-    fn helper(&mut self, ctx: &mut Context<&mut VmMemory>, id: u32) -> Option<u64> {
+    fn call_helper(&mut self, ctx: &mut Context<VmMemory>, id: u32) -> Option<u64> {
         if id == CORE_POISON_HELPER {
             return None;
         }
@@ -273,18 +304,21 @@ impl Host<&mut VmMemory> for HostCalls {
             self.stop = Some(Stop::UnknownHelper(id));
             return None;
         };
-        self.kfunc(ctx, slot)
+        self.call_kfunc(ctx, slot)
     }
 
     #[inline]
-    fn kfunc(&mut self, ctx: &mut Context<&mut VmMemory>, slot: u32) -> Option<u64> {
+    fn call_kfunc(&mut self, ctx: &mut Context<VmMemory>, slot: u32) -> Option<u64> {
         self.registry.call_slot(slot, ctx, &mut self.state, &mut self.stop)
     }
 
-    // A code address names a guest function, which `run` checks against the code. A helper's address is its ID, as in
-    // libbpf's `(void *)BPF_FUNC_*` helper declarations.
-    #[inline]
-    fn callx(&mut self, ctx: &mut Context<&mut VmMemory>, target: u64) -> Option<Callee> {
+    // A code address names a guest function, which the interpreter checks against the code. A helper's address is its
+    // ID, as in libbpf's `(void *)BPF_FUNC_*` helper declarations.
+    //
+    // Always inline: the interpreter has one `callx` handler for metered runs and one for the others, and LLVM leaves
+    // a function with two callers out of line, which costs every `callx` a call.
+    #[inline(always)]
+    fn call_indirect(&mut self, ctx: &mut Context<VmMemory>, target: u64) -> Option<Callee> {
         if let Some(pc) = code_index(target) {
             return Some(Callee::Local(pc));
         }
@@ -293,13 +327,13 @@ impl Host<&mut VmMemory> for HostCalls {
             self.stop = Some(Stop::UnknownHelper(id));
             return None;
         };
-        self.kfunc(ctx, slot).map(Callee::Host)
+        self.call_kfunc(ctx, slot).map(Callee::Host)
     }
 }
 
 /// The fault of the load or store at `pc` that failed at `addr`.
 fn memory_fault(pc: u64, addr: u64, code: &Code) -> VmError {
-    // only loads and stores fail with `Flow::FailMem`
+    // only loads and stores fail with `Reason::MemoryFault`
     let size = code.access_size(pc).expect("memory fault outside a load or store");
     ExecError::MemoryFault {
         pc,
@@ -321,8 +355,8 @@ fn code_index(addr: u64) -> Option<u64> {
     (offset % INSN_SIZE == 0).then_some(offset / INSN_SIZE)
 }
 
-/// The instruction budget of a call limited to `limit` instructions: 0 means no limit, and `run` takes at most
-/// `i64::MAX`.
+/// The fuel of a call limited to `limit` instructions, for [`Executor::call_fueled`]: 0 means no limit, which counts
+/// as `i64::MAX`, the most a limit can be.
 pub fn fuel_for(limit: u64) -> u64 {
     match limit {
         0 => i64::MAX as u64,
@@ -333,7 +367,7 @@ pub fn fuel_for(limit: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use ebpf_asm::{Assembler, R0, R1, R10, R2, R3, R6};
-    use rvm_core::decode_instructions;
+    use rvm_core::Instruction;
 
     use super::*;
     use crate::error::HostError;
@@ -343,7 +377,7 @@ mod tests {
 
     /// Run `code` from its first instruction on `memory` plus a one-frame stack.
     fn run_with(code: &[u8], helpers: &HelperRegistry, mut memory: VmMemory, config: &VmConfig) -> Result<u64> {
-        let code = Code::new(decode_instructions(code));
+        let code = Code::new(Instruction::decode(code));
         let len = config.frame_size as usize;
         let stack_top = memory.map_any(STACK_REGION, len, Perms::RW).unwrap() + config.frame_size;
         Executor::new(helpers.clone(), stack_top, config).call(&code, &mut memory, 0, &[])

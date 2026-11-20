@@ -22,7 +22,7 @@ default = ["link", "fuel", "maps"]
 # `Vm::prepare_modules`, `Vm::load_elf` and `Vm::load_modules`. Without it, rvm loads prepared images only.
 link = ["dep:constelf", "dep:btf"]
 # Enforces `VmConfig::instruction_limit`. Without it, the interpreter doesn't count instructions, and a non-zero limit
-# fails with `VmError::FuelNotEnabled`.
+# fails with `VmError::FuelNotEnabled`. A call without a limit costs the same with and without it.
 fuel = ["rvm-core/fuel"]
 # Guest maps: the map helpers, `Program::map` and `Vm::share_map`. Without it, an image that declares maps fails to
 # load with `LinkError::InvalidMap`.

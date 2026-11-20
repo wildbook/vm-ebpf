@@ -13,8 +13,8 @@
 
 use std::sync::Arc;
 
-use rvm_core::opcode::{CALL, LD_IMM64};
-use rvm_core::{decode_instructions, Code, Instruction, BPF_PSEUDO_KFUNC_CALL, MAX_CALL_DEPTH};
+use rvm_core::opcode::{call, CALL, LD_IMM64};
+use rvm_core::{Code, Instruction, MAX_CALL_DEPTH};
 
 use crate::error::{LinkError, Result, VmError};
 use crate::helper::{HelperRegistry, SharedHelpers};
@@ -306,7 +306,7 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
     #[cfg(feature = "maps")]
     let (maps, maps_len) = Maps::new(s.maps, &shared.maps, &mut budget)?;
 
-    let mut insns = decode_instructions(s.code);
+    let mut insns = Instruction::decode(s.code);
     // Bind against one version of the table; the program refreshes from there.
     let snapshot = helpers.snapshot();
     bind_helper_calls(&mut insns, s.code, &snapshot.table);
@@ -442,7 +442,7 @@ fn bind_call(insn: &mut Instruction, slot: u32) {
 
 /// Turn a call instruction into a call to extern-table `slot`.
 pub fn set_slot_call(insn: &mut [u8; 8], slot: u32) {
-    insn[1] = (insn[1] & 0x0F) | (BPF_PSEUDO_KFUNC_CALL << 4);
+    insn[1] = (insn[1] & 0x0F) | (call::KFUNC << 4);
     set_imm(insn, slot);
 }
 

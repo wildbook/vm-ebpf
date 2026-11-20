@@ -236,14 +236,19 @@ impl Program {
         }
     }
 
-    /// [`call_func`](Self::call_func) for a host function that runs inside another call, which has `fuel` left: the
-    /// call runs at most that and this program's limit, and takes what it ran from `fuel`.
+    /// [`call_func`](Self::call_func) for a host function that runs inside another call. With `fuel`, what that call
+    /// has left if it is metered, the call runs at most that and this program's limit, and takes what it ran from
+    /// `fuel`; without, it runs under this program's limit alone.
     #[inline]
-    pub(crate) fn call_func_charged(&mut self, func: Func, args: &[u64], fuel: &mut u64) -> Result<u64> {
+    pub(crate) fn call_func_charged(&mut self, func: Func, args: &[u64], fuel: Option<&mut u64>) -> Result<u64> {
+        let Some(fuel) = fuel else {
+            return self.call_func(func, args);
+        };
         if !self.owns(func) {
             return Err(VmError::ForeignFunc);
         }
-        let start = (*fuel).min(self.executor.instruction_limit());
+        let limit = self.executor.instruction_limit();
+        let start = limit.map_or(*fuel, |limit| limit.min(*fuel));
         let mut left = start;
         let result = self.call_pc_fueled(func.pc, args, &mut left);
         *fuel -= start - left;
@@ -265,7 +270,7 @@ impl Program {
     }
 
     /// [`call_pc`](Self::call_pc) with `*fuel` instructions, leaving what is left there. A function of its own, so that
-    /// `call_pc` starts from the instruction limit and reports nothing back.
+    /// `call_pc` stays a call under the executor's limit that reports nothing back.
     #[inline(never)]
     fn call_pc_fueled(&mut self, pc: u64, args: &[u64], fuel: &mut u64) -> Result<u64> {
         if self.shared_helpers.version() != self.helpers_version {
