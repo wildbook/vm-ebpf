@@ -61,6 +61,9 @@ pub enum VmError {
     /// The allocator refused this many bytes.
     OutOfMemory(usize),
 
+    /// A non-zero instruction limit in a build without the `fuel` feature, which can't enforce it.
+    FuelNotEnabled,
+
     /// The program's code, rodata or data (named) exceeds [`MAX_REGION_LEN`](crate::MAX_REGION_LEN) bytes.
     ProgramTooLarge(&'static str),
 
@@ -103,6 +106,9 @@ impl fmt::Display for VmError {
                 write!(f, "program needs more than {limit} bytes of memory; raise VmConfig::memory_limit to allow it")
             }
             Self::OutOfMemory(bytes) => write!(f, "failed to allocate {bytes} bytes"),
+            Self::FuelNotEnabled => {
+                write!(f, "instruction limits need rvm's `fuel` feature; enable it or set the limit to 0")
+            }
             Self::ProgramTooLarge(region) => {
                 write!(f, "program {region} exceeds {} bytes", crate::memory::MAX_REGION_LEN)
             }

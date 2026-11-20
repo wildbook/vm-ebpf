@@ -25,7 +25,7 @@ use crate::program::Program;
 use crate::std_helpers;
 use crate::sync::{lock, Published};
 
-/// [`VmConfig::instruction_limit`] in [`VmConfig::default`].
+/// A [`VmConfig::instruction_limit`] for hosts that want one; [`VmConfig::default`] has none.
 pub const DEFAULT_INSTRUCTION_LIMIT: u64 = 1_000_000;
 
 /// [`VmConfig::memory_limit`] in [`VmConfig::default`].
@@ -34,12 +34,12 @@ pub const DEFAULT_MEMORY_LIMIT: usize = 256 << 20;
 /// Configuration for the VM.
 #[derive(Debug, Clone)]
 pub struct VmConfig {
-    /// Maximum number of instructions one call into a program may execute, with 0 for no limit. Instructions that
-    /// plugins run for it through their exports count too, so the limit covers the whole call tree; a plugin's own
-    /// limit still caps the calls into it. Limits above `i64::MAX`, and no limit, count as `i64::MAX`. The count is
-    /// exact: the interpreter charges a basic block as it enters it, but stops at the instruction the limit runs out at.
-    /// Without the `fuel` feature the interpreter doesn't count instructions, and the limit does nothing;
-    /// [`Vm::enforces_instruction_limit`] tells which applies.
+    /// Maximum number of instructions one call into a program may execute, with 0 (the default) for no limit.
+    /// Instructions that plugins run for it through their exports count too, so the limit covers the whole call tree;
+    /// a plugin's own limit still caps the calls into it. Limits above `i64::MAX`, and no limit, count as `i64::MAX`.
+    /// The count is exact: the interpreter charges a basic block as it enters it, but stops at the instruction the
+    /// limit runs out at. Without the `fuel` feature the interpreter doesn't count instructions, and
+    /// [`Vm::with_config`] rejects any limit but 0.
     pub instruction_limit: u64,
     /// Stack bytes reserved per call frame. Loading fails with [`VmError::InvalidArgument`] if the stack for
     /// [`MAX_CALL_DEPTH`](crate::MAX_CALL_DEPTH) nested calls exceeds [`MAX_REGION_LEN`] bytes.
@@ -52,7 +52,7 @@ pub struct VmConfig {
 impl Default for VmConfig {
     fn default() -> Self {
         Self {
-            instruction_limit: DEFAULT_INSTRUCTION_LIMIT,
+            instruction_limit: 0,
             frame_size: DEFAULT_FRAME_SIZE,
             memory_limit: DEFAULT_MEMORY_LIMIT,
         }
@@ -80,14 +80,22 @@ impl Default for Vm {
 }
 
 impl Vm {
-    /// [`Vm::with_config`] with [`VmConfig::default`].
+    /// A VM with [`VmConfig::default`].
     pub fn new() -> Self {
-        Self::with_config(VmConfig::default())
+        Self::build(VmConfig::default())
     }
 
     /// A VM with `config`. Its only helpers are the map helpers with the `maps` feature, which touch nothing outside
-    /// the VM.
-    pub fn with_config(config: VmConfig) -> Self {
+    /// the VM. Without the `fuel` feature, a non-zero [`VmConfig::instruction_limit`] fails with
+    /// [`VmError::FuelNotEnabled`].
+    pub fn with_config(config: VmConfig) -> Result<Self> {
+        if !rvm_core::METERED && config.instruction_limit != 0 {
+            return Err(VmError::FuelNotEnabled);
+        }
+        Ok(Self::build(config))
+    }
+
+    fn build(config: VmConfig) -> Self {
         let helpers = Arc::new(SharedHelpers::default());
         #[cfg(feature = "maps")]
         helpers.update(maps::register_helpers);
@@ -98,12 +106,6 @@ impl Vm {
             types: ReentrantLock::default(),
             config,
         }
-    }
-
-    /// Whether calls stop at [`VmConfig::instruction_limit`]: false without the `fuel` feature or with a limit of 0.
-    #[inline]
-    pub fn enforces_instruction_limit(&self) -> bool {
-        rvm_core::METERED && self.config.instruction_limit != 0
     }
 
     // Helper registration: changes reach programs linked earlier at their next call. Replacing a function keeps its

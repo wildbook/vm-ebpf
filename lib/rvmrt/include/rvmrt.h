@@ -26,7 +26,7 @@ typedef enum rvm_status {
     RVM_ERR_NOT_FOUND = 3,
     // more than 5 call arguments, a region or length that can't be mapped, or a name that isn't UTF-8
     RVM_ERR_ARGUMENT = 4,
-    // the call ran more instructions than the limit, rvm's DEFAULT_INSTRUCTION_LIMIT
+    // the call ran more than the runtime's limit of 1,000,000 instructions (rvm's DEFAULT_INSTRUCTION_LIMIT)
     RVM_ERR_LIMIT = 5,
     // an invalid instruction or memory access, or a call stack overflow; also an rvm_read or rvm_write of bytes the
     // guest may not read or write

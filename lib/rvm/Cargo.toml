@@ -21,8 +21,8 @@ default = ["link", "fuel", "maps"]
 # ELF parsing, BTF, CO-RE and the linker: `Module`, `HostTypes`, `Vm::with_types`, `Vm::prepare`, `Vm::load_elf`,
 # `Vm::link` and `Vm::load_plugin`. Without it, rvm loads prepared images only.
 link = ["dep:constelf", "dep:btf"]
-# Enforces `VmConfig::instruction_limit`. Without it, the interpreter doesn't count instructions, and the limit does
-# nothing.
+# Enforces `VmConfig::instruction_limit`. Without it, the interpreter doesn't count instructions, and a non-zero limit
+# fails with `VmError::FuelNotEnabled`.
 fuel = ["rvm-core/fuel"]
 # Guest maps: the map helpers, `Program::map` and `Vm::share_map`. Without it, an image that declares maps fails to
 # load with `LinkError::InvalidMap`.

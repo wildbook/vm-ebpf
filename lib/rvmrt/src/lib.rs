@@ -1,11 +1,11 @@
 //! rvm as a C library: load a prepared image, map guest memory, copy bytes in and out, and call functions by name.
 //!
 //! `include/rvmrt.h` declares these functions for C. Images come from `rvm::Vm::prepare` and `rvm::Image::to_bytes`;
-//! the runtime has no helpers and no maps, and its instruction limit is `rvm::DEFAULT_INSTRUCTION_LIMIT`.
+//! the runtime has no helpers and no maps, and it limits each call to `rvm::DEFAULT_INSTRUCTION_LIMIT` instructions.
 
 use std::slice;
 
-use rvm::{ExecError, Perms, Program, Vm, VmError, FIRST_FREE_REGION};
+use rvm::{ExecError, Perms, Program, Vm, VmConfig, VmError, DEFAULT_INSTRUCTION_LIMIT, FIRST_FREE_REGION};
 
 /// Result of every call that can fail; `rvm_status` in the header.
 #[repr(C)]
@@ -53,7 +53,13 @@ impl Status {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rvm_load(image: *const u8, len: usize, program: *mut *mut Program) -> Status {
     let bytes = unsafe { slice_or_empty(image, len) };
-    let loaded = Vm::new().load_image(bytes).map(|p| Box::into_raw(Box::new(p)));
+    let config = VmConfig {
+        instruction_limit: DEFAULT_INSTRUCTION_LIMIT,
+        ..VmConfig::default()
+    };
+    let loaded = Vm::with_config(config)
+        .and_then(|vm| vm.load_image(bytes))
+        .map(|p| Box::into_raw(Box::new(p)));
     unsafe { finish(loaded, program) }
 }
 

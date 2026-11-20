@@ -13,7 +13,7 @@ use crate::common::object;
 #[test]
 fn instruction_limit_covers_plugin_calls() {
     use ebpf_asm::{Assembler, R0, R1, R6};
-    use rvm::{ExecError, Plugin, DEFAULT_INSTRUCTION_LIMIT};
+    use rvm::{ExecError, Plugin, VmConfig, DEFAULT_INSTRUCTION_LIMIT};
 
     const SPINS: i32 = 200_000;
     const CALLS: i32 = 50;
@@ -24,7 +24,11 @@ fn instruction_limit_covers_plugin_calls() {
     asm.set_label(&spin).unwrap();
     asm.sub64_imm(R1, 1).jne_imm(R1, 0, &spin);
     asm.mov64_imm(R0, 1).exit();
-    let vm = Vm::new();
+    let vm = Vm::with_config(VmConfig {
+        instruction_limit: DEFAULT_INSTRUCTION_LIMIT,
+        ..VmConfig::default()
+    })
+    .unwrap();
     let callee = Plugin::new("callee", vm.load(Image::from_code(asm.assemble().unwrap())).unwrap());
     vm.export(&callee, "main").unwrap();
 
@@ -53,6 +57,43 @@ fn instruction_limit_covers_plugin_calls() {
     let (result, used) = caller.call_with_limit(main, &[], DEFAULT_INSTRUCTION_LIMIT);
     assert!(result.is_err());
     assert_eq!(used, DEFAULT_INSTRUCTION_LIMIT);
+}
+
+#[test]
+fn default_has_no_instruction_limit() {
+    use ebpf_asm::{Assembler, R0, R1};
+
+    // 2 n + 3 instructions for n = DEFAULT_INSTRUCTION_LIMIT
+    let mut asm = Assembler::new();
+    let spin = asm.create_label();
+    asm.mov64_imm(R1, rvm::DEFAULT_INSTRUCTION_LIMIT as i32);
+    asm.set_label(&spin).unwrap();
+    asm.sub64_imm(R1, 1).jne_imm(R1, 0, &spin);
+    asm.mov64_imm(R0, 1).exit();
+    let mut program = Vm::new().load(Image::from_code(asm.assemble().unwrap())).unwrap();
+    assert_eq!(program.call("main", &[]).unwrap(), 1);
+}
+
+#[cfg(not(feature = "fuel"))]
+#[test]
+fn instruction_limit_needs_fuel() {
+    use ebpf_asm::{Assembler, R0};
+    use rvm::VmConfig;
+
+    let config = VmConfig {
+        instruction_limit: 1,
+        ..VmConfig::default()
+    };
+    assert!(matches!(Vm::with_config(config), Err(VmError::FuelNotEnabled)));
+
+    let mut asm = Assembler::new();
+    asm.mov64_imm(R0, 1).exit();
+    let mut program = Vm::new().load(Image::from_code(asm.assemble().unwrap())).unwrap();
+    let main = program.func("main").unwrap();
+    let (result, used) = program.call_with_limit(main, &[], 1);
+    assert!(matches!(result, Err(VmError::FuelNotEnabled)), "{result:?}");
+    assert_eq!(used, 0);
+    assert_eq!(program.call_with_limit(main, &[], 0).0.unwrap(), 1);
 }
 
 #[test]

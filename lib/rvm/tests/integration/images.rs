@@ -190,7 +190,8 @@ fn oversized_images_fail_to_load() {
     let small = Vm::with_config(VmConfig {
         memory_limit: 1 << 20,
         ..VmConfig::default()
-    });
+    })
+    .unwrap();
     image.maps = (0..3).map(|i| map(&format!("m{i}"), 1024, 400)).collect();
     assert_eq!(over_limit(&small, &image), 1 << 20);
     image.maps.pop();

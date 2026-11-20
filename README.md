@@ -49,12 +49,15 @@ and `cargo test` fails when they change without a rebuild.
 rvm's features are described in [`lib/rvm/Cargo.toml`](lib/rvm/Cargo.toml).
 
 With the `fuel` feature (on by default), a call stops after
-`VmConfig::instruction_limit` instructions. The count is exact: the interpreter
-charges a basic block's instructions as it enters the block, and runs a block
-the fuel can't pay for one instruction at a time. In the benchmarks, most guest
-code ran within 7% of its speed without the feature, and `Code::new` took about
-10% longer. Without the feature the limit does nothing, and
-`Vm::enforces_instruction_limit` returns false.
+`VmConfig::instruction_limit` instructions. The default limit is 0, which means
+no limit; `rvm::DEFAULT_INSTRUCTION_LIMIT` (1,000,000) is there for hosts that
+want one. The count is exact: the interpreter charges a basic block's
+instructions as it enters the block, and runs a block the fuel can't pay for
+one instruction at a time. In the benchmarks, most guest code ran within 7% of
+its speed without the feature, and `Code::new` took about 10% longer. Without
+the feature the interpreter doesn't count instructions, and a non-zero limit in
+`Vm::with_config` or `Program::call_with_limit` fails with
+`VmError::FuelNotEnabled`.
 
 The interpreter does everything for fuel through rvm-core's `Fuel` trait. The
 feature picks the implementation: `BlockFuel` meters, and the methods of

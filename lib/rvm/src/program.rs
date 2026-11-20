@@ -218,11 +218,14 @@ impl Program {
 
     /// [`call_func`](Self::call_func) with an instruction limit of its own instead of
     /// [`VmConfig::instruction_limit`], 0 for none. Returns the result and the instructions the call ran, those it ran
-    /// in other plugins through their exports included; without the `fuel` feature, nothing counts them and it
-    /// returns 0.
+    /// in other plugins through their exports included. Without the `fuel` feature, nothing counts them: it returns
+    /// 0, and a non-zero `limit` fails with [`VmError::FuelNotEnabled`].
     pub fn call_with_limit(&mut self, func: Func, args: &[u64], limit: u64) -> (Result<u64>, u64) {
         if !self.owns(func) {
             return (Err(VmError::ForeignFunc), 0);
+        }
+        if !rvm_core::METERED && limit != 0 {
+            return (Err(VmError::FuelNotEnabled), 0);
         }
         let start = crate::executor::fuel_for(limit);
         let mut fuel = start;

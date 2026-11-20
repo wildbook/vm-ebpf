@@ -146,6 +146,7 @@ fn layout_stays_within_memory_limit() {
             memory_limit,
             ..VmConfig::default()
         })
+        .unwrap()
     };
 
     let mut module = Module::from_elf("main", &object("examples/example.o")).unwrap();

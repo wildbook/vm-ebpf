@@ -60,10 +60,7 @@ fn helper_loop() -> Assembler {
 }
 
 fn bench(c: &mut Criterion) {
-    let vm = Vm::with_config(rvm::VmConfig {
-        instruction_limit: 0,
-        ..rvm::VmConfig::default()
-    });
+    let vm = Vm::new();
     vm.register_helper(1, |x: u64| x);
 
     let mut group = c.benchmark_group("exec");
