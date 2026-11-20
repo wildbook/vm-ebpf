@@ -65,9 +65,13 @@ macro_rules! byte_table {
 /// Continues at the slot after `$slot`: tail-calls the handler of its instruction, or stops with
 /// [`Flow::OutOfFuel`]. Either way, the handler that expands it ends here; the handler's generic parameters must be
 /// `M`, `H` and `FUEL`. `$slot` must lie below `len`, as the slot of every handler but the guard's does, or precede a
-/// target that [`transfer::bound`] proves lies in `0..=len`.
+/// target that [`transfer::bound`] proves lies in `0..=len`. A true `$split` makes the tail call one of two, as
+/// [`split`] describes.
 macro_rules! become_next {
-    ($ctx:expr, $code:expr, $slot:expr, $fuel:expr, $calls:expr, $table:expr) => {{
+    ($ctx:expr, $code:expr, $slot:expr, $fuel:expr, $calls:expr, $table:expr) => {
+        become_next!($ctx, $code, $slot, $fuel, $calls, $table, false)
+    };
+    ($ctx:expr, $code:expr, $slot:expr, $fuel:expr, $calls:expr, $table:expr, $split:expr) => {{
         let slot = $slot.offset(1);
         // SAFETY: the slot after one below `len` lies in `0..=len`, as do the targets `transfer::bound` proves (see
         // `Slot`)
@@ -75,6 +79,9 @@ macro_rules! become_next {
         // the op is read first, so that the arguments of `out_of_fuel` are all in place
         let left = $fuel.wrapping_sub(u64::from(FUEL));
         match $crate::charge::<FUEL>($fuel) {
+            Some(fuel) if $split && $crate::split::odd(op) => {
+                become $table.odd(op)($ctx, $code, slot, fuel, $calls, $table, op)
+            }
             Some(fuel) => become $table.of(op)($ctx, $code, slot, fuel, $calls, $table, op),
             None => become $crate::out_of_fuel::<M, H, FUEL>($ctx, $code, slot, left, $calls, $table, op),
         }
@@ -102,6 +109,7 @@ mod mem;
 mod memory;
 mod op;
 mod ops;
+mod split;
 mod stack;
 mod transfer;
 
@@ -214,8 +222,8 @@ type Handler<M, H> = extern "rust-preserve-none" fn(
     Op,
 );
 
-/// The handler of every opcode byte.
-struct Table<M: Memory, H>([Handler<M, H>; 256]);
+/// The handler of every opcode byte, and the copy of them that [`split`] dispatches through.
+struct Table<M: Memory, H>([Handler<M, H>; 256], [Handler<M, H>; split::COPY]);
 
 /// The [`Table`] of the handlers with and without `FUEL`. Each handler runs [`step`] with its opcode as a constant, so
 /// the class, operation, source, mode and size matches fold away; the bytes of superinstructions and r10 accesses get
@@ -252,12 +260,13 @@ impl<M: Memory, H: Host<M>, const FUEL: bool> Handlers<M, H, FUEL> {
         fuse::install::<M, H, FUEL>(&mut table);
         transfer::install::<M, H, FUEL>(&mut table);
         stack::install::<M, H, FUEL>(&mut table);
-        Table(table)
+        Table(table, split::second(&table))
     };
 }
 
-/// The [`Handler`] of opcode `OP`. Each handler fetches the next instruction itself and ends in its own indirect jump,
-/// so the branch predictor tracks the successors of every opcode separately.
+/// The [`Handler`] of opcode `OP`. Each handler fetches the next instruction itself and ends in indirect jumps of its
+/// own (two for the opcodes that [`split`] names), so the branch predictor tracks the successors of every opcode
+/// separately.
 #[inline(never)]
 extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, const OP: u8>(
     ctx: &mut Context<M>,
@@ -318,7 +327,7 @@ extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, 
 
     // `slot` is the slot of `insn` or of the second half of LD_IMM64, which `second_half` found below `len`, or it
     // precedes the target of a jump or local call
-    become_next!(ctx, code, slot, fuel, calls, table)
+    become_next!(ctx, code, slot, fuel, calls, table, split::splits(OP))
 }
 
 /// The rest of the handler of a helper `call`, or with `KFUNC` a kfunc `call`: runs it on the host and continues with
