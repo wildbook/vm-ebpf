@@ -37,7 +37,8 @@ pub const DEFAULT_MEMORY_LIMIT: usize = 256 << 20;
 pub struct VmConfig {
     /// Maximum number of instructions one call into a program may execute, with 0 for no limit. Instructions that
     /// plugins run for it through their exports count too, so the limit covers the whole call tree; a plugin's own
-    /// limit still caps the calls into it. Limits above `i64::MAX`, and no limit, count as `i64::MAX`.
+    /// limit still caps the calls into it. Limits above `i64::MAX`, and no limit, count as `i64::MAX`. The count is
+    /// exact: the interpreter charges a basic block as it enters it, but stops at the instruction the limit runs out at.
     #[cfg(feature = "fuel")]
     pub instruction_limit: u64,
     /// Stack bytes reserved per call frame. Loading fails with [`VmError::InvalidArgument`] if the stack for

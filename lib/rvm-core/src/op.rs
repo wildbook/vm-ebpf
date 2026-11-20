@@ -27,6 +27,10 @@
 //!
 //! A handler reads the fields of its slot with a [`View`], one instruction per field: its dispatch loaded the op into
 //! RCX, from which `movzx` reads `dst_reg` (CH) and one shift `src_reg` or `imm`; `offset` is a load from the slot.
+//!
+//! With the `fuel` feature, a code has twice as many slots as ops ([`ops`]): the ops come first, and the slot as many
+//! slots after each op holds the `rest` of its block as a `u64` ([`fuel`](crate::fuel)). Those slots hold no op; only
+//! [`Slot::rest`](crate::transfer::Slot::rest) reads them.
 
 use std::fmt::{self, Debug, Formatter};
 
@@ -171,6 +175,14 @@ const REPLACED: [u64; 256] = byte_table!(|byte| match LAYOUTS[byte as usize] {
 });
 
 impl Op {
+    /// An op of zeros, in [`Layout::Raw`], for a tail call to a handler that reads the op from its slot.
+    pub const UNREAD: Self = Self {
+        byte: 0,
+        regs: 0,
+        offset: 0,
+        imm: [0; 4],
+    };
+
     /// `insn` in the layout of its opcode byte. It establishes the register invariant (see the module docs).
     pub fn new(insn: Instruction) -> Self {
         // without branches, as `Code::new` converts every slot
@@ -209,6 +221,16 @@ impl Op {
         let [off_lo, off_hi] = self.offset.to_le_bytes();
         let [i0, i1, i2, i3] = self.imm;
         Instruction(u64::from_le_bytes([self.byte, self.regs, off_lo, off_hi, i0, i1, i2, i3]))
+    }
+}
+
+/// The number of slots of `code`, the slots of a [`Code`](crate::Code), that hold an op: with the `fuel` feature the
+/// first half, else all.
+#[inline(always)]
+pub fn ops(code: &[Op]) -> usize {
+    match cfg!(feature = "fuel") {
+        true => code.len() / 2,
+        false => code.len(),
     }
 }
 

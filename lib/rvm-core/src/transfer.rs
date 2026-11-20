@@ -83,11 +83,11 @@ fn lands(len: usize, pc: usize, displacement: i64) -> bool {
 
 /// A pointer to the slot of the instruction a handler runs, which handlers carry in place of its pc.
 ///
-/// Every `Slot` a handler receives points into the slots of the [`Code`](crate::Code) that [`run`](crate::run) runs:
-/// `run` and the checked fetches make one only for a pc they found in the slots, and a handler moves one without a check
-/// only from a slot below `len`, to the next slot or to a target that [`bound`] proves lies in `0..=len`. The slots
-/// from `len` on all hold [`GUARD`], whose handler continues nowhere. So a handler reads its own slot, and the slot it
-/// continues at, without a check.
+/// Every `Slot` a handler receives points into the ops of the [`Code`](crate::Code) that [`run`](crate::run) runs, the
+/// first [`op::ops`](crate::op::ops) of its slots: `run` and the checked fetches make one only for a pc they found there,
+/// and a handler moves one without a check only from a slot below `len`, to the next slot or to a target that [`bound`]
+/// proves lies in `0..=len`. The ops from `len` on all hold [`GUARD`], whose handler continues nowhere. So a handler
+/// reads its own slot, and the slot it continues at, without a check.
 #[derive(Clone, Copy)]
 pub struct Slot(*const Op);
 
@@ -120,11 +120,23 @@ impl Slot {
     ///
     /// # Safety
     ///
-    /// The slot must lie in the slots of a [`Code`](crate::Code) that is still borrowed.
+    /// The slot must lie in the ops of a [`Code`](crate::Code) that is still borrowed.
     #[inline(always)]
     pub unsafe fn get(self) -> Op {
         // SAFETY: the caller's
         unsafe { *self.0 }
+    }
+
+    /// The `rest` of the op in the slot ([`fuel`](crate::fuel)).
+    ///
+    /// # Safety
+    ///
+    /// The slot must lie in the ops of `code`, the slots of a [`Code`](crate::Code) built with the `fuel` feature.
+    #[inline(always)]
+    pub unsafe fn rest(self, code: &[Op]) -> u64 {
+        // SAFETY: the caller's; with the `fuel` feature the code has twice as many slots as ops, and the slot as many
+        // slots after an op as there are ops holds its `rest` as a `u64`
+        unsafe { self.0.byte_add(code.len() * (size_of::<Op>() / 2)).cast::<u64>().read() }
     }
 
     /// The fields of the op in the slot, as the handler of an opcode byte of shape `shape` reads them, which takes
@@ -249,7 +261,7 @@ extern "rust-preserve-none" fn guard<M: Memory, H: Host<M>, const FUEL: bool>(
     _table: &Table<M, H>,
     _op: Op,
 ) {
-    // the fetch charged the unit of an instruction that doesn't run
+    // the guard ends its block, so the fuel was charged for it as for an instruction, which doesn't run
     calls.stop.at(slot, fuel + u64::from(FUEL), Flow::BadPc)
 }
 

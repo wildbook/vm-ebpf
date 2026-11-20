@@ -48,6 +48,13 @@ and `cargo test` fails when they change without a rebuild.
 
 rvm's features are described in [`lib/rvm/Cargo.toml`](lib/rvm/Cargo.toml).
 
+With the `fuel` feature (on by default), a call stops after
+`VmConfig::instruction_limit` instructions. The count is exact: the interpreter
+charges a basic block's instructions as it enters the block, and runs a block
+the fuel can't pay for one instruction at a time. In the benchmarks, most guest
+code ran within 7% of its speed without the feature, and `Code::new` took about
+10% longer.
+
 The `release` profile optimizes for size but builds rvm at `opt-level = 3`,
 because the interpreter inlines into rvm. The `embedded` profile
 (`cargo build --profile embedded`) also strips symbols and panic locations and

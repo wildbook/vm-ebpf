@@ -6,12 +6,12 @@ use super::supers::{Super, MAX_LEN, MAX_ROLES};
 use crate::op::{Fields, Op, Reg, Shape, View};
 use crate::ops::Regs;
 use crate::transfer::Slot;
-use crate::{stack, step, step_ld64, CallStack, Context, Flow, Handlers, Host, Memory, Table};
+use crate::{fuel, stack, step, step_ld64, CallStack, Context, Flow, Host, Memory, Table};
 
 /// The handler of superinstruction `S`. It runs the sequence as the handlers of its instructions would, one after
 /// another, but keeps each role in a variable of its own: it loads the roles the sequence reads before it writes them,
 /// and stores the written ones back once, after the last instruction that writes one or before an instruction that
-/// stops.
+/// stops. The sequence lies in one block, so its fuel was charged where control entered the block ([`fuel`]).
 #[inline(never)]
 pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool, const S: u8>(
     ctx: &mut Context<M>,
@@ -20,17 +20,11 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool
     fuel: u64,
     calls: &mut CallStack<H, M::Err>,
     table: &Table<M, H>,
-    op: Op,
+    _op: Op,
 ) {
     let sup = const { Super::of(S) };
     let len = const { Super::of(S).len() };
 
-    // The sequence takes one unit per slot and the instruction after it one more. If the fuel runs out before then,
-    // the instructions run one at a time and stop where it runs out, as they would unfused.
-    if FUEL && fuel < len as u64 {
-        let alone = const { Handlers::<M, H, FUEL>::TABLE.0[Super::of(S).op(0) as usize] };
-        become alone(ctx, code, slot, fuel, calls, table, op)
-    }
     // SAFETY: `transfer::bound` leaves a superinstruction only where its sequence lies in the code, and the guard slot
     // follows the code (see `Slot`)
     let window = unsafe { slot.window(code, len + 1) };
@@ -59,15 +53,17 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool
     };
     roles.load(registers, sup.loads);
 
-    // Continue at `$next`, whose op is `$op`, charged for the sequence and for `$next`, which the test above leaves
-    // fuel for. A branch dispatches on each side, so that it stays a branch: a `cmov` of the next slot's address would
-    // make the next fetch wait for the registers the branch compares.
+    // Continue at `$next`: enter its block if the sequence ends one, or carry on in the block. A branch dispatches on
+    // each side, so that it stays a branch: a `cmov` of the next slot's address would make the next fetch wait for the
+    // registers the branch compares.
     macro_rules! dispatch {
-        ($next:expr, $op:expr) => {{
+        ($next:expr) => {{
             let next = $next;
-            let left = fuel - len as u64 * u64::from(FUEL);
-            let next_op = $op;
-            become table.of(next_op)(ctx, code, next, left, calls, table, next_op)
+            match const { Super::of(S).branches() } {
+                true => become_enter!(ctx, code, next, fuel, calls, table),
+                // the slot after the sequence lies in `0..=len` (see `window`)
+                false => become_at!(ctx, code, next, fuel, calls, table, false),
+            }
         }};
     }
 
@@ -83,11 +79,11 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool
                 let flow = match const { stack::windowed(Super::of(S).op($k)) } {
                     true if stack::data_step(&calls.windows, &mut roles, decoded) => ControlFlow::Break(Flow::Next),
                     // the access missed the data window: the sequence continues unfused from it, as a jump into its
-                    // middle would, with the fuel charged up to it
+                    // middle would
                     true => {
                         roles.save(registers, sup.unsaved[$k]);
                         let op = window[$k];
-                        become table.of(op)(ctx, code, at, fuel - $k * u64::from(FUEL), calls, table, op)
+                        become table.of(op)(ctx, code, at, fuel, calls, table, op)
                     }
                     false => step(&mut roles, &mut ctx.data, decoded),
                 };
@@ -95,14 +91,13 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool
                     ControlFlow::Break(Flow::Next) => {}
                     // only the last instruction branches, after `save_at`
                     ControlFlow::Break(Flow::Jump(offset)) if const { Super::of(S).branches_at($k) } => {
-                        let target = slot.offset($k + 1 + offset);
                         // SAFETY: `transfer::bound` leaves a superinstruction only where its branch target lies in
                         // `0..=len` (see `Slot`)
-                        dispatch!(target, unsafe { target.get() })
+                        dispatch!(slot.offset($k + 1 + offset))
                     }
                     ControlFlow::Break(flow) => {
                         roles.save(registers, sup.unsaved[$k]);
-                        return calls.stop.at(at, fuel - $k * u64::from(FUEL), flow);
+                        return calls.stop.at(at, fuel::unspent::<FUEL>(code, at, fuel), flow);
                     }
                     ControlFlow::Continue(()) => step_ld64(&mut roles, decoded, window[$k + 1].imm()),
                 }
@@ -115,7 +110,7 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool
     if sup.save_at as usize == len {
         roles.save(registers, sup.writes);
     }
-    dispatch!(slot.offset(len as i64), window[len])
+    dispatch!(slot.offset(len as i64))
 }
 
 /// The registers of a superinstruction's sequence as [`fused`] runs it: its instructions name role `r` as register
