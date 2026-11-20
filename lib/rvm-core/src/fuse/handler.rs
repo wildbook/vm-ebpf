@@ -3,17 +3,18 @@
 use std::ops::ControlFlow;
 
 use super::supers::{Super, MAX_LEN, MAX_ROLES};
+use crate::fuel::Fuel;
 use crate::op::{Fields, Op, Reg, Shape, View};
 use crate::ops::Regs;
 use crate::transfer::Slot;
-use crate::{fuel, stack, step, step_ld64, CallStack, Context, Flow, Host, Memory, Table};
+use crate::{stack, step, step_ld64, CallStack, Context, Flow, Host, Memory, Table};
 
 /// The handler of superinstruction `S`. It runs the sequence as the handlers of its instructions would, one after
 /// another, but keeps each role in a variable of its own: it loads the roles the sequence reads before it writes them,
 /// and stores the written ones back once, after the last instruction that writes one or before an instruction that
-/// stops. The sequence lies in one block, so its fuel was charged where control entered the block ([`fuel`]).
+/// stops. The sequence lies in one block, so its fuel was charged where control entered the block ([`Fuel::enter`]).
 #[inline(never)]
-pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool, const S: u8>(
+pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S: u8>(
     ctx: &mut Context<M>,
     code: &[Op],
     slot: Slot,
@@ -97,7 +98,7 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, const FUEL: bool
                     }
                     ControlFlow::Break(flow) => {
                         roles.save(registers, sup.unsaved[$k]);
-                        return calls.stop.at(at, fuel::unspent::<FUEL>(code, at, fuel), flow);
+                        return calls.stop.at(at, F::unspent(code, at, fuel), flow);
                     }
                     ControlFlow::Continue(()) => step_ld64(&mut roles, decoded, window[$k + 1].imm()),
                 }

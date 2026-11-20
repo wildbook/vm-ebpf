@@ -3,7 +3,7 @@
 //! [`Code::new`] gives the first slot of each sequence it recognises the opcode byte of a superinstruction, one of the
 //! bytes that no slot holds once it ran (see [`canonical`]). The other slots keep what they hold, so a jump into the
 //! middle of a sequence runs its instructions one by one. A superinstruction behaves exactly like its sequence:
-//! - it lies in one of the blocks that fuel is charged for ([`fuel`](crate::fuel)), and where the fuel runs out inside
+//! - it lies in one of the blocks that fuel is charged for ([`fuel`]), and where the fuel runs out inside
 //!   its block, its instructions run one at a time;
 //! - an instruction that faults stops execution at its own pc, with the effects of the instructions before it;
 //! - a load or store that misses its data window ([`stack::data_step`]) continues the sequence unfused from itself.
@@ -16,18 +16,19 @@ mod supers;
 pub use supers::Super;
 use supers::{Encode, SUPERS};
 
-use crate::op::{self, Op};
+use crate::fuel::{self, Fuel};
+use crate::op::Op;
 use crate::opcode::atomic::{CMPXCHG, FETCH, LOAD_ACQ};
 use crate::opcode::{AluEnd, AluOpc, Class, JmpOpc, MemMode, MemSize, OpCode, Source, CALL, LD_IMM64};
 use crate::transfer::{self, FAR, GUARD};
 use crate::{stack, Handler, Host, Instruction, Memory, BPF_PSEUDO_CALL, BPF_PSEUDO_KFUNC_CALL};
 
 /// Bytecode prepared for [`run`](crate::run).
-#[cfg_attr(not(feature = "fuel"), derive(Debug))]
+#[derive(Debug)]
 pub struct Code {
-    /// The code, then the slots [`transfer::bound`] appends, in the [slot format](crate::op), and with the `fuel`
-    /// feature the `rest` of each ([`fuel`](crate::fuel)).
-    slots: Box<[Op]>,
+    /// The code, then the slots [`transfer::bound`] appends, in the [slot format](crate::op), then what the metering
+    /// keeps for them ([`Fuel::Slots`]).
+    slots: <fuel::Active as Fuel>::Slots,
     len: usize,
 }
 
@@ -62,19 +63,11 @@ impl Code {
         let mut insns = insns.into();
         let len = insns.len();
         i32::try_from(len).expect("fewer than 2^31 slots");
-        #[cfg(feature = "fuel")]
-        // room for the guard and the `rest` of each slot, so that neither `bound` nor `fuel::slots` reallocates
-        // unless `bound` moves instructions behind the guard
-        insns.reserve_exact(len + 2);
+        fuel::Active::reserve(&mut insns);
         fuse(&mut insns);
         transfer::bound(&mut insns);
-        #[cfg(not(feature = "fuel"))]
-        // in place, as `Op` and `Instruction` have the same size and alignment
-        let slots: Vec<Op> = insns.into_iter().map(Op::new).collect();
-        #[cfg(feature = "fuel")]
-        let slots = crate::fuel::slots(insns);
         Self {
-            slots: slots.into_boxed_slice(),
+            slots: fuel::Active::slots(insns),
             len,
         }
     }
@@ -92,7 +85,7 @@ impl Code {
     /// [`Flow::FailMem`](crate::Flow::FailMem) at `pc`.
     #[cold]
     pub fn access_size(&self, pc: u64) -> Option<usize> {
-        let op = *self.slots[..op::ops(&self.slots)].get(usize::try_from(pc).ok()?)?;
+        let op = *self.slots[..fuel::Active::ops(&self.slots)].get(usize::try_from(pc).ok()?)?;
         let opc = OpCode(usual(op.byte()));
         if !matches!(opc.class(), Class::LdReg | Class::StReg | Class::StImm) {
             return None;
@@ -100,29 +93,9 @@ impl Code {
         Some(opc.mem_size().bytes())
     }
 
-    /// The code and the slots after it, which all hold [`GUARD`], then with the `fuel` feature the `rest` of each.
+    /// The code and the slots after it, which all hold [`GUARD`], then what the metering keeps for them.
     pub(crate) fn slots(&self) -> &[Op] {
         &self.slots
-    }
-}
-
-/// Shows each op with the `rest` of its block.
-#[cfg(feature = "fuel")]
-impl std::fmt::Debug for Code {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use std::fmt;
-
-        let ops = (0..op::ops(&self.slots) as u64).map(|pc| {
-            let slot = transfer::Slot::at(&self.slots, pc);
-            // SAFETY: the slot lies in the ops of a code built with the `fuel` feature
-            let (op, rest) = unsafe { (slot.get(), slot.rest(&self.slots)) };
-            fmt::from_fn(move |f| write!(f, "{op:?} rest {rest}"))
-        });
-        let slots = fmt::from_fn(|f| f.debug_list().entries(ops.clone()).finish());
-        f.debug_struct("Code")
-            .field("slots", &slots)
-            .field("len", &self.len)
-            .finish()
     }
 }
 
@@ -434,8 +407,8 @@ macro_rules! stack_accesses {
         const STACK: &[(u8, u8)] = &[$(($byte, $usual)),*];
 
         /// Give each r10 access byte its handler.
-        const fn install_stack<M: Memory, H: Host<M>, const FUEL: bool>(table: &mut [Handler<M, H>; 256]) {
-            $(table[$byte] = stack::access::<M, H, FUEL, { $usual }>;)*
+        const fn install_stack<M: Memory, H: Host<M>, F: Fuel>(table: &mut [Handler<M, H>; 256]) {
+            $(table[$byte] = stack::access::<M, H, F, { $usual }>;)*
         }
     };
 }
@@ -559,9 +532,9 @@ fn candidates(window: &[Instruction]) -> &'static [(u8, Super, Encode)] {
 }
 
 /// Give each superinstruction and r10 access byte its handler.
-pub const fn install<M: Memory, H: Host<M>, const FUEL: bool>(table: &mut [Handler<M, H>; 256]) {
-    supers::install::<M, H, FUEL>(table);
-    install_stack::<M, H, FUEL>(table);
+pub const fn install<M: Memory, H: Host<M>, F: Fuel>(table: &mut [Handler<M, H>; 256]) {
+    supers::install::<M, H, F>(table);
+    install_stack::<M, H, F>(table);
 }
 
 /// Each kind of field the verifier reserves, set where it is reserved and where an instruction uses it.

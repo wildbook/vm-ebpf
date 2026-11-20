@@ -6,6 +6,7 @@
 //! checked fetch would. [`run`](crate::run) checks the pc it starts at, the `exit` handler the pc it returns to, the
 //! `callx` handler the pc [`Host::callx`] names, and the runtime the targets of `gotox`.
 
+use crate::fuel::Fuel;
 use crate::fuse::Super;
 use crate::op::{Op, Shape, View};
 use crate::opcode::{Class, JmpOpc, OpCode, Source};
@@ -84,12 +85,12 @@ fn lands(len: usize, pc: usize, displacement: i64) -> bool {
 /// A pointer to the slot of the instruction a handler runs, which handlers carry in place of its pc.
 ///
 /// Every `Slot` a handler receives points into the ops of the [`Code`](crate::Code) that [`run`](crate::run) runs, the
-/// first [`op::ops`](crate::op::ops) of its slots: `run` and the checked fetches make one only for a pc they found there,
+/// first [`Fuel::ops`] of its slots: `run` and the checked fetches make one only for a pc they found there,
 /// and a handler moves one without a check only from a slot below `len`, to the next slot or to a target that [`bound`]
 /// proves lies in `0..=len`. The ops from `len` on all hold [`GUARD`], whose handler continues nowhere. So a handler
 /// reads its own slot, and the slot it continues at, without a check.
 #[derive(Clone, Copy)]
-pub struct Slot(*const Op);
+pub struct Slot(pub *const Op);
 
 impl Slot {
     /// The slot at `pc` in the slots `code`, which may lie outside them. The pointer comes from the whole slice, so it
@@ -125,18 +126,6 @@ impl Slot {
     pub unsafe fn get(self) -> Op {
         // SAFETY: the caller's
         unsafe { *self.0 }
-    }
-
-    /// The `rest` of the op in the slot ([`fuel`](crate::fuel)).
-    ///
-    /// # Safety
-    ///
-    /// The slot must lie in the ops of `code`, the slots of a [`Code`](crate::Code) built with the `fuel` feature.
-    #[inline(always)]
-    pub unsafe fn rest(self, code: &[Op]) -> u64 {
-        // SAFETY: the caller's; with the `fuel` feature the code has twice as many slots as ops, and the slot as many
-        // slots after an op as there are ops holds its `rest` as a `u64`
-        unsafe { self.0.byte_add(code.len() * (size_of::<Op>() / 2)).cast::<u64>().read() }
     }
 
     /// The fields of the op in the slot, as the handler of an opcode byte of shape `shape` reads them, which takes
@@ -244,15 +233,15 @@ pub fn moved_byte(far: Op) -> u8 {
 }
 
 /// Give [`GUARD`] and [`FAR`] their handlers.
-pub const fn install<M: Memory, H: Host<M>, const FUEL: bool>(table: &mut [Handler<M, H>; 256]) {
-    table[GUARD as usize] = guard::<M, H, FUEL>;
-    table[FAR as usize] = far::<M, H, FUEL>;
+pub const fn install<M: Memory, H: Host<M>, F: Fuel>(table: &mut [Handler<M, H>; 256]) {
+    table[GUARD as usize] = guard::<M, H, F>;
+    table[FAR as usize] = far::<M, H, F>;
 }
 
 /// The handler of [`GUARD`]: the code has no instruction in `slot`.
 #[cold]
 #[inline(never)]
-extern "rust-preserve-none" fn guard<M: Memory, H: Host<M>, const FUEL: bool>(
+extern "rust-preserve-none" fn guard<M: Memory, H: Host<M>, F: Fuel>(
     _ctx: &mut Context<M>,
     _code: &[Op],
     slot: Slot,
@@ -262,13 +251,13 @@ extern "rust-preserve-none" fn guard<M: Memory, H: Host<M>, const FUEL: bool>(
     _op: Op,
 ) {
     // the guard ends its block, so the fuel was charged for it as for an instruction, which doesn't run
-    calls.stop.at(slot, fuel + u64::from(FUEL), Flow::BadPc)
+    calls.stop.at(slot, F::refund(fuel), Flow::BadPc)
 }
 
 /// The handler of [`FAR`]: runs the instruction that `bound` moved behind the guard, and checks where it continues.
 #[cold]
 #[inline(never)]
-extern "rust-preserve-none" fn far<M: Memory, H: Host<M>, const FUEL: bool>(
+extern "rust-preserve-none" fn far<M: Memory, H: Host<M>, F: Fuel>(
     ctx: &mut Context<M>,
     code: &[Op],
     slot: Slot,
@@ -356,16 +345,12 @@ mod tests {
         ctx.regs[2] = 5;
         let mut calls = CallStack::new(0, NoHost);
         let mut pc = pc;
-        #[cfg(feature = "fuel")]
-        let mut fuel = fuel;
-        #[cfg(feature = "fuel")]
-        let flow = run(&mut ctx, &code, &mut pc, &mut fuel, &mut calls);
-        #[cfg(not(feature = "fuel"))]
-        let flow = run(&mut ctx, &code, &mut pc, &mut calls);
+        let mut left = fuel;
+        let flow = run(&mut ctx, &code, &mut pc, &mut left, &mut calls);
         let flow = format!("{flow:?}");
-        let (flow, left, r0) = (flow.split('(').next().unwrap(), fuel, ctx.regs[0]);
+        let (flow, r0) = (flow.split('(').next().unwrap(), ctx.regs[0]);
         assert_eq!((flow, pc, r0), (stop.0, stop.1, stop.3));
-        if cfg!(feature = "fuel") {
+        if crate::METERED {
             assert_eq!(left, stop.2);
         }
     }
@@ -411,7 +396,7 @@ mod tests {
                     (false, _) => ("BadPc", target as u64, 10 - ran, 0),
                 };
                 expect(&code, 1, 10, stop);
-                if cfg!(feature = "fuel") {
+                if crate::METERED {
                     expect(&code, 1, ran, ("OutOfFuel", target as u64, 0, 0));
                 }
             }
@@ -422,7 +407,7 @@ mod tests {
     fn ld_imm64_at_the_end() {
         let lddw = Instruction::from_parts(OpCode(LD_IMM64), 0, 0, 0, 7);
         expect(&[EXIT, lddw], 1, 10, ("BadPc", 1, 10, 0));
-        if cfg!(feature = "fuel") {
+        if crate::METERED {
             expect(&[EXIT, lddw], 1, 1, ("OutOfFuel", 1, 1, 0));
         }
 
@@ -442,7 +427,7 @@ mod tests {
         let code = [lddw, upper, add, EXIT];
         assert_ne!(Code::new(code).slots()[0].byte(), LD_IMM64);
         expect(&code, 0, 10, ("Exit", 3, 6, value + 5));
-        if cfg!(feature = "fuel") {
+        if crate::METERED {
             expect(&code, 0, 0, ("OutOfFuel", 0, 0, 0));
             expect(&code, 0, 1, ("OutOfFuel", 0, 1, 0));
             expect(&code, 0, 2, ("OutOfFuel", 2, 0, value));

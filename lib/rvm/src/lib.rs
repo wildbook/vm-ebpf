@@ -114,6 +114,4 @@ pub use std_helpers::{
 #[cfg(feature = "link")]
 pub use symbol::{Export, Symbol};
 pub use sync::TryLockGuard;
-#[cfg(feature = "fuel")]
-pub use vm::DEFAULT_INSTRUCTION_LIMIT;
-pub use vm::{Vm, VmConfig, DEFAULT_MEMORY_LIMIT};
+pub use vm::{Vm, VmConfig, DEFAULT_INSTRUCTION_LIMIT, DEFAULT_MEMORY_LIMIT};

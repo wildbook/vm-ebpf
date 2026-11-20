@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use rvm_core::{run, CallStack, Callee, Code, Context, Flow, Host};
+use rvm_core::{run, CallStack, Callee, Code, Context, Flow, Host, METERED};
 
 use crate::error::{ExecError, HelperError, MemoryError, Result, VmError};
 use crate::helper::{HelperRegistry, HostState};
@@ -47,7 +47,7 @@ impl Executor {
         Self {
             calls: CallStack::new(config.frame_size, helpers),
             stack_top,
-            instruction_limit: instruction_limit(config),
+            instruction_limit: fuel_for(config.instruction_limit),
         }
     }
 
@@ -121,7 +121,7 @@ impl Executor {
         // in a local, so that a call through `call`, whose budget ends with it, stores nothing back when it exits
         let start = *fuel;
         let mut left = start;
-        let flow = run_metered(&mut ctx, code, &mut pc, &mut left, calls);
+        let flow = run(&mut ctx, code, &mut pc, &mut left, calls);
         if let Flow::Exit = flow {
             *fuel = left;
             return Ok(ctx.regs[0]);
@@ -140,8 +140,9 @@ impl fmt::Debug for Executor {
         #[cfg(feature = "maps")]
         s.field("maps", &self.calls.host.state.maps);
         s.field("stack_top", &self.stack_top);
-        #[cfg(feature = "fuel")]
-        s.field("instruction_limit", &self.instruction_limit);
+        if METERED {
+            s.field("instruction_limit", &self.instruction_limit);
+        }
         s.finish_non_exhaustive()
     }
 }
@@ -166,7 +167,7 @@ fn run_on(
             Some(slot) => call_with_fuel(slot, pc, ctx, calls, &mut fuel)?,
             None => resume(flow, pc, code, calls, limit)?,
         };
-        flow = run_metered(ctx, code, &mut pc, &mut fuel, calls);
+        flow = run(ctx, code, &mut pc, &mut fuel, calls);
         if let Flow::Exit = flow {
             return Ok(ctx.regs[0]);
         }
@@ -316,37 +317,11 @@ fn code_index(addr: u64) -> Option<u64> {
 
 /// The instruction budget of a call limited to `limit` instructions: 0 means no limit, and `run` takes at most
 /// `i64::MAX`.
-#[cfg(feature = "fuel")]
 pub fn fuel_for(limit: u64) -> u64 {
     match limit {
         0 => i64::MAX as u64,
         limit => limit.min(i64::MAX as u64),
     }
-}
-
-#[cfg(feature = "fuel")]
-fn instruction_limit(config: &VmConfig) -> u64 {
-    fuel_for(config.instruction_limit)
-}
-
-#[cfg(not(feature = "fuel"))]
-fn instruction_limit(_: &VmConfig) -> u64 {
-    i64::MAX as u64
-}
-
-/// [`run`] with the budget `fuel`.
-#[inline(always)]
-fn run_metered(
-    ctx: &mut Context<&mut VmMemory>,
-    code: &Code,
-    pc: &mut u64,
-    #[cfg_attr(not(feature = "fuel"), expect(unused_variables))] fuel: &mut u64,
-    calls: &mut CallStack<HostCalls, u64>,
-) -> Flow<u64> {
-    #[cfg(feature = "fuel")]
-    return run(ctx, code, pc, fuel, calls);
-    #[cfg(not(feature = "fuel"))]
-    return run(ctx, code, pc, calls);
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::ControlFlow;
 
+use fuel::Fuel;
 use op::{Fields, Op, Shape};
 use opcode::{Class, OpCode, CALL, LD_IMM64};
 use transfer::Slot;
@@ -88,21 +89,21 @@ macro_rules! become_next {
     };
 }
 
-/// Enters the block of `$slot` there: charges the fuel of the slots from it to the end of its block and continues
-/// there as [`become_at!`] does, or in [`fuel::single_step`] if the fuel can't pay for them. Either way, the handler
-/// that expands it ends here; the handler's generic parameters must be `M`, `H` and `FUEL`. `$slot` must lie in
-/// `0..=len`: the slot after one below `len`, or a target that [`transfer::bound`] proves.
+/// Enters the block of `$slot` there ([`Fuel::enter`]) and continues there as [`become_at!`] does, or in
+/// [`Fuel::single_step`] if the fuel can't pay for the block. Either way, the handler that expands it ends here; the
+/// handler's generic parameters must be `M`, `H` and `F`. `$slot` must lie in `0..=len`: the slot after one below
+/// `len`, or a target that [`transfer::bound`] proves.
 macro_rules! become_enter {
     ($ctx:expr, $code:expr, $slot:expr, $fuel:expr, $calls:expr, $table:expr) => {
         become_enter!($ctx, $code, $slot, $fuel, $calls, $table, false)
     };
     ($ctx:expr, $code:expr, $slot:expr, $fuel:expr, $calls:expr, $table:expr, $split:expr) => {{
         let slot = $slot;
-        let left = $crate::fuel::enter::<FUEL>($code, slot, $fuel);
-        if FUEL && (left as i64) < 0 {
+        let left = F::enter($code, slot, $fuel);
+        if F::short(left) {
             core::hint::cold_path();
             let op = $crate::op::Op::UNREAD;
-            become $crate::fuel::single_step::<M, H, FUEL>($ctx, $code, slot, left, $calls, $table, op)
+            become F::single_step::<M, H>($ctx, $code, slot, left, $calls, $table, op)
         }
         become_at!($ctx, $code, slot, left, $calls, $table, $split)
     }};
@@ -114,7 +115,7 @@ macro_rules! become_enter {
 macro_rules! become_at_pc {
     ($ctx:expr, $code:expr, $pc:expr, $fuel:expr, $calls:expr, $table:expr) => {{
         let pc = $pc;
-        match $crate::fetch_checked::<M, H, FUEL>($table, $code, pc, $fuel) {
+        match $crate::fetch_checked::<M, H, F>($table, $code, pc, $fuel) {
             Ok((next, op, slot, fuel)) => become next($ctx, $code, slot, fuel, $calls, $table, op),
             Err(flow) => return $calls.stop.at_pc(pc, $fuel, flow),
         }
@@ -223,9 +224,8 @@ fn step<M: Memory, R: ops::Regs, I: Fields>(regs: &mut R, mem: &mut M, insn: I) 
 }
 
 /// Runs the instruction `op` in `slot` of `code` and continues with the next one, until it stops in `calls.stop`. A
-/// metering handler receives `fuel` already charged for the slots from its own to the end of its block, as [`fuel`]
-/// describes; the others pass it on as is. `table` is the [`Table`] the handler belongs to, which dispatch indexes from
-/// a register.
+/// handler receives `fuel` as [`Fuel::enter`] left it where control entered the block of `slot`, and passes it on as
+/// is within the block. `table` is the [`Table`] the handler belongs to, which dispatch indexes from a register.
 ///
 /// The handler of opcode byte `OP` runs only slots in the layout of `OP` ([`op::LAYOUTS`]), and reads their fields
 /// with [`Slot::view`]: from `op` where one instruction extracts them, else from the slot.
@@ -247,17 +247,16 @@ type Handler<M, H> = extern "rust-preserve-none" fn(
 /// The handler of every opcode byte, and the copy of them that [`split`] dispatches through.
 struct Table<M: Memory, H>([Handler<M, H>; 256], [Handler<M, H>; 256]);
 
-/// The [`Table`] of the handlers with and without `FUEL`. Each handler runs [`step`] with its opcode as a constant, so
+/// The [`Table`] of the handlers that meter with `F`. Each handler runs [`step`] with its opcode as a constant, so
 /// the class, operation, source, mode and size matches fold away; the bytes of superinstructions and r10 accesses get
-/// theirs from [`fuse::install`], and the plain loads and stores theirs from [`stack::install`]. With `FUEL`, the
-/// handlers meter fuel; without it, they never read it.
-struct Handlers<M, H, const FUEL: bool>(PhantomData<(M, H)>);
+/// theirs from [`fuse::install`], and the plain loads and stores theirs from [`stack::install`].
+struct Handlers<M, H, F>(PhantomData<(M, H, F)>);
 
-impl<M: Memory, H: Host<M>, const FUEL: bool> Handlers<M, H, FUEL> {
+impl<M: Memory, H: Host<M>, F: Fuel> Handlers<M, H, F> {
     const TABLE: Table<M, H> = {
         macro_rules! table {
             ($($op:literal)*) => {
-                [$(handler::<M, H, FUEL, $op> as Handler<M, H>,)*]
+                [$(handler::<M, H, F, $op> as Handler<M, H>,)*]
             };
         }
 
@@ -279,21 +278,18 @@ impl<M: Memory, H: Host<M>, const FUEL: bool> Handlers<M, H, FUEL> {
             0xe0 0xe1 0xe2 0xe3 0xe4 0xe5 0xe6 0xe7 0xe8 0xe9 0xea 0xeb 0xec 0xed 0xee 0xef
             0xf0 0xf1 0xf2 0xf3 0xf4 0xf5 0xf6 0xf7 0xf8 0xf9 0xfa 0xfb 0xfc 0xfd 0xfe 0xff
         );
-        fuse::install::<M, H, FUEL>(&mut table);
-        transfer::install::<M, H, FUEL>(&mut table);
-        stack::install::<M, H, FUEL>(&mut table);
+        fuse::install::<M, H, F>(&mut table);
+        transfer::install::<M, H, F>(&mut table);
+        stack::install::<M, H, F>(&mut table);
         Table(table, table)
     };
-
-    /// The table [`fuel::single_step`] runs a block's slots with: each dispatch returns to it.
-    const STEPS: Table<M, H> = Table([fuel::single_step::<M, H, FUEL>; 256], [fuel::single_step::<M, H, FUEL>; 256]);
 }
 
 /// The [`Handler`] of opcode `OP`. Each handler fetches the next instruction itself and ends in indirect jumps of its
 /// own (two for the opcodes that [`split`] names), so the branch predictor tracks the successors of every opcode
 /// separately.
 #[inline(never)]
-extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, const OP: u8>(
+extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, F: Fuel, const OP: u8>(
     ctx: &mut Context<M>,
     code: &[Op],
     mut slot: Slot,
@@ -323,26 +319,26 @@ extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, 
             None => return calls.stop.at(slot, fuel, Flow::Exit),
         },
         ControlFlow::Break(Flow::CallHelper(_)) if jumps => {
-            become host_call::<M, H, FUEL, false>(ctx, code, slot, fuel, calls, table, op)
+            become host_call::<M, H, F, false>(ctx, code, slot, fuel, calls, table, op)
         }
         ControlFlow::Break(Flow::CallKfunc(_)) if jumps => {
-            become host_call::<M, H, FUEL, true>(ctx, code, slot, fuel, calls, table, op)
+            become host_call::<M, H, F, true>(ctx, code, slot, fuel, calls, table, op)
         }
         ControlFlow::Break(Flow::CallIndirect(_)) if jumps => {
-            become indirect_call::<M, H, FUEL>(ctx, code, slot, fuel, calls, table, op)
+            become indirect_call::<M, H, F>(ctx, code, slot, fuel, calls, table, op)
         }
         ControlFlow::Continue(()) => {
             // SAFETY: this handler runs a slot below `len` (see `Slot`), so the next one lies in `0..=len`
             let second = unsafe { slot.offset(1).get() };
             let Some(upper) = transfer::second_half(second) else {
                 // the code ends inside LD_IMM64, which doesn't run and gets its unit back, as at the guard
-                let left = fuel::unspent::<FUEL>(code, slot, fuel) + u64::from(FUEL);
+                let left = F::refund(F::unspent(code, slot, fuel));
                 return calls.stop.at(slot, left, Flow::BadPc);
             };
             slot = slot.offset(1);
             step_ld64(&mut ctx.regs, insn, upper);
         }
-        ControlFlow::Break(flow) => return calls.stop.at(slot, fuel::unspent::<FUEL>(code, slot, fuel), flow),
+        ControlFlow::Break(flow) => return calls.stop.at(slot, F::unspent(code, slot, fuel), flow),
     }
 
     // `slot` is the slot of `insn` or of the second half of LD_IMM64, which `second_half` found below `len`, or it
@@ -357,7 +353,7 @@ extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const FUEL: bool, 
 /// the next instruction.
 // Out of line, so that the handler, which also runs local calls, calls no function and needs no stack frame.
 #[inline(never)]
-extern "rust-preserve-none" fn host_call<M: Memory, H: Host<M>, const FUEL: bool, const KFUNC: bool>(
+extern "rust-preserve-none" fn host_call<M: Memory, H: Host<M>, F: Fuel, const KFUNC: bool>(
     ctx: &mut Context<M>,
     code: &[Op],
     slot: Slot,
@@ -384,7 +380,7 @@ extern "rust-preserve-none" fn host_call<M: Memory, H: Host<M>, const FUEL: bool
 /// The rest of the handler of `callx`: enters the guest function that [`Host::callx`] names, as a local call does, or
 /// continues with the next instruction after the host function it ran.
 #[inline(never)]
-extern "rust-preserve-none" fn indirect_call<M: Memory, H: Host<M>, const FUEL: bool>(
+extern "rust-preserve-none" fn indirect_call<M: Memory, H: Host<M>, F: Fuel>(
     ctx: &mut Context<M>,
     code: &[Op],
     slot: Slot,
@@ -401,7 +397,7 @@ extern "rust-preserve-none" fn indirect_call<M: Memory, H: Host<M>, const FUEL: 
     match callee {
         Some(Callee::Local(pc)) => {
             // the ops from `len` on all hold the guard, and no op below it does
-            let in_code = pc < op::ops(code) as u64 && code[pc as usize].byte() != transfer::GUARD;
+            let in_code = pc < F::ops(code) as u64 && code[pc as usize].byte() != transfer::GUARD;
             if !in_code {
                 return calls.stop.at(slot, fuel, Flow::CallIndirect(target));
             }
@@ -419,29 +415,27 @@ extern "rust-preserve-none" fn indirect_call<M: Memory, H: Host<M>, const FUEL: 
 }
 
 /// The handler, op and slot at `pc`, which no proof covers, and the fuel the handler receives as it enters the block
-/// there ([`fuel::enter`]), or why it can't run.
+/// there ([`Fuel::enter`]), or why it can't run.
 #[inline(always)]
-fn fetch_checked<M: Memory, H: Host<M>, const FUEL: bool>(
+fn fetch_checked<M: Memory, H: Host<M>, F: Fuel>(
     table: &Table<M, H>,
     code: &[Op],
     pc: u64,
     fuel: u64,
 ) -> Result<Checked<M, H>, Flow<M::Err>> {
-    if pc >= op::ops(code) as u64 {
+    if pc >= F::ops(code) as u64 {
         // an instruction there would be charged first
-        return Err(match FUEL && fuel == 0 {
+        return Err(match F::spent(fuel) {
             true => Flow::OutOfFuel,
             false => Flow::BadPc,
         });
     }
     let op = code[pc as usize];
     let slot = Slot::at(code, pc);
-    let left = fuel::enter::<FUEL>(code, slot, fuel);
-    let mut next = table.of(op);
-    if FUEL {
-        // a `cmov`, as a branch would take a jump on the common side
-        next = core::hint::select_unpredictable((left as i64) < 0, fuel::single_step::<M, H, FUEL>, next);
-    }
+    let left = F::enter(code, slot, fuel);
+    let next = table.of(op);
+    // a `cmov`, as a branch would take a jump on the common side
+    let next = core::hint::select_unpredictable(F::short(left), F::single_step::<M, H> as Handler<M, H>, next);
     Ok((next, op, slot, left))
 }
 
@@ -466,8 +460,8 @@ fn step_ld64(regs: &mut impl ops::Regs, insn: impl Fields, upper: i32) {
     regs.set(insn.dst_reg(), imm_lo | (imm_hi << 32));
 }
 
-/// Whether [`run`] meters fuel, chosen by the `fuel` feature.
-const METERED: bool = cfg!(feature = "fuel");
+/// Whether [`run`] meters fuel, which the `fuel` feature chooses.
+pub const METERED: bool = <fuel::Active as Fuel>::METERED;
 
 /// Execute from `*pc` until an instruction the caller must handle.
 ///
@@ -479,22 +473,19 @@ const METERED: bool = cfg!(feature = "fuel");
 /// could not run. With the `fuel` feature, each executed instruction consumes one unit of `fuel`, and LD_IMM64 one per
 /// slot: with one unit left, it stops with [`Flow::OutOfFuel`] and that unit. The interpreter charges the units of a
 /// whole basic block as it enters the block, but stops and leaves `*fuel` exactly where charging each instruction would.
-/// `*fuel` must be at most `i64::MAX`. Without the feature, `run` takes no `fuel` and never runs out.
+/// `*fuel` must be at most `i64::MAX`. Without the feature, `run` leaves `*fuel` as it is and never runs out.
 #[inline]
 pub fn run<M: Memory, H: Host<M>>(
     ctx: &mut Context<M>,
     code: &Code,
     pc: &mut u64,
-    #[cfg(feature = "fuel")] fuel: &mut u64,
+    fuel: &mut u64,
     calls: &mut CallStack<H, M::Err>,
 ) -> Flow<M::Err> {
-    #[cfg(not(feature = "fuel"))]
-    let fuel = &mut 0;
-
     let slots = code.slots();
-    let table = &Handlers::<M, H, METERED>::TABLE;
+    let table = &Handlers::<M, H, fuel::Active>::TABLE;
     calls.windows.revalidate(&ctx.data);
-    let (first, op, slot, left) = match fetch_checked::<M, H, METERED>(table, slots, *pc, *fuel) {
+    let (first, op, slot, left) = match fetch_checked::<M, H, fuel::Active>(table, slots, *pc, *fuel) {
         Ok(next) => next,
         Err(flow) => return flow,
     };

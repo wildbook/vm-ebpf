@@ -12,6 +12,7 @@
 
 use std::ptr;
 
+use crate::fuel::Fuel;
 use crate::op::{Fields, Op, Reg, Shape, View};
 use crate::opcode::{Class, MemMode, MemSize, OpCode};
 use crate::ops::Regs;
@@ -260,10 +261,10 @@ pub fn data_step<R: Regs>(windows: &Windows, regs: &mut R, insn: impl Fields) ->
 }
 
 /// Make [`data_access`] the handler of the plain `ldx`, `stx` and `st` of every size.
-pub const fn install<M: Memory, H: Host<M>, const FUEL: bool>(table: &mut [Handler<M, H>; 256]) {
+pub const fn install<M: Memory, H: Host<M>, F: Fuel>(table: &mut [Handler<M, H>; 256]) {
     macro_rules! install {
         ($($op:expr),*) => {
-            $(table[$op as usize] = data_access::<M, H, FUEL, { $op }>;)*
+            $(table[$op as usize] = data_access::<M, H, F, { $op }>;)*
         };
     }
     install!(
@@ -284,7 +285,7 @@ pub const fn install<M: Memory, H: Host<M>, const FUEL: bool>(table: &mut [Handl
 
 /// The handler of the r10 access that stands for the load or store `OP`.
 #[inline(never)]
-pub extern "rust-preserve-none" fn access<M: Memory, H: Host<M>, const FUEL: bool, const OP: u8>(
+pub extern "rust-preserve-none" fn access<M: Memory, H: Host<M>, F: Fuel, const OP: u8>(
     ctx: &mut Context<M>,
     code: &[Op],
     slot: Slot,
@@ -297,14 +298,14 @@ pub extern "rust-preserve-none" fn access<M: Memory, H: Host<M>, const FUEL: boo
     let insn = unsafe { slot.view(op, const { Shape::of(OP) }) };
     let addr = mem::address(ctx.regs[10], insn);
     if !calls.windows.stack.access::<OP>(&mut ctx.regs, insn, addr) {
-        become miss::<M, H, FUEL, OP, false>(ctx, code, slot, fuel, calls, table, op)
+        become miss::<M, H, F, OP, false>(ctx, code, slot, fuel, calls, table, op)
     }
     become_next!(ctx, code, slot, fuel, calls, table)
 }
 
 /// The handler of the load or store `OP` through a register other than r10.
 #[inline(never)]
-pub extern "rust-preserve-none" fn data_access<M: Memory, H: Host<M>, const FUEL: bool, const OP: u8>(
+pub extern "rust-preserve-none" fn data_access<M: Memory, H: Host<M>, F: Fuel, const OP: u8>(
     ctx: &mut Context<M>,
     code: &[Op],
     slot: Slot,
@@ -327,14 +328,14 @@ pub extern "rust-preserve-none" fn data_access<M: Memory, H: Host<M>, const FUEL
     if small(OpCode(OP).mem_size()) && calls.windows.spare.access::<OP>(&mut ctx.regs, insn, addr) {
         become_next!(ctx, code, slot, fuel, calls, table)
     }
-    become data_miss::<M, H, FUEL, OP>(ctx, code, slot, fuel, calls, table, op)
+    become data_miss::<M, H, F, OP>(ctx, code, slot, fuel, calls, table, op)
 }
 
 /// Runs a load or store that missed the data window through the window around r10 if it fits there, as one through
 /// a pointer into the stack does, and in [`miss`] otherwise.
 // out of line from `miss`, whose call of `Windows::take` needs a stack frame
 #[inline(never)]
-extern "rust-preserve-none" fn data_miss<M: Memory, H: Host<M>, const FUEL: bool, const OP: u8>(
+extern "rust-preserve-none" fn data_miss<M: Memory, H: Host<M>, F: Fuel, const OP: u8>(
     ctx: &mut Context<M>,
     code: &[Op],
     slot: Slot,
@@ -347,7 +348,7 @@ extern "rust-preserve-none" fn data_miss<M: Memory, H: Host<M>, const FUEL: bool
     let insn = unsafe { slot.view(op, const { Shape::of(OP) }) };
     let addr = mem::address(ctx.regs.get(base_reg::<OP>(insn)), insn);
     if !calls.windows.stack.access::<OP>(&mut ctx.regs, insn, addr) {
-        become miss::<M, H, FUEL, OP, true>(ctx, code, slot, fuel, calls, table, op)
+        become miss::<M, H, F, OP, true>(ctx, code, slot, fuel, calls, table, op)
     }
     become_next!(ctx, code, slot, fuel, calls, table)
 }
@@ -356,7 +357,7 @@ extern "rust-preserve-none" fn data_miss<M: Memory, H: Host<M>, const FUEL: bool
 /// usual handler.
 #[cold]
 #[inline(never)]
-extern "rust-preserve-none" fn miss<M: Memory, H: Host<M>, const FUEL: bool, const OP: u8, const DATA: bool>(
+extern "rust-preserve-none" fn miss<M: Memory, H: Host<M>, F: Fuel, const OP: u8, const DATA: bool>(
     ctx: &mut Context<M>,
     code: &[Op],
     slot: Slot,
@@ -373,7 +374,7 @@ extern "rust-preserve-none" fn miss<M: Memory, H: Host<M>, const FUEL: bool, con
         false => ctx.regs[10].wrapping_sub(1),
     };
     calls.windows.take::<M, DATA>(&ctx.data, around, OpCode(OP).mem_size());
-    become handler::<M, H, FUEL, OP>(ctx, code, slot, fuel, calls, table, op)
+    become handler::<M, H, F, OP>(ctx, code, slot, fuel, calls, table, op)
 }
 
 /// The register that holds the base address of the load or store `OP`.

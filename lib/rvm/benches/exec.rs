@@ -61,7 +61,6 @@ fn helper_loop() -> Assembler {
 
 fn bench(c: &mut Criterion) {
     let vm = Vm::with_config(rvm::VmConfig {
-        #[cfg(feature = "fuel")]
         instruction_limit: 0,
         ..rvm::VmConfig::default()
     });

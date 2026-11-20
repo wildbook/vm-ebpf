@@ -53,7 +53,13 @@ With the `fuel` feature (on by default), a call stops after
 charges a basic block's instructions as it enters the block, and runs a block
 the fuel can't pay for one instruction at a time. In the benchmarks, most guest
 code ran within 7% of its speed without the feature, and `Code::new` took about
-10% longer.
+10% longer. Without the feature the limit does nothing, and
+`Vm::enforces_instruction_limit` returns false.
+
+The interpreter does everything for fuel through rvm-core's `Fuel` trait. The
+feature picks the implementation: `BlockFuel` meters, and the methods of
+`NoFuel` do nothing and compile away, so `run` has the same signature in both
+builds.
 
 The `release` profile optimizes for size but builds rvm at `opt-level = 3`,
 because the interpreter inlines into rvm. The `embedded` profile

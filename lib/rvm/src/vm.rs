@@ -26,7 +26,6 @@ use crate::std_helpers;
 use crate::sync::{lock, Published};
 
 /// [`VmConfig::instruction_limit`] in [`VmConfig::default`].
-#[cfg(feature = "fuel")]
 pub const DEFAULT_INSTRUCTION_LIMIT: u64 = 1_000_000;
 
 /// [`VmConfig::memory_limit`] in [`VmConfig::default`].
@@ -39,7 +38,8 @@ pub struct VmConfig {
     /// plugins run for it through their exports count too, so the limit covers the whole call tree; a plugin's own
     /// limit still caps the calls into it. Limits above `i64::MAX`, and no limit, count as `i64::MAX`. The count is
     /// exact: the interpreter charges a basic block as it enters it, but stops at the instruction the limit runs out at.
-    #[cfg(feature = "fuel")]
+    /// Without the `fuel` feature the interpreter doesn't count instructions, and the limit does nothing;
+    /// [`Vm::enforces_instruction_limit`] tells which applies.
     pub instruction_limit: u64,
     /// Stack bytes reserved per call frame. Loading fails with [`VmError::InvalidArgument`] if the stack for
     /// [`MAX_CALL_DEPTH`](crate::MAX_CALL_DEPTH) nested calls exceeds [`MAX_REGION_LEN`] bytes.
@@ -52,7 +52,6 @@ pub struct VmConfig {
 impl Default for VmConfig {
     fn default() -> Self {
         Self {
-            #[cfg(feature = "fuel")]
             instruction_limit: DEFAULT_INSTRUCTION_LIMIT,
             frame_size: DEFAULT_FRAME_SIZE,
             memory_limit: DEFAULT_MEMORY_LIMIT,
@@ -99,6 +98,12 @@ impl Vm {
             types: ReentrantLock::default(),
             config,
         }
+    }
+
+    /// Whether calls stop at [`VmConfig::instruction_limit`]: false without the `fuel` feature or with a limit of 0.
+    #[inline]
+    pub fn enforces_instruction_limit(&self) -> bool {
+        rvm_core::METERED && self.config.instruction_limit != 0
     }
 
     // Helper registration: changes reach programs linked earlier at their next call. Replacing a function keeps its

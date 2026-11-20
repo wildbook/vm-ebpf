@@ -102,13 +102,13 @@ fn call_export(
     ctx: &mut HelperContext,
 ) -> std::result::Result<u64, HelperError> {
     // The caller's remaining instructions bound the callee and pay for what it runs. Asking for them stops the caller,
-    // which only a call into another plugin pays for.
-    #[cfg(feature = "fuel")]
-    let Some(fuel) = ctx.host.fuel.as_mut() else {
-        return Err(HelperError::FuelWanted);
+    // which only a call into another plugin pays for. Without metering there is nothing to ask for.
+    let mut unmetered = 0;
+    let fuel = match ctx.host.fuel.as_mut() {
+        _ if !rvm_core::METERED => &mut unmetered,
+        Some(fuel) => fuel,
+        None => return Err(HelperError::FuelWanted),
     };
-    #[cfg(not(feature = "fuel"))]
-    let fuel = &mut 0;
 
     let failed = |error: VmError| HelperError::Plugin {
         plugin: name.to_string(),
@@ -282,7 +282,6 @@ impl PluginFunc {
     }
 
     /// [`call`](Self::call) with [`Program::call_with_limit`].
-    #[cfg(feature = "fuel")]
     pub fn call_with_limit(&self, args: &[u64], limit: u64) -> (Result<u64>, u64) {
         let mut program = match self.plugin.lock() {
             Ok(program) => program,

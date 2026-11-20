@@ -1,6 +1,7 @@
 //! The superinstruction table, and the [`Super`] that the compiler derives from each of its lines.
 
 use super::handler::fused;
+use crate::fuel::Fuel;
 use crate::op::{Fields, Reg};
 use crate::opcode::{AluOpc, Class, JmpOpc, MemMode, MemSize, OpCode, Source, LD_IMM64};
 use crate::{Handler, Host, Instruction, Memory};
@@ -13,8 +14,8 @@ macro_rules! superinstructions {
             &[$(($byte, Super::new(&[$((stringify!($op), &[$(operand!($operand)),*])),+]), encode_as::<$byte>)),*];
 
         /// Give each superinstruction byte its handler.
-        pub const fn install<M: Memory, H: Host<M>, const FUEL: bool>(table: &mut [Handler<M, H>; 256]) {
-            $(table[$byte] = fused::<M, H, FUEL, $byte>;)*
+        pub const fn install<M: Memory, H: Host<M>, F: Fuel>(table: &mut [Handler<M, H>; 256]) {
+            $(table[$byte] = fused::<M, H, F, $byte>;)*
         }
     };
 }
