@@ -1,14 +1,17 @@
 //! Loads and stores that skip the [`Memory`] methods.
 //!
-//! [`Code::new`](crate::Code::new) gives each 4 and 8 byte `ldx`, `stx` and `st` with base register r10 an opcode byte
-//! of its own, whose handler is [`access`]. Through any other register, and at every size, they keep their opcode byte,
-//! whose handler [`install`] makes [`data_access`]. Both check the address against a [`Window`] that the memory
-//! reported and access the host memory directly: [`access`] against the window around r10, [`data_access`] against
-//! the window around the last address of its size class that missed (1 and 2 byte accesses also the one before) and
-//! then, for pointers into the stack, the window around r10. An address outside the windows takes the usual handler of
-//! the instruction, so the access behaves exactly as it does there. The accesses of superinstructions try the data
-//! window of their size class through [`data_step`] and continue unfused at an access that misses it. Guest code can't
-//! write r10, so it stays in the stack, inside the window of the stack.
+//! The handlers here check the address of a plain `ldx`, `stx` or `st` against a [`Window`] that the memory reported
+//! and access the host memory directly. An address outside the windows takes the usual handler of the instruction, so
+//! the access behaves exactly as it does there.
+//!
+//! - [`access`] runs the 4 and 8 byte accesses with base register r10, which [`Code::new`](crate::Code::new) gives an
+//!   opcode byte of their own. It checks the window around r10. Guest code can't write r10, so it stays in the stack,
+//!   inside the window of the stack.
+//! - [`data_access`] runs the accesses through any other register, and those of 1 and 2 bytes through r10, which keep
+//!   their opcode byte ([`install`]). It checks the window around the last address of its size class that missed (1
+//!   and 2 byte accesses also the one before) and then, for pointers into the stack, the window around r10.
+//! - [`data_step`] runs the accesses of superinstructions in the data window of their size class. A superinstruction
+//!   continues unfused at an access that misses it.
 
 use std::ptr;
 
@@ -63,8 +66,9 @@ impl Window {
 /// The windows that [`access`] and [`data_access`] check addresses against, kept in the [`CallStack`].
 ///
 /// Each cache that isn't empty holds a window of epoch `epoch`, which [`Windows::take`] ensures. [`run`](crate::run)
-/// calls [`Windows::revalidate`] whenever code outside the handler chain may have changed the memory, and the methods of
-/// [`Memory`] leave its epoch alone, so inside the handler chain the memory is at `epoch` whenever a cache isn't empty.
+/// calls [`Windows::revalidate`] whenever code outside the handler chain may have changed the memory, and the methods
+/// of [`Memory`] leave its epoch alone, so inside the handler chain the memory is at `epoch` whenever a cache isn't
+/// empty.
 pub struct Windows {
     /// The window around r10.
     stack: Cache,

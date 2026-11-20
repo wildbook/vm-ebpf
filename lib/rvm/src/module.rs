@@ -32,9 +32,6 @@ pub struct Relocation {
 /// A parsed eBPF ELF module.
 #[derive(Debug, Default)]
 pub struct Module {
-    /// The name given to [`Module::from_elf`].
-    pub name: String,
-
     /// The allocated sections and `.jumptables`, in ELF order.
     pub sections: Vec<Section>,
 
@@ -58,14 +55,11 @@ pub struct Module {
 
 impl Module {
     /// Parse a module from ELF bytes.
-    pub fn from_elf(name: impl Into<String>, elf_bytes: &[u8]) -> Result<Self> {
+    pub fn from_elf(elf_bytes: &[u8]) -> Result<Self> {
         let elf = ElfFile::new(elf_bytes)?;
         let elf_sections = elf.sections()?;
 
-        let mut module = Self {
-            name: name.into(),
-            ..Default::default()
-        };
+        let mut module = Self::default();
         module.parse_sections(elf_sections)?;
         module.parse_symbols(elf_sections)?;
         module.parse_relocations(elf)?;
@@ -184,7 +178,7 @@ impl Module {
 
     /// Collect relocations against loaded sections, decoding REL addends from the bytes they patch.
     fn parse_relocations(&mut self, elf: ElfFile<'_>) -> Result<()> {
-        for chunk in elf.relocs().iter()? {
+        for chunk in elf.relocs()? {
             let Some(section_idx) = self.section_of(chunk.target_idx()) else {
                 continue; // relocations for sections that aren't loaded
             };

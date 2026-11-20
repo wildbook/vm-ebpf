@@ -11,7 +11,7 @@ use hashbrown::HashMap;
 use rvm_core::Code;
 
 use crate::error::{MemoryError, Result, VmError};
-use crate::executor::{Executor, MAX_ARGS};
+use crate::executor::{fuel_for, Executor, MAX_ARGS};
 use crate::helper::{SharedHelpers, Snapshot};
 #[cfg(feature = "maps")]
 use crate::maps::{MapRef, Maps};
@@ -65,12 +65,10 @@ pub struct Func {
 /// # Example
 ///
 /// ```ignore
-/// let program = vm.load_elf(&elf_bytes)?;
+/// let mut program = vm.load_elf(&elf_bytes)?;
 ///
-/// // Call with no arguments
+/// // Arguments go in r1-r5
 /// let result = program.call("main", &[])?;
-///
-/// // Call with arguments (passed in r1-r5)
 /// let result = program.call("process", &[ctx_ptr, len])?;
 ///
 /// // Skip the name lookup on repeated calls
@@ -152,8 +150,8 @@ impl Program {
         self.functions.list.iter().map(|(name, info)| (name.as_str(), info))
     }
 
-    /// The exported function called `name`.
-    pub fn function(&self, name: &str) -> Option<&FunctionInfo> {
+    /// The entry of the exported function called `name` in [`Program::functions`].
+    pub fn function_info(&self, name: &str) -> Option<&FunctionInfo> {
         let index = self.functions.find(name)?.index;
         Some(&self.functions.list.get(index)?.1)
     }
@@ -220,14 +218,14 @@ impl Program {
     /// [`VmConfig::instruction_limit`], 0 for none. Returns the result and the instructions the call ran, those it ran
     /// in other plugins through their exports included. Without the `fuel` feature, nothing counts them: it returns
     /// 0, and a non-zero `limit` fails with [`VmError::FuelNotEnabled`].
-    pub fn call_with_limit(&mut self, func: Func, args: &[u64], limit: u64) -> (Result<u64>, u64) {
+    pub fn call_func_with_limit(&mut self, func: Func, args: &[u64], limit: u64) -> (Result<u64>, u64) {
         if !self.owns(func) {
             return (Err(VmError::ForeignFunc), 0);
         }
         if !rvm_core::METERED && limit != 0 {
             return (Err(VmError::FuelNotEnabled), 0);
         }
-        let start = crate::executor::fuel_for(limit);
+        let start = fuel_for(limit);
         let mut fuel = start;
         let result = self.call_pc_fueled(func.pc, args, &mut fuel);
         (result, start - fuel)

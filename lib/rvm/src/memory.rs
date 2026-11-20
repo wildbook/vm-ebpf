@@ -369,6 +369,14 @@ impl VmMemory {
     }
 }
 
+impl Drop for VmMemory {
+    fn drop(&mut self) {
+        for idx in 0..MAX_REGIONS {
+            self.free(idx);
+        }
+    }
+}
+
 /// Fail unless region `idx` is one the layout leaves to the host and `len` fits in a region.
 fn check_host_region(idx: usize, len: usize) -> crate::Result<()> {
     if !(FIRST_FREE_REGION..BORROW_FIRST_REGION).contains(&idx) {
@@ -411,14 +419,6 @@ impl MemoryBudget {
     pub fn take(&mut self, bytes: u64) -> crate::Result<()> {
         self.left = self.left.checked_sub(bytes).ok_or(VmError::MemoryLimit(self.limit))?;
         Ok(())
-    }
-}
-
-impl Drop for VmMemory {
-    fn drop(&mut self) {
-        for idx in 0..MAX_REGIONS {
-            self.free(idx);
-        }
     }
 }
 
@@ -929,7 +929,7 @@ mod tests {
         asm.stw(R2, 4, 5).ldxw(R3, R2, 4).add64(R7, R3);
         asm.stxw(R6, 4, R7);
         asm.call(1).ldxw(R0, R6, 0).add64(R0, R7).exit();
-        let code = rvm_core::instructions_from_bytes(&asm.assemble().unwrap());
+        let code = rvm_core::Code::new(rvm_core::decode_instructions(&asm.assemble().unwrap()));
         let result = Executor::new(helpers, stack_top, &config).call(&code, &mut mem, 0, &[]);
         assert_eq!(result.unwrap(), 21);
     }
@@ -956,8 +956,8 @@ mod tests {
         assert_eq!(guest.read_vec(rw, usize::MAX).unwrap_err(), fault(rw, usize::MAX));
     }
 
-    // Whether a guest atomic is aligned depends on guest addresses only: the host maps only aligned memory, and a borrow
-    // goes by the caller's address of the same byte.
+    // Whether a guest atomic is aligned depends on guest addresses only: the host maps only aligned memory, and a
+    // borrow goes by the caller's address of the same byte.
     #[test]
     fn atomics_follow_guest_addresses() {
         let mut buf = [0u64; 3];

@@ -1,26 +1,23 @@
-//! BTF parsing from raw bytes.
+//! `.BTF` parsing.
 
 use crate::raw::{
-    BtfKind, TypeHeader, BTF_ENUM64_SIZE, BTF_ENUM_SIZE, BTF_MAGIC, BTF_MEMBER_SIZE, BTF_PARAM_SIZE,
+    BtfKind, TypeHeader, BTF_ENUM64_SIZE, BTF_ENUM_SIZE, BTF_HEADER_LEN, BTF_MAGIC, BTF_MEMBER_SIZE, BTF_PARAM_SIZE,
     BTF_VAR_SECINFO_SIZE, BTF_VERSION, TYPE_HEADER_LEN,
 };
 use crate::strings::BtfStrings;
-use crate::types::*;
+use crate::types::{BtfTypeInfo, EnumValue, Member, Param, VarSecInfo};
 
-/// Error type for BTF parsing.
+/// Why `.BTF` or `.BTF.ext` data failed to parse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BtfError {
-    /// Data too short for header.
+    /// The data is shorter than its header.
     TooShort,
-    /// Invalid magic number.
     BadMagic(u16),
-    /// Unsupported version.
     BadVersion(u8),
-    /// Section extends beyond data.
+    /// A section named by the header extends past the data.
     SectionOverflow,
-    /// Invalid type data.
+    /// The record of the type with this ID is malformed.
     InvalidType(u32),
-    /// Unknown type kind.
     UnknownKind(u8),
     /// Unknown CO-RE relocation kind in `.BTF.ext`.
     UnknownReloKind(u32),
@@ -45,12 +42,8 @@ impl core::fmt::Display for BtfError {
 
 impl std::error::Error for BtfError {}
 
-/// Read a little-endian `u32` at word index `i` (byte offset `i * 4`).
-///
-/// # Panics
-///
-/// Panics if the word does not fit in `b`; callers only use it on slices already bounds-checked against the record size
-/// they are reading.
+/// Read a little-endian `u32` at word index `i` (byte offset `i * 4`). Panics if the word does not fit in `b`; callers
+/// use it on slices that they checked against the size of the record they read.
 pub fn word(b: &[u8], i: usize) -> u32 {
     let o = i * 4;
     u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
@@ -81,19 +74,18 @@ pub fn section(data: &[u8], hdr_len: usize, off: u32, len: u32) -> Result<&[u8],
         .ok_or(BtfError::SectionOverflow)
 }
 
-/// Parsed BTF data.
+/// A parsed `.BTF` section: its types and its string table.
 #[derive(Debug, Clone)]
 pub struct Btf<'a> {
-    /// String table.
     strings: BtfStrings<'a>,
-    /// Parsed types (index 0 is void, types start at index 1).
+    /// Indexed by type ID; index 0 is void.
     types: Vec<BtfTypeInfo<'a>>,
 }
 
 impl<'a> Btf<'a> {
-    /// Parse BTF from raw section bytes.
+    /// Parses the bytes of a `.BTF` section.
     pub fn parse(data: &'a [u8]) -> Result<Self, BtfError> {
-        let hdr_len = check_header(data, 24)?;
+        let hdr_len = check_header(data, BTF_HEADER_LEN)?;
         let type_data = section(data, hdr_len, word(data, 2), word(data, 3))?;
         let str_data = section(data, hdr_len, word(data, 4), word(data, 5))?;
         let strings = BtfStrings::new(str_data);
@@ -104,7 +96,6 @@ impl<'a> Btf<'a> {
     }
 
     fn parse_types(type_data: &'a [u8], strings: &BtfStrings<'a>) -> Result<Vec<BtfTypeInfo<'a>>, BtfError> {
-        // Type ID 0 is void
         let mut types = vec![BtfTypeInfo::Void];
         let mut offset = 0;
         let mut type_id = 1u32;
@@ -127,19 +118,16 @@ impl<'a> Btf<'a> {
         Ok(types)
     }
 
-    /// Get the string table.
     pub fn strings(&self) -> &BtfStrings<'a> {
         &self.strings
     }
 
-    /// Get a type by ID.
-    ///
-    /// Type ID 0 is void. IDs start at 1.
+    /// The type with this ID. ID 0 is void, and the types of the section have IDs from 1 in section order.
     pub fn type_by_id(&self, id: u32) -> Option<&BtfTypeInfo<'a>> {
         self.types.get(id as usize)
     }
 
-    /// Iterate over all types.
+    /// Every type with its ID, starting with void at ID 0.
     pub fn types(&self) -> impl Iterator<Item = (u32, &BtfTypeInfo<'a>)> {
         self.types.iter().enumerate().map(|(i, t)| (i as u32, t))
     }

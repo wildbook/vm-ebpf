@@ -24,6 +24,21 @@ use crate::program::{Borrow, Func, FuncSlot, FunctionInfo, Program};
 use crate::sync::{TryLock, TryLockGuard};
 
 /// A linked program that other programs can call into.
+///
+/// # Example
+///
+/// ```ignore
+/// let math = vm.load_plugin("math", &math_elf)?;
+/// // programs linked from here on can declare `extern u64 scale(u64 x);` and call it
+/// vm.export(&math, "scale")?;
+/// let game = vm.load_plugin("game", &game_elf)?;
+///
+/// let tick = game.func("on_tick")?;
+/// tick.call(&[1])?;
+/// // exports and function handles follow the new program
+/// math.replace(vm.load_elf(&math_v2_elf)?)?;
+/// tick.call(&[2])?;
+/// ```
 #[derive(Clone)]
 pub struct Plugin {
     name: Arc<str>,
@@ -184,8 +199,8 @@ impl Drop for UnmapBorrows<'_> {
     }
 }
 
-/// An exported function as last found in the plugin's program, with its borrows; [`Plugin::replace`] makes the next call
-/// look it up again. Only used under the plugin lock, which orders its relaxed accesses.
+/// An exported function as last found in the plugin's program, with its borrows; [`Plugin::replace`] makes the next
+/// call look it up again. Only used under the plugin lock, which orders its relaxed accesses.
 struct ExportSlot {
     func: FuncSlot,
     borrows: AtomicU64,
@@ -281,14 +296,14 @@ impl PluginFunc {
         self.func.call(&mut *self.plugin.lock()?, &self.plugin.name, args)
     }
 
-    /// [`call`](Self::call) with [`Program::call_with_limit`].
+    /// [`call`](Self::call) with [`Program::call_func_with_limit`].
     pub fn call_with_limit(&self, args: &[u64], limit: u64) -> (Result<u64>, u64) {
         let mut program = match self.plugin.lock() {
             Ok(program) => program,
             Err(error) => return (Err(error), 0),
         };
         match self.func.get(&program, |_| ()) {
-            Some(func) => program.call_with_limit(func, args, limit),
+            Some(func) => program.call_func_with_limit(func, args, limit),
             None => (Err(not_found(&self.plugin.name, self.func.name())), 0),
         }
     }

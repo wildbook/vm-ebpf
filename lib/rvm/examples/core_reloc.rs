@@ -1,6 +1,6 @@
-//! Runs `bpf/prebuilt/examples/core_example.o` against two host layouts of `struct event`: the one it was compiled against, and
-//! one with the fields reordered. The linker patches each field access through its CO-RE relocation, so the same object
-//! reads the right bytes from both. Exits with an error when a read returns the wrong value.
+//! Runs `bpf/prebuilt/examples/core_example.o` against two host layouts of `struct event`: the one it was compiled
+//! against, and one with the fields reordered. The linker patches each field access through its CO-RE relocation, so
+//! the same object reads the right bytes from both. Exits with an error when a read returns the wrong value.
 //!
 //! Run with: cargo run -p rvm --example core_reloc
 

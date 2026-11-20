@@ -357,7 +357,7 @@ mod tests {
     /// structs.
     #[test]
     fn map_values_match_the_plugin() {
-        let module = Module::from_elf("rules", RULES).unwrap();
+        let module = Module::from_elf(RULES).unwrap();
         let btf = Btf::parse(module.btf_data.as_deref().unwrap()).unwrap();
 
         let wave_state = vec![

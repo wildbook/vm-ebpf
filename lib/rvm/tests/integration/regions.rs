@@ -34,9 +34,9 @@ fn is_mem_fault(r: rvm::Result<u64>) -> bool {
 #[test]
 fn rodata_is_read_only_data_is_writable() {
     let vm = Vm::new();
-    let module = Module::from_elf("example", &object("examples/example.o")).unwrap();
+    let module = Module::from_elf(&object("examples/example.o")).unwrap();
     let magic = region_base(RODATA_REGION) + module.symbol("MAGIC_VALUE").unwrap().value;
-    let mut program = vm.link(&[&module]).unwrap();
+    let mut program = vm.load_modules(&[&module]).unwrap();
     assert_eq!(program.memory().read::<u64>(magic).unwrap(), 0xDEAD_BEEF_CAFE_BABE);
     assert_eq!(program.call("return_magic", &[]).unwrap(), 0xDEAD_BEEF_CAFE_BABE);
 

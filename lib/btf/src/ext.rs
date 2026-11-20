@@ -3,167 +3,38 @@
 use crate::parse::{check_header, section, word, BtfError};
 use crate::strings::BtfStrings;
 
-/// CO-RE relocation kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u32)]
-pub enum CoreReloKind {
-    /// Field byte offset.
-    FieldByteOffset = 0,
-    /// Field byte size.
-    FieldByteSize = 1,
-    /// Field existence (0 or 1).
-    FieldExists = 2,
-    /// Field signedness (0 or 1).
-    FieldSigned = 3,
-    /// Field left shift for reading/writing.
-    FieldLShiftU64 = 4,
-    /// Field right shift for reading/writing.
-    FieldRShiftU64 = 5,
-    /// Type ID (local BTF).
-    TypeIdLocal = 6,
-    /// Type ID (target BTF).
-    TypeIdTarget = 7,
-    /// Type existence (0 or 1).
-    TypeExists = 8,
-    /// Type size.
-    TypeSize = 9,
-    /// Enum value existence.
-    EnumvalExists = 10,
-    /// Enum value.
-    EnumvalValue = 11,
-    /// Type matches (0 or 1).
-    TypeMatches = 12,
-}
-
-impl CoreReloKind {
-    /// The kind with discriminant `val`, or `None` if BTF defines no such kind.
-    pub fn from_u32(val: u32) -> Option<Self> {
-        KINDS.get(usize::try_from(val).ok()?).copied()
-    }
-
-    /// Check if this is a field-based relocation.
-    pub fn is_field_relo(self) -> bool {
-        matches!(
-            self,
-            Self::FieldByteOffset
-                | Self::FieldByteSize
-                | Self::FieldExists
-                | Self::FieldSigned
-                | Self::FieldLShiftU64
-                | Self::FieldRShiftU64
-        )
-    }
-
-    /// Check if this is a type-based relocation.
-    pub fn is_type_relo(self) -> bool {
-        matches!(self, Self::TypeIdLocal | Self::TypeIdTarget | Self::TypeExists | Self::TypeSize | Self::TypeMatches)
-    }
-
-    /// Check if this is an enum-based relocation.
-    pub fn is_enum_relo(self) -> bool {
-        matches!(self, Self::EnumvalExists | Self::EnumvalValue)
-    }
-}
-
-/// Every kind, indexed by its discriminant.
-const KINDS: [CoreReloKind; 13] = {
-    use CoreReloKind::*;
-    [
-        FieldByteOffset,
-        FieldByteSize,
-        FieldExists,
-        FieldSigned,
-        FieldLShiftU64,
-        FieldRShiftU64,
-        TypeIdLocal,
-        TypeIdTarget,
-        TypeExists,
-        TypeSize,
-        EnumvalExists,
-        EnumvalValue,
-        TypeMatches,
-    ]
-};
-
-const _: () = {
-    let mut i = 0;
-    while i < KINDS.len() {
-        assert!(KINDS[i] as usize == i);
-        i += 1;
-    }
-};
-
-/// A single CO-RE relocation entry.
-#[derive(Debug, Clone)]
-pub struct CoreRelo {
-    /// Instruction offset (in bytes from section start).
-    pub insn_off: u32,
-    /// BTF type ID in the local (program) BTF.
-    pub type_id: u32,
-    /// Access string offset in BTF strings.
-    pub access_str_off: u32,
-    /// Relocation kind.
-    pub kind: CoreReloKind,
-}
-
-impl CoreRelo {
-    pub const SIZE: usize = 16;
-
-    /// Parse from bytes. Fails on a relocation kind this crate doesn't know, since skipping it would leave the
-    /// instruction with its compile-time value.
-    pub fn parse(data: &[u8]) -> Result<Self, BtfError> {
-        if data.len() < Self::SIZE {
-            return Err(BtfError::TooShort);
-        }
-        let raw_kind = word(data, 3);
-        let kind = CoreReloKind::from_u32(raw_kind).ok_or(BtfError::UnknownReloKind(raw_kind))?;
-
-        Ok(Self {
-            insn_off: word(data, 0),
-            type_id: word(data, 1),
-            access_str_off: word(data, 2),
-            kind,
-        })
-    }
-}
-
-/// Minimum size of a `.BTF.ext` header: magic, version, flags, hdr_len, and the (unused) func_info/line_info
-/// offset/length fields.
+/// Minimum size of a `.BTF.ext` header: magic, version, flags, hdr_len, and the func_info and line_info offsets and
+/// lengths, which this crate doesn't read.
 const BTF_EXT_HDR_MIN_SIZE: usize = 24;
-/// Header size once the (optional, added later) CO-RE relocation fields are present.
+/// Size of a header that also has the offset and length of the CO-RE relocations. Older headers end before them.
 const BTF_EXT_HDR_SIZE_WITH_CORE: usize = 32;
 
-/// CO-RE relocations for a specific section.
-#[derive(Debug, Clone)]
-pub struct SectionCoreRelos<'a> {
-    /// Section name.
-    pub section_name: &'a str,
-    /// Relocations for this section.
-    pub relos: Vec<CoreRelo>,
-}
-
-/// Parsed BTF.ext data.
+/// The CO-RE relocations of a `.BTF.ext` section.
 #[derive(Debug, Clone)]
 pub struct BtfExt<'a> {
-    /// CO-RE relocations grouped by section.
-    pub core_relos: Vec<SectionCoreRelos<'a>>,
+    sections: Vec<SectionCoreRelos<'a>>,
+}
+
+/// The CO-RE relocations of one code section.
+#[derive(Debug, Clone)]
+struct SectionCoreRelos<'a> {
+    section_name: &'a str,
+    relos: Vec<CoreRelo>,
 }
 
 impl<'a> BtfExt<'a> {
-    /// Parse BTF.ext from raw bytes.
-    ///
-    /// Requires the BTF strings table for resolving section names.
+    /// Parses a `.BTF.ext` section. `strings` is the string table of the `.BTF` section next to it, which holds the
+    /// section names.
     pub fn parse(data: &'a [u8], strings: &BtfStrings<'a>) -> Result<Self, BtfError> {
         let hdr_len = check_header(data, BTF_EXT_HDR_MIN_SIZE)?;
 
-        // older headers end before the CO-RE relocation fields
         if hdr_len < BTF_EXT_HDR_SIZE_WITH_CORE || data.len() < BTF_EXT_HDR_SIZE_WITH_CORE {
-            return Ok(Self { core_relos: Vec::new() });
+            return Ok(Self { sections: Vec::new() });
         }
         let relo_data = section(data, hdr_len, word(data, 6), word(data, 7))?;
-        let core_relos = Self::parse_core_relos(relo_data, strings)?;
+        let sections = Self::parse_core_relos(relo_data, strings)?;
 
-        Ok(Self { core_relos })
+        Ok(Self { sections })
     }
 
     fn parse_core_relos(relo_data: &[u8], strings: &BtfStrings<'a>) -> Result<Vec<SectionCoreRelos<'a>>, BtfError> {
@@ -203,11 +74,128 @@ impl<'a> BtfExt<'a> {
         Ok(sections)
     }
 
-    /// Get CO-RE relocations for a specific section.
+    /// The relocations of the code section `section_name`, or `None` if it has none.
     pub fn relos_for_section(&self, section_name: &str) -> Option<&[CoreRelo]> {
-        self.core_relos
+        self.sections
             .iter()
             .find(|s| s.section_name == section_name)
             .map(|s| s.relos.as_slice())
     }
 }
+
+/// One CO-RE relocation.
+#[derive(Debug, Clone)]
+pub struct CoreRelo {
+    /// Byte offset of the instruction in its section.
+    pub insn_off: u32,
+    /// The root type of the access, an ID in the program's BTF.
+    pub type_id: u32,
+    /// Offset of the access string, such as `0:1:2`, in the string table of the program's BTF.
+    pub access_str_off: u32,
+    pub kind: CoreReloKind,
+}
+
+impl CoreRelo {
+    /// Size of the fields this crate reads from a record.
+    const SIZE: usize = 16;
+
+    /// Parses a record of at least [`SIZE`](Self::SIZE) bytes. Fails on a relocation kind this crate doesn't know,
+    /// since skipping it would leave the instruction with its compile-time value.
+    fn parse(data: &[u8]) -> Result<Self, BtfError> {
+        let raw_kind = word(data, 3);
+        let kind = CoreReloKind::from_u32(raw_kind).ok_or(BtfError::UnknownReloKind(raw_kind))?;
+
+        Ok(Self {
+            insn_off: word(data, 0),
+            type_id: word(data, 1),
+            access_str_off: word(data, 2),
+            kind,
+        })
+    }
+}
+
+/// What a CO-RE relocation patches into its instruction (`enum bpf_core_relo_kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum CoreReloKind {
+    FieldByteOffset = 0,
+    FieldByteSize = 1,
+    /// Whether the field exists, 0 or 1.
+    FieldExists = 2,
+    /// Whether the field is signed, 0 or 1.
+    FieldSigned = 3,
+    /// The left shift that moves a bitfield, loaded into a `u64`, to the top bits.
+    FieldLShiftU64 = 4,
+    /// The right shift that then moves it down to bit 0.
+    FieldRShiftU64 = 5,
+    /// The type's ID in the program's BTF.
+    TypeIdLocal = 6,
+    /// The type's ID in the target BTF.
+    TypeIdTarget = 7,
+    /// Whether the type exists, 0 or 1.
+    TypeExists = 8,
+    TypeSize = 9,
+    /// Whether the enumerator exists, 0 or 1.
+    EnumvalExists = 10,
+    EnumvalValue = 11,
+    /// Whether the target has a type that matches the local one member by member, 0 or 1.
+    TypeMatches = 12,
+}
+
+impl CoreReloKind {
+    /// The kind with discriminant `val`, or `None` if BTF defines no such kind.
+    pub fn from_u32(val: u32) -> Option<Self> {
+        KINDS.get(usize::try_from(val).ok()?).copied()
+    }
+
+    /// Whether the relocation is about a struct or union field.
+    pub fn is_field_relo(self) -> bool {
+        matches!(
+            self,
+            Self::FieldByteOffset
+                | Self::FieldByteSize
+                | Self::FieldExists
+                | Self::FieldSigned
+                | Self::FieldLShiftU64
+                | Self::FieldRShiftU64
+        )
+    }
+
+    /// Whether the relocation is about a type as a whole.
+    pub fn is_type_relo(self) -> bool {
+        matches!(self, Self::TypeIdLocal | Self::TypeIdTarget | Self::TypeExists | Self::TypeSize | Self::TypeMatches)
+    }
+
+    /// Whether the relocation is about an enumerator.
+    pub fn is_enum_relo(self) -> bool {
+        matches!(self, Self::EnumvalExists | Self::EnumvalValue)
+    }
+}
+
+/// Every kind, indexed by its discriminant.
+const KINDS: [CoreReloKind; 13] = {
+    use CoreReloKind::*;
+    [
+        FieldByteOffset,
+        FieldByteSize,
+        FieldExists,
+        FieldSigned,
+        FieldLShiftU64,
+        FieldRShiftU64,
+        TypeIdLocal,
+        TypeIdTarget,
+        TypeExists,
+        TypeSize,
+        EnumvalExists,
+        EnumvalValue,
+        TypeMatches,
+    ]
+};
+
+const _: () = {
+    let mut i = 0;
+    while i < KINDS.len() {
+        assert!(KINDS[i] as usize == i);
+        i += 1;
+    }
+};

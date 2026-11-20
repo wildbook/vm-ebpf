@@ -1,47 +1,43 @@
 use crate::err::ElfError;
-use crate::file::ElfFile;
 use crate::raw::{sht, Elf64Rel, Elf64Rela, Elf64Shdr};
 use crate::sections::{ElfSection, ElfSections};
 use crate::util::cast_slice;
 use crate::{tryres, ElfResult};
 
-#[derive(Copy, Clone, Debug)]
-pub enum ElfRelocsChunk<'a> {
-    Rel(&'a [Elf64Rel]),
-    Rela(&'a [Elf64Rela]),
-}
-
+/// Iterator over the `SHT_REL` and `SHT_RELA` sections of a file.
 #[derive(Copy, Clone)]
 pub struct ElfRelocSections<'a> {
-    pub sects: ElfSections<'a>,
-    pub index: usize,
+    sects: ElfSections<'a>,
+    index: usize,
 }
 
 impl<'a> ElfRelocSections<'a> {
+    pub(crate) const fn new(sects: ElfSections<'a>) -> Self {
+        Self { sects, index: 0 }
+    }
+
+    /// [`Iterator::next`] for const contexts: the iterator past the next relocation section, and that section.
     pub const fn into_next(mut self) -> (Self, Option<ElfRelocSection<'a>>) {
         loop {
-            let Some(src) = self.sects.header_by_index(self.index) else {
+            let Some(source) = self.sects.header_by_index(self.index) else {
                 return (self, None);
             };
-
             self.index += 1;
 
-            if src.sh_type != sht::REL && src.sh_type != sht::RELA {
+            if source.sh_type != sht::REL && source.sh_type != sht::RELA {
                 continue;
             }
-
-            let Some(dst) = self.sects.header_by_index(src.sh_info as usize) else {
-                // dangling sh_info: skip this relocation section
+            // a relocation section whose `sh_info` names no section is skipped
+            let Some(target) = self.sects.header_by_index(source.sh_info as usize) else {
                 continue;
             };
 
-            let rel = ElfRelocSection {
+            let section = ElfRelocSection {
                 sects: self.sects,
-                source: src,
-                target: dst,
+                source,
+                target,
             };
-
-            return (self, Some(rel));
+            return (self, Some(section));
         }
     }
 }
@@ -50,26 +46,18 @@ impl<'a> Iterator for ElfRelocSections<'a> {
     type Item = ElfRelocSection<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let (next, res) = self.into_next();
+        let (next, section) = self.into_next();
         *self = next;
-        res
+        section
     }
 }
 
+/// A relocation section (`source`) and the section its relocations apply to (`target`).
 #[derive(Copy, Clone)]
 pub struct ElfRelocSection<'a> {
     sects: ElfSections<'a>,
     source: &'a Elf64Shdr,
     target: &'a Elf64Shdr,
-}
-
-impl<'a> std::fmt::Debug for ElfRelocSection<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ElfRelocSection")
-            .field("source", &self.source)
-            .field("target", &self.target)
-            .finish()
-    }
 }
 
 impl<'a> ElfRelocSection<'a> {
@@ -87,6 +75,7 @@ impl<'a> ElfRelocSection<'a> {
         }
     }
 
+    /// Section index of [`target`](Self::target).
     pub const fn target_idx(self) -> usize {
         self.source.sh_info as usize
     }
@@ -103,21 +92,25 @@ impl<'a> ElfRelocSection<'a> {
                 Some(rela) => ElfRelocsChunk::Rela(rela),
                 None => return Err(ElfError::InvalidData),
             },
-            _ => return Err(ElfError::Unsupported),
+            _ => unreachable!(), // `into_next` yields only these two types
         };
 
         Ok(chunk)
     }
 }
 
-#[derive(Copy, Clone)]
-pub struct ElfRelocs<'a>(pub ElfFile<'a>);
-
-impl<'a> ElfRelocs<'a> {
-    pub const fn iter(self) -> ElfResult<ElfRelocSections<'a>> {
-        Ok(ElfRelocSections {
-            sects: tryres!(self.0.sections()),
-            index: 0,
-        })
+impl std::fmt::Debug for ElfRelocSection<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ElfRelocSection")
+            .field("source", &self.source)
+            .field("target", &self.target)
+            .finish()
     }
+}
+
+/// The entries of one relocation section.
+#[derive(Copy, Clone, Debug)]
+pub enum ElfRelocsChunk<'a> {
+    Rel(&'a [Elf64Rel]),
+    Rela(&'a [Elf64Rela]),
 }

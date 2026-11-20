@@ -1,109 +1,14 @@
 //! Builder for host-defined BTF.
 //!
-//! The host describes its own types the same way a compiler describes a program's: as standard BTF. [`BtfBuilder`]
-//! assembles that BTF incrementally and [`encode`] produces bytes [`Btf::parse`] can read back, so CO-RE relocations
-//! resolve against the host's types as they would against a second translation unit.
-//!
-//! [`encode`]: BtfBuilder::encode
+//! The host describes its own types as a compiler describes a program's: as standard BTF. [`BtfBuilder`] collects the
+//! types and [`BtfBuilder::encode`] produces bytes that [`Btf::parse`] reads back, so CO-RE relocations resolve against
+//! the host's types as they would against a second translation unit.
 
 use hashbrown::HashMap;
 
 use crate::parse::{Btf, BtfError};
-use crate::raw::{BtfKind, TypeHeader, BTF_INT_SIGNED, BTF_MAGIC, BTF_VERSION};
+use crate::raw::{BtfKind, TypeHeader, BTF_HEADER_LEN, BTF_INT_SIGNED, BTF_MAGIC, BTF_VERSION};
 use crate::types::{BtfTypeInfo, Member};
-
-/// One struct/union member, pending encoding.
-struct MemberEntry {
-    name: u32,
-    type_id: u32,
-    bit_offset: u32,
-    bitfield_size: u32,
-}
-
-/// One BTF type, pending encoding. Mirrors [`BtfTypeInfo`] but owns its data, so `member`/`enumerator` can keep
-/// extending a struct or enum after it is created.
-enum TypeEntry {
-    Int {
-        name: u32,
-        size: u32,
-        encoding: u8,
-        offset: u8,
-        bits: u8,
-    },
-    Ptr {
-        pointee: u32,
-    },
-    Array {
-        elem: u32,
-        index: u32,
-        nelems: u32,
-    },
-    Struct {
-        name: u32,
-        size: u32,
-        members: Vec<MemberEntry>,
-    },
-    Union {
-        name: u32,
-        size: u32,
-        members: Vec<MemberEntry>,
-    },
-    Enum {
-        name: u32,
-        size: u32,
-        is_signed: bool,
-        variants: Vec<(u32, i64)>,
-    },
-    Fwd {
-        name: u32,
-        is_union: bool,
-    },
-    Typedef {
-        name: u32,
-        target: u32,
-    },
-    Volatile {
-        target: u32,
-    },
-    Const {
-        target: u32,
-    },
-    Restrict {
-        target: u32,
-    },
-    Func {
-        name: u32,
-        proto: u32,
-        linkage: u16,
-    },
-    FuncProto {
-        ret: u32,
-        params: Vec<(u32, u32)>,
-    },
-    Var {
-        name: u32,
-        target: u32,
-        linkage: u32,
-    },
-    DataSec {
-        name: u32,
-        size: u32,
-        vars: Vec<(u32, u32, u32)>,
-    },
-    Float {
-        name: u32,
-        size: u32,
-    },
-    DeclTag {
-        name: u32,
-        target: u32,
-        component_idx: i32,
-    },
-    TypeTag {
-        name: u32,
-        target: u32,
-    },
-}
 
 /// Builds standard BTF describing the host's types.
 ///
@@ -122,7 +27,7 @@ impl Default for BtfBuilder {
 }
 
 impl BtfBuilder {
-    /// Create an empty builder.
+    /// An empty builder.
     pub fn new() -> Self {
         Self {
             // Offset 0 is the empty string, used for every anonymous type's name.
@@ -272,7 +177,7 @@ impl BtfBuilder {
     }
 
     fn convert(&mut self, ty: &BtfTypeInfo<'_>, id_base: u32) -> TypeEntry {
-        let remap = |id: u32| if id == 0 { 0 } else { id + id_base };
+        let remap = |id| remap_id(id, id_base);
         match ty {
             BtfTypeInfo::Void => unreachable!("void is type 0, not a stored entry"),
             &BtfTypeInfo::Int {
@@ -381,7 +286,7 @@ impl BtfBuilder {
             .iter()
             .map(|m| MemberEntry {
                 name: self.string(m.name),
-                type_id: if m.type_id == 0 { 0 } else { m.type_id + id_base },
+                type_id: remap_id(m.type_id, id_base),
                 bit_offset: m.bit_offset,
                 bitfield_size: m.bitfield_size,
             })
@@ -416,7 +321,7 @@ impl BtfBuilder {
             entry.encode(&mut type_data);
         }
 
-        let hdr_len = 24u32;
+        let hdr_len = BTF_HEADER_LEN as u32;
         let type_len = type_data.len() as u32;
         let str_len = self.strings.len() as u32;
         let mut out = Vec::with_capacity((hdr_len + type_len + str_len) as usize);
@@ -432,6 +337,108 @@ impl BtfBuilder {
         out.extend_from_slice(&self.strings);
         out
     }
+}
+
+/// The ID that type `id` of an appended BTF gets after `id_base` earlier types. Void stays 0.
+fn remap_id(id: u32, id_base: u32) -> u32 {
+    if id == 0 {
+        0
+    } else {
+        id + id_base
+    }
+}
+
+/// One struct/union member, pending encoding.
+struct MemberEntry {
+    name: u32,
+    type_id: u32,
+    bit_offset: u32,
+    bitfield_size: u32,
+}
+
+/// One BTF type, pending encoding. Mirrors [`BtfTypeInfo`] but owns its data, so `member`/`enumerator` can keep
+/// extending a struct or enum after it is created.
+enum TypeEntry {
+    Int {
+        name: u32,
+        size: u32,
+        encoding: u8,
+        offset: u8,
+        bits: u8,
+    },
+    Ptr {
+        pointee: u32,
+    },
+    Array {
+        elem: u32,
+        index: u32,
+        nelems: u32,
+    },
+    Struct {
+        name: u32,
+        size: u32,
+        members: Vec<MemberEntry>,
+    },
+    Union {
+        name: u32,
+        size: u32,
+        members: Vec<MemberEntry>,
+    },
+    Enum {
+        name: u32,
+        size: u32,
+        is_signed: bool,
+        variants: Vec<(u32, i64)>,
+    },
+    Fwd {
+        name: u32,
+        is_union: bool,
+    },
+    Typedef {
+        name: u32,
+        target: u32,
+    },
+    Volatile {
+        target: u32,
+    },
+    Const {
+        target: u32,
+    },
+    Restrict {
+        target: u32,
+    },
+    Func {
+        name: u32,
+        proto: u32,
+        linkage: u16,
+    },
+    FuncProto {
+        ret: u32,
+        params: Vec<(u32, u32)>,
+    },
+    Var {
+        name: u32,
+        target: u32,
+        linkage: u32,
+    },
+    DataSec {
+        name: u32,
+        size: u32,
+        vars: Vec<(u32, u32, u32)>,
+    },
+    Float {
+        name: u32,
+        size: u32,
+    },
+    DeclTag {
+        name: u32,
+        target: u32,
+        component_idx: i32,
+    },
+    TypeTag {
+        name: u32,
+        target: u32,
+    },
 }
 
 /// Write a BTF type header: name offset, kind/vlen/kind_flag info, and size-or-type.

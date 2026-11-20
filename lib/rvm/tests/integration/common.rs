@@ -25,7 +25,7 @@ pub fn host_vm() -> Vm {
 /// [`host_vm`] with `config`.
 pub fn host_vm_with(config: VmConfig) -> Vm {
     let vm = Vm::with_config(config).unwrap();
-    let host = Module::from_elf("host_event", &object("tests/host_event.o")).unwrap();
+    let host = Module::from_elf(&object("tests/host_event.o")).unwrap();
     vm.with_types(|types| {
         types.append_btf(host.btf_data.as_ref().unwrap()).unwrap();
         describe_bits(types);

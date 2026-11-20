@@ -1,3 +1,5 @@
+//! Prints the sections and relocations of `bpf/prebuilt/examples/example.o`.
+
 use constelf::file::ElfFile;
 use constelf::ElfResult;
 
@@ -6,16 +8,14 @@ fn main() -> ElfResult {
     let elf = ElfFile::new(elf)?;
     println!("{elf:#?}");
 
-    let sections = elf.sections()?;
-
-    for sect in sections.iter() {
+    for sect in elf.sections()?.iter() {
         let name = sect.name()?;
 
         println!("{name:?} | {:#x?}", sect.raw());
-        println!(" - {:?}", hex::encode(sect.bytes()?));
+        println!(" - {:02x?}", sect.bytes()?);
     }
 
-    for sect in elf.relocs().iter()? {
+    for sect in elf.relocs()? {
         let src = sect.source().name()?.to_string_lossy();
         let tgt = sect.target().name()?.to_string_lossy();
         let relocs = sect.relocs()?;

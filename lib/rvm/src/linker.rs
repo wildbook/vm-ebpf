@@ -332,8 +332,8 @@ fn apply_relocation(
         LinkError::InvalidReference(format!("symbol index {idx}"))
     })?;
 
-    // `lddw rX, map`: the guest gets the map's handle, its index in the image. Only a symbol in `.maps`, or an undefined
-    // one, names a map; a global of the same name in another module is plain data.
+    // `lddw rX, map`: the guest gets the map's handle, its index in the image. Only a symbol in `.maps`, or an
+    // undefined one, names a map; a global of the same name in another module is plain data.
     let in_maps = symbol
         .section_idx
         .is_none_or(|i| module.sections[i].kind == SectionKind::Maps);

@@ -79,7 +79,7 @@ fn bench(c: &mut Criterion) {
 
     // Map helpers from a compiled object; each call runs N operations in a guest loop.
     let elf = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/prebuilt/bench/map_bench.o")).unwrap();
-    let mut program = rvm::Vm::new().load_elf(&elf).unwrap();
+    let mut program = Vm::new().load_elf(&elf).unwrap();
     program.call("hash_update", &[N as u64]).unwrap(); // fill all keys before timing lookups
 
     let mut group = c.benchmark_group("maps");
@@ -89,7 +89,7 @@ fn bench(c: &mut Criterion) {
     }
 
     // Same guest loop with helper 1 replaced by a stub: the cost outside the map code.
-    let vm = rvm::Vm::new();
+    let vm = Vm::new();
     vm.register_helper(1, |_: ()| 0u64);
     let mut stub = vm.load_elf(&elf).unwrap();
     group.bench_function("lookup_stub", |b| b.iter(|| stub.call("array_lookup", black_box(&[N as u64])).unwrap()));

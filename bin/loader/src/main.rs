@@ -1,6 +1,5 @@
-//! Loads `bpf/prebuilt/examples/example.o`, prints what `Module::from_elf` and `Vm::link` produce, and calls its
-//! exported functions.
-//! Exits with an error when a call fails or returns the wrong value.
+//! Loads `bpf/prebuilt/examples/example.o`, prints what `Module::from_elf` and `Vm::load_modules` produce, and calls
+//! its exported functions. Exits with an error when a call fails or returns the wrong value.
 
 use std::mem::offset_of;
 
@@ -21,11 +20,11 @@ fn main() -> Result<()> {
     let vm = Vm::new();
 
     println!("\n=== Parsing ELF ===");
-    let module = Module::from_elf("example", &elf_bytes)?;
+    let module = Module::from_elf(&elf_bytes)?;
     print_module_info(&module);
 
     println!("\n=== Linking ===");
-    let mut program = vm.link(&[&module])?;
+    let mut program = vm.load_modules(&[&module])?;
     println!("  Stack region: {} bytes", program.memory().region_len(rvm::STACK_REGION));
     println!("  Stack top: 0x{:x}", stack_top(&program));
     print_function_table(&program);
@@ -119,7 +118,7 @@ fn stack_top(program: &Program) -> u64 {
 
 /// Call `name` with `args`, printing the entry point, arguments and result.
 fn run_and_report(program: &mut Program, name: &str, args: &[u64]) -> Result<u64> {
-    if let Some(info) = program.function(name) {
+    if let Some(info) = program.function_info(name) {
         let pc = info.pc;
         let byte_offset = pc * rvm::INSN_SIZE;
         println!("Entry PC: {pc} (byte offset: 0x{byte_offset:x})");
@@ -167,7 +166,7 @@ mod tests {
     /// `bpf_main` reads and writes these structs in host memory, so their layouts must match the C structs.
     #[test]
     fn context_structs_match_the_program() {
-        let module = Module::from_elf("example", &std::fs::read(ELF_PATH).unwrap()).unwrap();
+        let module = Module::from_elf(&std::fs::read(ELF_PATH).unwrap()).unwrap();
         let btf = Btf::parse(module.btf_data.as_deref().unwrap()).unwrap();
 
         let input_ctx = vec![

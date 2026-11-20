@@ -59,7 +59,7 @@ impl Default for VmConfig {
     }
 }
 
-/// The entry point: holds the helper table, the host types for CO-RE, and the maps and regions shared between the
+/// The entry point: holds the host functions, the host types for CO-RE, and the maps and regions shared between the
 /// programs it links and loads.
 pub struct Vm {
     /// Extern table shared with every program this VM links.
@@ -277,7 +277,7 @@ impl Vm {
     /// Externs and helper IDs must be registered here as they will be in the loading VM, so the link checks signatures
     /// and fails on unknown names early; CO-RE resolves against the types from [`Vm::with_types`].
     pub fn prepare(&self, elf_bytes: &[u8]) -> Result<Image> {
-        let module = Module::from_elf("main", elf_bytes)?;
+        let module = Module::from_elf(elf_bytes)?;
         self.prepare_modules(&[&module])
     }
 
@@ -288,35 +288,34 @@ impl Vm {
         linker::link(&self.helpers.read(), &types, modules, self.config.memory_limit)
     }
 
-    /// Link modules into an executable program: [`Vm::prepare_modules`], then load.
+    /// Link modules into an executable program: [`Vm::prepare_modules`], then [`Vm::load`].
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let utils = Module::from_elf("utils", &utils_elf)?;
-    /// let main = Module::from_elf("main", &main_elf)?;
-    /// let program = vm.link(&[&utils, &main])?;
+    /// let utils = Module::from_elf(&utils_elf)?;
+    /// let main = Module::from_elf(&main_elf)?;
+    /// let program = vm.load_modules(&[&utils, &main])?;
     /// ```
-    pub fn link(&self, modules: &[&Module]) -> Result<Program> {
+    pub fn load_modules(&self, modules: &[&Module]) -> Result<Program> {
         self.load(self.prepare_modules(modules)?)
     }
 
-    /// Parse and link a single ELF file into a program.
+    /// Parse and link a single ELF file into a program: [`Vm::prepare`], then [`Vm::load`].
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let program = vm.load_elf(&elf_bytes)?;
+    /// let mut program = vm.load_elf(&elf_bytes)?;
     /// let result = program.call("main", &[])?;
     /// ```
     pub fn load_elf(&self, elf_bytes: &[u8]) -> Result<Program> {
         self.load(self.prepare(elf_bytes)?)
     }
 
-    /// Load an ELF file as a plugin that other programs can call into.
+    /// Load an ELF file as a plugin that other programs can call into: [`Vm::load_elf`], then [`Plugin::new`].
     pub fn load_plugin(&self, name: &str, elf_bytes: &[u8]) -> Result<Plugin> {
-        let module = Module::from_elf(name, elf_bytes)?;
-        Ok(Plugin::new(name, self.link(&[&module])?))
+        Ok(Plugin::new(name, self.load_elf(elf_bytes)?))
     }
 }
 
@@ -360,6 +359,7 @@ impl SharedRegions {
     fn add(&self, region: usize, len: usize, perms: Perms) -> Result<SharedRegion> {
         let _writer = lock(&self.writer);
         let list = self.list.get();
+
         let invalid = |msg: String| Err(VmError::InvalidArgument(msg));
         if !(FIRST_FREE_REGION..BORROW_FIRST_REGION).contains(&region) {
             return invalid(format!("region {region} is outside {FIRST_FREE_REGION}..{BORROW_FIRST_REGION}"));
@@ -370,6 +370,7 @@ impl SharedRegions {
         if len == 0 || len > MAX_REGION_LEN {
             return invalid(format!("region length {len} is not in 1..={MAX_REGION_LEN}"));
         }
+
         let buffer = Arc::new(SharedBuffer::new(len)?);
         let mapping = Mapping {
             region,

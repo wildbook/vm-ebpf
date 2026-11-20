@@ -13,9 +13,9 @@ fn full_vm() -> Vm {
 }
 
 fn link(vm: &Vm) -> rvm::Result<rvm::Program> {
-    let main = Module::from_elf("main", &object("tests/link_main.o"))?;
-    let lib = Module::from_elf("lib", &object("tests/link_lib.o"))?;
-    vm.link(&[&main, &lib])
+    let main = Module::from_elf(&object("tests/link_main.o"))?;
+    let lib = Module::from_elf(&object("tests/link_lib.o"))?;
+    vm.load_modules(&[&main, &lib])
 }
 
 #[test]
@@ -89,9 +89,9 @@ fn replacing_extern_rebinds_linked_calls() {
 #[test]
 fn global_named_like_a_map_is_data() {
     let vm = Vm::new();
-    let counter = Module::from_elf("counter", &object("tests/shared_counter.o")).unwrap();
-    let global = Module::from_elf("global", &object("tests/global_hits.o")).unwrap();
-    let mut program = vm.link(&[&counter, &global]).unwrap();
+    let counter = Module::from_elf(&object("tests/shared_counter.o")).unwrap();
+    let global = Module::from_elf(&object("tests/global_hits.o")).unwrap();
+    let mut program = vm.load_modules(&[&counter, &global]).unwrap();
     assert_eq!(program.call("get", &[]).unwrap(), 5);
     assert_eq!(program.call("bump", &[]).unwrap(), 1);
 }
@@ -99,8 +99,8 @@ fn global_named_like_a_map_is_data() {
 /// A relocation must patch whole instructions inside its own section, not the next section or half an `imm`.
 #[test]
 fn relocation_outside_its_section_fails() {
-    let parse = || Module::from_elf("main", &object("tests/link_main.o")).unwrap();
-    let lib = Module::from_elf("lib", &object("tests/link_lib.o")).unwrap();
+    let parse = || Module::from_elf(&object("tests/link_main.o")).unwrap();
+    let lib = Module::from_elf(&object("tests/link_lib.o")).unwrap();
     let main = parse();
     let at = main
         .relocations
@@ -111,7 +111,7 @@ fn relocation_outside_its_section_fails() {
     for offset in [size, main.relocations[at].offset + 4] {
         let mut main = parse();
         main.relocations[at].offset = offset;
-        let err = full_vm().link(&[&main, &lib]).unwrap_err();
+        let err = full_vm().load_modules(&[&main, &lib]).unwrap_err();
         assert!(matches!(err, VmError::Link(LinkError::InvalidReference(_))), "offset {offset}: {err}");
     }
 }
@@ -134,7 +134,7 @@ fn unreadable_btf_fails() {
         .unwrap();
     // sh_offset past the end of the file
     elf[header(btf) + 0x18..][..8].copy_from_slice(&u64::MAX.to_le_bytes());
-    assert!(Module::from_elf("main", &elf).is_err());
+    assert!(Module::from_elf(&elf).is_err());
 }
 
 /// Linking counts code and data against the memory limit before it grows the image. A `.bss` stays a length, and
@@ -149,7 +149,7 @@ fn layout_stays_within_memory_limit() {
         .unwrap()
     };
 
-    let mut module = Module::from_elf("main", &object("examples/example.o")).unwrap();
+    let mut module = Module::from_elf(&object("examples/example.o")).unwrap();
     module.sections.push(Section {
         name: ".bss.big".into(),
         kind: SectionKind::Bss,
@@ -165,7 +165,7 @@ fn layout_stays_within_memory_limit() {
     assert!(matches!(err, VmError::MemoryLimit(DEFAULT_MEMORY_LIMIT)), "{err}");
 
     // 64 code sections that each load 64 tables: 4096 copies from 128 sections
-    let mut module = Module::from_elf("main", &object("tests/func_ptr.o")).unwrap();
+    let mut module = Module::from_elf(&object("tests/func_ptr.o")).unwrap();
     let base = Vm::new().prepare_modules(&[&module]).unwrap();
     let base = base.code.len() + base.rodata_len + base.data_len;
     let (reloc, table) = module

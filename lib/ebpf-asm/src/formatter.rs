@@ -1,6 +1,4 @@
-//! eBPF instruction formatting.
-//!
-//! Provides customizable text formatting for decoded instructions.
+//! Text for decoded instructions.
 
 use std::fmt::Write;
 
@@ -8,34 +6,34 @@ use crate::instruction::{Instruction, RawInstruction};
 use crate::mnemonic::Mnemonic;
 use crate::operand::Operand;
 
-/// eBPF instruction formatter.
+/// Renders decoded instructions as text:
 ///
-/// Produces output like:
 /// - `mov64 r0, 0x2a`
 /// - `add64 r0, r1`
 /// - `ldxdw r0, [r1+0x10]`
 /// - `jeq r0, 0x0, +5`
 ///
-/// With `show_bytes` enabled:
-/// - `b7 00 00 00 2a 00 00 00  mov64 r0, 0x2a`
-pub struct DefaultFormatter {
+/// [`with_bytes`](Self::with_bytes) puts the raw bytes in front: `b7 00 00 00 2a 00 00 00  mov64 r0, 0x2a`.
+/// `Instruction` implements `Display` with the text of `Formatter::new()`.
+#[derive(Default)]
+pub struct Formatter {
     show_bytes: bool,
 }
 
-impl DefaultFormatter {
-    /// Create a new default formatter.
+impl Formatter {
+    /// A formatter that shows no raw bytes.
     pub fn new() -> Self {
-        Self { show_bytes: false }
+        Self::default()
     }
 
-    /// Enable raw bytes display before the instruction, both slots for `lddw` and other wide instructions.
+    /// Show the raw bytes before the instruction, both slots for `lddw` and other wide instructions.
     pub fn with_bytes(mut self) -> Self {
         self.show_bytes = true;
         self
     }
 
-    /// Format an instruction to a string.
-    pub fn format_to_string(&self, insn: &Instruction) -> String {
+    /// The text of `insn`.
+    pub fn format(&self, insn: &Instruction) -> String {
         let mut out = String::new();
 
         if self.show_bytes {
@@ -89,11 +87,5 @@ impl DefaultFormatter {
         }
 
         out
-    }
-}
-
-impl Default for DefaultFormatter {
-    fn default() -> Self {
-        Self::new()
     }
 }

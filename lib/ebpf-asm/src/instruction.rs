@@ -1,35 +1,35 @@
-//! Decoded eBPF instruction representation.
+//! Decoded and raw eBPF instructions.
 
 use std::fmt;
 
-use crate::formatter::DefaultFormatter;
+use crate::formatter::Formatter;
 use crate::mnemonic::Mnemonic;
 use crate::operand::Operand;
 
-/// A decoded eBPF instruction with full metadata.
+/// A decoded eBPF instruction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Instruction {
-    /// The instruction mnemonic.
+    /// What the instruction does; [`Mnemonic::Unknown`] for an invalid encoding, which has no operands.
     pub mnemonic: Mnemonic,
-    /// Destination operand (usually a register).
+    /// Destination operand, or the only operand.
     pub dst: Operand,
-    /// Source operand (register, immediate, or memory).
+    /// Source operand.
     pub src: Operand,
-    /// Byte offset within the bytecode.
+    /// Byte offset in the bytecode.
     pub offset: u64,
-    /// Size in bytes (8 for normal instructions, 16 for LDDW).
+    /// Size in bytes: 16 for `lddw` and `ld_pseudo`, 8 for the rest.
     pub size: u8,
-    /// Raw opcode byte.
+    /// The opcode byte.
     pub opcode: u8,
-    /// Raw instruction bytes (first 8 bytes).
+    /// The first 8 bytes, as a little-endian word.
     pub raw: u64,
-    /// Second 8 bytes for wide instructions (LDDW).
+    /// The second 8 bytes of a 16-byte instruction.
     pub raw2: Option<u64>,
 }
 
 impl fmt::Display for Instruction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&DefaultFormatter::new().format_to_string(self))
+        f.write_str(&Formatter::new().format(self))
     }
 }
 
@@ -230,23 +230,3 @@ pub mod atomic {
 pub const SRC_IMM: u8 = 0x00;
 /// Source is register (X).
 pub const SRC_REG: u8 = 0x08;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn raw_instruction_parts() {
-        let raw = RawInstruction::from_parts(0xBF, 1, 2, -16, 42);
-        assert_eq!(raw.opcode(), 0xBF);
-        assert_eq!(raw.dst(), 1);
-        assert_eq!(raw.src(), 2);
-        assert_eq!(raw.offset(), -16);
-        assert_eq!(raw.imm(), 42);
-
-        // ldxw r1, [r2+0] is LDX | W | MEM; mov64 r1, r2 is ALU64 | MOV | X
-        let load = RawInstruction::from_parts(0x61, 1, 2, 0, 0);
-        assert_eq!((load.class(), load.size(), load.mode()), (class::LDX, size::W, mode::MEM));
-        assert_eq!((raw.class(), raw.op()), (class::ALU64, alu::MOV));
-    }
-}

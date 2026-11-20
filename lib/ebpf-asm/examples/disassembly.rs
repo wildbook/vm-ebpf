@@ -1,8 +1,8 @@
-//! Decodes eBPF bytecode and prints it with `DefaultFormatter`, and inspects the decoded fields.
+//! Decodes eBPF bytecode, prints it as text with and without the raw bytes, and inspects the decoded fields.
 //!
 //! Run with: cargo run --example disassembly
 
-use ebpf_asm::{decode_all, AsmError, Assembler, Decoder, DefaultFormatter, Operand, R0, R1, R10};
+use ebpf_asm::{AsmError, Assembler, Decoder, Formatter, Operand, R0, R1, R10};
 
 fn main() -> Result<(), AsmError> {
     basic_disassembly()?;
@@ -24,19 +24,17 @@ fn basic_disassembly() -> Result<(), AsmError> {
 
     let bytecode = asm.assemble()?;
 
-    let formatter = DefaultFormatter::new();
-
     println!("Offset  Instruction");
     println!("------  -----------");
     for insn in Decoder::new(&bytecode) {
         let offset = insn.offset;
-        println!("{offset:04x}    {}", formatter.format_to_string(&insn));
+        println!("{offset:04x}    {insn}");
     }
     println!();
     Ok(())
 }
 
-/// Compare the default formatter with raw bytes enabled; `lddw` shows both of its 8-byte slots.
+/// Print each instruction after its raw bytes; `lddw` shows both of its 8-byte slots.
 fn with_raw_bytes() -> Result<(), AsmError> {
     println!("--- Example 2: Formatter with Raw Bytes ---\n");
 
@@ -48,17 +46,9 @@ fn with_raw_bytes() -> Result<(), AsmError> {
 
     let bytecode = asm.assemble()?;
 
-    let default_fmt = DefaultFormatter::new();
-    let bytes_fmt = DefaultFormatter::new().with_bytes();
-
-    println!("Default:");
+    let formatter = Formatter::new().with_bytes();
     for insn in Decoder::new(&bytecode) {
-        println!("  {}", default_fmt.format_to_string(&insn));
-    }
-
-    println!("\nWith raw bytes:");
-    for insn in Decoder::new(&bytecode) {
-        println!("  {}", bytes_fmt.format_to_string(&insn));
+        println!("  {}", formatter.format(&insn));
     }
     println!();
     Ok(())
@@ -76,9 +66,7 @@ fn inspect_instructions() -> Result<(), AsmError> {
 
     let bytecode = asm.assemble()?;
 
-    let instructions = decode_all(&bytecode);
-
-    for (i, insn) in instructions.iter().enumerate() {
+    for (i, insn) in Decoder::new(&bytecode).enumerate() {
         println!("Instruction {i}:");
         println!("  Mnemonic: {:?}", insn.mnemonic);
         let size = insn.size;
@@ -129,10 +117,9 @@ fn disassemble_raw() {
     }
 
     println!("\nDisassembled:");
-    let formatter = DefaultFormatter::new();
     for insn in Decoder::new(&raw_bytecode) {
         let offset = insn.offset;
-        println!("  {offset:04x}: {}", formatter.format_to_string(&insn));
+        println!("  {offset:04x}: {insn}");
     }
     println!();
 }

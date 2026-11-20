@@ -1,43 +1,29 @@
 use std::mem;
 
-use super::ElfResult;
-use crate::err::{self, ElfError, ErrHeader};
+use crate::err::{ElfError, ErrHeader};
 use crate::raw::Elf64Ehdr;
-use crate::relocs::ElfRelocs;
+use crate::relocs::ElfRelocSections;
 use crate::sections::ElfSections;
 use crate::util::cast_slice;
-use crate::{ensure, relocs, tryres};
+use crate::{ensure, tryres, ElfResult};
 
+/// A relocatable eBPF object, with its ELF header checked.
 #[derive(Clone, Copy)]
 pub struct ElfFile<'a>(&'a [u8]);
 
-impl<'a> std::fmt::Debug for ElfFile<'a> {
-    fn fmt(&self, fout: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        fout.debug_struct("ElfFile") //
-            .field("header", &self.header())
-            .finish()
-    }
-}
-
-impl ElfFile<'_> {
-    pub const fn validate(&self) -> Result<(), err::ElfError> {
-        ensure!(ElfError::Header(ErrHeader::Size), self.0.len() >= mem::size_of::<Elf64Ehdr>());
-        tryres!(self.header().validate());
-        Ok(())
-    }
-
-    /// `header` panics on an image shorter than `Elf64Ehdr`, so every `ElfFile` must pass through here.
-    pub const fn validated(self) -> ElfResult<Self> {
-        tryres!(self.validate());
-        Ok(self)
-    }
-}
-
 impl<'a> ElfFile<'a> {
+    /// Checks that `data` starts with the ELF header of a relocatable 64-bit little-endian eBPF object. Sections,
+    /// symbols and relocations are checked when they are read.
     pub const fn new(data: &'a [u8]) -> ElfResult<Self> {
-        ElfFile(data).validated()
+        // `header` relies on this length check
+        ensure!(ElfError::Header(ErrHeader::Size), data.len() >= mem::size_of::<Elf64Ehdr>());
+
+        let file = ElfFile(data);
+        tryres!(file.header().validate());
+        Ok(file)
     }
 
+    /// The whole file.
     pub const fn image(self) -> &'a [u8] {
         self.0
     }
@@ -51,10 +37,20 @@ impl<'a> ElfFile<'a> {
     }
 
     pub const fn sections(self) -> ElfResult<ElfSections<'a>> {
-        ElfSections::new(self, self.header())
+        ElfSections::new(self)
     }
 
-    pub const fn relocs(self) -> relocs::ElfRelocs<'a> {
-        ElfRelocs(self)
+    /// The relocation sections, each with the section it applies to.
+    pub const fn relocs(self) -> ElfResult<ElfRelocSections<'a>> {
+        match self.sections() {
+            Ok(sections) => Ok(ElfRelocSections::new(sections)),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl std::fmt::Debug for ElfFile<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ElfFile").field("header", &self.header()).finish()
     }
 }

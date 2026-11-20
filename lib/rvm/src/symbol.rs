@@ -1,25 +1,24 @@
-//! Symbol representation for eBPF programs.
+//! Symbols of a parsed eBPF module.
 
 /// A symbol in an eBPF module.
 #[derive(Debug, Clone)]
 pub struct Symbol {
-    /// Symbol name.
     pub name: String,
-    /// Section index where the symbol is defined (None for undefined/external).
+    /// Index into [`Module::sections`](crate::Module::sections) of the section that defines the symbol; `None` for an
+    /// undefined symbol.
     pub section_idx: Option<usize>,
-    /// Value (offset within section, or absolute address after linking).
+    /// Byte offset within the section.
     pub value: u64,
 }
 
-/// An export (defined symbol that can be referenced by other modules).
+/// A defined global symbol, which other modules can refer to by name.
 #[derive(Debug, Clone)]
 pub struct Export {
-    /// Section index where the symbol is defined.
+    /// Index into [`Module::sections`](crate::Module::sections) of the section that defines the symbol.
     pub section_idx: usize,
-    /// Offset within the section.
+    /// Byte offset within the section.
     pub offset: u64,
-    /// Size of the symbol.
+    /// Size in bytes.
     pub size: u64,
-    /// Whether this is a function.
     pub is_function: bool,
 }

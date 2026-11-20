@@ -11,9 +11,6 @@ mod data;
 
 use rvm::{Image, Perms, Vm, FIRST_FREE_REGION};
 
-/// Files that exercise something rvm deliberately does not implement, with why.
-const SKIP: &[(&str, &str)] = &[];
-
 #[test]
 fn bpf_conformance_suite() {
     let dir = format!("{}/tests/conformance/data", env!("CARGO_MANIFEST_DIR"));
@@ -29,11 +26,6 @@ fn bpf_conformance_suite() {
 
     for path in &entries {
         let name = path.file_name().unwrap().to_str().unwrap();
-        if let Some((_, reason)) = SKIP.iter().find(|(skipped, _)| *skipped == name) {
-            eprintln!("SKIP {name}: {reason}");
-            continue;
-        }
-
         let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {name}: {e}"));
         match run_one(&text) {
             Ok(()) => passed += 1,
@@ -41,7 +33,7 @@ fn bpf_conformance_suite() {
         }
     }
 
-    eprintln!("bpf_conformance: {passed} passed, {} skipped, {} failed", SKIP.len(), failures.len());
+    eprintln!("bpf_conformance: {passed} passed, {} failed", failures.len());
     assert!(failures.is_empty(), "bpf_conformance failures:\n{}", failures.join("\n"));
 }
 

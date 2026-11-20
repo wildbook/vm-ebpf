@@ -39,13 +39,13 @@ pub struct Executor {
 impl Executor {
     /// An executor whose calls start with r10 at `stack_top`, with the frame size and instruction limit of `config`.
     pub fn new(helpers: HelperRegistry, stack_top: u64, config: &VmConfig) -> Self {
-        let helpers = HostCalls {
+        let host = HostCalls {
             registry: helpers,
             state: HostState::default(),
             error: None,
         };
         Self {
-            calls: CallStack::new(config.frame_size, helpers),
+            calls: CallStack::new(config.frame_size, host),
             stack_top,
             instruction_limit: fuel_for(config.instruction_limit),
         }
@@ -68,8 +68,8 @@ impl Executor {
         self.instruction_limit
     }
 
-    /// Call the function at `pc` (instruction index) of `code` with `args` in r1-r5 under the instruction limit; returns
-    /// r0. More than 5 arguments fail with [`VmError::TooManyArgs`].
+    /// Call the function at `pc` (instruction index) of `code` with `args` in r1-r5 under the instruction limit;
+    /// returns r0. More than 5 arguments fail with [`VmError::TooManyArgs`].
     #[inline(always)]
     pub fn call(&mut self, code: &Code, memory: &mut VmMemory, pc: u64, args: &[u64]) -> Result<u64> {
         let mut fuel = self.instruction_limit;
@@ -326,18 +326,17 @@ pub fn fuel_for(limit: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use ebpf_asm::{Assembler, R0, R1, R10, R2, R3, R6, R7};
-    use rvm_core::instructions_from_bytes;
+    use ebpf_asm::{Assembler, R0, R1, R10, R2, R3, R6};
+    use rvm_core::decode_instructions;
 
     use super::*;
-    use crate::error::MemoryError;
     use crate::helper::HelperContext;
     use crate::layout::STACK_REGION;
     use crate::memory::{GuestMemory, Perms};
 
     /// Run `code` from its first instruction on `memory` plus a one-frame stack.
     fn run_with(code: &[u8], helpers: &HelperRegistry, mut memory: VmMemory, config: &VmConfig) -> Result<u64> {
-        let code = instructions_from_bytes(code);
+        let code = Code::new(decode_instructions(code));
         let len = config.frame_size as usize;
         let stack_top = memory.map_any(STACK_REGION, len, Perms::RW).unwrap() + config.frame_size;
         Executor::new(helpers.clone(), stack_top, config).call(&code, &mut memory, 0, &[])
@@ -345,22 +344,6 @@ mod tests {
 
     fn run(asm: &mut Assembler) -> Result<u64> {
         run_with(&asm.assemble().unwrap(), &HelperRegistry::default(), VmMemory::new(), &VmConfig::default())
-    }
-
-    #[cfg(feature = "fuel")]
-    #[test]
-    fn instruction_limit() {
-        let mut asm = Assembler::new();
-        let loop_label = asm.create_label();
-        asm.set_label(&loop_label).unwrap();
-        asm.ja(&loop_label);
-        let code = asm.assemble().unwrap();
-        let config = VmConfig {
-            instruction_limit: 10,
-            ..VmConfig::default()
-        };
-        let result = run_with(&code, &HelperRegistry::default(), VmMemory::new(), &config);
-        assert!(matches!(result, Err(VmError::Exec(ExecError::InstructionLimit(_)))));
     }
 
     #[test]
@@ -415,26 +398,6 @@ mod tests {
         asm.call_local(&func_start);
         asm.exit();
         assert!(matches!(run(&mut asm), Err(VmError::Exec(ExecError::StackOverflow { .. }))));
-    }
-
-    #[test]
-    fn callee_saved_registers_survive_a_local_call() {
-        let mut asm = Assembler::new();
-        let callee = asm.create_label();
-
-        asm.mov64_imm(R6, 100);
-        asm.mov64_imm(R7, 200);
-        asm.call_local(&callee);
-        asm.mov64(R0, R6);
-        asm.add64(R0, R7);
-        asm.exit();
-
-        asm.set_label(&callee).unwrap();
-        asm.mov64_imm(R6, 0);
-        asm.mov64_imm(R7, 0);
-        asm.exit();
-
-        assert_eq!(run(&mut asm).unwrap(), 300);
     }
 
     // helper calls run inside the handler chain; this is the lib test that takes Miri through that path

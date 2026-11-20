@@ -1,22 +1,13 @@
-//! BTF (BPF Type Format) parsing library for embeddable eBPF VMs.
+//! BTF (BPF Type Format) for an embeddable eBPF VM: a parser for `.BTF` and `.BTF.ext`, a builder for the host's own
+//! types, and CO-RE (Compile Once, Run Everywhere) relocation.
 //!
-//! This crate provides:
-//! - Parsing of BTF sections from eBPF ELF files
-//! - A builder for host applications to describe their types as BTF
-//! - CO-RE (Compile Once - Run Everywhere) relocation support
-//!
-//! # Host types as the target
-//!
-//! The host application's types stand in for the kernel's: eBPF programs compiled with BTF have their field accesses
-//! relocated to match the host's actual layouts, as kernel CO-RE relocates a program's accesses against the running
-//! kernel's BTF.
-//!
-//! # Example
+//! The host's types stand in for the kernel's. A program compiled with BTF has its field accesses relocated to the
+//! host's layouts, as kernel CO-RE relocates a program's accesses against the BTF of the running kernel.
 //!
 //! ```ignore
 //! use btf::{apply_core_relocations, Btf, BtfBuilder, BtfExt};
 //!
-//! // Host application describes its struct layout as BTF
+//! // the host describes its struct layout as BTF
 //! let mut host = BtfBuilder::new();
 //! let u64_t = host.int("u64", 8, false);
 //! let u32_t = host.int("u32", 4, false);
@@ -27,12 +18,12 @@
 //! let target_bytes = host.encode();
 //! let target = Btf::parse(&target_bytes)?;
 //!
-//! // Parse BTF and CO-RE relocations from the eBPF program
+//! // the program's BTF and CO-RE relocations, from its `.BTF` and `.BTF.ext` sections
 //! let local = Btf::parse(btf_section_bytes)?;
 //! let btf_ext = BtfExt::parse(btf_ext_bytes, local.strings())?;
 //! let relocations = btf_ext.relos_for_section(".text").unwrap_or(&[]);
 //!
-//! apply_core_relocations(&mut instructions, &local, &target, relocations)?;
+//! let unresolved = apply_core_relocations(&mut instructions, &local, &target, relocations)?;
 //! ```
 
 mod builder;
@@ -49,8 +40,6 @@ pub use core_relo::{apply_core_relocations, CoreReloError, Unresolved};
 pub use ext::{BtfExt, CoreRelo, CoreReloKind};
 pub use parse::{Btf, BtfError};
 pub use patch::CORE_POISON_HELPER;
-pub use raw::{
-    BtfKind, BTF_FUNC_EXTERN, BTF_FUNC_GLOBAL, BTF_FUNC_STATIC, BTF_INT_SIGNED, BTF_MAGIC, BTF_VERSION, TYPE_HEADER_LEN,
-};
+pub use raw::{BtfKind, BTF_FUNC_EXTERN, BTF_FUNC_GLOBAL, BTF_FUNC_STATIC, BTF_INT_SIGNED};
 pub use strings::BtfStrings;
-pub use types::*;
+pub use types::{BtfTypeInfo, EnumValue, Member, Param, VarSecInfo};

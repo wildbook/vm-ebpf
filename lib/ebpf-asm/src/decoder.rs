@@ -85,11 +85,6 @@ impl Decoder<'_> {
 
 const LDDW: u8 = class::LD | mode::IMM | size::DW;
 
-/// Decode all instructions from bytes.
-pub fn decode_all(bytes: &[u8]) -> Vec<Instruction> {
-    Decoder::new(bytes).collect()
-}
-
 fn reg(number: u8) -> Option<Register> {
     Register::from_u8(number)
 }
@@ -359,7 +354,6 @@ fn decode_st(raw: RawInstruction) -> Decoded {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DefaultFormatter;
 
     /// Encodings where field validation matters, with llvm-objdump 22's text for the same bytes. llvm ignores fields an
     /// instruction does not define and rejects defined fields with invalid values; register 11, which llvm prints as
@@ -425,14 +419,13 @@ mod tests {
             ("ed21030000000000", "<unknown>", "unknown"),
         ];
 
-        let fmt = DefaultFormatter::new();
         for (hex, llvm, want) in table {
             let bytes: Vec<u8> = (0..hex.len())
                 .step_by(2)
                 .map(|i| u8::from_str_radix(&hex[i..][..2], 16).unwrap())
                 .collect();
             let insn = Decoder::new(&bytes).next().unwrap();
-            assert_eq!(fmt.format_to_string(&insn), want, "{hex} (llvm: {llvm})");
+            assert_eq!(insn.to_string(), want, "{hex} (llvm: {llvm})");
         }
     }
 
@@ -447,57 +440,5 @@ mod tests {
         assert_eq!(insn.mnemonic, Mnemonic::Lddw);
         assert_eq!(insn.size, 16);
         assert_eq!(insn.src, Operand::Imm64(0x123456789abcdef0u64 as i64));
-    }
-
-    #[test]
-    fn decode_ldxdw() {
-        // ldxdw r0, [r1+16]
-        let bytes = [0x79, 0x10, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let insn = Decoder::new(&bytes).next().unwrap();
-        assert_eq!(insn.mnemonic, Mnemonic::Ldxdw);
-        assert_eq!(insn.dst, Operand::Reg(Register::R0));
-        assert_eq!(
-            insn.src,
-            Operand::Mem {
-                base: Register::R1,
-                offset: 16
-            }
-        );
-    }
-
-    #[test]
-    fn decode_atomic_ops() {
-        // Atomic ops use opcode 0xDB (STX | DW | ATOMIC); the imm selects the operation.
-        for (imm, want) in [
-            (0x00, Mnemonic::AtomicAdd64),
-            (0x01, Mnemonic::AtomicFetchAdd64),
-            (0x40, Mnemonic::AtomicOr64),
-            (0x50, Mnemonic::AtomicAnd64),
-            (0xa0, Mnemonic::AtomicXor64),
-            (0xe1, Mnemonic::AtomicXchg64),
-            (0xf1, Mnemonic::AtomicCmpxchg64),
-        ] {
-            // lock *(u64 *)(r1 + 0) <op>= r2
-            let bytes = [0xdb, 0x21, 0x00, 0x00, imm, 0x00, 0x00, 0x00];
-            let insn = Decoder::new(&bytes).next().unwrap();
-            assert_eq!(insn.mnemonic, want, "imm=0x{imm:02x}");
-        }
-
-        // W-sized atomics (STX | W | ATOMIC = 0xC3) decode to the 32-bit mnemonic.
-        let bytes = [0xc3, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let insn = Decoder::new(&bytes).next().unwrap();
-        assert_eq!(insn.mnemonic, Mnemonic::AtomicAdd32);
-
-        // the atomic operand shape: `[dst+off], src`
-        let bytes = [0xdb, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let insn = Decoder::new(&bytes).next().unwrap();
-        assert_eq!(
-            insn.dst,
-            Operand::Mem {
-                base: Register::R1,
-                offset: 0
-            }
-        );
-        assert_eq!(insn.src, Operand::Reg(Register::R2));
     }
 }

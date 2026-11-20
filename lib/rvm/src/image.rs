@@ -362,10 +362,7 @@ fn check_lengths(s: &Sections<'_>) -> Result<()> {
 fn bind_helper_calls(insns: &mut [Instruction], code: &[u8], table: &HelperRegistry) {
     for (at, id) in helper_calls(code) {
         if let Some(slot) = table.slot_of_id(id) {
-            let insn = &mut insns[at as usize];
-            let mut bytes = insn.0.to_le_bytes();
-            set_slot_call(&mut bytes, slot);
-            insn.0 = u64::from_le_bytes(bytes);
+            bind_call(&mut insns[at as usize], slot);
         }
     }
 }
@@ -383,9 +380,7 @@ fn bind_externs(insns: &mut [Instruction], externs: &[(u32, Import)], table: &He
                 .ok_or_else(|| LinkError::UnresolvedSymbol(name.clone()))?,
             Import::Helper(id) => table.slot_of_id(*id).ok_or(LinkError::UnknownHelper(*id))?,
         };
-        let mut bytes = insn.0.to_le_bytes();
-        set_slot_call(&mut bytes, slot);
-        insn.0 = u64::from_le_bytes(bytes);
+        bind_call(insn, slot);
     }
     Ok(())
 }
@@ -436,6 +431,13 @@ fn helper_calls(code: &[u8]) -> impl Iterator<Item = (u32, u32)> + '_ {
         }
         None
     })
+}
+
+/// Turn the call `insn` into a call to extern-table `slot`.
+fn bind_call(insn: &mut Instruction, slot: u32) {
+    let mut bytes = insn.0.to_le_bytes();
+    set_slot_call(&mut bytes, slot);
+    insn.0 = u64::from_le_bytes(bytes);
 }
 
 /// Turn a call instruction into a call to extern-table `slot`.

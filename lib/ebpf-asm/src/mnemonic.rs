@@ -1,10 +1,4 @@
 //! eBPF instruction mnemonics.
-//!
-//! This module defines all eBPF instruction mnemonics, categorized by type:
-//! - ALU operations (32-bit and 64-bit)
-//! - Jump/branch operations
-//! - Memory load/store operations
-//! - Special instructions (call, exit, etc.)
 
 use std::fmt;
 
@@ -148,12 +142,6 @@ impl Mnemonic {
                 | Mnemonic::Bswap32
                 | Mnemonic::Bswap64
         )
-    }
-
-    /// Check if this is a wide instruction (16 bytes, 2 slots).
-    #[inline]
-    pub const fn is_wide(self) -> bool {
-        matches!(self, Mnemonic::Lddw | Mnemonic::LdPseudo)
     }
 }
 

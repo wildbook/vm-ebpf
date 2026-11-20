@@ -51,10 +51,10 @@ fn instruction_limit_covers_plugin_calls() {
     assert!(matches!(**error, VmError::Exec(ExecError::InstructionLimit(_))), "{err}");
 
     let main = caller.func("main").unwrap();
-    let (result, used) = caller.call_with_limit(main, &[], 0);
+    let (result, used) = caller.call_func_with_limit(main, &[], 0);
     let total = (4 * CALLS + 3 + CALLS * (2 * SPINS + 2)) as u64;
     assert_eq!((result.unwrap(), used), (0, total));
-    let (result, used) = caller.call_with_limit(main, &[], DEFAULT_INSTRUCTION_LIMIT);
+    let (result, used) = caller.call_func_with_limit(main, &[], DEFAULT_INSTRUCTION_LIMIT);
     assert!(result.is_err());
     assert_eq!(used, DEFAULT_INSTRUCTION_LIMIT);
 }
@@ -90,10 +90,10 @@ fn instruction_limit_needs_fuel() {
     asm.mov64_imm(R0, 1).exit();
     let mut program = Vm::new().load(Image::from_code(asm.assemble().unwrap())).unwrap();
     let main = program.func("main").unwrap();
-    let (result, used) = program.call_with_limit(main, &[], 1);
+    let (result, used) = program.call_func_with_limit(main, &[], 1);
     assert!(matches!(result, Err(VmError::FuelNotEnabled)), "{result:?}");
     assert_eq!(used, 0);
-    assert_eq!(program.call_with_limit(main, &[], 0).0.unwrap(), 1);
+    assert_eq!(program.call_func_with_limit(main, &[], 0).0.unwrap(), 1);
 }
 
 #[test]

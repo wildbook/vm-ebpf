@@ -13,7 +13,7 @@ fn clang_atomics() {
 
     assert_eq!(program.call("run", &[5]).unwrap(), 1058);
 
-    let bss = rvm::region_base(rvm::DATA_REGION);
+    let bss = region_base(DATA_REGION);
     assert_eq!(program.memory().read::<u64>(bss).unwrap(), 9);
     assert_eq!(program.memory().read::<u32>(bss + 8).unwrap(), 0xFFFF_FFFF);
 }
@@ -109,7 +109,7 @@ fn core_relocations_follow_host_layout() {
 /// field by field: `append_btf` reads the struct straight out of the compiled object.
 #[test]
 fn core_relocations_follow_appended_host_btf() {
-    let host_module = rvm::Module::from_elf("host_event", &object("tests/host_event.o")).unwrap();
+    let host_module = rvm::Module::from_elf(&object("tests/host_event.o")).unwrap();
     let vm = Vm::new();
     vm.with_types(|types| types.append_btf(host_module.btf_data.as_ref().unwrap()).unwrap());
     let mut program = vm.load_elf(&object("tests/core_guard.o")).unwrap();

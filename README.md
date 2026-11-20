@@ -15,9 +15,9 @@ cargo run -p rvm --example core_reloc          # one object against two struct l
 cargo run -p rvm --example hello               # hand-assembled bytecode with host helpers, loaded as an Image, no ELF
 ```
 
-The eBPF objects are built from the C sources under `bpf/` (`examples/`, `bench/`, `tests/`) and checked in under
-`bpf/prebuilt/`. Rebuilding them needs clang on `PATH`, and the CMake version and clang flags that `CMakeLists.txt`
-sets:
+The eBPF objects are built from the C sources under `bpf/` (`examples/`, `bench/`, `corpus/`, `tests/`) and checked in
+under `bpf/prebuilt/`. Rebuilding them needs clang, Ninja and CMake 3.21 or later on `PATH`; `CMakeLists.txt` sets the
+clang flags:
 
 ```bash
 cmake --preset bpf && cmake --build --preset bpf
@@ -30,10 +30,11 @@ and `cargo test` fails when they change without a rebuild.
 ## Crates
 
 - `lib/rvm-core`: the instruction set and interpreter (`run`) over a `Memory`
-  and a `Host` trait. `run` returns a `Flow` saying why execution stopped: exit,
-  an indirect call or jump, a declined host call, an invalid or unimplemented
-  instruction, a memory fault, a `pc` outside the code, a call stack overflow, or
-  out of fuel. `Code` fuses common instruction sequences into superinstructions.
+  and a `Host` trait. `Code::new` prepares bytecode for it: it decodes each
+  instruction once and fuses common sequences into superinstructions. `run`
+  returns a `Flow` saying why execution stopped: exit, an indirect call or jump,
+  a declined host call, an invalid or unimplemented instruction, a memory fault,
+  a `pc` outside the code, a call stack overflow, or out of fuel.
 - `lib/rvm`: the runtime: ELF loading, linking, guest memory, helpers, maps and
   plugins.
 - `lib/btf`: BTF parsing, `BtfBuilder` and CO-RE relocations.
@@ -48,21 +49,20 @@ and `cargo test` fails when they change without a rebuild.
 
 rvm's features are described in [`lib/rvm/Cargo.toml`](lib/rvm/Cargo.toml).
 
-With the `fuel` feature (on by default), a call stops after
-`VmConfig::instruction_limit` instructions. The default limit is 0, which means
-no limit; `rvm::DEFAULT_INSTRUCTION_LIMIT` (1,000,000) is there for hosts that
-want one. The count is exact: the interpreter charges a basic block's
-instructions as it enters the block, and runs a block the fuel can't pay for
-one instruction at a time. In the benchmarks, most guest code ran within 7% of
-its speed without the feature, and `Code::new` took about 10% longer. Without
-the feature the interpreter doesn't count instructions, and a non-zero limit in
-`Vm::with_config` or `Program::call_with_limit` fails with
-`VmError::FuelNotEnabled`.
+With the `fuel` feature (on by default), a call that runs more than
+`VmConfig::instruction_limit` instructions fails with
+`ExecError::InstructionLimit`. The default limit is 0, which means no limit;
+`rvm::DEFAULT_INSTRUCTION_LIMIT` (1,000,000) is there for hosts that want one.
+`Program::call_func_with_limit` gives one call a limit of its own and returns
+how many instructions it ran. The count is exact: the interpreter charges a
+basic block's instructions as it enters the block, and runs a block the fuel
+can't pay for one instruction at a time. In the benchmarks, guest code with the
+feature ran up to 9% more host instructions and took up to about 5% longer than
+without it.
 
-The interpreter does everything for fuel through rvm-core's `Fuel` trait. The
-feature picks the implementation: `BlockFuel` meters, and the methods of
-`NoFuel` do nothing and compile away, so `run` has the same signature in both
-builds.
+Without the feature the interpreter doesn't count instructions. The API is the
+same in both builds, but a non-zero limit in `Vm::with_config` or
+`Program::call_func_with_limit` fails with `VmError::FuelNotEnabled`.
 
 The `release` profile optimizes for size but builds rvm at `opt-level = 3`,
 because the interpreter inlines into rvm. The `embedded` profile
@@ -112,7 +112,7 @@ and `bpf/rvm_bpf.h` declares them for C.
 ## Linking
 
 `load_elf` parses and links one object. For several, call `Module::from_elf` for
-each and `Vm::link` with the set. The linker places code and data sections,
+each and `Vm::load_modules` with the set. The linker places code and data sections,
 resolves relocations between modules, and applies CO-RE relocations; loading
 binds each call to a numeric helper or named extern. Linking fails if a named
 extern has no matching helper or module export, or if a helper ID isn't
@@ -184,8 +184,8 @@ rvmrt it is 9,216 bytes with 44 imports.
 
 | build | `rvmrt.dll` | added to the C host by `rvmrt.lib` |
 |---|---|---|
-| in `lib/rvmrt` | 71,680 B, 31 imports from 3 DLLs | 61,952 B, 8 imports |
-| at the root | 155,648 B, 58 imports from 6 DLLs | 146,944 B, 33 imports |
+| in `lib/rvmrt` | 111,616 B, 31 imports from 3 DLLs | 102,400 B, 8 imports |
+| at the root | 198,656 B, 58 imports from 6 DLLs | 188,416 B, 33 imports |
 
 The 8 imports are the process heap (`GetProcessHeap`, `HeapAlloc`, `HeapFree`,
 `HeapReAlloc`), `memcmp`, `memmove`, and `GetCurrentProcess` with

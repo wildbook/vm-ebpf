@@ -36,8 +36,8 @@ macro_rules! operand {
     };
 }
 
-// Each line gives the opcode byte of a superinstruction and its sequence in eBPF assembler syntax, with roles in place of
-// registers. A sequence fuses where each role stands for one register throughout and different roles for different
+// Each line gives the opcode byte of a superinstruction and its sequence in eBPF assembler syntax, with roles in place
+// of registers. A sequence fuses where each role stands for one register throughout and different roles for different
 // registers. `_` stands for whatever its slot holds: an immediate, an offset, a jump target, or a register that no role
 // names, which only the last instruction may have. Every field a line doesn't mention is zero. `lddw` is LD_IMM64 with
 // `src_reg` 0, whose second slot `Code::new` leaves only where it holds the upper half of the immediate and nothing

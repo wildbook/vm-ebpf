@@ -65,7 +65,7 @@ fn mutated_elf_files_load_or_fail() {
     for (fixture, elf) in &fixtures() {
         let regions = elf_regions(elf);
         fuzz.run(fixture, elf, &regions, |bytes| {
-            let Ok(module) = Module::from_elf("main", bytes) else {
+            let Ok(module) = Module::from_elf(bytes) else {
                 return Outcome::Rejected;
             };
             let Ok(image) = vm.prepare_modules(&[&module]) else {

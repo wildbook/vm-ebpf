@@ -53,10 +53,10 @@ fn images_run_like_elf() {
 
     for &(objects, calls) in cases {
         let elfs: Vec<_> = objects.iter().map(|name| object(name)).collect();
-        let modules: Vec<Module> = elfs.iter().map(|elf| Module::from_elf("main", elf).unwrap()).collect();
+        let modules: Vec<Module> = elfs.iter().map(|elf| Module::from_elf(elf).unwrap()).collect();
         let modules: Vec<&Module> = modules.iter().collect();
 
-        let mut linked = vm.link(&modules).unwrap();
+        let mut linked = vm.load_modules(&modules).unwrap();
         let image = vm.prepare_modules(&modules).unwrap().to_bytes();
         let mut loaded = vm.load_image(&image).unwrap();
 

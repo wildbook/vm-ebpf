@@ -1,3 +1,58 @@
+//! The eBPF instruction set ([RFC 9669](https://www.rfc-editor.org/rfc/rfc9669.html)) and an interpreter for it.
+//!
+//! [`Code::new`] prepares a program, and [`run`] executes it. `run` works on a [`Context`], which holds the registers
+//! and the guest [`Memory`], and on a [`CallStack`], which holds the frames of local calls and the [`Host`] that runs
+//! helper, kfunc and `callx` calls. It returns a [`Flow`] that says why it stopped.
+//!
+//! ```
+//! use rvm_core::opcode::{AluOpc, JmpOpc, OpCode, Source};
+//! use rvm_core::{run, CallStack, Callee, Code, Context, Flow, Host, Instruction, Memory};
+//!
+//! struct NoMemory;
+//!
+//! // SAFETY: the default `window` reports no windows
+//! unsafe impl Memory for NoMemory {
+//!     type Err = ();
+//!
+//!     fn load_u8(&self, _addr: u64) -> Result<u8, ()> {
+//!         Err(())
+//!     }
+//!
+//!     fn store_u8(&mut self, _addr: u64, _value: u8) -> Result<(), ()> {
+//!         Err(())
+//!     }
+//! }
+//!
+//! /// Declines every call, so `run` stops at it.
+//! struct NoHost;
+//!
+//! impl Host<NoMemory> for NoHost {
+//!     fn helper(&mut self, _ctx: &mut Context<NoMemory>, _id: u32) -> Option<u64> {
+//!         None
+//!     }
+//!
+//!     fn kfunc(&mut self, _ctx: &mut Context<NoMemory>, _id: u32) -> Option<u64> {
+//!         None
+//!     }
+//!
+//!     fn callx(&mut self, _ctx: &mut Context<NoMemory>, _target: u64) -> Option<Callee> {
+//!         None
+//!     }
+//! }
+//!
+//! // mov r0, 7; exit
+//! let code = Code::new([
+//!     Instruction::from_parts(OpCode::alu64_from_parts(AluOpc::Mov, Source::Imm), 0, 0, 0, 7),
+//!     Instruction::from_parts(OpCode::jmp64_from_parts(JmpOpc::Exit, Source::Imm), 0, 0, 0, 0),
+//! ]);
+//! let mut ctx = Context::new(NoMemory);
+//! let mut calls = CallStack::new(0, NoHost);
+//! let (mut pc, mut fuel) = (0, 100);
+//!
+//! assert_eq!(run(&mut ctx, &code, &mut pc, &mut fuel, &mut calls), Flow::Exit);
+//! assert_eq!((ctx.regs[0], pc), (7, 1));
+//! ```
+
 #![feature(explicit_tail_calls, rust_preserve_none_cc)]
 #![allow(incomplete_features)]
 
@@ -139,25 +194,24 @@ pub mod opcode;
 
 pub use call::{CallStack, Callee, Host, MAX_CALL_DEPTH};
 pub use fuse::Code;
-pub use instruction::{
-    decode_instructions, instructions_from_bytes, Instruction, BPF_PSEUDO_CALL, BPF_PSEUDO_KFUNC_CALL,
-};
+pub use instruction::{decode_instructions, Instruction, BPF_PSEUDO_CALL, BPF_PSEUDO_KFUNC_CALL};
 pub use memory::{AtomicOp, Memory};
 pub use stack::Window;
 
 #[cfg(test)]
 mod tests;
 
-// https://www.rfc-editor.org/rfc/rfc9669.html
-
-/// Why [`run`] stopped, or what an instruction does next; `E` is the error type of the memory, [`Memory::Err`].
+/// Why [`run`] stopped, or what an instruction does next; `E` is the error type of the memory, [`Memory::Err`]. `run`
+/// never returns [`Flow::Next`], [`Flow::Jump`] or [`Flow::Call`], which it follows itself.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Flow<E> {
     Next,
 
+    /// A jump by this many slots from the next instruction.
     Jump(i64),
     /// A program-local call, with the offset of the callee.
     Call(i64),
+    /// `exit`. [`run`] stops with it at the `exit` of the entry frame, with the result in r0.
     Exit,
 
     /// Call a helper by its numeric ID (`src_reg = 0`).
@@ -168,6 +222,7 @@ pub enum Flow<E> {
 
     /// An invalid or reserved instruction.
     FailCpu,
+    /// A load or store that the memory failed with this error.
     FailMem(E),
 
     /// A valid instruction that rvm doesn't implement.
@@ -186,14 +241,17 @@ pub enum Flow<E> {
     JumpIndirect(u64),
 }
 
+/// The state of the guest that instructions read and write: its registers and its memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Context<M: Memory> {
-    // R0: return value from function calls, and exit value for eBPF programs
-    // R1 - R5: arguments for function calls
-    // R6 - R9: callee saved registers that function calls will preserve
-    // R10: read-only frame pointer to access stack
-    // R11 - R15: unused; a 4-bit register index into 16 entries needs no bounds check
+    /// The registers:
+    /// - r0: the return value of function calls, and the exit value of the program
+    /// - r1 to r5: the arguments of function calls
+    /// - r6 to r9: callee-saved registers, which function calls preserve
+    /// - r10: the frame pointer, which guest code can't write
+    /// - r11 to r15: unused; a 4-bit register index into 16 entries needs no bounds check
     pub regs: [u64; 16],
+    /// The guest memory.
     pub data: M,
 }
 
@@ -246,6 +304,20 @@ type Handler<M, H> = extern "rust-preserve-none" fn(
 
 /// The handler of every opcode byte, and the copy of them that [`split`] dispatches through.
 struct Table<M: Memory, H>([Handler<M, H>; 256], [Handler<M, H>; 256]);
+
+impl<M: Memory, H> Table<M, H> {
+    /// The handler of `op`.
+    #[inline(always)]
+    fn of(&self, op: Op) -> Handler<M, H> {
+        self.0[usize::from(op.byte())]
+    }
+
+    /// The handler of `op`, from the second copy.
+    #[inline(always)]
+    fn odd(&self, op: Op) -> Handler<M, H> {
+        self.1[usize::from(op.byte())]
+    }
+}
 
 /// The [`Table`] of the handlers that meter with `F`. Each handler runs [`step`] with its opcode as a constant, so
 /// the class, operation, source, mode and size matches fold away; the bytes of superinstructions and r10 accesses get
@@ -442,14 +514,6 @@ fn fetch_checked<M: Memory, H: Host<M>, F: Fuel>(
 /// The handler, op and slot at the pc [`fetch_checked`] checked, and the fuel the handler receives.
 type Checked<M, H> = (Handler<M, H>, Op, Slot, u64);
 
-impl<M: Memory, H> Table<M, H> {
-    /// The handler of `op`.
-    #[inline(always)]
-    fn of(&self, op: Op) -> Handler<M, H> {
-        self.0[usize::from(op.byte())]
-    }
-}
-
 /// Runs the LD_IMM64 `insn`, whose second slot holds the upper half `upper` of its immediate.
 #[inline(always)]
 fn step_ld64(regs: &mut impl ops::Regs, insn: impl Fields, upper: i32) {
@@ -463,17 +527,20 @@ fn step_ld64(regs: &mut impl ops::Regs, insn: impl Fields, upper: i32) {
 /// Whether [`run`] meters fuel, which the `fuel` feature chooses.
 pub const METERED: bool = <fuel::Active as Fuel>::METERED;
 
-/// Execute from `*pc` until an instruction the caller must handle.
+/// Runs `code` from `*pc` until an instruction the caller must handle, and returns why it stopped.
 ///
 /// ALU, memory and jump instructions, local calls and their returns, and helper, kfunc and `callx` calls that
 /// `calls.host` runs or resolves stay inside the handler chain, so each one costs a single dispatch. `calls` holds the
-/// frames of the local calls in progress and keeps them from one `run` to the next. Execution returns helper, kfunc and
-/// `callx` calls that the host declined, indirect jumps, [`Flow::Exit`] from the entry frame and faults with `*pc` at
-/// the instruction that produced them, and [`Flow::OutOfFuel`] or [`Flow::BadPc`] with `*pc` at the instruction that
-/// could not run. With the `fuel` feature, each executed instruction consumes one unit of `fuel`, and LD_IMM64 one per
-/// slot: with one unit left, it stops with [`Flow::OutOfFuel`] and that unit. The interpreter charges the units of a
-/// whole basic block as it enters the block, but stops and leaves `*fuel` exactly where charging each instruction would.
-/// `*fuel` must be at most `i64::MAX`. Without the feature, `run` leaves `*fuel` as it is and never runs out.
+/// frames of the local calls in progress and keeps them from one `run` to the next.
+///
+/// `run` stops with `*pc` at the instruction that produced the flow: a helper, kfunc or `callx` call that the host
+/// declined, an indirect jump, [`Flow::Exit`] from the entry frame, or a fault. It stops with [`Flow::OutOfFuel`] or
+/// [`Flow::BadPc`] with `*pc` at the instruction that could not run.
+///
+/// With the `fuel` feature, each executed instruction consumes one unit of `*fuel`, and LD_IMM64 one per slot: with
+/// one unit left, it stops with [`Flow::OutOfFuel`] and that unit. The interpreter charges the units of a whole basic
+/// block as it enters the block, but stops and leaves `*fuel` exactly where charging each instruction would. `*fuel`
+/// must be at most `i64::MAX`. Without the feature, `run` leaves `*fuel` as it is and never runs out ([`METERED`]).
 #[inline]
 pub fn run<M: Memory, H: Host<M>>(
     ctx: &mut Context<M>,
@@ -485,11 +552,13 @@ pub fn run<M: Memory, H: Host<M>>(
     let slots = code.slots();
     let table = &Handlers::<M, H, fuel::Active>::TABLE;
     calls.windows.revalidate(&ctx.data);
+
     let (first, op, slot, left) = match fetch_checked::<M, H, fuel::Active>(table, slots, *pc, *fuel) {
         Ok(next) => next,
         Err(flow) => return flow,
     };
     first(ctx, slots, slot, left, calls, table, op);
+
     let stop = &mut calls.stop;
     (*pc, *fuel) = (stop.pc(code.slots()), stop.fuel);
     // Test the tag alone first: the handler stored the flow one field at a time, and a single load of the whole flow

@@ -82,11 +82,66 @@ fn lands(len: usize, pc: usize, displacement: i64) -> bool {
     (0..=len as i64).contains(&target)
 }
 
+/// The displacement of the fixed target the handler of `insn` may continue at, `pc + 1 + displacement`, as
+/// [`ops::jump`] computes it, or `None` if it continues only at `pc + 1` or a target it computes at run time.
+fn displacement(insn: Instruction) -> Option<i64> {
+    let target = TARGETS[usize::from(insn.byte())];
+    if !target.fixed || (target.local_call && insn.src_reg() != BPF_PSEUDO_CALL) {
+        return None;
+    }
+    Some(if target.in_imm {
+        insn.imm().into()
+    } else {
+        insn.offset().into()
+    })
+}
+
+/// Whether and where an instruction with a given opcode byte holds the displacement of a fixed target.
+#[derive(Clone, Copy)]
+struct Target {
+    fixed: bool,
+    /// In `imm`, else in `offset`.
+    in_imm: bool,
+    /// A call, which has a fixed target only if it is a local one.
+    local_call: bool,
+}
+
+/// The [`Target`] of each opcode byte.
+const TARGETS: [Target; 256] = {
+    const NONE: Target = Target {
+        fixed: false,
+        in_imm: false,
+        local_call: false,
+    };
+    const OFFSET: Target = Target { fixed: true, ..NONE };
+    const IMM: Target = Target { in_imm: true, ..OFFSET };
+    const CALL: Target = Target {
+        local_call: true,
+        ..IMM
+    };
+
+    byte_table!(|byte| {
+        let opc = OpCode(byte);
+        let jmp64 = matches!(opc.class(), Class::Jmp64);
+        let imm = matches!(opc.alu_src(), Source::Imm);
+        match opc.jmp_opc() {
+            _ if !matches!(opc.class(), Class::Jmp64 | Class::Jmp32) => NONE,
+            JmpOpc::Ja if imm && jmp64 => OFFSET,
+            JmpOpc::Ja if imm => IMM,
+            JmpOpc::Call if imm && jmp64 => CALL,
+            // `gotox`, helper and kfunc calls, `callx`, `exit`, `may_goto` and the encodings that fail
+            JmpOpc::Ja | JmpOpc::Call | JmpOpc::Exit | JmpOpc::Jcond | JmpOpc::UndefF => NONE,
+            // conditional jumps
+            _ => OFFSET,
+        }
+    })
+};
+
 /// A pointer to the slot of the instruction a handler runs, which handlers carry in place of its pc.
 ///
 /// Every `Slot` a handler receives points into the ops of the [`Code`](crate::Code) that [`run`](crate::run) runs, the
-/// first [`Fuel::ops`] of its slots: `run` and the checked fetches make one only for a pc they found there,
-/// and a handler moves one without a check only from a slot below `len`, to the next slot or to a target that [`bound`]
+/// first [`Fuel::ops`] of its slots: `run` and the checked fetches make one only for a pc they found there, and a
+/// handler moves one without a check only from a slot below `len`, to the next slot or to a target that [`bound`]
 /// proves lies in `0..=len`. The ops from `len` on all hold [`GUARD`], whose handler continues nowhere. So a handler
 /// reads its own slot, and the slot it continues at, without a check.
 #[derive(Clone, Copy)]
@@ -159,62 +214,6 @@ pub fn pc_at(addr: usize, code: &[Op]) -> u64 {
     ((addr - code.as_ptr().addr()) / size_of::<Op>()) as u64
 }
 
-/// The displacement of the fixed target the handler of `insn` may continue at, `pc + 1 + displacement`, as
-/// [`ops::jump`](crate::ops::jump) computes it, or `None` if it continues only at `pc + 1` or a target it computes at
-/// run time.
-fn displacement(insn: Instruction) -> Option<i64> {
-    let target = TARGETS[usize::from(insn.byte())];
-    if !target.fixed || (target.local_call && insn.src_reg() != BPF_PSEUDO_CALL) {
-        return None;
-    }
-    Some(if target.in_imm {
-        insn.imm().into()
-    } else {
-        insn.offset().into()
-    })
-}
-
-/// Whether and where an instruction with a given opcode byte holds the displacement of a fixed target.
-#[derive(Clone, Copy)]
-struct Target {
-    fixed: bool,
-    /// In `imm`, else in `offset`.
-    in_imm: bool,
-    /// A call, which has a fixed target only if it is a local one.
-    local_call: bool,
-}
-
-/// The [`Target`] of each opcode byte.
-const TARGETS: [Target; 256] = {
-    const NONE: Target = Target {
-        fixed: false,
-        in_imm: false,
-        local_call: false,
-    };
-    const OFFSET: Target = Target { fixed: true, ..NONE };
-    const IMM: Target = Target { in_imm: true, ..OFFSET };
-    const CALL: Target = Target {
-        local_call: true,
-        ..IMM
-    };
-
-    byte_table!(|byte| {
-        let opc = OpCode(byte);
-        let jmp64 = matches!(opc.class(), Class::Jmp64);
-        let imm = matches!(opc.alu_src(), Source::Imm);
-        match opc.jmp_opc() {
-            _ if !matches!(opc.class(), Class::Jmp64 | Class::Jmp32) => NONE,
-            JmpOpc::Ja if imm && jmp64 => OFFSET,
-            JmpOpc::Ja if imm => IMM,
-            JmpOpc::Call if imm && jmp64 => CALL,
-            // `gotox`, helper and kfunc calls, `callx`, `exit`, `may_goto` and the encodings that fail
-            JmpOpc::Ja | JmpOpc::Call | JmpOpc::Exit | JmpOpc::Jcond | JmpOpc::UndefF => NONE,
-            // conditional jumps
-            _ => OFFSET,
-        }
-    })
-};
-
 /// The upper half of the immediate of the LD_IMM64 whose second slot holds `second`, or `None` if the code ends before
 /// it.
 #[inline(always)]
@@ -227,7 +226,7 @@ pub fn second_half(second: Op) -> Option<i32> {
 }
 
 /// The opcode byte of the instruction that the [`FAR`] slot `far` runs.
-pub fn moved_byte(far: Op) -> u8 {
+fn moved_byte(far: Op) -> u8 {
     let far = far.instruction();
     far.dst_reg() | far.src_reg() << 4
 }

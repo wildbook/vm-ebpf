@@ -23,7 +23,7 @@
 //! fields of an [`Op`] are private to this module, so every op holds it. A [`View`] hands those numbers out as a
 //! [`Reg`], whose reads of the register file are unchecked.
 //!
-//! Besides, the slots with the opcode byte of `mov` or `mov32` hold offset 0 ([`fuse::offset_is_zero`]).
+//! Besides, the slots with an opcode byte that [`fuse::offset_is_zero`] names hold offset 0.
 //!
 //! A handler reads the fields of its slot with a [`View`], one instruction per field: its dispatch loaded the op into
 //! RCX, from which `movzx` reads `dst_reg` (CH) and one shift `src_reg` or `imm`; `offset` is a load from the slot.
@@ -243,7 +243,7 @@ impl Debug for Op {
 /// What a [`View`] reads of the opcode byte its handler runs: the layout, the opcode and whether `offset` is 0. Each
 /// handler passes the shape of its byte as a constant (`const { Shape::of(OP) }`), so the view's choices fold away
 /// without loads from the byte tables.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy)]
 pub struct Shape {
     layout: Layout,
     opcode: u8,

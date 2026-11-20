@@ -233,26 +233,6 @@ fn may_goto() {
 }
 
 #[test]
-fn mem_fault() {
-    // (base address in r1, offset) pairs that must fault for both loads and stores.
-    for (addr, off) in [
-        (10000u64, 0i16), // out of bounds
-        (0u64, -8i16),    // 0 - 8 wraps to a huge address
-    ] {
-        let mut ctx = Context::new(TestMem::new());
-        ctx.regs[1] = addr;
-        let load = instr(OpCode::ldreg_from_parts(MemSize::Byte, MemMode::Mem), 0, 1, off, 0);
-        assert!(matches!(exec(&mut ctx, load), Flow::FailMem(())), "load at {addr}+{off}");
-
-        let mut ctx = Context::new(TestMem::new());
-        ctx.regs[1] = addr;
-        ctx.regs[2] = 0xFF;
-        let store = instr(OpCode::streg_from_parts(MemSize::Byte, MemMode::Mem), 1, 2, off, 0);
-        assert!(matches!(exec(&mut ctx, store), Flow::FailMem(())), "store at {addr}+{off}");
-    }
-}
-
-#[test]
 fn alu32_imm_is_unsigned_32bit() {
     let mut ctx = Context::new(TestMem::new());
     ctx.regs[1] = 0xFFFF_FFFF;

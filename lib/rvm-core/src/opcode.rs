@@ -1,12 +1,23 @@
+//! The fields of the opcode byte, as RFC 9669 lays them out.
+
+/// An opcode byte. Its low 3 bits are the [`Class`], which decides how the other bits read: an operation and its
+/// [`Source`] for the ALU and jump classes, a [`MemSize`] and [`MemMode`] for the load and store classes.
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct OpCode(pub u8);
 
+#[rustfmt::skip]
 #[allow(clippy::unusual_byte_groupings)]
 impl OpCode {
-    #[inline(always)]
-    pub const fn class(self) -> Class {
-        Class::from_u8(self.0 & 0b00000_111)
-    }
+    #[inline(always)] pub const fn class(self) -> Class { Class::from_u8(self.0 & 0b00000_111) }
+
+    #[inline(always)] pub const fn alu_opc(self) -> AluOpc { AluOpc::from_u8(self.0 & 0b1111_0_000) }
+    #[inline(always)] pub const fn alu_src(self) -> Source { Source::from_u8(self.0 & 0b0000_1_000) }
+    #[inline(always)] pub const fn alu_end(self) -> AluEnd { AluEnd::from_u8(self.0 & 0b0000_1_000) }
+
+    #[inline(always)] pub const fn jmp_opc(self) -> JmpOpc { JmpOpc::from_u8(self.0 & 0b1111_0_000) }
+
+    #[inline(always)] pub const fn mem_size(self) -> MemSize { MemSize::from_u8(self.0 & 0b000_11_000) }
+    #[inline(always)] pub const fn mem_mode(self) -> MemMode { MemMode::from_u8(self.0 & 0b111_00_000) }
 }
 
 impl OpCode {
@@ -52,27 +63,6 @@ pub const LD_IMM64: u8 = OpCode(Class::LdImm as u8 | MemMode::Imm as u8 | MemSiz
 
 /// The opcode byte of `call`: a helper, local or kfunc call, as `src_reg` selects.
 pub const CALL: u8 = OpCode::jmp64_from_parts(JmpOpc::Call, Source::Imm).0;
-
-#[rustfmt::skip]
-#[allow(clippy::unusual_byte_groupings)]
-impl OpCode {
-    #[inline(always)] pub const fn alu_opc(self) -> AluOpc { AluOpc::from_u8(self.0 & 0b1111_0_000) }
-    #[inline(always)] pub const fn alu_src(self) -> Source { Source::from_u8(self.0 & 0b0000_1_000) }
-    #[inline(always)] pub const fn alu_end(self) -> AluEnd { AluEnd::from_u8(self.0 & 0b0000_1_000) }
-}
-
-#[rustfmt::skip]
-#[allow(clippy::unusual_byte_groupings)]
-impl OpCode {
-    #[inline(always)] pub const fn jmp_opc(self) -> JmpOpc { JmpOpc::from_u8(self.0 & 0b1111_0_000) }
-}
-
-#[rustfmt::skip]
-#[allow(clippy::unusual_byte_groupings)]
-impl OpCode {
-    #[inline(always)] pub const fn mem_size(self) -> MemSize { MemSize::from_u8(self.0 & 0b000_11_000) }
-    #[inline(always)] pub const fn mem_mode(self) -> MemMode { MemMode::from_u8(self.0 & 0b111_00_000) }
-}
 
 /// Declares a `#[repr(u8)]` enum covering every value of `mask`, a `from_u8` decoder for it and a `from_name` lookup
 /// by mnemonic. `mask` documents which bits belong to the enum; `from_u8` asserts the input carries no other bits. A

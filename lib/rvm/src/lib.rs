@@ -1,20 +1,22 @@
 //! # rvm: embeddable eBPF runtime
 //!
-//! `rvm` is an embeddable eBPF virtual machine library for Rust.
+//! `rvm` is an embeddable eBPF virtual machine library for Rust. It links eBPF ELF objects against host functions and
+//! host types, and runs their functions in an interpreter.
 //!
 //! ## Quick Start
 //!
 //! ```ignore
 //! use rvm::Vm;
 //!
-//! // Create a VM and register helpers
 //! let vm = Vm::new();
 //!
-//! // Register a helper function (type-safe), under an ID that no standard helper (`BPF_FUNC_*`) uses
+//! // A host function the program calls by helper ID; pick an ID that no standard helper (`BPF_FUNC_*`) uses
 //! vm.register_helper(100, |x: u64| {
 //!     println!("eBPF called helper with: {}", x);
 //!     x * 2
 //! });
+//! // A host function the program declares as `extern u64 host_add(u64 a, u64 b);`
+//! vm.register_fn("host_add", |(a, b): (u64, u64)| a + b);
 //!
 //! // Describe the host's types, as BTF, for CO-RE
 //! #[repr(C)]
@@ -25,17 +27,28 @@
 //! vm.with_types(|types| rvm::host_struct!(types, Event as "event" { timestamp, pid }));
 //!
 //! // Load and execute an eBPF program
-//! let program = vm.load_elf(&elf_bytes)?;
+//! let mut program = vm.load_elf(&elf_bytes)?;
 //! let result = program.call("main", &[])?;
 //!
 //! // Or link ahead of time, ship the image, and load it without the linker
 //! let image = vm.prepare(&elf_bytes)?.to_bytes();
-//! let program = vm.load_image(&image)?;
+//! let mut program = vm.load_image(&image)?;
 //! ```
+//!
+//! ## Loading
+//!
+//! | From | To an [`Image`] | To a [`Program`] |
+//! |---|---|---|
+//! | one ELF file | `Vm::prepare` | `Vm::load_elf` |
+//! | several `Module`s | `Vm::prepare_modules` | `Vm::load_modules` |
+//! | an [`Image`] | | [`Vm::load`] |
+//! | bytes from [`Image::to_bytes`] | [`Image::from_bytes`] | [`Vm::load_image`] |
+//!
+//! The ELF and module rows need the `link` feature.
 //!
 //! ## Components
 //!
-//! - [`Vm`]: the entry point. Holds the shared helper table, type registry, and the maps and regions shared across the
+//! - [`Vm`]: the entry point. Holds the host functions, the host types, and the maps and regions shared across the
 //!   programs it loads.
 //! - `Module`: a parsed eBPF ELF file, not yet linked.
 //! - [`Image`]: a linked program, before binding and allocation; serializable. [`Vm::load`] also takes one built

@@ -7,6 +7,3 @@ description = "eBPF assembler and disassembler library"
 
 [lints]
 workspace = true
-
-[dependencies]
-btf.workspace = true

@@ -29,9 +29,9 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
     // SAFETY: `transfer::bound` leaves a superinstruction only where its sequence lies in the code, and the guard slot
     // follows the code (see `Slot`)
     let window = unsafe { slot.window(code, len + 1) };
-    // SAFETY: `encode` found the opcode of each instruction of the sequence in its first slot, and the bytes `Code::new`
-    // gives such a slot afterwards stand for the same opcode (see `usual`), so they have its layout. Each slot's shape is
-    // a constant, so that the views fold for the constant `k` every caller passes.
+    // SAFETY: `encode` found the opcode of each instruction of the sequence in its first slot, and the bytes
+    // `Code::new` gives such a slot afterwards stand for the same opcode (see `usual`), so they have its layout. Each
+    // slot's shape is a constant, so that the views fold for the constant `k` every caller passes.
     let slot_of = |k: usize| {
         macro_rules! view {
             ($($k:literal),*) => {
@@ -92,8 +92,8 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
                     ControlFlow::Break(Flow::Next) => {}
                     // only the last instruction branches, after `save_at`
                     ControlFlow::Break(Flow::Jump(offset)) if const { Super::of(S).branches_at($k) } => {
-                        // SAFETY: `transfer::bound` leaves a superinstruction only where its branch target lies in
-                        // `0..=len` (see `Slot`)
+                        // `transfer::bound` leaves a superinstruction only where its branch target lies in `0..=len`
+                        // (see `Slot`)
                         dispatch!(slot.offset($k + 1 + offset))
                     }
                     ControlFlow::Break(flow) => {

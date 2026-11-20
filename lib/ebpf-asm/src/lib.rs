@@ -1,64 +1,37 @@
-//! eBPF Assembler and Disassembler Library
+//! An eBPF assembler and disassembler.
 //!
-//! This crate provides tools for working with eBPF bytecode:
-//!
-//! - **Decoder**: Disassemble eBPF bytecode into structured instructions
-//! - **Assembler**: Build eBPF bytecode with label support
-//! - **DefaultFormatter**: Render decoded instructions as text
-//!
-//! # Disassembly Example
+//! [`Assembler`] builds bytecode through one method per instruction and resolves jumps to labels:
 //!
 //! ```
-//! use ebpf_asm::{Decoder, DefaultFormatter};
+//! use ebpf_asm::{Assembler, R0};
 //!
-//! // eBPF bytecode: mov64 r0, 42; exit
+//! let mut asm = Assembler::new();
+//! let loop_start = asm.create_label();
+//!
+//! asm.mov64_imm(R0, 10);
+//! asm.set_label(&loop_start).unwrap();
+//! asm.sub64_imm(R0, 1);
+//! asm.jne_imm(R0, 0, &loop_start);
+//! asm.exit();
+//!
+//! let bytecode = asm.assemble().unwrap();
+//! assert_eq!(bytecode.len(), 4 * 8);
+//! ```
+//!
+//! [`Decoder`] iterates over the instructions in bytecode. An [`Instruction`] prints as text, and [`Formatter`] can
+//! put the raw bytes in front:
+//!
+//! ```
+//! use ebpf_asm::Decoder;
+//!
+//! // mov64 r0, 42; exit
 //! let bytes = [
 //!     0xb7, 0x00, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00,
 //!     0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 //! ];
 //!
-//! let formatter = DefaultFormatter::new();
-//! for insn in Decoder::new(&bytes) {
-//!     println!("{:04x}: {}", insn.offset, formatter.format_to_string(&insn));
-//! }
-//! ```
-//!
-//! # Assembly Example
-//!
-//! ```
-//! use ebpf_asm::{Assembler, R0, R1};
-//!
-//! let mut asm = Assembler::new();
-//!
-//! // Create a countdown loop
-//! let loop_start = asm.create_label();
-//!
-//! asm.mov64_imm(R0, 10);       // r0 = 10
-//! asm.set_label(&loop_start).unwrap();
-//! asm.sub64_imm(R0, 1);         // r0--
-//! asm.jne_imm(R0, 0, &loop_start); // if r0 != 0 goto loop_start
-//! asm.exit();
-//!
-//! let bytecode = asm.assemble().unwrap();
-//! assert_eq!(bytecode.len(), 32); // 4 instructions * 8 bytes
-//! ```
-//!
-//! # Round-Trip Example
-//!
-//! ```
-//! use ebpf_asm::{Assembler, Decoder, R0};
-//!
-//! // Assemble
-//! let mut asm = Assembler::new();
-//! asm.mov64_imm(R0, 42);
-//! asm.exit();
-//! let code = asm.assemble().unwrap();
-//!
-//! // Disassemble
-//! let insns: Vec<_> = Decoder::new(&code).collect();
-//! assert_eq!(insns.len(), 2);
-//! assert_eq!(insns[0].mnemonic.name(), "mov64");
-//! assert_eq!(insns[1].mnemonic.name(), "exit");
+//! let text: Vec<String> = Decoder::new(&bytes).map(|insn| insn.to_string()).collect();
+//! assert_eq!(text, ["mov64 r0, 0x2a", "exit"]);
 //! ```
 
 #![warn(missing_docs)]
@@ -72,9 +45,9 @@ mod mnemonic;
 mod operand;
 mod register;
 
-pub use assembler::{AsmError, AssembledProgram, Assembler, Label};
-pub use decoder::{decode_all, Decoder};
-pub use formatter::DefaultFormatter;
+pub use assembler::{AsmError, Assembler, Label};
+pub use decoder::Decoder;
+pub use formatter::Formatter;
 pub use instruction::Instruction;
 pub use mnemonic::Mnemonic;
 pub use operand::Operand;
@@ -102,10 +75,8 @@ mod tests {
         asm.set_label(&far).unwrap();
         asm.exit();
 
-        let fmt = DefaultFormatter::new();
-        let text: Vec<String> = decode_all(&asm.assemble().unwrap())
-            .iter()
-            .map(|i| fmt.format_to_string(i))
+        let text: Vec<String> = Decoder::new(&asm.assemble().unwrap())
+            .map(|insn| insn.to_string())
             .collect();
         assert_eq!(
             text,
@@ -130,7 +101,7 @@ mod tests {
         );
 
         // `ja32` carries its offset in the 32-bit imm, beyond the reach of `off`
-        let insn = &decode_all(&[0x06, 0, 0, 0, 0x00, 0x00, 0x01, 0x00])[0];
-        assert_eq!(fmt.format_to_string(insn), "ja32 +65536");
+        let insn = Decoder::new(&[0x06, 0, 0, 0, 0x00, 0x00, 0x01, 0x00]).next().unwrap();
+        assert_eq!(insn.to_string(), "ja32 +65536");
     }
 }

@@ -30,13 +30,14 @@ pub const fn cast_slice<T: Plain>(bytes: &[u8]) -> Option<&[T]> {
     Some(unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast(), len) })
 }
 
-pub const fn derva_slice(image: &[u8], beg: usize, len: usize) -> ElfResult<&[u8]> {
+/// `image[beg..][..len]`, or [`ElfError::OutOfBounds`].
+pub const fn subslice(image: &[u8], beg: usize, len: usize) -> ElfResult<&[u8]> {
     let Some((_, tail)) = image.split_at_checked(beg) else {
-        return Err(ElfError::DeRvaBounds);
+        return Err(ElfError::OutOfBounds);
     };
     match tail.split_at_checked(len) {
         Some((data, _)) => Ok(data),
-        None => Err(ElfError::DeRvaBounds),
+        None => Err(ElfError::OutOfBounds),
     }
 }
 

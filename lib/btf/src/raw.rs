@@ -5,10 +5,13 @@ use crate::parse::{word, BtfError};
 /// BTF magic number (little-endian).
 pub const BTF_MAGIC: u16 = 0xEB9F;
 
-/// BTF version we support.
+/// The BTF version this crate reads and writes.
 pub const BTF_VERSION: u8 = 1;
 
-/// Integer-encoding flag: the value is signed.
+/// Size in bytes of the `btf_header` that starts a `.BTF` section.
+pub const BTF_HEADER_LEN: usize = 24;
+
+/// Flag in the encoding of an `Int`: the value is signed.
 pub const BTF_INT_SIGNED: u8 = 1 << 0;
 
 /// Size in bytes of the `btf_type` header that starts every type record.

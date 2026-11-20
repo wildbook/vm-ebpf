@@ -1,48 +1,46 @@
-//! High-level BTF type representations.
+//! Parsed BTF types.
 
 use crate::raw::BtfKind;
 
-/// A parsed BTF type with all its information.
+/// A parsed BTF type. Fields named `type_id` and `*_type` hold the ID of another type in the same BTF.
 #[derive(Debug, Clone)]
 pub enum BtfTypeInfo<'a> {
-    /// Void type (implicit, type_id 0).
+    /// Type ID 0, which no record encodes.
     Void,
 
-    /// Integer type.
     Int {
         name: &'a str,
         size: u32,
+        /// Flags such as [`BTF_INT_SIGNED`](crate::BTF_INT_SIGNED).
         encoding: u8,
         offset: u8,
         bits: u8,
     },
 
-    /// Pointer type.
-    Ptr { pointee_type: u32 },
+    Ptr {
+        pointee_type: u32,
+    },
 
-    /// Array type.
     Array {
         elem_type: u32,
         index_type: u32,
         nelems: u32,
     },
 
-    /// Struct type.
     Struct {
         name: &'a str,
         size: u32,
         members: Vec<Member<'a>>,
     },
 
-    /// Union type.
     Union {
         name: &'a str,
         size: u32,
         members: Vec<Member<'a>>,
     },
 
-    /// Enum type. `is_64` tells apart the kernel's 32-bit `BTF_KIND_ENUM` and 64-bit `BTF_KIND_ENUM64` encodings;
-    /// `kind()` reports them separately, but every other consumer treats the two the same.
+    /// `is_64` tells apart the kernel's 32-bit `BTF_KIND_ENUM` and 64-bit `BTF_KIND_ENUM64` encodings; `kind()` reports
+    /// them separately, but every other consumer treats the two the same.
     Enum {
         name: &'a str,
         size: u32,
@@ -51,57 +49,74 @@ pub enum BtfTypeInfo<'a> {
         variants: Vec<EnumValue<'a>>,
     },
 
-    /// Forward declaration.
-    Fwd { name: &'a str, is_union: bool },
+    /// Forward declaration of a struct or union.
+    Fwd {
+        name: &'a str,
+        is_union: bool,
+    },
 
-    /// Typedef.
-    Typedef { name: &'a str, type_id: u32 },
+    Typedef {
+        name: &'a str,
+        type_id: u32,
+    },
 
-    /// Volatile qualifier.
-    Volatile { type_id: u32 },
+    Volatile {
+        type_id: u32,
+    },
 
-    /// Const qualifier.
-    Const { type_id: u32 },
+    Const {
+        type_id: u32,
+    },
 
-    /// Restrict qualifier.
-    Restrict { type_id: u32 },
+    Restrict {
+        type_id: u32,
+    },
 
-    /// Function.
     Func {
         name: &'a str,
         proto_type: u32,
+        /// One of [`BTF_FUNC_STATIC`](crate::BTF_FUNC_STATIC), [`BTF_FUNC_GLOBAL`](crate::BTF_FUNC_GLOBAL) and
+        /// [`BTF_FUNC_EXTERN`](crate::BTF_FUNC_EXTERN).
         linkage: u16,
     },
 
-    /// Function prototype.
-    FuncProto { return_type: u32, params: Vec<Param<'a>> },
+    FuncProto {
+        return_type: u32,
+        params: Vec<Param<'a>>,
+    },
 
-    /// Variable.
-    Var { name: &'a str, type_id: u32, linkage: u32 },
+    Var {
+        name: &'a str,
+        type_id: u32,
+        linkage: u32,
+    },
 
-    /// Data section.
+    /// A data section and the variables in it.
     DataSec {
         name: &'a str,
         size: u32,
         vars: Vec<VarSecInfo>,
     },
 
-    /// Floating point type.
-    Float { name: &'a str, size: u32 },
+    Float {
+        name: &'a str,
+        size: u32,
+    },
 
-    /// Declaration tag.
+    /// A tag on the type `type_id`, or on its member or parameter `component_idx` when that is not -1.
     DeclTag {
         name: &'a str,
         type_id: u32,
         component_idx: i32,
     },
 
-    /// Type tag.
-    TypeTag { name: &'a str, type_id: u32 },
+    TypeTag {
+        name: &'a str,
+        type_id: u32,
+    },
 }
 
 impl<'a> BtfTypeInfo<'a> {
-    /// Get the kind of this type.
     pub fn kind(&self) -> BtfKind {
         match self {
             Self::Void => BtfKind::Void,
@@ -127,7 +142,7 @@ impl<'a> BtfTypeInfo<'a> {
         }
     }
 
-    /// Get the name of this type, if it has one.
+    /// The name, for the kinds that have one; `""` for an anonymous type of such a kind.
     pub fn name(&self) -> Option<&'a str> {
         match self {
             Self::Void => None,
@@ -152,7 +167,8 @@ impl<'a> BtfTypeInfo<'a> {
         }
     }
 
-    /// Get the size of this type in bytes, if applicable.
+    /// The size in bytes, for the kinds that record one. [`Btf::resolve_size`](crate::Btf::resolve_size) also covers
+    /// pointers, arrays, typedefs and qualifiers.
     pub fn size(&self) -> Option<u32> {
         match self {
             Self::Int { size, .. } => Some(*size),
@@ -166,45 +182,37 @@ impl<'a> BtfTypeInfo<'a> {
     }
 }
 
-/// A struct/union member.
+/// A struct or union member.
 #[derive(Debug, Clone)]
 pub struct Member<'a> {
-    /// Member name.
     pub name: &'a str,
-    /// Type ID of the member.
     pub type_id: u32,
-    /// Bit offset from the start of the struct.
+    /// Offset from the start of the struct, in bits.
     pub bit_offset: u32,
-    /// Bitfield size (0 if not a bitfield).
+    /// Width in bits, or 0 if the member is not a bitfield.
     pub bitfield_size: u32,
 }
 
-/// An enum value. 32-bit `BTF_KIND_ENUM` values are sign-extended to `i64` at parse time, the same widening libbpf
+/// An enumerator. 32-bit `BTF_KIND_ENUM` values are sign-extended to `i64` at parse time, the same widening libbpf
 /// applies when comparing a 32-bit enum against a 64-bit one.
 #[derive(Debug, Clone)]
 pub struct EnumValue<'a> {
-    /// Variant name.
     pub name: &'a str,
-    /// Value.
     pub value: i64,
 }
 
 /// A function parameter.
 #[derive(Debug, Clone)]
 pub struct Param<'a> {
-    /// Parameter name.
     pub name: &'a str,
-    /// Type ID.
     pub type_id: u32,
 }
 
-/// Variable info within a data section.
+/// A variable in a data section.
 #[derive(Debug, Clone, Copy)]
 pub struct VarSecInfo {
-    /// Type ID of the variable.
     pub type_id: u32,
-    /// Offset within the section.
+    /// Offset in the section, in bytes.
     pub offset: u32,
-    /// Size of the variable.
     pub size: u32,
 }

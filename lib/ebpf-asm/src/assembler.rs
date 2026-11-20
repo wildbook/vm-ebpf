@@ -1,4 +1,4 @@
-//! eBPF assembler with label resolution and CO-RE relocation tracking.
+//! eBPF assembler with labels.
 //!
 //! ```
 //! use ebpf_asm::{Assembler, R0};
@@ -14,32 +14,10 @@
 //!
 //! let code = asm.assemble().unwrap();
 //! ```
-//!
-//! # CO-RE Example
-//!
-//! ```
-//! use btf::CoreReloKind;
-//! use ebpf_asm::{Assembler, R1, R3};
-//!
-//! let mut asm = Assembler::new();
-//!
-//! // placeholder offset, patched at load time
-//! asm.mov64_imm(R3, 8);
-//! asm.mark_core_relo(CoreReloKind::FieldByteOffset, 1, 17);
-//!
-//! asm.add64(R1, R3);
-//! asm.exit();
-//!
-//! let result = asm.assemble_with_core().unwrap();
-//! assert_eq!(result.relocations.len(), 1);
-//! assert_eq!(result.relocations[0].insn_off, 0);
-//! ```
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fmt;
-
-use btf::{CoreRelo, CoreReloKind};
 
 use crate::instruction::{alu, atomic, class, jmp, mode, size, RawInstruction, SRC_IMM, SRC_REG};
 #[cfg(test)]
@@ -73,32 +51,6 @@ impl fmt::Display for AsmError {
 }
 
 impl std::error::Error for AsmError {}
-
-/// CO-RE relocation attached to an instruction index, resolved to a byte offset on assembly.
-#[derive(Debug, Clone)]
-struct PendingCoreRelo {
-    insn_index: usize,
-    type_id: u32,
-    access_str_off: u32,
-    kind: CoreReloKind,
-}
-
-/// Result of assembling with CO-RE relocation tracking.
-#[derive(Debug, Clone)]
-pub struct AssembledProgram {
-    /// The assembled bytecode.
-    pub bytecode: Vec<u8>,
-    /// CO-RE relocations with resolved byte offsets.
-    pub relocations: Vec<CoreRelo>,
-}
-
-impl AssembledProgram {
-    /// Bytecode as u64 instruction words.
-    pub fn instructions(&self) -> Vec<u64> {
-        let (words, _) = self.bytecode.as_chunks::<8>();
-        words.iter().map(|w| u64::from_le_bytes(*w)).collect()
-    }
-}
 
 /// A branch target, created with `Assembler::create_label` and bound with `Assembler::set_label`.
 #[derive(Debug, Clone)]
@@ -357,25 +309,23 @@ macro_rules! endian_family {
     };
 }
 
-/// eBPF bytecode assembler with a fluent API.
+/// Builds eBPF bytecode one instruction per method call. The instruction methods return the assembler, so calls chain.
 pub struct Assembler {
     instructions: Vec<AsmInsn>,
     label_counter: usize,
     /// Label ID to instruction index.
     label_positions: HashMap<usize, usize>,
     label_refs: Vec<LabelRef>,
-    core_relos: Vec<PendingCoreRelo>,
 }
 
 impl Assembler {
-    /// Create a new assembler.
+    /// An assembler with no instructions.
     pub fn new() -> Self {
         Self {
             instructions: Vec::new(),
             label_counter: 0,
             label_positions: HashMap::new(),
             label_refs: Vec::new(),
-            core_relos: Vec::new(),
         }
     }
 
@@ -471,59 +421,6 @@ impl Assembler {
         }
 
         Ok(code)
-    }
-
-    /// Mark the last emitted instruction with a CO-RE relocation.
-    ///
-    /// # Panics
-    ///
-    /// Panics if no instructions have been emitted yet.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use btf::CoreReloKind;
-    /// use ebpf_asm::{Assembler, R3};
-    ///
-    /// let mut asm = Assembler::new();
-    ///
-    /// // placeholder offset, patched at load time
-    /// asm.mov64_imm(R3, 8);
-    /// asm.mark_core_relo(CoreReloKind::FieldByteOffset, 1, 17);
-    ///
-    /// let result = asm.assemble_with_core().unwrap();
-    /// assert_eq!(result.relocations.len(), 1);
-    /// ```
-    pub fn mark_core_relo(&mut self, kind: CoreReloKind, type_id: u32, access_str_off: u32) -> &mut Self {
-        assert!(!self.instructions.is_empty(), "mark_core_relo called with no instructions");
-        let insn_index = self.instructions.len() - 1;
-        self.core_relos.push(PendingCoreRelo {
-            insn_index,
-            type_id,
-            access_str_off,
-            kind,
-        });
-        self
-    }
-
-    /// Assemble the program and resolve each CO-RE relocation's `insn_off` to the byte offset of its instruction.
-    pub fn assemble_with_core(&mut self) -> Result<AssembledProgram, AsmError> {
-        let byte_offsets: Vec<u32> = self.slot_prefix().iter().map(|&s| (s * 8) as u32).collect();
-
-        let bytecode = self.assemble()?;
-
-        let relocations = self
-            .core_relos
-            .iter()
-            .map(|pending| CoreRelo {
-                insn_off: byte_offsets[pending.insn_index],
-                type_id: pending.type_id,
-                access_str_off: pending.access_str_off,
-                kind: pending.kind,
-            })
-            .collect();
-
-        Ok(AssembledProgram { bytecode, relocations })
     }
 
     /// `neg64 dst`: 64-bit negation.
@@ -766,7 +663,7 @@ impl Default for Assembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decoder::decode_all;
+    use crate::decoder::Decoder;
 
     /// The methods not defined through a `*_family!`.
     const OTHER_CASES: &[Case] = &[
@@ -813,128 +710,11 @@ mod tests {
             let mut asm = Assembler::new();
             emit(&mut asm);
             let code = asm.assemble().unwrap();
-            let insns = decode_all(&code);
+            let insns: Vec<_> = Decoder::new(&code).collect();
             assert_eq!(insns.len(), 1, "{name}");
             assert_eq!(insns[0].mnemonic, mnemonic, "{name}");
             assert_eq!(insns[0].size as usize, code.len(), "{name}");
         }
-    }
-
-    #[test]
-    fn undefined_label() {
-        let mut asm = Assembler::new();
-        let end = asm.create_label();
-
-        asm.ja(&end);
-        asm.exit();
-
-        let result = asm.assemble();
-        assert!(matches!(result, Err(AsmError::UndefinedLabel(_))));
-    }
-
-    #[test]
-    fn duplicate_label() {
-        let mut asm = Assembler::new();
-        let label = asm.create_label();
-
-        asm.set_label(&label).unwrap();
-        let result = asm.set_label(&label.clone());
-        assert!(matches!(result, Err(AsmError::DuplicateLabel(_))));
-    }
-
-    #[test]
-    fn memory_operations() {
-        let mut asm = Assembler::new();
-        asm.ldxdw(R0, R1, 16);
-        asm.stxdw(R1, -8, R0);
-        asm.exit();
-
-        let code = asm.assemble().unwrap();
-        assert_eq!(code.len(), 24);
-
-        // ldxdw r0, [r1+16]
-        assert_eq!(code[0], 0x79);
-        let offset = i16::from_le_bytes([code[2], code[3]]);
-        assert_eq!(offset, 16);
-
-        // stxdw [r1-8], r0
-        assert_eq!(code[8], 0x7b);
-        let offset = i16::from_le_bytes([code[10], code[11]]);
-        assert_eq!(offset, -8);
-    }
-
-    #[test]
-    fn local_call() {
-        let mut asm = Assembler::new();
-        let func = asm.create_label();
-
-        asm.call_local(&func);
-        asm.exit();
-        asm.set_label(&func).unwrap();
-        asm.mov64_imm(R0, 0);
-        asm.exit();
-
-        let code = asm.assemble().unwrap();
-        assert_eq!((code[1] >> 4) & 0xF, 1);
-    }
-
-    #[test]
-    fn core_relo_with_wide_instruction() {
-        let mut asm = Assembler::new();
-        asm.lddw(R0, 0x1234567890ABCDEF_i64);
-        asm.mov64_imm(R1, 42);
-        asm.mark_core_relo(CoreReloKind::TypeSize, 2, 0);
-        asm.exit();
-
-        let result = asm.assemble_with_core().unwrap();
-        assert_eq!(result.relocations.len(), 1);
-        assert_eq!(result.relocations[0].insn_off, 16);
-    }
-
-    #[test]
-    fn jmp32_opcodes() {
-        let mut asm = Assembler::new();
-        let labels: Vec<_> = (0..11).map(|_| asm.create_label()).collect();
-
-        asm.mov32_imm(R0, 100);
-        asm.jeq32_imm(R0, 100, &labels[0]);
-        asm.set_label(&labels[0]).unwrap();
-        asm.jne32_imm(R0, 50, &labels[1]);
-        asm.set_label(&labels[1]).unwrap();
-        asm.jgt32_imm(R0, 10, &labels[2]);
-        asm.set_label(&labels[2]).unwrap();
-        asm.jge32_imm(R0, 10, &labels[3]);
-        asm.set_label(&labels[3]).unwrap();
-        asm.jlt32_imm(R0, 10, &labels[4]);
-        asm.set_label(&labels[4]).unwrap();
-        asm.jle32_imm(R0, 10, &labels[5]);
-        asm.set_label(&labels[5]).unwrap();
-        asm.jsgt32_imm(R0, -10, &labels[6]);
-        asm.set_label(&labels[6]).unwrap();
-        asm.jsge32_imm(R0, -10, &labels[7]);
-        asm.set_label(&labels[7]).unwrap();
-        asm.jslt32_imm(R0, -10, &labels[8]);
-        asm.set_label(&labels[8]).unwrap();
-        asm.jsle32_imm(R0, -10, &labels[9]);
-        asm.set_label(&labels[9]).unwrap();
-        asm.jset32_imm(R0, 0x80, &labels[10]);
-        asm.set_label(&labels[10]).unwrap();
-        asm.exit();
-
-        let code = asm.assemble().unwrap();
-
-        // JMP32 = 0x06, each condition in the high nibble, SRC_IMM = 0x00.
-        assert_eq!(code[8], 0x16); // jeq32
-        assert_eq!(code[16], 0x56); // jne32
-        assert_eq!(code[24], 0x26); // jgt32
-        assert_eq!(code[32], 0x36); // jge32
-        assert_eq!(code[40], 0xa6); // jlt32
-        assert_eq!(code[48], 0xb6); // jle32
-        assert_eq!(code[56], 0x66); // jsgt32
-        assert_eq!(code[64], 0x76); // jsge32
-        assert_eq!(code[72], 0xc6); // jslt32
-        assert_eq!(code[80], 0xd6); // jsle32
-        assert_eq!(code[88], 0x46); // jset32
     }
 
     #[test]

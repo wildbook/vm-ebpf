@@ -1,40 +1,38 @@
-//! Section representation for eBPF programs.
+//! Sections of a parsed eBPF module.
 
 use std::fmt;
 
-/// Section type.
+/// What the linker does with a section.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SectionKind {
     /// Executable code.
     Code,
-    /// Initialized data (.data).
+    /// Initialized data (`.data`).
     Data,
-    /// Read-only data (.rodata).
+    /// Read-only data (`.rodata`).
     RoData,
-    /// Uninitialized data (.bss).
+    /// Zeroed data (`.bss`).
     Bss,
-    /// Maps section.
+    /// Map definitions (`.maps`).
     Maps,
     /// Jump tables for `gotox` (`.jumptables`): byte offsets into the code section that references them.
     JumpTable,
-    /// Other/unknown.
+    /// An allocated section the linker has no use for.
     Other,
 }
 
 /// A section in an eBPF module.
 #[derive(Clone)]
 pub struct Section {
-    /// Section name.
     pub name: String,
-    /// Section kind.
     pub kind: SectionKind,
-    /// Section data (empty for .bss).
+    /// Contents; empty for `.bss`.
     pub data: Vec<u8>,
     /// Size in bytes.
     pub size: u64,
-    /// Alignment requirement.
+    /// Alignment in bytes, at least 1.
     pub align: u64,
-    /// Original section index in the ELF.
+    /// Section index in the ELF file.
     pub elf_index: usize,
 }
 

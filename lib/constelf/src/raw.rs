@@ -1,6 +1,4 @@
-#![allow(non_camel_case_types)]
-
-//! ELF definitions. Implementations live in the `impls` child module.
+//! ELF definitions. The methods of the structs are in the `impls` child module.
 
 mod impls;
 
