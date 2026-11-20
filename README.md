@@ -57,10 +57,13 @@ With the `fuel` feature (on by default), a call that runs more than
 `Program::call_func_with_limit` gives one call a limit of its own and reports
 how many instructions it ran. The count is exact: the interpreter charges a
 basic block's instructions as it enters the block, and runs a block the fuel
-can't pay for one instruction at a time. A call without a limit counts nothing
-and runs the same code as in a build without the feature. In the benchmarks,
-guest code with a limit ran 1% to 8% more host instructions than without one
-and took up to about 5% longer; a workload of indirect calls took 11% longer.
+can't pay for one instruction at a time. A call without a limit counts
+nothing: it runs the same code as in a build without the feature, and its
+program holds no data for the count. The first call with a limit computes the
+block lengths of the program, 8 bytes per instruction. In the benchmarks, guest
+code with a limit ran 1% to 12% more host instructions than without one and
+took up to about 10% longer; a workload of indirect calls took 15% longer, and
+a call of an empty function 15 instructions more.
 
 Without the feature the interpreter doesn't count instructions. The API is the
 same in both builds, but a non-zero limit in `Vm::with_config` or
@@ -189,12 +192,15 @@ rvmrt it is 9,216 bytes with 44 imports.
 
 | build | `rvmrt.dll` | added to the C host by `rvmrt.lib` |
 |---|---|---|
-| in `lib/rvmrt` | 113,152 B, 31 imports from 3 DLLs | 105,984 B, 8 imports |
-| at the root | 200,192 B, 58 imports from 6 DLLs | 193,024 B, 33 imports |
+| in `lib/rvmrt` | 101,376 B, 31 imports from 3 DLLs | 94,720 B, 8 imports |
+| at the root | 187,392 B, 58 imports from 6 DLLs | 180,736 B, 33 imports |
+| in `lib/rvmrt`, without `fuel` | 82,944 B, 31 imports from 3 DLLs | 75,776 B, 8 imports |
+| at the root, without `fuel` | 168,960 B, 58 imports from 6 DLLs | 161,792 B, 33 imports |
 
-The 8 imports are the process heap (`GetProcessHeap`, `HeapAlloc`, `HeapFree`,
-`HeapReAlloc`), `memcmp`, `memmove`, and `GetCurrentProcess` with
-`TerminateProcess` for aborts.
+The rows without `fuel` drop the feature from `lib/rvmrt/Cargo.toml` and the
+instruction limit from the runtime's configuration. The 8 imports are the
+process heap (`GetProcessHeap`, `HeapAlloc`, `HeapFree`, `HeapReAlloc`),
+`memcmp`, `memmove`, and `GetCurrentProcess` with `TerminateProcess` for aborts.
 
 ## Plugins
 

@@ -2,7 +2,7 @@
 
 use super::supers::{Super, MAX_LEN, MAX_ROLES};
 use crate::code::Slots;
-use crate::dispatch::Table;
+use crate::dispatch::{Spare, Table, SPARE};
 use crate::fuel::Fuel;
 use crate::slot::{Fields, Reg, Shape, Slot, View};
 use crate::step::{self, Regs, Step};
@@ -18,9 +18,9 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
     ctx: &mut Context<M>,
     code: Slots,
     ip: Ip,
-    fuel: u64,
     interp: &mut Interpreter<M, H>,
     table: &Table<M, H>,
+    _: Spare,
     _slot: Slot,
 ) {
     let sup = const { Super::of(S) };
@@ -61,9 +61,9 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
         ($next:expr) => {{
             let next = $next;
             match const { Super::of(S).branches() } {
-                true => become_enter!(ctx, code, next, fuel, interp, table),
+                true => become_enter!(ctx, code, next, interp, table),
                 // the slot after the sequence lies in `0..=len` (see `sequence`)
-                false => become_at!(ctx, code, next, fuel, interp, table, false),
+                false => become_at!(ctx, code, next, interp, table, false),
             }
         }};
     }
@@ -84,7 +84,7 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
                     true => {
                         roles.save(registers, sup.unsaved[$k]);
                         let slot = sequence[$k];
-                        become table.of(slot)(ctx, code, at, fuel, interp, table, slot)
+                        become table.of(slot)(ctx, code, at, interp, table, SPARE, slot)
                     }
                     false => step::step(&mut roles, ctx.memory, decoded),
                 };
@@ -96,7 +96,7 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
                     Step::LdImm64 => step::ld_imm64(&mut roles, decoded, sequence[$k + 1].imm()),
                     Step::Stop(reason) => {
                         roles.save(registers, sup.unsaved[$k]);
-                        return interp.stop.at(at, fuel, reason);
+                        return interp.stop.at(at, reason);
                     }
                     _ => unreachable!("a sequence holds no call and no `exit`"),
                 }

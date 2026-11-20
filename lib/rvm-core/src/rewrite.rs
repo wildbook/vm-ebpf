@@ -16,14 +16,12 @@ use crate::Instruction;
 
 /// Runs the pass on `code`.
 pub fn rewrite(code: &mut [Instruction]) {
-    // The loop rewrites only slot `i`, so it reads slot `i + 1` as loaded, and the second slot of LD_IMM64 keeps its
-    // `imm`.
     for i in 0..code.len() {
         let insn = code[i];
-        let rewrite = REWRITES[usize::from(insn.byte())];
+        let rewrite = &REWRITES[usize::from(insn.byte())];
         // most instructions pass both tests
         if insn.0 & rewrite.screen != 0 || (rewrite.dst && insn.dst_reg() == R10) {
-            code[i] = rewrite.apply(insn, code.get(i + 1));
+            rewrite.apply(code, i);
         }
     }
 }
@@ -61,22 +59,25 @@ struct Rewrite {
 }
 
 impl Rewrite {
-    /// `insn`, whose opcode byte has this rewrite and which `next` follows, with the opcode byte the pass gives it.
+    /// Gives the instruction in slot `i` of `code`, whose opcode byte has this rewrite, the opcode byte of the pass.
+    /// The pass has rewritten only the slots before `i`, so slot `i + 1` is as loaded, and the second slot of
+    /// LD_IMM64 keeps its `imm`.
     #[cold]
     #[inline(never)]
-    fn apply(self, insn: Instruction, next: Option<&Instruction>) -> Instruction {
+    fn apply(&self, code: &mut [Instruction], i: usize) {
+        let insn = code[i];
         let r10 = (self.dst && insn.dst_reg() == R10) || (self.atomic && atomic_writes_r10(insn));
         let reserved = (insn.0 & field_bits(self.reserved) != 0)
             || (insn.byte() == CALL && call_reserved(insn))
-            || (insn.byte() == LD_IMM64 && next.is_some_and(|second| second.0 as u32 != 0));
+            || (insn.byte() == LD_IMM64 && code.get(i + 1).is_some_and(|second| second.0 as u32 != 0));
         let byte = match (self.canonical, r10 || reserved) {
             (Some(byte), _) => byte,
             (None, true) => INVALID,
             (None, false) if insn.0 & field_bits(self.nonzero) != 0 => self.nonzero_byte,
             // an atomic, `call` or LD_IMM64 that needs no rewrite
-            (None, false) => return insn,
+            (None, false) => return,
         };
-        insn.with_byte(byte)
+        code[i] = insn.with_byte(byte);
     }
 }
 

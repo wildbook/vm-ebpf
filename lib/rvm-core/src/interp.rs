@@ -4,10 +4,8 @@ use std::mem::MaybeUninit;
 
 use crate::code::Slots;
 use crate::context::FP;
-#[cfg(not(feature = "fuel"))]
-use crate::dispatch::Tables;
-#[cfg(feature = "fuel")]
-use crate::fuel;
+use crate::dispatch::{Table, SPARE};
+use crate::fuel::Meter;
 use crate::transfer::Ip;
 use crate::windows::Windows;
 use crate::{Code, Context, Host, Memory};
@@ -49,8 +47,6 @@ pub enum Reason<E> {
     /// A load or store that the memory failed with this error.
     MemoryFault(E),
     /// The fuel ran out before the instruction at `pc`. Only a metered run stops with it.
-    // Directly before `BadPc`: a handler that continues at a checked pc picks one of the two, and in the other order
-    // LLVM zeroes a register for that ahead of the check, on the path of every `exit`.
     OutOfFuel,
     /// A pc outside the code.
     BadPc,
@@ -80,8 +76,8 @@ pub struct Interpreter<M: Memory, H> {
 
     /// `frames[..depth]` are initialised.
     frames: [MaybeUninit<Frame>; MAX_CALL_DEPTH],
-    #[cfg(feature = "fuel")]
-    limit: fuel::Limit<M, H>,
+    /// The limit of the runs and the fuel of the run in progress.
+    pub(crate) meter: Meter<M, H>,
 }
 
 /// Caller state saved across a local call.
@@ -107,8 +103,7 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
             windows: Windows::EMPTY,
             host,
             frames: [const { MaybeUninit::uninit() }; MAX_CALL_DEPTH],
-            #[cfg(feature = "fuel")]
-            limit: fuel::Limit::new(None),
+            meter: Meter::default(),
         }
     }
 
@@ -119,33 +114,34 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
     #[inline]
     pub fn run(&mut self, ctx: &mut Context<M>, code: &Code, pc: u64) -> Stop<M::Error> {
         self.depth = 0;
-        #[cfg(feature = "fuel")]
-        let fuel = self.limit.fuel();
-        #[cfg(not(feature = "fuel"))]
-        let fuel = 0;
-        self.enter(ctx, code, pc, fuel)
+        let table = self.meter.start();
+        self.enter(ctx, code, pc, table, true)
     }
 
     /// Continues the call at `pc` of `code`, with the frames and the fuel that the last stop left.
     #[inline]
     pub fn resume(&mut self, ctx: &mut Context<M>, code: &Code, pc: u64) -> Stop<M::Error> {
-        self.enter(ctx, code, pc, self.stop.fuel)
+        let table = self.meter.resume(code.slots(), pc);
+        self.enter(ctx, code, pc, table, false)
     }
 
-    /// Runs `code` from `pc` with `fuel`.
+    /// Runs `code` from `pc` through `table`, for a call that starts there if `fresh` and one that resumes if not.
     #[inline(always)]
-    fn enter(&mut self, ctx: &mut Context<M>, code: &Code, pc: u64, fuel: u64) -> Stop<M::Error> {
+    fn enter(
+        &mut self,
+        ctx: &mut Context<M>,
+        code: &Code,
+        pc: u64,
+        table: &Table<M, H>,
+        fresh: bool,
+    ) -> Stop<M::Error> {
         let slots = code.slots();
-        #[cfg(feature = "fuel")]
-        let table = self.limit.start();
-        #[cfg(not(feature = "fuel"))]
-        let table = &Tables::<M, H>::PLAIN;
         self.windows.revalidate(ctx.memory);
 
         let Some(slot) = slots.get(pc) else {
-            return self.outside(pc, fuel);
+            return self.outside(pc, fresh);
         };
-        table.of(slot)(ctx, slots, Ip::at(slots, pc), fuel, self, table, slot);
+        table.of(slot)(ctx, slots, Ip::at(slots, pc), self, table, SPARE, slot);
 
         // Test the tag alone first: the handler stored the reason one field at a time, and a single load of the whole
         // reason can't take its bytes from several stores, so it waits for them to reach the cache. Each arm builds
@@ -166,11 +162,7 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
     #[inline(never)]
     fn stopped(&mut self, code: &Code) -> Stop<M::Error> {
         let code = code.slots();
-        #[cfg(feature = "fuel")]
-        if self.limit.get().is_some() {
-            let stop = &mut self.stop;
-            stop.fuel = fuel::settled(code, stop.ip(code), &stop.reason, stop.fuel);
-        }
+        self.meter.settle(code, self.stop.ip(code), &mut self.stop.reason);
         Stop {
             pc: self.stop.pc(code),
             // moved out, as the error of the memory needn't be `Copy`
@@ -178,15 +170,10 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
         }
     }
 
-    /// The stop of a run that starts at a `pc` outside the code.
+    /// The stop of a call that starts or resumes at a `pc` outside the code.
     #[cold]
-    fn outside(&mut self, pc: u64, fuel: u64) -> Stop<M::Error> {
-        self.stop.fuel = fuel;
-        // an instruction there would be charged first
-        let reason = match self.fuel() {
-            Some(0) => Reason::OutOfFuel,
-            _ => Reason::BadPc,
-        };
+    fn outside(&mut self, pc: u64, fresh: bool) -> Stop<M::Error> {
+        let reason = self.meter.outside(fresh);
         Stop { reason, pc }
     }
 
@@ -198,26 +185,23 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
     /// exactly where charging each instruction would.
     #[cfg(feature = "fuel")]
     pub fn set_limit(&mut self, limit: Option<u64>) {
-        self.limit = fuel::Limit::new(limit);
+        self.meter = Meter::new(limit);
     }
 
     /// The fuel each [`run`](Self::run) starts with, if runs are metered.
     pub fn limit(&self) -> Option<u64> {
-        #[cfg(feature = "fuel")]
-        return self.limit.get();
-        #[cfg(not(feature = "fuel"))]
-        None
+        self.meter.limit()
     }
 
     /// The fuel that the last stop left, if runs are metered.
     pub fn fuel(&self) -> Option<u64> {
-        self.limit().map(|_| self.stop.fuel)
+        self.meter.left()
     }
 
     /// Set the fuel that the next [`resume`](Self::resume) continues with, at most `i64::MAX`. It has no effect on
     /// runs that aren't metered.
     pub fn set_fuel(&mut self, fuel: u64) {
-        self.stop.fuel = fuel.min(i64::MAX as u64);
+        self.meter.set_left(fuel);
     }
 
     /// Save the caller's state for the call at `call_pc` and give the callee its stack frame. Returns false, changing
@@ -260,8 +244,6 @@ pub struct StopRecord<E> {
     /// The address of the slot it stopped at, or 0 if it stopped at `pc`.
     slot: usize,
     pc: u64,
-    /// The fuel the handler had, and after a metered run the fuel left (`fuel::settled`).
-    fuel: u64,
     /// [`Reason::Exit`] where no chain has stopped since the interpreter took the last one.
     reason: Reason<E>,
 }
@@ -270,22 +252,21 @@ impl<E> StopRecord<E> {
     const NONE: Self = Self {
         slot: 0,
         pc: 0,
-        fuel: 0,
         reason: Reason::Exit,
     };
 
     /// Stop at `ip`, the ip of the handler.
     #[inline(always)]
-    pub fn at(&mut self, ip: Ip, fuel: u64, reason: Reason<E>) {
+    pub fn at(&mut self, ip: Ip, reason: Reason<E>) {
         core::hint::cold_path();
-        (self.slot, self.fuel, self.reason) = (ip.addr(), fuel, reason);
+        (self.slot, self.reason) = (ip.addr(), reason);
     }
 
     /// Stop at `pc`, which may lie outside the code.
     #[inline(always)]
-    pub fn at_pc(&mut self, pc: u64, fuel: u64, reason: Reason<E>) {
+    pub fn at_pc(&mut self, pc: u64, reason: Reason<E>) {
         core::hint::cold_path();
-        (self.slot, self.pc, self.fuel, self.reason) = (0, pc, fuel, reason);
+        (self.slot, self.pc, self.reason) = (0, pc, reason);
     }
 
     /// The pc it stopped at, in the slots `code` of the code it ran.
@@ -298,7 +279,6 @@ impl<E> StopRecord<E> {
     }
 
     /// The ip it stopped at in `code`, unless it stopped at a pc.
-    #[cfg(feature = "fuel")]
     fn ip(&self, code: Slots) -> Option<Ip> {
         (self.slot != 0).then(|| Ip::at(code, code.pc_at(self.slot)))
     }

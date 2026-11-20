@@ -18,7 +18,7 @@ use std::ptr;
 
 use crate::code::Slots;
 use crate::context::FP;
-use crate::dispatch::{Handler, Table};
+use crate::dispatch::{Handler, Spare, Table, SPARE};
 use crate::handler::handler;
 use crate::memory::Window;
 use crate::opcode::{Class, MemMode, MemSize, OpCode};
@@ -296,18 +296,18 @@ pub extern "rust-preserve-none" fn stack_access<M: Memory, H: Host<M>, const OP:
     ctx: &mut Context<M>,
     code: Slots,
     ip: Ip,
-    fuel: u64,
     interp: &mut Interpreter<M, H>,
     table: &Table<M, H>,
+    _: Spare,
     slot: Slot,
 ) {
     // SAFETY: a handler's ip lies below `len`, and an r10 access has the layout of its load or store
     let insn = unsafe { ip.view(slot, const { Shape::of(OP) }) };
     let addr = step::address(ctx.regs[FP], insn);
     if !interp.windows.stack.access::<OP>(&mut ctx.regs, insn, addr) {
-        become miss::<M, H, OP, false>(ctx, code, ip, fuel, interp, table, slot)
+        become miss::<M, H, OP, false>(ctx, code, ip, interp, table, SPARE, slot)
     }
-    become_next!(ctx, code, ip, fuel, interp, table)
+    become_next!(ctx, code, ip, interp, table)
 }
 
 /// The handler of the load or store `OP` through a register other than r10.
@@ -316,9 +316,9 @@ pub extern "rust-preserve-none" fn data_access<M: Memory, H: Host<M>, const OP: 
     ctx: &mut Context<M>,
     code: Slots,
     ip: Ip,
-    fuel: u64,
     interp: &mut Interpreter<M, H>,
     table: &Table<M, H>,
+    _: Spare,
     slot: Slot,
 ) {
     // SAFETY: as in `handler`
@@ -329,13 +329,13 @@ pub extern "rust-preserve-none" fn data_access<M: Memory, H: Host<M>, const OP: 
         .data_for(OpCode(OP))
         .access::<OP>(&mut ctx.regs, insn, addr)
     {
-        become_next!(ctx, code, ip, fuel, interp, table)
+        become_next!(ctx, code, ip, interp, table)
     }
     // a dispatch of its own, so that the hit above keeps its instructions
     if small(OpCode(OP).mem_size()) && interp.windows.spare.access::<OP>(&mut ctx.regs, insn, addr) {
-        become_next!(ctx, code, ip, fuel, interp, table)
+        become_next!(ctx, code, ip, interp, table)
     }
-    become data_miss::<M, H, OP>(ctx, code, ip, fuel, interp, table, slot)
+    become data_miss::<M, H, OP>(ctx, code, ip, interp, table, SPARE, slot)
 }
 
 /// Runs a load or store that missed the data window through the window around r10 if it fits there, as one through
@@ -346,18 +346,18 @@ extern "rust-preserve-none" fn data_miss<M: Memory, H: Host<M>, const OP: u8>(
     ctx: &mut Context<M>,
     code: Slots,
     ip: Ip,
-    fuel: u64,
     interp: &mut Interpreter<M, H>,
     table: &Table<M, H>,
+    _: Spare,
     slot: Slot,
 ) {
     // SAFETY: as in `data_access`, which continues here
     let insn = unsafe { ip.view(slot, const { Shape::of(OP) }) };
     let addr = step::address(ctx.regs.get(base_reg::<OP>(insn)), insn);
     if !interp.windows.stack.access::<OP>(&mut ctx.regs, insn, addr) {
-        become miss::<M, H, OP, true>(ctx, code, ip, fuel, interp, table, slot)
+        become miss::<M, H, OP, true>(ctx, code, ip, interp, table, SPARE, slot)
     }
-    become_next!(ctx, code, ip, fuel, interp, table)
+    become_next!(ctx, code, ip, interp, table)
 }
 
 /// Takes the window around the address of the access, or without `DATA` around r10, and runs the access with its
@@ -368,9 +368,9 @@ extern "rust-preserve-none" fn miss<M: Memory, H: Host<M>, const OP: u8, const D
     ctx: &mut Context<M>,
     code: Slots,
     ip: Ip,
-    fuel: u64,
     interp: &mut Interpreter<M, H>,
     table: &Table<M, H>,
+    _: Spare,
     slot: Slot,
 ) {
     // SAFETY: as in `stack_access` and `data_access`, which continue here
@@ -383,7 +383,7 @@ extern "rust-preserve-none" fn miss<M: Memory, H: Host<M>, const OP: u8, const D
     interp
         .windows
         .take::<M, DATA>(ctx.memory, around, OpCode(OP).mem_size());
-    become handler::<M, H, OP>(ctx, code, ip, fuel, interp, table, slot)
+    become handler::<M, H, OP>(ctx, code, ip, interp, table, SPARE, slot)
 }
 
 /// The register that holds the base address of the load or store `OP`.

@@ -3,7 +3,10 @@
 use crate::Memory;
 
 /// The state of the guest that instructions read and write: its registers and its memory.
+// Aligned to 16 bytes with the registers first, as the frames of the interpreter are: `call` and `exit` move r6 to
+// r10 16 bytes at a time, and a move that crosses a cache line costs them several cycles.
 #[derive(Debug)]
+#[repr(C, align(16))]
 pub struct Context<'a, M: Memory> {
     /// The registers:
     /// - r0: the return value of function calls, and the exit value of the program

@@ -1,19 +1,20 @@
 //! Prepared code: [`Code`], and the passes of [`Code::new`] that turn instructions into the slots the handlers run.
 
 use std::fmt::{self, Debug, Formatter};
-use std::marker::PhantomData;
 
+#[cfg(feature = "fuel")]
+use crate::fuel::Rests;
 use crate::opcode::OpCode;
 use crate::slot::Slot;
-use crate::{bytes, fuel, fuse, rewrite, transfer, Instruction};
+use crate::{bytes, fuse, rewrite, transfer, Instruction};
 
 /// Bytecode prepared for an [`Interpreter`](crate::Interpreter).
 pub struct Code {
-    /// The slots, then what the metering keeps for them ([`fuel::store`]).
-    storage: Box<[Slot]>,
-    /// The number of slots: the code, then the slots [`transfer::bound`] appends.
-    slots: usize,
+    /// The code, then the slots [`transfer::bound`] appends.
+    slots: Box<[Slot]>,
     len: usize,
+    #[cfg(feature = "fuel")]
+    rests: Rests,
 }
 
 impl Code {
@@ -37,8 +38,7 @@ impl Code {
     /// The verifier accepts `exit` with `src_reg` 1, which unwinds; `Code::new` fails it, as it does `may_goto` with
     /// that `src_reg`.
     ///
-    /// The code keeps the allocation of `insns` if it has room for one more slot, or with the `fuel` feature for two
-    /// slots per instruction and two more.
+    /// The code keeps the allocation of `insns` if it has room for one more slot.
     ///
     /// # Panics
     ///
@@ -48,15 +48,17 @@ impl Code {
         let len = insns.len();
         i32::try_from(len).expect("fewer than 2^31 slots");
 
-        fuel::reserve(&mut insns);
         rewrite::rewrite(&mut insns);
         fuse::fuse(&mut insns);
         transfer::bound(&mut insns);
 
+        // in place, as `Slot` and `Instruction` have the same size and alignment
+        let slots: Vec<Slot> = insns.into_iter().map(Slot::new).collect();
         Self {
-            slots: insns.len(),
-            storage: fuel::store(insns),
+            slots: slots.into_boxed_slice(),
             len,
+            #[cfg(feature = "fuel")]
+            rests: Rests::default(),
         }
     }
 
@@ -81,65 +83,50 @@ impl Code {
     #[inline(always)]
     pub(crate) fn slots(&self) -> Slots<'_> {
         Slots {
-            first: self.storage.as_ptr(),
-            len: self.slots,
-            code: PhantomData,
+            first: self.slots.as_ptr(),
+            code: self,
         }
     }
 }
 
-/// Shows the slots, each with the `rest` of its block if the code keeps it.
 impl Debug for Code {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let code = self.slots();
-        let slots = (0..self.slots as u64).filter_map(|pc| {
-            let (slot, rest) = (code.get(pc)?, fuel::rest_at(code, pc));
-            Some(fmt::from_fn(move |f| match rest {
-                Some(rest) => write!(f, "{slot:?} rest {rest}"),
-                None => write!(f, "{slot:?}"),
-            }))
-        });
         f.debug_struct("Code")
-            .field("slots", &fmt::from_fn(|f| f.debug_list().entries(slots.clone()).finish()))
+            .field("slots", &self.slots)
             .field("len", &self.len)
             .finish()
     }
 }
 
-/// The slots of a [`Code`] as the handlers receive them: a pointer and a length, which take two registers as a slice
-/// does.
-///
-/// It is no slice, because a slice may only reach its own elements: a pointer made from `Slots` may reach the whole
-/// storage of the code, in which [`fuel`] keeps the `rest` of each slot behind the slots.
+/// The slots of a [`Code`] as the handlers receive them: the pointer to the first, which every handler that needs
+/// the pc of its ip reads, and the code, for the handlers that check a pc. They take two registers.
 #[derive(Clone, Copy)]
 pub struct Slots<'a> {
-    /// Valid for reads of `len` slots while the code is borrowed.
+    /// `code.slots.as_ptr()`.
     first: *const Slot,
-    len: usize,
-    code: PhantomData<&'a Code>,
+    code: &'a Code,
 }
 
-impl Slots<'_> {
-    /// The number of slots, which the `rest` of each follows if the code keeps it.
-    #[cfg(feature = "fuel")]
-    #[inline(always)]
-    pub fn len(self) -> usize {
-        self.len
-    }
-
-    /// The pointer to the first slot, which may reach the whole storage of the code.
+impl<'a> Slots<'a> {
+    /// The pointer to the first slot, valid for reads of every slot while the code is borrowed.
     #[inline(always)]
     pub fn first(self) -> *const Slot {
         self.first
     }
 
+    /// All slots.
+    #[inline(always)]
+    pub fn all(self) -> &'a [Slot] {
+        &self.code.slots
+    }
+
     /// The slot at `pc`, if there is one.
     #[inline(always)]
     pub fn get(self, pc: u64) -> Option<Slot> {
-        if pc >= self.len as u64 {
+        if pc >= self.all().len() as u64 {
             return None;
         }
-        // SAFETY: `pc` is below `len`, and `first` is valid for reads of `len` slots
+        // SAFETY: `pc` is below the number of slots, which `first` points to
         Some(unsafe { *self.first.add(pc as usize) })
     }
 
@@ -147,5 +134,12 @@ impl Slots<'_> {
     #[inline(always)]
     pub fn pc_at(self, addr: usize) -> u64 {
         ((addr - self.first.addr()) / size_of::<Slot>()) as u64
+    }
+
+    /// The `rest` of each slot, which metered runs read.
+    #[cfg(feature = "fuel")]
+    #[inline(always)]
+    pub fn rests(self) -> &'a Rests {
+        &self.code.rests
     }
 }

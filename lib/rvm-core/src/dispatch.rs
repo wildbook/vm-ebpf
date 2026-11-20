@@ -10,9 +10,9 @@
 //! - `become_enter!` continues at the start of another block, at a slot that needs no bounds check;
 //! - `become_at_pc!` continues at a pc that has no proof, or stops there.
 //!
-//! A block ends at each slot whose handler may continue anywhere but at the next slot ([`fuel`](crate::fuel) defines
-//! it). Only the handlers that end a block know about fuel: they take a [`Fuel`], which charges the block they enter.
-//! The other handlers pass the `fuel` they receive on unread.
+//! A block ends at each slot whose handler may continue anywhere but at the next slot. The handlers that end a block
+//! take a [`Fuel`], which charges a metered run for the block they enter ([`fuel`](crate::fuel)). No other handler
+//! has anything for fuel.
 //!
 //! # Split dispatch
 //!
@@ -43,6 +43,7 @@
 //! Other processors keep other history, so the gain there is unmeasured.
 
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 
 use crate::code::Slots;
 use crate::fuel::{Fuel, Unmetered};
@@ -50,18 +51,18 @@ use crate::handler::{handler, jump};
 use crate::opcode::{Class, OpCode};
 use crate::slot::Slot;
 use crate::transfer::Ip;
-use crate::{fuse, transfer, windows, Context, Host, Interpreter, Memory, Reason};
+use crate::{fuse, transfer, windows, Context, Host, Interpreter, Memory};
 
 /// Continues at `$ip`, in the block of the slot the handler runs: tail-calls the handler of its instruction. `$ip`
 /// must lie in `0..=len`. A true `$split` makes the tail call one of two, as the module docs describe.
 macro_rules! become_at {
-    ($ctx:expr, $code:expr, $ip:expr, $fuel:expr, $interp:expr, $table:expr, $split:expr) => {{
+    ($ctx:expr, $code:expr, $ip:expr, $interp:expr, $table:expr, $split:expr) => {{
         let ip = $ip;
         // SAFETY: the caller's (see `Ip`)
         let slot = unsafe { ip.get() };
         match $split && $crate::dispatch::odd(slot) {
-            true => become $table.odd(slot)($ctx, $code, ip, $fuel, $interp, $table, slot),
-            false => become $table.of(slot)($ctx, $code, ip, $fuel, $interp, $table, slot),
+            true => become $table.odd(slot)($ctx, $code, ip, $interp, $table, $crate::dispatch::SPARE, slot),
+            false => become $table.of(slot)($ctx, $code, ip, $interp, $table, $crate::dispatch::SPARE, slot),
         }
     }};
 }
@@ -69,11 +70,11 @@ macro_rules! become_at {
 /// Continues at the slot after `$ip`, in the same block, as `become_at!` does. `$ip` must lie below `len`, as the
 /// ip of every handler but the guard's does, and must not end its block.
 macro_rules! become_next {
-    ($ctx:expr, $code:expr, $ip:expr, $fuel:expr, $interp:expr, $table:expr) => {
-        become_next!($ctx, $code, $ip, $fuel, $interp, $table, false)
+    ($ctx:expr, $code:expr, $ip:expr, $interp:expr, $table:expr) => {
+        become_next!($ctx, $code, $ip, $interp, $table, false)
     };
-    ($ctx:expr, $code:expr, $ip:expr, $fuel:expr, $interp:expr, $table:expr, $split:expr) => {
-        become_at!($ctx, $code, $ip.offset(1), $fuel, $interp, $table, $split)
+    ($ctx:expr, $code:expr, $ip:expr, $interp:expr, $table:expr, $split:expr) => {
+        become_at!($ctx, $code, $ip.offset(1), $interp, $table, $split)
     };
 }
 
@@ -81,43 +82,52 @@ macro_rules! become_next {
 /// fuel can't pay for the block. The handler's generic parameters must be `M`, `H` and `F`. `$ip` must lie in
 /// `0..=len`: the slot after one below `len`, or a target that [`transfer::bound`] proves.
 macro_rules! become_enter {
-    ($ctx:expr, $code:expr, $ip:expr, $fuel:expr, $interp:expr, $table:expr) => {{
+    ($ctx:expr, $code:expr, $ip:expr, $interp:expr, $table:expr) => {{
         let ip = $ip;
-        let left = F::enter($code, ip, $fuel);
-        if F::short(left) {
+        if !F::enter($interp, $code, ip) {
             core::hint::cold_path();
             let slot = $crate::slot::Slot::UNREAD;
-            become F::step::<M, H>($ctx, $code, ip, left, $interp, $table, slot)
+            become F::step::<M, H>($ctx, $code, ip, $interp, $table, $crate::dispatch::SPARE, slot)
         }
-        become_at!($ctx, $code, ip, left, $interp, $table, false)
+        become_at!($ctx, $code, ip, $interp, $table, false)
     }};
 }
 
-/// Continues at `$pc`, which no proof covers: enters its block there as `become_enter!` does, or stops with the
-/// reason [`fetch_checked`] gives. The handler's generic parameters are named as for `become_enter!`.
+/// Continues at `$pc`, which no proof covers: enters its block there as `become_enter!` does, or stops with
+/// [`Reason::BadPc`](crate::Reason::BadPc) if the code has no slot there. The handler's generic parameters are named
+/// as for `become_enter!`.
 macro_rules! become_at_pc {
-    ($ctx:expr, $code:expr, $pc:expr, $fuel:expr, $interp:expr, $table:expr) => {{
+    ($ctx:expr, $code:expr, $pc:expr, $interp:expr, $table:expr) => {{
         let pc = $pc;
-        match $crate::dispatch::fetch_checked::<M, H, F>($table, $code, pc, $fuel) {
-            Ok((next, slot, ip, fuel)) => become next($ctx, $code, ip, fuel, $interp, $table, slot),
-            Err(reason) => return $interp.stop.at_pc(pc, $fuel, reason),
+        match $crate::dispatch::fetch_checked::<M, H, F>($table, $code, pc, $interp) {
+            Some((next, slot, ip)) => become next($ctx, $code, ip, $interp, $table, $crate::dispatch::SPARE, slot),
+            None => return $interp.stop.at_pc(pc, $crate::Reason::BadPc),
         }
     }};
 }
 
 /// Runs the instruction `slot` at `ip` in `code` and continues with the next one, until a handler stops the run in
-/// `interp.stop`. `table` is the [`Table`] the run dispatches through. `fuel` is the counter of a metered run, which
-/// only the handlers that end a block and [`fuel`](crate::fuel) read.
+/// `interp.stop`. `table` is the [`Table`] the run dispatches through.
 ///
 /// The handler of opcode byte `OP` runs only slots in the layout of `OP` ([`slot::LAYOUTS`](crate::slot::LAYOUTS)),
 /// and reads their fields with [`Ip::view`]: from `slot` where one instruction extracts them, else from the code.
 ///
 /// `preserve_none` passes all arguments in registers (the Windows x64 C convention has four) and saves no registers, so
-/// a tail call between handlers is a jump. It passes them in R12, R13, R14, R15, RDI, RSI, RDX, RCX ... in order;
-/// `code` takes two, so `slot` comes eighth and lands in RCX: a single `movzx` reads its second byte from CH, and a
-/// shift by its `imm` takes the count from CL.
+/// a tail call between handlers is a jump. It passes them in R12, R13, R14, R15, RDI, RSI, RDX, RCX ... in order, and
+/// `code` takes two:
+/// - `interp` and `table` are in RDI and RSI, which a host function preserves, so a handler that calls one needn't
+///   save them;
+/// - the [`Spare`] is in RDX, which `div` and `mul` write: nothing is there to save around them;
+/// - `slot` comes eighth and lands in RCX: a single `movzx` reads its second byte from CH, and a shift by its `imm`
+///   takes the count from CL.
 pub type Handler<M, H> =
-    extern "rust-preserve-none" fn(&mut Context<M>, Slots, Ip, u64, &mut Interpreter<M, H>, &Table<M, H>, Slot);
+    extern "rust-preserve-none" fn(&mut Context<M>, Slots, Ip, &mut Interpreter<M, H>, &Table<M, H>, Spare, Slot);
+
+/// The argument of a [`Handler`] that carries nothing: it takes the register before that of `slot`. Every caller
+/// passes [`SPARE`], which costs no instruction, and no handler reads it.
+pub type Spare = MaybeUninit<u64>;
+
+pub const SPARE: Spare = Spare::uninit();
 
 /// The handler of every opcode byte, and the copy of them that split dispatch continues through.
 pub struct Table<M: Memory, H>(pub [Handler<M, H>; 256], pub [Handler<M, H>; 256]);
@@ -152,7 +162,7 @@ pub fn odd(slot: Slot) -> bool {
 pub struct Tables<M, H>(PhantomData<(M, H)>);
 
 impl<M: Memory, H: Host<M>> Tables<M, H> {
-    /// The table of a run without fuel.
+    /// The table of a run without a limit.
     pub const PLAIN: Table<M, H> = table::<M, H, Unmetered>();
 }
 
@@ -201,29 +211,23 @@ const fn by_class<M: Memory, H: Host<M>, F: Fuel, const OP: u8>() -> Handler<M, 
     }
 }
 
-/// The handler, slot and ip at `pc`, which no proof covers, and the fuel the handler receives as it enters the block
-/// there ([`Fuel::enter`]), or why it can't run.
+/// The handler, slot and ip at `pc`, which no proof covers, as the handler enters the block there ([`Fuel::enter`]).
+/// `None` if the code has no slot at `pc`.
 #[inline(always)]
 pub fn fetch_checked<M: Memory, H: Host<M>, F: Fuel>(
     table: &Table<M, H>,
     code: Slots,
     pc: u64,
-    fuel: u64,
-) -> Result<Checked<M, H>, Reason<M::Error>> {
-    let Some(slot) = code.get(pc) else {
-        // an instruction there would be charged first
-        return Err(match F::spent(fuel) {
-            true => Reason::OutOfFuel,
-            false => Reason::BadPc,
-        });
-    };
+    interp: &mut Interpreter<M, H>,
+) -> Option<Checked<M, H>> {
+    let slot = code.get(pc)?;
     let ip = Ip::at(code, pc);
-    let left = F::enter(code, ip, fuel);
+    let paid = F::enter(interp, code, ip);
     let next = table.of(slot);
     // a `cmov`, as a branch would take a jump on the common side
-    let next = core::hint::select_unpredictable(F::short(left), F::step::<M, H> as Handler<M, H>, next);
-    Ok((next, slot, ip, left))
+    let next = core::hint::select_unpredictable(paid, next, F::step::<M, H> as Handler<M, H>);
+    Some((next, slot, ip))
 }
 
-/// The handler, slot and ip at the pc [`fetch_checked`] checked, and the fuel the handler receives.
-pub type Checked<M, H> = (Handler<M, H>, Slot, Ip, u64);
+/// The handler, slot and ip at the pc [`fetch_checked`] checked.
+pub type Checked<M, H> = (Handler<M, H>, Slot, Ip);

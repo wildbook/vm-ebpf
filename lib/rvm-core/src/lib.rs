@@ -100,7 +100,7 @@
 //! # Unsafe code
 //!
 //! Each invariant that unsafe code relies on is stated where it is established: the register numbers of a slot in
-//! `slot`, where handlers continue in `transfer` (`Ip`), the `rest` behind the slots in `fuel`, the windows in
+//! `slot`, where handlers continue in `transfer` (`Ip`), the `rest` of each slot in `fuel`, the windows in
 //! [`Memory`] and `windows`, and the frames in `interp`.
 
 #![feature(explicit_tail_calls, rust_preserve_none_cc)]

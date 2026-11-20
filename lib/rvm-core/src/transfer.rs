@@ -7,7 +7,7 @@
 //! `callx` handler the pc [`Host::call_indirect`] names, and the caller of the run the targets of `gotox`.
 
 use crate::code::Slots;
-use crate::dispatch::{Handler, Table};
+use crate::dispatch::{Handler, Spare, Table};
 use crate::fuel::Fuel;
 use crate::fuse::Super;
 use crate::opcode::{call, Class, JmpOpc, OpCode, Source};
@@ -224,12 +224,12 @@ extern "rust-preserve-none" fn guard<M: Memory, H: Host<M>>(
     _ctx: &mut Context<M>,
     _code: Slots,
     ip: Ip,
-    fuel: u64,
     interp: &mut Interpreter<M, H>,
     _table: &Table<M, H>,
+    _: Spare,
     _slot: Slot,
 ) {
-    interp.stop.at(ip, fuel, Reason::BadPc)
+    interp.stop.at(ip, Reason::BadPc)
 }
 
 /// The handler of [`FAR`]: runs the instruction that `bound` moved behind the guard, and checks where it continues.
@@ -239,15 +239,15 @@ extern "rust-preserve-none" fn far<M: Memory, H: Host<M>, F: Fuel>(
     ctx: &mut Context<M>,
     code: Slots,
     ip: Ip,
-    fuel: u64,
     interp: &mut Interpreter<M, H>,
     table: &Table<M, H>,
+    _: Spare,
     far: Slot,
 ) {
-    let Some(pc) = run_moved(ctx, code, ip, fuel, interp, far) else {
+    let Some(pc) = run_moved(ctx, code, ip, interp, far) else {
         return;
     };
-    become_at_pc!(ctx, code, pc, fuel, interp, table)
+    become_at_pc!(ctx, code, pc, interp, table)
 }
 
 /// Runs the jump or local call that the [`FAR`] slot `far` at `ip` stands for, and returns the pc it continues at.
@@ -258,7 +258,6 @@ fn run_moved<M: Memory, H: Host<M>>(
     ctx: &mut Context<M>,
     code: Slots,
     ip: Ip,
-    fuel: u64,
     interp: &mut Interpreter<M, H>,
     far: Slot,
 ) -> Option<u64> {
@@ -281,7 +280,7 @@ fn run_moved<M: Memory, H: Host<M>>(
         Step::Jump(offset) => pc.wrapping_add_signed(offset),
         Step::Call(offset) => {
             if !interp.push(&mut ctx.regs, pc) {
-                interp.stop.at(ip, fuel, Reason::StackOverflow);
+                interp.stop.at(ip, Reason::StackOverflow);
                 return None;
             }
             pc.wrapping_add_signed(offset)
@@ -389,6 +388,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// One interpreter over several runs: each `run` starts with the limit whatever the last one left, also at a pc
+    /// outside the code, and `resume` continues with the fuel left.
+    #[cfg(feature = "fuel")]
+    #[test]
+    fn fuel_across_runs() {
+        let add = Instruction::new(OpCode::alu64(AluOpc::Add, Source::Imm), 0, 0, 0, 1);
+        let code = Code::new([add, add, add, EXIT]);
+        let mut memory = NoMem;
+        let mut interp = Interpreter::new(0, NoHost);
+        interp.set_limit(Some(2));
+
+        let mut run = |pc: u64| {
+            let mut ctx = Context::new(&mut memory);
+            let stop = interp.run(&mut ctx, &code, pc);
+            (stop.reason, stop.pc, interp.fuel(), ctx.regs[0])
+        };
+        assert_eq!(run(0), (Reason::OutOfFuel, 2, Some(0), 2));
+        assert_eq!(run(9), (Reason::BadPc, 9, Some(2), 0));
+        assert_eq!(run(2), (Reason::Exit, 3, Some(0), 1));
+        assert_eq!(run(1), (Reason::OutOfFuel, 3, Some(0), 2));
+
+        let mut resume = |fuel: u64, pc: u64| {
+            let mut ctx = Context::new(&mut memory);
+            interp.set_fuel(fuel);
+            let stop = interp.resume(&mut ctx, &code, pc);
+            (stop.reason, stop.pc, interp.fuel())
+        };
+        assert_eq!(resume(1, 3), (Reason::Exit, 3, Some(0)));
+        assert_eq!(resume(0, 9), (Reason::OutOfFuel, 9, Some(0)));
+        assert_eq!(resume(3, 1), (Reason::Exit, 3, Some(0)));
+        assert_eq!(resume(2, 1), (Reason::OutOfFuel, 3, Some(0)));
     }
 
     #[test]

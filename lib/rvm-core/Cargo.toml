@@ -10,5 +10,6 @@ workspace = true
 [features]
 default = ["fuel"]
 # `Interpreter::set_limit`: runs can be metered and stop with `Reason::OutOfFuel`. Runs without a limit cost the same
-# with and without the feature; it adds the metered handlers, their tables, and a `u64` per slot of every `Code`.
+# with and without the feature; it adds the metered handlers, their tables, and a `u64` per slot of each `Code` that
+# a metered run runs.
 fuel = []
