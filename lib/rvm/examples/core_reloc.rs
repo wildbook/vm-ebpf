@@ -42,8 +42,8 @@ fn run_against(layout: &[Field]) -> Result<(), Box<dyn Error>> {
     let size = layout.iter().map(|&(_, size, _)| size).sum();
     let mut fields = Vec::new();
     vm.with_types(|types| {
-        let u32_t = types.int("__u32", 4, false);
-        let u64_t = types.int("__u64", 8, false);
+        let u32_t = types.add_int("__u32", 4, false);
+        let u64_t = types.add_int("__u64", 8, false);
         let event = types.add_struct("event", size);
         let mut offset = 0;
         for &(name, size, value) in layout {

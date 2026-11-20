@@ -1,12 +1,13 @@
 //! Host functions callable from eBPF: typed registration and slot dispatch.
 
+use std::error::Error;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use hashbrown::HashMap;
 use rvm_core::Context;
 
-use crate::error::HelperError;
+use crate::error::HostError;
 #[cfg(feature = "maps")]
 use crate::maps::Maps;
 use crate::memory::{GuestMemory, VmMemory};
@@ -46,9 +47,9 @@ pub struct HelperContext<'a> {
 pub struct HostState {
     #[cfg(feature = "maps")]
     pub maps: Maps,
-    /// The instructions the caller has left. `None` until a host function asks for them by failing with
-    /// [`HelperError::FuelWanted`]: the executor then stops the caller, and calls the function again with the fuel
-    /// here, and the caller continues with what the function leaves.
+    /// The instructions the caller has left. `None` until a host function asks for them by stopping with
+    /// [`Stop::FuelWanted`]: the executor then stops the caller, and calls the function again with the fuel here, and
+    /// the caller continues with what the function leaves.
     pub fuel: Option<u64>,
 }
 
@@ -103,15 +104,15 @@ single_arg!(u64, u32, i64, i32);
 
 /// The value a host function puts in r0, or the error that fails the guest call.
 ///
-/// `Err` fails the call into the guest with [`HelperError`], via `E: Into<HelperError>`. A host function that wants the
-/// guest to see an error code returns it as an `i64`.
+/// `Err` fails the call into the guest with [`HostError::Failed`], which holds the error. A host function that wants
+/// the guest to see an error code returns it as an `i64`.
 pub trait IntoReturn {
-    fn into_return(self) -> Result<u64, HelperError>;
+    fn into_return(self) -> Result<u64, HostError>;
 }
 
 impl IntoReturn for () {
     #[inline]
-    fn into_return(self) -> Result<u64, HelperError> {
+    fn into_return(self) -> Result<u64, HostError> {
         Ok(0)
     }
 }
@@ -120,7 +121,7 @@ macro_rules! into_return {
     ($($ty:ty),*) => {$(
         impl IntoReturn for $ty {
             #[inline]
-            fn into_return(self) -> Result<u64, HelperError> {
+            fn into_return(self) -> Result<u64, HostError> {
                 Ok(self as u64)
             }
         }
@@ -129,22 +130,50 @@ macro_rules! into_return {
 
 into_return!(u64, u32, i64, i32, bool);
 
-impl<T: IntoReturn, E: Into<HelperError>> IntoReturn for Result<T, E> {
+impl<T: IntoReturn, E: Into<Box<dyn Error + Send + Sync>>> IntoReturn for Result<T, E> {
     #[inline]
-    fn into_return(self) -> Result<u64, HelperError> {
-        self.map_err(Into::into)?.into_return()
+    fn into_return(self) -> Result<u64, HostError> {
+        match self {
+            Ok(value) => value.into_return(),
+            Err(error) => Err(failed(error)),
+        }
+    }
+}
+
+// Host functions convert their errors on the failure path only; keep that code out of the call path.
+#[cold]
+#[inline(never)]
+fn failed(error: impl Into<Box<dyn Error + Send + Sync>>) -> HostError {
+    HostError::Failed(error.into())
+}
+
+/// Why a host function call stops the guest call that made it.
+pub enum Stop {
+    Failed(HostError),
+    /// The function asks for the caller's remaining instructions; the executor calls it again with them in
+    /// [`HostState::fuel`].
+    FuelWanted,
+    /// A call to a helper ID that isn't registered.
+    UnknownHelper(u32),
+    /// A call to an extern table slot that doesn't exist.
+    UnknownSlot(u32),
+}
+
+impl From<HostError> for Stop {
+    #[inline]
+    fn from(error: HostError) -> Self {
+        Self::Failed(error)
     }
 }
 
 /// How [`HostFn::call`] reaches a host function: with its closure, the caller's context, its [`HostState`] and the
-/// place for the error of a failed call. It returns the new r0, or `None` once it stored the error. Four arguments, so
-/// that every one of them arrives in a register, and an `Option<u64>`, which returns in two.
-type Trampoline =
-    unsafe fn(*const (), &mut Context<&mut VmMemory>, &mut HostState, &mut Option<HelperError>) -> Option<u64>;
+/// place for the reason of a stop. It returns the new r0, or `None` once it stored the reason. Four arguments, so that
+/// every one of them arrives in a register, and an `Option<u64>`, which returns in two.
+type Trampoline = unsafe fn(*const (), &mut Context<&mut VmMemory>, &mut HostState, &mut Option<Stop>) -> Option<u64>;
 
-/// A registered function, called directly through `call` with `data` as its closure.
+/// A host function, called directly through `call` with `data` as its closure.
 #[derive(Clone)]
-struct HostFn {
+pub struct HostFn {
     call: Trampoline,
     data: *const (),
     // keeps `data` alive; the call path never touches it
@@ -171,9 +200,10 @@ impl HostFn {
         }
     }
 
-    fn new<F>(func: F, arity: Option<u8>) -> Self
+    /// A function that reads its arguments from the registers itself and reaches the caller's memory, maps and fuel.
+    pub fn raw<F>(func: F) -> Self
     where
-        F: Fn(&mut HelperContext) -> Result<u64, HelperError> + Send + Sync + 'static,
+        F: Fn(&mut HelperContext) -> Result<u64, Stop> + Send + Sync + 'static,
     {
         /// # Safety
         ///
@@ -182,23 +212,24 @@ impl HostFn {
             data: *const (),
             ctx: &mut Context<&mut VmMemory>,
             host: &mut HostState,
-            error: &mut Option<HelperError>,
+            stop: &mut Option<Stop>,
         ) -> Option<u64>
         where
-            F: Fn(&mut HelperContext) -> Result<u64, HelperError>,
+            F: Fn(&mut HelperContext) -> Result<u64, Stop>,
         {
             let mut helper_ctx = HelperContext {
                 args: HelperArgs::from_regs(&ctx.regs),
                 memory: &mut *ctx.data,
                 host,
             };
-            finish(unsafe { (*data.cast::<F>())(&mut helper_ctx) }, error)
+            finish(unsafe { (*data.cast::<F>())(&mut helper_ctx) }, stop)
         }
 
-        Self::with_trampoline(func, trampoline::<F>, arity)
+        Self::with_trampoline(func, trampoline::<F>, None)
     }
 
-    fn typed<F, A, R>(func: F) -> Self
+    /// A function of the typed arguments.
+    pub fn typed<F, A, R>(func: F) -> Self
     where
         F: Fn(A) -> R + Send + Sync + 'static,
         A: FromArgs,
@@ -211,7 +242,7 @@ impl HostFn {
             data: *const (),
             ctx: &mut Context<&mut VmMemory>,
             _host: &mut HostState,
-            error: &mut Option<HelperError>,
+            stop: &mut Option<Stop>,
         ) -> Option<u64>
         where
             F: Fn(A) -> R,
@@ -219,13 +250,14 @@ impl HostFn {
             R: IntoReturn,
         {
             let args = A::from_args(&HelperArgs::from_regs(&ctx.regs));
-            finish(unsafe { (*data.cast::<F>())(args) }.into_return(), error)
+            finish(unsafe { (*data.cast::<F>())(args) }.into_return(), stop)
         }
 
         Self::with_trampoline(func, trampoline::<F, A, R>, Some(A::ARITY))
     }
 
-    fn with_memory<F, A, R>(func: F) -> Self
+    /// A function of the caller's memory and the typed arguments.
+    pub fn with_memory<F, A, R>(func: F) -> Self
     where
         F: Fn(&mut GuestMemory, A) -> R + Send + Sync + 'static,
         A: FromArgs,
@@ -238,7 +270,7 @@ impl HostFn {
             data: *const (),
             ctx: &mut Context<&mut VmMemory>,
             _host: &mut HostState,
-            error: &mut Option<HelperError>,
+            stop: &mut Option<Stop>,
         ) -> Option<u64>
         where
             F: Fn(&mut GuestMemory, A) -> R,
@@ -247,20 +279,20 @@ impl HostFn {
         {
             let args = A::from_args(&HelperArgs::from_regs(&ctx.regs));
             let result = unsafe { (*data.cast::<F>())(&mut GuestMemory::new(ctx.data), args) };
-            finish(result.into_return(), error)
+            finish(result.into_return(), stop)
         }
 
         Self::with_trampoline(func, trampoline::<F, A, R>, Some(A::ARITY))
     }
 }
 
-/// The r0 of a host function call that returned `result`, or `None` once the error is in `error`.
+/// The r0 of a host function call that returned `result`, or `None` once the reason it stops the caller is in `stop`.
 #[inline(always)]
-fn finish(result: Result<u64, HelperError>, error: &mut Option<HelperError>) -> Option<u64> {
+fn finish<E: Into<Stop>>(result: Result<u64, E>, stop: &mut Option<Stop>) -> Option<u64> {
     match result {
         Ok(r0) => Some(r0),
-        Err(err) => {
-            *error = Some(err);
+        Err(reason) => {
+            *stop = Some(reason.into());
             None
         }
     }
@@ -268,9 +300,9 @@ fn finish(result: Result<u64, HelperError>, error: &mut Option<HelperError>) -> 
 
 /// Extern table: host functions callable from eBPF, stored in dense slots.
 ///
-/// Functions are registered either by numeric helper ID (standard BPF helpers, `call <id>`) or by name (extern
-/// functions declared in the program). The linker rewrites every call into a slot call, so linked programs dispatch by
-/// index. Re-registering an ID or name replaces the function in its existing slot, which keeps linked call sites valid
+/// A function sits under a numeric helper ID (standard BPF helpers, `call <id>`) or under a name (extern functions
+/// declared in the program). The linker rewrites every call into a slot call, so linked programs dispatch by index.
+/// Putting a function under an ID or name that has one replaces it in its slot, which keeps linked call sites valid
 /// (hot reload).
 #[derive(Default, Clone)]
 pub struct HelperRegistry {
@@ -280,79 +312,31 @@ pub struct HelperRegistry {
 }
 
 impl HelperRegistry {
-    /// Register a helper function by ID, with typed arguments.
-    pub fn register_helper<F, A, R>(&mut self, id: u32, func: F)
-    where
-        F: Fn(A) -> R + Send + Sync + 'static,
-        A: FromArgs + 'static,
-        R: IntoReturn + 'static,
-    {
-        self.put_id(id, HostFn::typed(func));
-    }
-
-    /// Register a helper function by ID that reads its arguments and memory from the context.
-    pub fn register_helper_raw<F, R>(&mut self, id: u32, func: F)
-    where
-        F: Fn(&mut HelperContext) -> R + Send + Sync + 'static,
-        R: IntoReturn + 'static,
-    {
-        self.put_id(id, HostFn::new(move |ctx| func(ctx).into_return(), None));
-    }
-
-    /// Register an extern function by name, with typed arguments.
-    pub fn register_fn<F, A, R>(&mut self, name: impl Into<String>, func: F)
-    where
-        F: Fn(A) -> R + Send + Sync + 'static,
-        A: FromArgs + 'static,
-        R: IntoReturn + 'static,
-    {
-        self.put_name(name.into(), HostFn::typed(func));
-    }
-
-    /// Register an extern function by name that reads or writes the calling program's memory through [`GuestMemory`],
-    /// with typed arguments.
-    pub fn register_fn_with_memory<F, A, R>(&mut self, name: impl Into<String>, func: F)
-    where
-        F: Fn(&mut GuestMemory, A) -> R + Send + Sync + 'static,
-        A: FromArgs + 'static,
-        R: IntoReturn + 'static,
-    {
-        self.put_name(name.into(), HostFn::with_memory(func));
-    }
-
-    /// Register a raw extern function by name, called directly with the context.
-    pub fn register_fn_raw<F>(&mut self, name: impl Into<String>, func: F)
-    where
-        F: Fn(&mut HelperContext) -> Result<u64, HelperError> + Send + Sync + 'static,
-    {
-        self.put_name(name.into(), HostFn::new(func, None));
-    }
-
-    /// Replace the function registered under `id`, or append a new slot.
-    fn put_id(&mut self, id: u32, helper: HostFn) {
+    /// Put `func` under helper ID `id`: in the slot of the function the ID had, or in a new slot.
+    pub fn put_id(&mut self, id: u32, func: HostFn) {
         let found = self.slot_of_id(id);
-        let slot = self.put(found, helper);
+        let slot = self.put(found, func);
         if found.is_none() {
             self.by_id.push((id, slot));
         }
     }
 
-    /// Replace the function registered under `name`, or append a new slot.
-    fn put_name(&mut self, name: String, helper: HostFn) {
+    /// Put `func` under `name`: in the slot of the function the name had, or in a new slot.
+    pub fn put_name(&mut self, name: String, func: HostFn) {
         let slot = self.by_name.get(&name).copied();
-        let slot = self.put(slot, helper);
+        let slot = self.put(slot, func);
         self.by_name.insert(name, slot);
     }
 
     /// Replace the function in `slot`, or append a new slot.
-    fn put(&mut self, slot: Option<u32>, helper: HostFn) -> u32 {
+    fn put(&mut self, slot: Option<u32>, func: HostFn) -> u32 {
         match slot {
             Some(slot) => {
-                self.slots[slot as usize] = helper;
+                self.slots[slot as usize] = func;
                 slot
             }
             None => {
-                self.slots.push(helper);
+                self.slots.push(func);
                 (self.slots.len() - 1) as u32
             }
         }
@@ -374,22 +358,22 @@ impl HelperRegistry {
         self.by_name.get(name).copied()
     }
 
-    /// Call the function in `slot` with the caller's context and host state: the new r0, or `None` once the error is in
-    /// `error`.
+    /// Call the function in `slot` with the caller's context and host state: the new r0, or `None` once the reason it
+    /// stops the caller is in `stop`.
     #[inline]
     pub fn call_slot(
         &self,
         slot: u32,
         ctx: &mut Context<&mut VmMemory>,
         host: &mut HostState,
-        error: &mut Option<HelperError>,
+        stop: &mut Option<Stop>,
     ) -> Option<u64> {
-        let Some(helper) = self.slots.get(slot as usize) else {
-            *error = Some(HelperError::UnknownSlot(slot));
+        let Some(func) = self.slots.get(slot as usize) else {
+            *stop = Some(Stop::UnknownSlot(slot));
             return None;
         };
         // SAFETY: `HostFn::with_trampoline` paired `call` with a `data` pointer of the type it expects.
-        unsafe { (helper.call)(helper.data, ctx, host, error) }
+        unsafe { (func.call)(func.data, ctx, host, stop) }
     }
 }
 

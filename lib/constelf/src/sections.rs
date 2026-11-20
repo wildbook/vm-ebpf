@@ -18,14 +18,14 @@ pub struct ElfSections<'a> {
 impl<'a> ElfSections<'a> {
     pub(crate) const fn new(file: ElfFile<'a>) -> ElfResult<Self> {
         let ehdr = file.header();
-        ensure!(ElfError::Sections, ehdr.e_shentsize as usize == mem::size_of::<Elf64Shdr>());
+        ensure!(ElfError::BadSectionTable, ehdr.e_shentsize as usize == mem::size_of::<Elf64Shdr>());
 
         let len = ehdr.e_shentsize as usize * ehdr.e_shnum as usize;
         let Ok(bytes) = util::subslice(file.image(), ehdr.e_shoff as usize, len) else {
-            return Err(ElfError::Sections);
+            return Err(ElfError::BadSectionTable);
         };
         let Some(headers) = util::cast_slice(bytes) else {
-            return Err(ElfError::Sections);
+            return Err(ElfError::BadSectionTable);
         };
 
         Ok(Self { file, headers })

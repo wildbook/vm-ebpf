@@ -77,7 +77,7 @@ macro_rules! host_int {
     ($($ty:ty => $name:literal),* $(,)?) => {$(
         impl HostType for $ty {
             fn btf_type(types: &mut HostTypes) -> u32 {
-                types.int($name, size_of::<$ty>() as u32, <$ty>::MIN != 0)
+                types.add_int($name, size_of::<$ty>() as u32, <$ty>::MIN != 0)
             }
         }
     )*};
@@ -96,26 +96,26 @@ host_int!(
 
 impl HostType for bool {
     fn btf_type(types: &mut HostTypes) -> u32 {
-        types.int("_Bool", 1, false)
+        types.add_int("_Bool", 1, false)
     }
 }
 
 impl HostType for f32 {
     fn btf_type(types: &mut HostTypes) -> u32 {
-        types.float("float", 4)
+        types.add_float("float", 4)
     }
 }
 
 impl HostType for f64 {
     fn btf_type(types: &mut HostTypes) -> u32 {
-        types.float("double", 8)
+        types.add_float("double", 8)
     }
 }
 
 impl<T: HostType + 'static, const N: usize> HostType for [T; N] {
     fn btf_type(types: &mut HostTypes) -> u32 {
         let elem = types.add::<T>();
-        types.array(elem, N as u32)
+        types.add_array(elem, N as u32)
     }
 }
 
@@ -167,7 +167,7 @@ pub fn __host_field_type<S, T: HostType + 'static>(types: &mut HostTypes, _field
 
 #[cfg(test)]
 mod tests {
-    use btf::{Btf, BtfTypeInfo};
+    use btf::{Btf, BtfType};
 
     use super::*;
 
@@ -190,7 +190,7 @@ mod tests {
         let bytes = types.encode();
         let btf = Btf::parse(&bytes).unwrap();
 
-        let Some(BtfTypeInfo::Struct { name, size, members }) = btf.type_by_id(id) else {
+        let Some(BtfType::Struct { name, size, members }) = btf.type_by_id(id) else {
             panic!("not a struct");
         };
         assert_eq!((*name, *size), ("entity", 32));
@@ -198,11 +198,11 @@ mod tests {
         assert_eq!(fields, [("id", 0), ("position", 4), ("hp", 24), ("target", 28)]);
         // `u32` fields share one type
         assert_eq!(members[0].type_id, members[3].type_id);
-        let Some(BtfTypeInfo::Array { elem_type, nelems, .. }) = btf.type_by_id(members[1].type_id) else {
+        let Some(BtfType::Array { elem_type, nelems, .. }) = btf.type_by_id(members[1].type_id) else {
             panic!("position is not an array");
         };
         assert_eq!(*nelems, 2);
-        assert!(matches!(btf.type_by_id(*elem_type), Some(BtfTypeInfo::Int { size: 4, .. })));
+        assert!(matches!(btf.type_by_id(*elem_type), Some(BtfType::Int { size: 4, .. })));
         assert_eq!(btf.types().count(), 6); // void, entity, u32, int[2], int, short
     }
 }

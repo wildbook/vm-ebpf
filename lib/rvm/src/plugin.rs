@@ -15,12 +15,12 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Weak};
 
-use crate::error::{HelperError, Result, VmError};
+use crate::error::{HostError, Result, VmError};
 use crate::executor::MAX_ARGS;
-use crate::helper::HelperContext;
+use crate::helper::{HelperContext, Stop};
 use crate::layout::{BORROW_FIRST_REGION, BORROW_REGIONS};
 use crate::memory::{region_base, Perms, VmMemory};
-use crate::program::{Borrow, Func, FuncSlot, FunctionInfo, Program};
+use crate::program::{Borrow, Func, FuncSlot, FunctionInfo, LimitedCall, Program};
 use crate::sync::{TryLock, TryLockGuard};
 
 /// A linked program that other programs can call into.
@@ -28,10 +28,10 @@ use crate::sync::{TryLock, TryLockGuard};
 /// # Example
 ///
 /// ```ignore
-/// let math = vm.load_plugin("math", &math_elf)?;
+/// let math = Plugin::new("math", vm.load_elf(&math_elf)?);
 /// // programs linked from here on can declare `extern u64 scale(u64 x);` and call it
 /// vm.export(&math, "scale")?;
-/// let game = vm.load_plugin("game", &game_elf)?;
+/// let game = Plugin::new("game", vm.load_elf(&game_elf)?);
 ///
 /// let tick = game.func("on_tick")?;
 /// tick.call(&[1])?;
@@ -100,7 +100,7 @@ impl Plugin {
     pub(crate) fn export_fn(
         &self,
         func: &str,
-    ) -> Result<impl Fn(&mut HelperContext) -> std::result::Result<u64, HelperError> + Send + Sync + 'static> {
+    ) -> Result<impl Fn(&mut HelperContext) -> std::result::Result<u64, Stop> + Send + Sync + 'static> {
         let slot = ExportSlot::find(&*self.lock()?, func).ok_or_else(|| not_found(&self.name, func))?;
         let program = Arc::downgrade(&self.program);
         let name = self.name.clone();
@@ -115,20 +115,22 @@ fn call_export(
     name: &Arc<str>,
     slot: &ExportSlot,
     ctx: &mut HelperContext,
-) -> std::result::Result<u64, HelperError> {
+) -> std::result::Result<u64, Stop> {
     // The caller's remaining instructions bound the callee and pay for what it runs. Asking for them stops the caller,
     // which only a call into another plugin pays for. Without metering there is nothing to ask for.
     let mut unmetered = 0;
     let fuel = match ctx.host.fuel.as_mut() {
         _ if !rvm_core::METERED => &mut unmetered,
         Some(fuel) => fuel,
-        None => return Err(HelperError::FuelWanted),
+        None => return Err(Stop::FuelWanted),
     };
 
-    let failed = |error: VmError| HelperError::Plugin {
-        plugin: name.to_string(),
-        func: slot.func.name().to_string(),
-        error: Box::new(error),
+    let failed = |error: VmError| {
+        Stop::Failed(HostError::Plugin {
+            plugin: name.to_string(),
+            func: slot.func.name().to_string(),
+            error: Box::new(error),
+        })
     };
     let program = program
         .upgrade()
@@ -297,14 +299,14 @@ impl PluginFunc {
     }
 
     /// [`call`](Self::call) with [`Program::call_func_with_limit`].
-    pub fn call_with_limit(&self, args: &[u64], limit: u64) -> (Result<u64>, u64) {
+    pub fn call_with_limit(&self, args: &[u64], limit: u64) -> LimitedCall {
         let mut program = match self.plugin.lock() {
             Ok(program) => program,
-            Err(error) => return (Err(error), 0),
+            Err(error) => return LimitedCall::failed(error),
         };
         match self.func.get(&program, |_| ()) {
             Some(func) => program.call_func_with_limit(func, args, limit),
-            None => (Err(not_found(&self.plugin.name, self.func.name())), 0),
+            None => LimitedCall::failed(not_found(&self.plugin.name, self.func.name())),
         }
     }
 }

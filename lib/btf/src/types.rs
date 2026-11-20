@@ -4,7 +4,7 @@ use crate::raw::BtfKind;
 
 /// A parsed BTF type. Fields named `type_id` and `*_type` hold the ID of another type in the same BTF.
 #[derive(Debug, Clone)]
-pub enum BtfTypeInfo<'a> {
+pub enum BtfType<'a> {
     /// Type ID 0, which no record encodes.
     Void,
 
@@ -116,7 +116,7 @@ pub enum BtfTypeInfo<'a> {
     },
 }
 
-impl<'a> BtfTypeInfo<'a> {
+impl<'a> BtfType<'a> {
     pub fn kind(&self) -> BtfKind {
         match self {
             Self::Void => BtfKind::Void,

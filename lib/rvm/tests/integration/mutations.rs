@@ -41,7 +41,7 @@ fn mutated_images_load_or_fail() {
     let vm = limited_vm();
     let images: Vec<(String, Vec<u8>)> = fixtures()
         .into_iter()
-        .filter_map(|(name, elf)| Some((name, vm.prepare(&elf).ok()?.to_bytes())))
+        .filter_map(|(name, elf)| Some((name, vm.prepare_elf(&elf).ok()?.to_bytes())))
         .collect();
     assert!(images.len() >= 15, "only {} fixtures prepare", images.len());
 
@@ -52,7 +52,7 @@ fn mutated_images_load_or_fail() {
             if Image::from_bytes(bytes).is_err() {
                 return Outcome::Rejected;
             }
-            outcome(vm.load_image(bytes))
+            outcome(vm.load_image_bytes(bytes))
         });
     }
     fuzz.finish();
@@ -71,7 +71,7 @@ fn mutated_elf_files_load_or_fail() {
             let Ok(image) = vm.prepare_modules(&[&module]) else {
                 return Outcome::Rejected;
             };
-            outcome(vm.load_image(&image.to_bytes()))
+            outcome(vm.load_image_bytes(&image.to_bytes()))
         });
     }
     fuzz.finish();

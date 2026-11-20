@@ -80,22 +80,23 @@ impl<'a> ElfRelocSection<'a> {
         self.source.sh_info as usize
     }
 
-    pub const fn relocs(self) -> ElfResult<ElfRelocsChunk<'a>> {
+    /// The entries of the section.
+    pub const fn relocs(self) -> ElfResult<ElfRelocs<'a>> {
         let bytes = tryres!(self.sects.bytes(self.source));
 
-        let chunk = match self.source.sh_type {
+        let relocs = match self.source.sh_type {
             sht::REL => match cast_slice(bytes) {
-                Some(rel) => ElfRelocsChunk::Rel(rel),
+                Some(rel) => ElfRelocs::Rel(rel),
                 None => return Err(ElfError::InvalidData),
             },
             sht::RELA => match cast_slice(bytes) {
-                Some(rela) => ElfRelocsChunk::Rela(rela),
+                Some(rela) => ElfRelocs::Rela(rela),
                 None => return Err(ElfError::InvalidData),
             },
             _ => unreachable!(), // `into_next` yields only these two types
         };
 
-        Ok(chunk)
+        Ok(relocs)
     }
 }
 
@@ -110,7 +111,7 @@ impl std::fmt::Debug for ElfRelocSection<'_> {
 
 /// The entries of one relocation section.
 #[derive(Copy, Clone, Debug)]
-pub enum ElfRelocsChunk<'a> {
+pub enum ElfRelocs<'a> {
     Rel(&'a [Elf64Rel]),
     Rela(&'a [Elf64Rela]),
 }

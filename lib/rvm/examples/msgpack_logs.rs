@@ -383,7 +383,7 @@ mod tests {
     #[test]
     fn map_values_match_the_plugin() {
         let module = Module::from_elf(PARSER).unwrap();
-        let btf = Btf::parse(module.btf_data.as_deref().unwrap()).unwrap();
+        let btf = Btf::parse(module.btf().unwrap()).unwrap();
 
         let svc_stats = vec![
             ("name", offset_of!(SvcStats, name)),

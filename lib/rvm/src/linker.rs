@@ -9,7 +9,7 @@
 //! and loads and stores reject. Data sections go into guest memory regions; see [`crate::layout`] for the complete
 //! table.
 
-use btf::{apply_core_relocations, Btf, BtfBuilder, BtfTypeInfo, BTF_FUNC_EXTERN};
+use btf::{apply_core_relocations, Btf, BtfBuilder, BtfType, BTF_FUNC_EXTERN};
 use constelf::raw::reloc;
 use hashbrown::HashMap;
 
@@ -248,7 +248,7 @@ fn lay_out_jump_tables(
 fn check_extern_signatures(helpers: &HelperRegistry, btfs: &[Option<Btf<'_>>]) -> Result<()> {
     for btf in btfs.iter().flatten() {
         for (_, ty) in btf.types() {
-            let BtfTypeInfo::Func {
+            let BtfType::Func {
                 name,
                 proto_type,
                 linkage: BTF_FUNC_EXTERN,
@@ -259,7 +259,7 @@ fn check_extern_signatures(helpers: &HelperRegistry, btfs: &[Option<Btf<'_>>]) -
             let Some(host) = helpers.slot_of_name(name).and_then(|slot| helpers.arity(slot)) else {
                 continue;
             };
-            let Some(BtfTypeInfo::FuncProto { params, .. }) = btf.type_by_id(*proto_type) else {
+            let Some(BtfType::FuncProto { params, .. }) = btf.type_by_id(*proto_type) else {
                 continue;
             };
             // a trailing unnamed void parameter marks a variadic prototype
@@ -493,7 +493,7 @@ fn function_borrows(btf: Option<&Btf<'_>>) -> Result<HashMap<String, Vec<Borrow>
         return Ok(borrows);
     };
     for (_, ty) in btf.types() {
-        let BtfTypeInfo::DeclTag {
+        let BtfType::DeclTag {
             name: tag,
             type_id,
             component_idx,
@@ -506,7 +506,7 @@ fn function_borrows(btf: Option<&Btf<'_>>) -> Result<HashMap<String, Vec<Borrow>
             Some(("borrow_ro", n)) => (false, n),
             _ => continue,
         };
-        let Some(BtfTypeInfo::Func { name, .. }) = btf.type_by_id(*type_id) else {
+        let Some(BtfType::Func { name, .. }) = btf.type_by_id(*type_id) else {
             continue;
         };
         let borrow = u8::try_from(*component_idx)

@@ -32,7 +32,7 @@ mod shared;
 
 use hash::HashIndex;
 pub use helpers::register_helpers;
-pub use shared::{SharedMap, SharedMaps};
+pub use shared::{SharedMap, SharedMaps, ValueSpacing};
 
 /// `map_update_elem` flag: insert the key or replace its value.
 pub const BPF_ANY: u64 = 0;

@@ -33,13 +33,13 @@ pub struct SharedMap {
 
 impl SharedMaps {
     /// Make maps called `name` shared by every program linked afterwards.
-    pub fn declare(&self, name: &str, pad_values: bool) {
+    pub fn declare(&self, name: &str, spacing: ValueSpacing) {
         let mut state = lock(&self.state);
         match state.declared.iter_mut().find(|d| d.name == name) {
-            Some(d) => d.pad_values = pad_values,
+            Some(d) => d.spacing = spacing,
             None => state.declared.push(Declared {
                 name: name.to_string(),
-                pad_values,
+                spacing,
             }),
         }
     }
@@ -56,7 +56,7 @@ impl SharedMaps {
             }
             return Ok(Some(map.clone()));
         }
-        let Some(&Declared { pad_values, .. }) = state.declared.iter().find(|d| d.name == def.name) else {
+        let Some(&Declared { spacing, .. }) = state.declared.iter().find(|d| d.name == def.name) else {
             return Ok(None);
         };
 
@@ -64,7 +64,11 @@ impl SharedMaps {
         if region >= MAX_REGIONS {
             return Err(LinkError::InvalidMap(format!("too many shared maps for {}", def.name)).into());
         }
-        let stride = u64::from(def.value_size).next_multiple_of(if pad_values { CACHE_LINE } else { VALUE_ALIGN });
+        let align = match spacing {
+            ValueSpacing::Packed => VALUE_ALIGN,
+            ValueSpacing::CacheLine => CACHE_LINE,
+        };
+        let stride = u64::from(def.value_size).next_multiple_of(align);
         let values = stride * u64::from(def.max_entries);
         budget.take(values)?;
         let storage = Arc::new(SharedBuffer::new(values as usize)?);
@@ -89,6 +93,15 @@ impl SharedMaps {
 #[derive(Debug)]
 struct Declared {
     name: String,
-    // pad values to a cache line
-    pad_values: bool,
+    spacing: ValueSpacing,
+}
+
+/// How a shared map spaces its values in guest memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueSpacing {
+    /// Values follow each other, each aligned to 8 bytes.
+    Packed,
+    /// Each value starts on its own cache line, so atomics on neighbouring values from different threads don't
+    /// contend.
+    CacheLine,
 }

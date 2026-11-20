@@ -8,7 +8,7 @@ use hashbrown::HashMap;
 
 use crate::parse::{Btf, BtfError};
 use crate::raw::{BtfKind, TypeHeader, BTF_HEADER_LEN, BTF_INT_SIGNED, BTF_MAGIC, BTF_VERSION};
-use crate::types::{BtfTypeInfo, Member};
+use crate::types::{BtfType, Member};
 
 /// Builds standard BTF describing the host's types.
 ///
@@ -38,7 +38,7 @@ impl BtfBuilder {
     }
 
     /// Add an integer type (`unsigned long`, `int`, `_Bool`, ...).
-    pub fn int(&mut self, name: &str, size: u32, signed: bool) -> u32 {
+    pub fn add_int(&mut self, name: &str, size: u32, signed: bool) -> u32 {
         let name = self.string(name);
         let encoding = if signed { BTF_INT_SIGNED } else { 0 };
         let bits = (size * 8) as u8;
@@ -52,12 +52,12 @@ impl BtfBuilder {
     }
 
     /// Add a pointer to `target`.
-    pub fn ptr(&mut self, target: u32) -> u32 {
+    pub fn add_ptr(&mut self, target: u32) -> u32 {
         self.push(TypeEntry::Ptr { pointee: target })
     }
 
     /// Add an array of `nelems` elements of `elem`.
-    pub fn array(&mut self, elem: u32, nelems: u32) -> u32 {
+    pub fn add_array(&mut self, elem: u32, nelems: u32) -> u32 {
         self.push(TypeEntry::Array { elem, index: 0, nelems })
     }
 
@@ -145,19 +145,19 @@ impl BtfBuilder {
     }
 
     /// Add a typedef naming `target`.
-    pub fn typedef(&mut self, name: &str, target: u32) -> u32 {
+    pub fn add_typedef(&mut self, name: &str, target: u32) -> u32 {
         let name = self.string(name);
         self.push(TypeEntry::Typedef { name, target })
     }
 
     /// Add a floating-point type.
-    pub fn float(&mut self, name: &str, size: u32) -> u32 {
+    pub fn add_float(&mut self, name: &str, size: u32) -> u32 {
         let name = self.string(name);
         self.push(TypeEntry::Float { name, size })
     }
 
     /// Add a forward declaration of a struct (`is_union = false`) or union.
-    pub fn fwd(&mut self, name: &str, is_union: bool) -> u32 {
+    pub fn add_fwd(&mut self, name: &str, is_union: bool) -> u32 {
         let name = self.string(name);
         self.push(TypeEntry::Fwd { name, is_union })
     }
@@ -176,11 +176,11 @@ impl BtfBuilder {
         Ok(())
     }
 
-    fn convert(&mut self, ty: &BtfTypeInfo<'_>, id_base: u32) -> TypeEntry {
+    fn convert(&mut self, ty: &BtfType<'_>, id_base: u32) -> TypeEntry {
         let remap = |id| remap_id(id, id_base);
         match ty {
-            BtfTypeInfo::Void => unreachable!("void is type 0, not a stored entry"),
-            &BtfTypeInfo::Int {
+            BtfType::Void => unreachable!("void is type 0, not a stored entry"),
+            &BtfType::Int {
                 name,
                 size,
                 encoding,
@@ -193,10 +193,10 @@ impl BtfBuilder {
                 offset,
                 bits,
             },
-            &BtfTypeInfo::Ptr { pointee_type } => TypeEntry::Ptr {
+            &BtfType::Ptr { pointee_type } => TypeEntry::Ptr {
                 pointee: remap(pointee_type),
             },
-            &BtfTypeInfo::Array {
+            &BtfType::Array {
                 elem_type,
                 index_type,
                 nelems,
@@ -205,17 +205,17 @@ impl BtfBuilder {
                 index: remap(index_type),
                 nelems,
             },
-            BtfTypeInfo::Struct { name, size, members } => TypeEntry::Struct {
+            BtfType::Struct { name, size, members } => TypeEntry::Struct {
                 name: self.string(name),
                 size: *size,
                 members: self.convert_members(members, id_base),
             },
-            BtfTypeInfo::Union { name, size, members } => TypeEntry::Union {
+            BtfType::Union { name, size, members } => TypeEntry::Union {
                 name: self.string(name),
                 size: *size,
                 members: self.convert_members(members, id_base),
             },
-            BtfTypeInfo::Enum {
+            BtfType::Enum {
                 name,
                 size,
                 is_signed,
@@ -227,18 +227,18 @@ impl BtfBuilder {
                 is_signed: *is_signed,
                 variants: variants.iter().map(|v| (self.string(v.name), v.value)).collect(),
             },
-            &BtfTypeInfo::Fwd { name, is_union } => TypeEntry::Fwd {
+            &BtfType::Fwd { name, is_union } => TypeEntry::Fwd {
                 name: self.string(name),
                 is_union,
             },
-            &BtfTypeInfo::Typedef { name, type_id } => TypeEntry::Typedef {
+            &BtfType::Typedef { name, type_id } => TypeEntry::Typedef {
                 name: self.string(name),
                 target: remap(type_id),
             },
-            &BtfTypeInfo::Volatile { type_id } => TypeEntry::Volatile { target: remap(type_id) },
-            &BtfTypeInfo::Const { type_id } => TypeEntry::Const { target: remap(type_id) },
-            &BtfTypeInfo::Restrict { type_id } => TypeEntry::Restrict { target: remap(type_id) },
-            &BtfTypeInfo::Func {
+            &BtfType::Volatile { type_id } => TypeEntry::Volatile { target: remap(type_id) },
+            &BtfType::Const { type_id } => TypeEntry::Const { target: remap(type_id) },
+            &BtfType::Restrict { type_id } => TypeEntry::Restrict { target: remap(type_id) },
+            &BtfType::Func {
                 name,
                 proto_type,
                 linkage,
@@ -247,25 +247,25 @@ impl BtfBuilder {
                 proto: remap(proto_type),
                 linkage,
             },
-            BtfTypeInfo::FuncProto { return_type, params } => TypeEntry::FuncProto {
+            BtfType::FuncProto { return_type, params } => TypeEntry::FuncProto {
                 ret: remap(*return_type),
                 params: params.iter().map(|p| (self.string(p.name), remap(p.type_id))).collect(),
             },
-            &BtfTypeInfo::Var { name, type_id, linkage } => TypeEntry::Var {
+            &BtfType::Var { name, type_id, linkage } => TypeEntry::Var {
                 name: self.string(name),
                 target: remap(type_id),
                 linkage,
             },
-            BtfTypeInfo::DataSec { name, size, vars } => TypeEntry::DataSec {
+            BtfType::DataSec { name, size, vars } => TypeEntry::DataSec {
                 name: self.string(name),
                 size: *size,
                 vars: vars.iter().map(|v| (remap(v.type_id), v.offset, v.size)).collect(),
             },
-            &BtfTypeInfo::Float { name, size } => TypeEntry::Float {
+            &BtfType::Float { name, size } => TypeEntry::Float {
                 name: self.string(name),
                 size,
             },
-            &BtfTypeInfo::DeclTag {
+            &BtfType::DeclTag {
                 name,
                 type_id,
                 component_idx,
@@ -274,7 +274,7 @@ impl BtfBuilder {
                 target: remap(type_id),
                 component_idx,
             },
-            &BtfTypeInfo::TypeTag { name, type_id } => TypeEntry::TypeTag {
+            &BtfType::TypeTag { name, type_id } => TypeEntry::TypeTag {
                 name: self.string(name),
                 target: remap(type_id),
             },
@@ -356,7 +356,7 @@ struct MemberEntry {
     bitfield_size: u32,
 }
 
-/// One BTF type, pending encoding. Mirrors [`BtfTypeInfo`] but owns its data, so `member`/`enumerator` can keep
+/// One BTF type, pending encoding. Mirrors [`BtfType`] but owns its data, so `member`/`enumerator` can keep
 /// extending a struct or enum after it is created.
 enum TypeEntry {
     Int {

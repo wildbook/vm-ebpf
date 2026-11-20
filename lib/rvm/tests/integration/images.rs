@@ -58,7 +58,7 @@ fn images_run_like_elf() {
 
         let mut linked = vm.load_modules(&modules).unwrap();
         let image = vm.prepare_modules(&modules).unwrap().to_bytes();
-        let mut loaded = vm.load_image(&image).unwrap();
+        let mut loaded = vm.load_image_bytes(&image).unwrap();
 
         assert_eq!(functions(&linked), functions(&loaded), "{objects:?}");
         for (func, args) in calls {
@@ -69,32 +69,35 @@ fn images_run_like_elf() {
 }
 
 fn functions(program: &Program) -> Vec<(&str, &FunctionInfo)> {
-    let mut functions: Vec<_> = program.functions().collect();
-    functions.sort_by_key(|&(name, _)| name);
-    functions
+    program
+        .functions()
+        .iter()
+        .map(|(name, info)| (name.as_str(), info))
+        .collect()
 }
 
 /// Plugins loaded from images bind exports by name and hot reload from images.
 #[test]
 fn plugins_from_images() {
     let vm = Vm::new();
-    vm.register_fn("host_reenter", |x: u64| x);
-    let image = |name: &str| vm.prepare(&object(name)).unwrap().to_bytes();
+    vm.register_extern("host_reenter", |x: u64| x);
+    let image = |name: &str| vm.prepare_elf(&object(name)).unwrap().to_bytes();
 
-    let a = Plugin::new("a", vm.load_image(&image("tests/plugin_a.o")).unwrap());
+    let a = Plugin::new("a", vm.load_image_bytes(&image("tests/plugin_a.o")).unwrap());
     vm.export(&a, "a_scale").unwrap();
     let b_image = image("tests/plugin_b.o");
-    let b = Plugin::new("b", vm.load_image(&b_image).unwrap());
+    let b = Plugin::new("b", vm.load_image_bytes(&b_image).unwrap());
     assert_eq!(b.call("b_run", &[5]).unwrap(), 11);
 
-    a.replace(vm.load_image(&image("tests/plugin_a3.o")).unwrap()).unwrap();
+    a.replace(vm.load_image_bytes(&image("tests/plugin_a3.o")).unwrap())
+        .unwrap();
     assert_eq!(b.call("b_run", &[5]).unwrap(), 16);
 
     // a VM without the export can't bind b's import
     let other = Vm::new();
-    other.register_fn("host_reenter", |x: u64| x);
+    other.register_extern("host_reenter", |x: u64| x);
     assert!(matches!(
-        other.load_image(&b_image).unwrap_err(),
+        other.load_image_bytes(&b_image).unwrap_err(),
         VmError::Link(LinkError::UnresolvedSymbol(name)) if name == "a_scale"
     ));
 }
@@ -102,25 +105,25 @@ fn plugins_from_images() {
 #[test]
 fn malformed_images_fail_to_load() {
     let vm = Vm::new();
-    let good = vm.prepare(&object("tests/maps.o")).unwrap();
+    let good = vm.prepare_elf(&object("tests/maps.o")).unwrap();
     let bytes = good.to_bytes();
-    let load = |image: &Image| vm.load_image(&image.to_bytes());
+    let load = |image: &Image| vm.load_image_bytes(&image.to_bytes());
     let is_invalid = |r: rvm::Result<rvm::Program>| matches!(r, Err(VmError::InvalidImage(_)));
 
     for len in 0..bytes.len() {
-        assert!(is_invalid(vm.load_image(&bytes[..len])), "truncated to {len} bytes");
+        assert!(is_invalid(vm.load_image_bytes(&bytes[..len])), "truncated to {len} bytes");
     }
 
     let mut other_magic = bytes.clone();
     other_magic[0] = b'X';
-    assert!(is_invalid(vm.load_image(&other_magic)));
+    assert!(is_invalid(vm.load_image_bytes(&other_magic)));
 
     // the version string follows the magic, the format version and its length
     let ours = env!("CARGO_PKG_VERSION");
     let mut other_version = bytes.clone();
     other_version[12] ^= 1;
     let theirs = std::str::from_utf8(&other_version[12..][..ours.len()]).unwrap();
-    let err = vm.load_image(&other_version).unwrap_err().to_string();
+    let err = vm.load_image_bytes(&other_version).unwrap_err().to_string();
     assert!(err.contains(&format!("rvm {theirs} ")) && err.contains(&format!("rvm {ours} ")), "{err}");
 
     let insns = (good.code.len() / 8) as u32;
@@ -164,8 +167,8 @@ fn malformed_images_fail_to_load() {
 #[test]
 fn oversized_images_fail_to_load() {
     let vm = Vm::new();
-    let good = vm.prepare(&object("tests/maps.o")).unwrap();
-    let over_limit = |vm: &Vm, image: &Image| match vm.load_image(&image.to_bytes()) {
+    let good = vm.prepare_elf(&object("tests/maps.o")).unwrap();
+    let over_limit = |vm: &Vm, image: &Image| match vm.load_image_bytes(&image.to_bytes()) {
         Err(VmError::MemoryLimit(limit)) => limit,
         other => panic!("{other:?}"),
     };
@@ -195,5 +198,5 @@ fn oversized_images_fail_to_load() {
     image.maps = (0..3).map(|i| map(&format!("m{i}"), 1024, 400)).collect();
     assert_eq!(over_limit(&small, &image), 1 << 20);
     image.maps.pop();
-    small.load_image(&image.to_bytes()).unwrap();
+    small.load_image_bytes(&image.to_bytes()).unwrap();
 }

@@ -8,7 +8,7 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use rvm::{Perms, Vm, FIRST_FREE_REGION};
+use rvm::{Perms, Plugin, Vm, FIRST_FREE_REGION};
 
 fn object(name: &str) -> Vec<u8> {
     std::fs::read(format!("{}/../../bpf/prebuilt/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
@@ -18,7 +18,7 @@ fn object(name: &str) -> Vec<u8> {
 fn entry(c: &mut Criterion) {
     let vm = Vm::new();
     let mut program = vm.load_elf(&object("bench/workloads.o")).unwrap();
-    let plugin = vm.load_plugin("w", &object("bench/workloads.o")).unwrap();
+    let plugin = Plugin::new("w", vm.load_elf(&object("bench/workloads.o")).unwrap());
 
     let mut group = c.benchmark_group("entry");
     group.bench_function("program_call", |b| b.iter(|| program.call("noop", black_box(&[])).unwrap()));
@@ -29,16 +29,16 @@ fn entry(c: &mut Criterion) {
 /// One plugin calling another's export, plain and with two borrowed buffers.
 fn cross_plugin(c: &mut Criterion) {
     let vm = Vm::new();
-    vm.register_fn("host_reenter", |x: u64| x);
-    let a = vm.load_plugin("a", &object("tests/plugin_a.o")).unwrap();
+    vm.register_extern("host_reenter", |x: u64| x);
+    let a = Plugin::new("a", vm.load_elf(&object("tests/plugin_a.o")).unwrap());
     vm.export(&a, "a_scale").unwrap();
-    let b = vm.load_plugin("b", &object("tests/plugin_b.o")).unwrap();
+    let b = Plugin::new("b", vm.load_elf(&object("tests/plugin_b.o")).unwrap());
 
-    let callee = vm.load_plugin("callee", &object("tests/borrow_callee.o")).unwrap();
+    let callee = Plugin::new("callee", vm.load_elf(&object("tests/borrow_callee.o")).unwrap());
     for func in ["sum", "fill", "poke"] {
         vm.export(&callee, func).unwrap();
     }
-    let caller = vm.load_plugin("caller", &object("tests/borrow_caller.o")).unwrap();
+    let caller = Plugin::new("caller", vm.load_elf(&object("tests/borrow_caller.o")).unwrap());
 
     let mut group = c.benchmark_group("cross_plugin");
     group.bench_function("export_call", |bench| bench.iter(|| b.call("b_run", black_box(&[5])).unwrap()));

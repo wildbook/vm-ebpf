@@ -23,7 +23,7 @@ fn main() -> ExitCode {
 
 /// Loads the image and returns what `bpf_main` returns.
 fn run() -> rvm::Result<u64> {
-    let mut program = Vm::new().load_image(IMAGE)?;
+    let mut program = Vm::new().load_image_bytes(IMAGE)?;
     let input = program.memory_mut().map(FIRST_FREE_REGION, 64, Perms::RW)?;
     program.call("bpf_main", &[input, input + 32])
 }

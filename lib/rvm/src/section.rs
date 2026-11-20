@@ -50,7 +50,9 @@ impl fmt::Debug for Section {
 
 impl fmt::Display for Section {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:20} {:8?} ({:6} bytes)", self.name, self.kind, self.size)
+        // the derived `Debug` of `SectionKind` ignores the width
+        let kind = format!("{:?}", self.kind);
+        write!(f, "{:20} {kind:9} ({:6} bytes)", self.name, self.size)
     }
 }
 

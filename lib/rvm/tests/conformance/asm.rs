@@ -28,13 +28,13 @@ pub fn assemble(source: &str) -> Result<Vec<u8>, String> {
     let mut label_by_slot: HashMap<usize, Label> = HashMap::new();
     for insn in &insns {
         if let Some(target) = label_operand(insn, &label_slot)? {
-            label_by_slot.entry(target).or_insert_with(|| asm.create_label());
+            label_by_slot.entry(target).or_insert_with(|| asm.label());
         }
     }
 
     for insn in &insns {
-        if let Some(label) = label_by_slot.get_mut(&insn.slot) {
-            asm.set_label(label).map_err(|e| e.to_string())?;
+        if let Some(&label) = label_by_slot.get(&insn.slot) {
+            asm.bind(label);
         }
         emit(&mut asm, insn, &label_slot, &label_by_slot)?;
     }
@@ -192,7 +192,7 @@ macro_rules! jmp_table {
             matches!(base, $( $name )|+)
         }
 
-        fn emit_jmp(asm: &mut Assembler, base: &str, is32: bool, dst: Register, src: Operand, label: &Label) {
+        fn emit_jmp(asm: &mut Assembler, base: &str, is32: bool, dst: Register, src: Operand, label: Label) {
             match (base, is32, src) {
                 $(
                     ($name, false, Operand::Reg(r)) => { asm.$m64(dst, r, label); }
@@ -262,11 +262,10 @@ fn emit(
 ) -> Result<(), String> {
     let ops = &insn.operands;
     // `label_operand` alone knows which operand holds the target.
-    let label = || -> Result<&Label, String> {
+    let label = || -> Result<Label, String> {
         let target = label_operand(insn, label_slot)?.ok_or_else(|| format!("{} takes no label", insn.mnemonic))?;
-        label_by_slot
-            .get(&target)
-            .ok_or_else(|| format!("no label created for slot {target}"))
+        let label = label_by_slot.get(&target).copied();
+        label.ok_or_else(|| format!("no label created for slot {target}"))
     };
 
     match insn.mnemonic.as_str() {

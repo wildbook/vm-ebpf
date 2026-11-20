@@ -7,7 +7,7 @@ use std::hash::BuildHasher;
 use std::sync::LazyLock;
 use std::time::Instant;
 
-use crate::helper::{HelperContext, HelperRegistry};
+use crate::helper::{HelperContext, HelperRegistry, HostFn};
 use crate::memory::GuestMemory;
 
 /// Declares the standard helpers: an ID constant for each, [`helper_name`] and, for tests, `STD_HELPERS`.
@@ -52,7 +52,8 @@ pub const EINVAL: i64 = 22;
 pub fn register_time(helpers: &mut HelperRegistry) {
     static START: LazyLock<Instant> = LazyLock::new(Instant::now);
     let start = *START;
-    helpers.register_helper(BPF_FUNC_KTIME_GET_NS, move |_: ()| start.elapsed().as_nanos() as u64);
+    let now = move |_: ()| start.elapsed().as_nanos() as u64;
+    helpers.put_id(BPF_FUNC_KTIME_GET_NS, HostFn::typed(now));
 }
 
 /// Register `get_prandom_u32`: a per-thread xorshift generator with a random seed. Not cryptographically secure, like
@@ -62,7 +63,7 @@ pub fn register_random(helpers: &mut HelperRegistry) {
         // foldhash seeds from address-space layout, so this needs no OS randomness
         static STATE: Cell<u64> = Cell::new(foldhash::fast::RandomState::default().hash_one(0u64) | 1);
     }
-    helpers.register_helper(BPF_FUNC_GET_PRANDOM_U32, |_: ()| {
+    let next = |_: ()| {
         STATE.with(|state| {
             let mut x = state.get();
             x ^= x << 13;
@@ -71,7 +72,8 @@ pub fn register_random(helpers: &mut HelperRegistry) {
             state.set(x);
             (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u32
         })
-    });
+    };
+    helpers.put_id(BPF_FUNC_GET_PRANDOM_U32, HostFn::typed(next));
 }
 
 /// Register `trace_printk`, passing each formatted line to `sink`.
@@ -80,15 +82,16 @@ pub fn register_random(helpers: &mut HelperRegistry) {
 /// arguments. Returns the formatted length, or -EINVAL if the format string isn't readable. The format string and `%s`
 /// arguments are read with the guest's permissions.
 pub fn register_print(helpers: &mut HelperRegistry, sink: impl Fn(&str) + Send + Sync + 'static) {
-    helpers.register_helper_raw(BPF_FUNC_TRACE_PRINTK, move |ctx: &mut HelperContext| -> i64 {
+    let print = move |ctx: &mut HelperContext| {
         let mem = GuestMemory::new(ctx.memory);
         let Ok(fmt) = mem.read_vec(ctx.args.r1, ctx.args.r2 as usize) else {
-            return -EINVAL;
+            return Ok(-EINVAL as u64);
         };
         let line = format(&mem, &fmt, [ctx.args.r3, ctx.args.r4, ctx.args.r5]);
         sink(line.trim_end_matches('\n'));
-        line.len() as i64
-    });
+        Ok(line.len() as u64)
+    };
+    helpers.put_id(BPF_FUNC_TRACE_PRINTK, HostFn::raw(print));
 }
 
 fn format(mem: &GuestMemory, fmt: &[u8], args: [u64; 3]) -> String {

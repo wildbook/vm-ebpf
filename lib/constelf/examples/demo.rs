@@ -1,7 +1,6 @@
 //! Prints the sections and relocations of `bpf/prebuilt/examples/example.o`.
 
-use constelf::file::ElfFile;
-use constelf::ElfResult;
+use constelf::{ElfFile, ElfResult};
 
 fn main() -> ElfResult {
     let elf = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/prebuilt/examples/example.o"));

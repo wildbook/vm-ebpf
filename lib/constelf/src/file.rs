@@ -1,6 +1,6 @@
 use std::mem;
 
-use crate::err::{ElfError, ErrHeader};
+use crate::err::ElfError;
 use crate::raw::Elf64Ehdr;
 use crate::relocs::ElfRelocSections;
 use crate::sections::ElfSections;
@@ -16,7 +16,7 @@ impl<'a> ElfFile<'a> {
     /// symbols and relocations are checked when they are read.
     pub const fn new(data: &'a [u8]) -> ElfResult<Self> {
         // `header` relies on this length check
-        ensure!(ElfError::Header(ErrHeader::Size), data.len() >= mem::size_of::<Elf64Ehdr>());
+        ensure!(ElfError::TooShort, data.len() >= mem::size_of::<Elf64Ehdr>());
 
         let file = ElfFile(data);
         tryres!(file.header().validate());

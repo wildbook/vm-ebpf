@@ -11,26 +11,26 @@ const N: i32 = 10_000;
 
 /// `asm` as the program's `main`; with `slot_calls`, its `call <id>` instructions bind to helper slots at load time,
 /// as linked calls do.
-fn load(vm: &Vm, asm: &mut Assembler, slot_calls: bool) -> Program {
+fn load(vm: &Vm, asm: &Assembler, slot_calls: bool) -> Program {
     let mut image = Image::from_code(asm.assemble().unwrap());
     if slot_calls {
         image.externs = image.helper_calls().map(|(at, id)| (at, Import::Helper(id))).collect();
     }
-    vm.load(image).unwrap()
+    vm.load_image(image).unwrap()
 }
 
 /// r0 += r1 * 3 ^ r1, N times: pure ALU + one conditional branch per iteration.
 fn alu_loop() -> Assembler {
     let mut asm = Assembler::new();
-    let top = asm.create_label();
+    let top = asm.label();
     asm.mov64_imm(R0, 0).mov64_imm(R1, 0);
-    asm.set_label(&top).unwrap();
+    asm.bind(top);
     asm.mov64(R2, R1)
         .mul64_imm(R2, 3)
         .xor64(R2, R1)
         .add64(R0, R2)
         .add64_imm(R1, 1);
-    asm.jlt_imm(R1, N, &top);
+    asm.jlt_imm(R1, N, top);
     asm.exit();
     asm
 }
@@ -38,11 +38,11 @@ fn alu_loop() -> Assembler {
 /// Store then load a stack slot each iteration: two memory accesses per iteration.
 fn mem_loop() -> Assembler {
     let mut asm = Assembler::new();
-    let top = asm.create_label();
+    let top = asm.label();
     asm.mov64_imm(R0, 0).mov64_imm(R1, 0);
-    asm.set_label(&top).unwrap();
+    asm.bind(top);
     asm.stxdw(R10, -8, R1).ldxdw(R2, R10, -8).add64(R0, R2).add64_imm(R1, 1);
-    asm.jlt_imm(R1, N, &top);
+    asm.jlt_imm(R1, N, top);
     asm.exit();
     asm
 }
@@ -50,11 +50,11 @@ fn mem_loop() -> Assembler {
 /// Call helper 1 (identity) each iteration; r6 is the callee-saved counter.
 fn helper_loop() -> Assembler {
     let mut asm = Assembler::new();
-    let top = asm.create_label();
+    let top = asm.label();
     asm.mov64_imm(R0, 0).mov64_imm(R6, 0);
-    asm.set_label(&top).unwrap();
+    asm.bind(top);
     asm.mov64(R1, R6).call(1).add64_imm(R6, 1);
-    asm.jlt_imm(R6, N, &top);
+    asm.jlt_imm(R6, N, top);
     asm.exit();
     asm
 }
@@ -66,10 +66,10 @@ fn bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("exec");
     group.throughput(Throughput::Elements(N as u64));
     let programs = [
-        ("alu_loop", load(&vm, &mut alu_loop(), false)),
-        ("mem_loop", load(&vm, &mut mem_loop(), false)),
-        ("helper_loop", load(&vm, &mut helper_loop(), false)),
-        ("slot_call_loop", load(&vm, &mut helper_loop(), true)),
+        ("alu_loop", load(&vm, &alu_loop(), false)),
+        ("mem_loop", load(&vm, &mem_loop(), false)),
+        ("helper_loop", load(&vm, &helper_loop(), false)),
+        ("slot_call_loop", load(&vm, &helper_loop(), true)),
     ];
     for (name, mut program) in programs {
         let main = program.func("main").unwrap();

@@ -6,12 +6,12 @@
 //! use ebpf_asm::{Assembler, R0};
 //!
 //! let mut asm = Assembler::new();
-//! let loop_start = asm.create_label();
+//! let loop_start = asm.label();
 //!
 //! asm.mov64_imm(R0, 10);
-//! asm.set_label(&loop_start).unwrap();
+//! asm.bind(loop_start);
 //! asm.sub64_imm(R0, 1);
-//! asm.jne_imm(R0, 0, &loop_start);
+//! asm.jne_imm(R0, 0, loop_start);
 //! asm.exit();
 //!
 //! let bytecode = asm.assemble().unwrap();
@@ -62,17 +62,17 @@ mod tests {
     #[test]
     fn v4_forms_disassemble_distinctly() {
         let mut asm = Assembler::new();
-        let far = asm.create_label();
+        let far = asm.label();
         asm.movsx832(R0, R1)
             .movsx1632(R0, R1)
             .movsx864(R0, R1)
             .movsx1664(R0, R1)
             .movsx3264(R0, R1);
         asm.bswap16(R0).bswap32(R0).bswap64(R0).le16(R0).be64(R0);
-        asm.ja32(&far);
+        asm.ja32(far);
         asm.gotox(R1).callx(R2);
-        asm.ldxdw(R0, R1, i16::MIN).jeq_imm(R0, i32::MIN, &far);
-        asm.set_label(&far).unwrap();
+        asm.ldxdw(R0, R1, i16::MIN).jeq_imm(R0, i32::MIN, far);
+        asm.bind(far);
         asm.exit();
 
         let text: Vec<String> = Decoder::new(&asm.assemble().unwrap())

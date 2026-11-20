@@ -22,7 +22,7 @@ use std::error::Error;
 use std::mem::{offset_of, size_of};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use rvm::{MemoryError, Perms, Plugin, Pod, Scalar, SharedRegion, Vm};
+use rvm::{MemoryError, Perms, Plugin, Pod, Scalar, SharedRegion, ValueSpacing, Vm};
 
 const RULES: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/prebuilt/examples/game_rules.o"));
 const RULES_V2: &[u8] =
@@ -64,8 +64,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     vm.with_types(|types| rvm::host_struct!(types, Entity as "entity" { id, hp, armor, kind, x, y, attack }));
     // SAFETY: plugins only run on this thread.
     unsafe {
-        vm.share_map("scores", false);
-        vm.share_map("waves", false);
+        vm.share_map("scores", ValueSpacing::Packed);
+        vm.share_map("waves", ValueSpacing::Packed);
     }
 
     let world = Arc::new(World::new(&vm)?);
@@ -74,12 +74,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         world.spawn(HERO, 0, 1 + 2 * i as i32, *stats);
     }
 
-    let rules = vm.load_plugin("rules", RULES)?;
+    let rules = Plugin::new("rules", vm.load_elf(RULES)?);
     vm.export(&rules, "record_kills")?;
     // A game would prepare the image when it installs the mod; this links the plugin against the host's externs and
     // entity layout.
-    let combat_image = vm.prepare(COMBAT)?.to_bytes();
-    let combat = Plugin::new("combat", vm.load_image(&combat_image)?);
+    let combat_image = vm.prepare_elf(COMBAT)?.to_bytes();
+    let combat = Plugin::new("combat", vm.load_image_bytes(&combat_image)?);
 
     run(&vm, &world, &rules, &combat)?;
     print_summary(&world, &rules)
@@ -87,7 +87,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn register_host_fns(vm: &Vm, world: &Arc<World>) {
     let w = world.clone();
-    vm.register_fn("spawn", move |(kind, x, y): (u64, u64, u64)| {
+    vm.register_extern("spawn", move |(kind, x, y): (u64, u64, u64)| {
         let stats = match kind as u32 {
             GOBLIN => Stats {
                 hp: 12,
@@ -110,10 +110,10 @@ fn register_host_fns(vm: &Vm, world: &Arc<World>) {
     });
 
     let w = world.clone();
-    vm.register_fn("damage", move |(id, amount): (u64, u64)| w.damage(id as u32, amount as i32));
+    vm.register_extern("damage", move |(id, amount): (u64, u64)| w.damage(id as u32, amount as i32));
 
     let w = world.clone();
-    vm.register_fn_with_memory("print", move |mem, (msg, len): (u64, u64)| {
+    vm.register_extern_with_memory("print", move |mem, (msg, len): (u64, u64)| {
         let line = mem.read_vec(msg, len as usize)?;
         println!("tick {:>2}  {}", w.tick(), String::from_utf8_lossy(&line));
         Ok::<_, MemoryError>(())
@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn map_values_match_the_plugin() {
         let module = Module::from_elf(RULES).unwrap();
-        let btf = Btf::parse(module.btf_data.as_deref().unwrap()).unwrap();
+        let btf = Btf::parse(module.btf().unwrap()).unwrap();
 
         let wave_state = vec![
             ("wave", offset_of!(WaveState, wave)),

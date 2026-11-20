@@ -8,7 +8,7 @@ fn main() {
 
     let bytes = std::fs::read(elf).unwrap_or_else(|e| panic!("reading {elf}: {e}"));
     let image = rvm::Vm::new()
-        .prepare(&bytes)
+        .prepare_elf(&bytes)
         .unwrap_or_else(|e| panic!("linking {elf}: {e}"));
 
     let out = Path::new(&std::env::var("OUT_DIR").unwrap()).join("bpf.rvmi");

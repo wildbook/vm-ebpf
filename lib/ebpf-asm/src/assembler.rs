@@ -4,19 +4,17 @@
 //! use ebpf_asm::{Assembler, R0};
 //!
 //! let mut asm = Assembler::new();
-//! let loop_start = asm.create_label();
+//! let loop_start = asm.label();
 //!
 //! asm.mov64_imm(R0, 10);
-//! asm.set_label(&loop_start).unwrap();
+//! asm.bind(loop_start);
 //! asm.sub64_imm(R0, 1);
-//! asm.jne_imm(R0, 0, &loop_start);
+//! asm.jne_imm(R0, 0, loop_start);
 //! asm.exit();
 //!
 //! let code = asm.assemble().unwrap();
 //! ```
 
-use std::collections::hash_map::Entry;
-use std::collections::HashMap;
 use std::fmt;
 
 use crate::instruction::{alu, atomic, class, jmp, mode, size, RawInstruction, SRC_IMM, SRC_REG};
@@ -26,14 +24,13 @@ use crate::register::Register;
 #[cfg(test)]
 use crate::register::{R0, R1};
 
-/// Assembler error type.
+/// Why [`Assembler::assemble`] failed. The fields are instruction indices, where `lddw` counts as one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AsmError {
-    /// Label was not defined (set_label never called).
-    UndefinedLabel(String),
-    /// Label was already defined.
-    DuplicateLabel(String),
-    /// Jump offset is out of range for i16.
+    /// Instruction `insn` jumps to a label that [`Assembler::bind`] never bound.
+    #[allow(missing_docs)]
+    UnboundLabel { insn: usize },
+    /// The jump from instruction `from` to instruction `to` doesn't fit the offset field of the instruction.
     #[allow(missing_docs)]
     OffsetOutOfRange { from: usize, to: usize },
 }
@@ -41,8 +38,7 @@ pub enum AsmError {
 impl fmt::Display for AsmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AsmError::UndefinedLabel(name) => write!(f, "undefined label: {name}"),
-            AsmError::DuplicateLabel(name) => write!(f, "duplicate label: {name}"),
+            AsmError::UnboundLabel { insn } => write!(f, "instruction {insn} jumps to a label that is not bound"),
             AsmError::OffsetOutOfRange { from, to } => {
                 write!(f, "jump offset out of range: {from} -> {to}")
             }
@@ -52,8 +48,8 @@ impl fmt::Display for AsmError {
 
 impl std::error::Error for AsmError {}
 
-/// A branch target, created with `Assembler::create_label` and bound with `Assembler::set_label`.
-#[derive(Debug, Clone)]
+/// A branch target of one [`Assembler`], created with [`Assembler::label`] and bound with [`Assembler::bind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Label {
     id: usize,
 }
@@ -91,12 +87,9 @@ type Case = (&'static str, fn(&mut Assembler) -> &mut Assembler, Mnemonic);
 
 /// Emits a jump through `emit` that targets the instruction after it.
 #[cfg(test)]
-fn jump_to_next(
-    asm: &mut Assembler,
-    emit: for<'a> fn(&'a mut Assembler, &Label) -> &'a mut Assembler,
-) -> &mut Assembler {
-    let next = asm.create_label();
-    emit(asm, &next).set_label(&next).unwrap()
+fn jump_to_next(asm: &mut Assembler, emit: fn(&mut Assembler, Label) -> &mut Assembler) -> &mut Assembler {
+    let next = asm.label();
+    emit(asm, next).bind(next)
 }
 
 /// Emits a register/immediate pair of ALU instruction methods for one opcode. `$off` is the ALU `offset` nibble eBPF
@@ -152,7 +145,7 @@ macro_rules! jmp_family {
     ($cases:ident, $class:ident; $( $name:ident, $name_imm:ident = $op:ident => $mnem:ident; )+) => {
         $(
             #[doc = concat!("`", stringify!($name), " dst, src, label`")]
-            pub fn $name(&mut self, dst: Register, src: Register, label: &Label) -> &mut Self {
+            pub fn $name(&mut self, dst: Register, src: Register, label: Label) -> &mut Self {
                 let opcode = class::$class | jmp::$op | SRC_REG;
                 self.emit(RawInstruction::from_parts(opcode, dst.number(), src.number(), 0, 0));
                 self.add_label_ref(label, LabelRefType::Jump);
@@ -160,7 +153,7 @@ macro_rules! jmp_family {
             }
 
             #[doc = concat!("`", stringify!($name_imm), " dst, imm, label`")]
-            pub fn $name_imm(&mut self, dst: Register, imm: i32, label: &Label) -> &mut Self {
+            pub fn $name_imm(&mut self, dst: Register, imm: i32, label: Label) -> &mut Self {
                 let opcode = class::$class | jmp::$op | SRC_IMM;
                 self.emit(RawInstruction::from_parts(opcode, dst.number(), 0, 0, imm));
                 self.add_label_ref(label, LabelRefType::Jump);
@@ -310,23 +303,18 @@ macro_rules! endian_family {
 }
 
 /// Builds eBPF bytecode one instruction per method call. The instruction methods return the assembler, so calls chain.
+#[derive(Default)]
 pub struct Assembler {
     instructions: Vec<AsmInsn>,
-    label_counter: usize,
-    /// Label ID to instruction index.
-    label_positions: HashMap<usize, usize>,
+    /// The instruction index each label is bound to, by label ID.
+    labels: Vec<Option<usize>>,
     label_refs: Vec<LabelRef>,
 }
 
 impl Assembler {
     /// An assembler with no instructions.
     pub fn new() -> Self {
-        Self {
-            instructions: Vec::new(),
-            label_counter: 0,
-            label_positions: HashMap::new(),
-            label_refs: Vec::new(),
-        }
+        Self::default()
     }
 
     /// Slot index (8-byte units) of each instruction entry, plus the total at the end.
@@ -341,23 +329,24 @@ impl Assembler {
         slots
     }
 
-    /// Create a new unbound label.
-    pub fn create_label(&mut self) -> Label {
-        let id = self.label_counter;
-        self.label_counter += 1;
-        Label { id }
+    /// A new label, not bound yet.
+    pub fn label(&mut self) -> Label {
+        self.labels.push(None);
+        Label {
+            id: self.labels.len() - 1,
+        }
     }
 
-    /// Bind a label to the next instruction added. Fails if the label, or a clone of it, is already bound.
-    pub fn set_label(&mut self, label: &Label) -> Result<&mut Self, AsmError> {
+    /// Bind `label` to the next instruction added.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `label` is already bound or comes from another assembler.
+    pub fn bind(&mut self, label: Label) -> &mut Self {
         let position = self.instructions.len();
-        match self.label_positions.entry(label.id) {
-            Entry::Occupied(_) => Err(AsmError::DuplicateLabel(format!("L{}", label.id))),
-            Entry::Vacant(slot) => {
-                slot.insert(position);
-                Ok(self)
-            }
-        }
+        let bound = self.labels[label.id].replace(position);
+        assert!(bound.is_none(), "label bound twice");
+        self
     }
 
     /// Add a single-slot instruction.
@@ -371,7 +360,7 @@ impl Assembler {
     }
 
     /// Reference `label` from the last emitted instruction.
-    fn add_label_ref(&mut self, label: &Label, ref_type: LabelRefType) {
+    fn add_label_ref(&mut self, label: Label, ref_type: LabelRefType) {
         self.label_refs.push(LabelRef {
             label_id: label.id,
             insn_index: self.instructions.len() - 1,
@@ -380,43 +369,34 @@ impl Assembler {
     }
 
     /// Resolve all label references and return the bytecode.
-    pub fn assemble(&mut self) -> Result<Vec<u8>, AsmError> {
-        // Labels and refs hold entry indices; jumps count 8-byte slots (LDDW takes two).
-        let slot_of = self.slot_prefix();
-
-        for label_ref in &self.label_refs {
-            let target_pos = self
-                .label_positions
-                .get(&label_ref.label_id)
-                .copied()
-                .ok_or_else(|| AsmError::UndefinedLabel(format!("L{}", label_ref.label_id)))?;
-
-            // eBPF jumps are relative to the next slot
-            let offset = (slot_of[target_pos] as i64) - (slot_of[label_ref.insn_index] as i64 + 1);
-            let out_of_range = AsmError::OffsetOutOfRange {
-                from: label_ref.insn_index,
-                to: target_pos,
-            };
-
-            let insn = &mut self.instructions[label_ref.insn_index];
-            let raw = insn.raw.value();
-            insn.raw = RawInstruction::new(match label_ref.ref_type {
-                LabelRefType::Jump => {
-                    let offset = i16::try_from(offset).map_err(|_| out_of_range)?;
-                    (raw & 0xFFFFFFFF_0000FFFF) | ((offset as u16 as u64) << 16)
-                }
-                LabelRefType::Imm32 => {
-                    let offset = i32::try_from(offset).map_err(|_| out_of_range)?;
-                    (raw & 0x00000000_FFFFFFFF) | ((offset as u32 as u64) << 32)
-                }
-            });
-        }
-
+    pub fn assemble(&self) -> Result<Vec<u8>, AsmError> {
         let mut code = Vec::with_capacity(self.instructions.len() * 8);
         for insn in &self.instructions {
             code.extend_from_slice(&insn.raw.to_le_bytes());
             if let Some(raw2) = insn.raw2 {
                 code.extend_from_slice(&raw2.to_le_bytes());
+            }
+        }
+
+        // Labels and refs hold entry indices; jumps count 8-byte slots (LDDW takes two).
+        let slot_of = self.slot_prefix();
+        for label_ref in &self.label_refs {
+            let from = label_ref.insn_index;
+            let to = self.labels[label_ref.label_id].ok_or(AsmError::UnboundLabel { insn: from })?;
+            // eBPF jumps are relative to the next slot
+            let offset = slot_of[to] as i64 - (slot_of[from] as i64 + 1);
+            let out_of_range = AsmError::OffsetOutOfRange { from, to };
+
+            let insn = &mut code[slot_of[from] * 8..][..8];
+            match label_ref.ref_type {
+                LabelRefType::Jump => {
+                    let offset = i16::try_from(offset).map_err(|_| out_of_range)?;
+                    insn[2..4].copy_from_slice(&offset.to_le_bytes());
+                }
+                LabelRefType::Imm32 => {
+                    let offset = i32::try_from(offset).map_err(|_| out_of_range)?;
+                    insn[4..8].copy_from_slice(&offset.to_le_bytes());
+                }
             }
         }
 
@@ -558,7 +538,7 @@ impl Assembler {
     );
 
     /// `ja label`: unconditional jump to a label.
-    pub fn ja(&mut self, label: &Label) -> &mut Self {
+    pub fn ja(&mut self, label: Label) -> &mut Self {
         let opcode = class::JMP64 | jmp::JA;
         self.emit(RawInstruction::from_parts(opcode, 0, 0, 0, 0));
         self.add_label_ref(label, LabelRefType::Jump);
@@ -574,7 +554,7 @@ impl Assembler {
 
     /// `ja32 label`: unconditional jump in the JMP32 class, whose offset sits in the 32-bit `imm` field instead of the
     /// 16-bit `offset` (RFC 9669 Section 4.3).
-    pub fn ja32(&mut self, label: &Label) -> &mut Self {
+    pub fn ja32(&mut self, label: Label) -> &mut Self {
         let opcode = class::JMP32 | jmp::JA;
         self.emit(RawInstruction::from_parts(opcode, 0, 0, 0, 0));
         self.add_label_ref(label, LabelRefType::Imm32);
@@ -589,7 +569,7 @@ impl Assembler {
     }
 
     /// `may_goto label`: jump to a label once the runtime's loop budget runs out (`JMP | JCOND`, `src_reg` 0).
-    pub fn may_goto(&mut self, label: &Label) -> &mut Self {
+    pub fn may_goto(&mut self, label: Label) -> &mut Self {
         let opcode = class::JMP64 | jmp::JCOND;
         self.emit(RawInstruction::from_parts(opcode, 0, 0, 0, 0));
         self.add_label_ref(label, LabelRefType::Jump);
@@ -632,7 +612,7 @@ impl Assembler {
     }
 
     /// `call label`: BPF-to-BPF call (`src_reg = 1`).
-    pub fn call_local(&mut self, label: &Label) -> &mut Self {
+    pub fn call_local(&mut self, label: Label) -> &mut Self {
         let opcode = class::JMP64 | jmp::CALL;
         self.emit(RawInstruction::from_parts(opcode, 0, 1, 0, 0));
         self.add_label_ref(label, LabelRefType::Imm32);
@@ -651,12 +631,6 @@ impl Assembler {
         let opcode = class::JMP64 | jmp::EXIT;
         self.emit(RawInstruction::from_parts(opcode, 0, 0, 0, 0));
         self
-    }
-}
-
-impl Default for Assembler {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -720,14 +694,14 @@ mod tests {
     #[test]
     fn jump_offsets_count_lddw_slots() {
         let mut asm = Assembler::new();
-        let fwd = asm.create_label();
-        let back = asm.create_label();
+        let fwd = asm.label();
+        let back = asm.label();
 
-        asm.set_label(&back).unwrap();
-        asm.ja(&fwd); // slot 0
+        asm.bind(back);
+        asm.ja(fwd); // slot 0
         asm.lddw(R0, 0x1_0000_0002); // slots 1-2
-        asm.ja(&back); // slot 3
-        asm.set_label(&fwd).unwrap();
+        asm.ja(back); // slot 3
+        asm.bind(fwd);
         asm.exit(); // slot 4
 
         let code = asm.assemble().unwrap();

@@ -4,9 +4,7 @@ use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 
 use ebpf_asm::{Assembler, R0, R1, R2};
-use rvm::{
-    region_base, ExecError, Image, Module, Perms, Program, Vm, VmError, DATA_REGION, FIRST_FREE_REGION, RODATA_REGION,
-};
+use rvm::{region_base, ExecError, Image, Perms, Program, Vm, VmError, DATA_REGION, FIRST_FREE_REGION, RODATA_REGION};
 
 use crate::common::object;
 
@@ -24,7 +22,7 @@ fn store_load() -> Program {
         data_len: 8,
         ..Image::from_code(asm.assemble().unwrap())
     };
-    Vm::new().load(image).unwrap()
+    Vm::new().load_image(image).unwrap()
 }
 
 fn is_mem_fault(r: rvm::Result<u64>) -> bool {
@@ -33,11 +31,7 @@ fn is_mem_fault(r: rvm::Result<u64>) -> bool {
 
 #[test]
 fn rodata_is_read_only_data_is_writable() {
-    let vm = Vm::new();
-    let module = Module::from_elf(&object("examples/example.o")).unwrap();
-    let magic = region_base(RODATA_REGION) + module.symbol("MAGIC_VALUE").unwrap().value;
-    let mut program = vm.load_modules(&[&module]).unwrap();
-    assert_eq!(program.memory().read::<u64>(magic).unwrap(), 0xDEAD_BEEF_CAFE_BABE);
+    let mut program = Vm::new().load_elf(&object("examples/example.o")).unwrap();
     assert_eq!(program.call("return_magic", &[]).unwrap(), 0xDEAD_BEEF_CAFE_BABE);
 
     let mut program = store_load();

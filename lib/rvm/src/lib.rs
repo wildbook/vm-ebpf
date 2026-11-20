@@ -16,7 +16,7 @@
 //!     x * 2
 //! });
 //! // A host function the program declares as `extern u64 host_add(u64 a, u64 b);`
-//! vm.register_fn("host_add", |(a, b): (u64, u64)| a + b);
+//! vm.register_extern("host_add", |(a, b): (u64, u64)| a + b);
 //!
 //! // Describe the host's types, as BTF, for CO-RE
 //! #[repr(C)]
@@ -31,18 +31,18 @@
 //! let result = program.call("main", &[])?;
 //!
 //! // Or link ahead of time, ship the image, and load it without the linker
-//! let image = vm.prepare(&elf_bytes)?.to_bytes();
-//! let mut program = vm.load_image(&image)?;
+//! let image = vm.prepare_elf(&elf_bytes)?.to_bytes();
+//! let mut program = vm.load_image_bytes(&image)?;
 //! ```
 //!
 //! ## Loading
 //!
 //! | From | To an [`Image`] | To a [`Program`] |
 //! |---|---|---|
-//! | one ELF file | `Vm::prepare` | `Vm::load_elf` |
+//! | one ELF file | `Vm::prepare_elf` | `Vm::load_elf` |
 //! | several `Module`s | `Vm::prepare_modules` | `Vm::load_modules` |
-//! | an [`Image`] | | [`Vm::load`] |
-//! | bytes from [`Image::to_bytes`] | [`Image::from_bytes`] | [`Vm::load_image`] |
+//! | an [`Image`] | | [`Vm::load_image`] |
+//! | bytes from [`Image::to_bytes`] | [`Image::from_bytes`] | [`Vm::load_image_bytes`] |
 //!
 //! The ELF and module rows need the `link` feature.
 //!
@@ -51,10 +51,10 @@
 //! - [`Vm`]: the entry point. Holds the host functions, the host types, and the maps and regions shared across the
 //!   programs it loads.
 //! - `Module`: a parsed eBPF ELF file, not yet linked.
-//! - [`Image`]: a linked program, before binding and allocation; serializable. [`Vm::load`] also takes one built
-//!   around raw bytecode.
+//! - [`Image`]: a linked program, before binding and allocation; serializable. [`Vm::load_image`] also takes one
+//!   built around raw bytecode.
 //! - [`Program`]: a loaded, executable program with its own memory, maps and function table.
-//! - [`Plugin`]: a loaded program that other programs can call into.
+//! - [`Plugin`]: a loaded program that other programs can call into; [`Plugin::new`] wraps one.
 //! - `HostTypes`: the host's types, as BTF, for CO-RE relocations; `host_struct!` fills it from Rust struct
 //!   definitions.
 //!
@@ -94,7 +94,7 @@ mod vm;
 
 #[cfg(feature = "link")]
 pub use btf::{BtfBuilder, BtfError, CoreReloError};
-pub use error::{ExecError, HelperError, LinkError, MemoryError, Result, VmError};
+pub use error::{ExecError, HostError, LinkError, MemoryError, Result, VmError};
 pub use executor::DEFAULT_FRAME_SIZE;
 pub use helper::{FromArgs, IntoReturn};
 #[cfg(feature = "link")]
@@ -109,22 +109,18 @@ pub use layout::{
 };
 pub use map_def::{MapDef, MapKind};
 #[cfg(feature = "maps")]
-pub use maps::{Entries, MapError, MapIter, MapKey, MapRef, BPF_ANY, BPF_EXIST, BPF_NOEXIST};
+pub use maps::{Entries, MapError, MapIter, MapKey, MapRef, ValueSpacing, BPF_ANY, BPF_EXIST, BPF_NOEXIST};
 pub use memory::{
     region_base, GuestMemory, Perms, Pod, Scalar, SharedRegion, VmMemory, MAX_REGIONS, MAX_REGION_LEN, REGION_SHIFT,
 };
 #[cfg(feature = "link")]
-pub use module::{Module, Relocation};
+pub use module::Module;
 pub use plugin::{Plugin, PluginFunc, WeakPlugin};
-pub use program::{Borrow, Func, FunctionInfo, Program, ProgramMemory};
+pub use program::{Borrow, Func, FunctionInfo, LimitedCall, Program, ProgramMemory};
 pub use rvm_core::{AtomicOp, MAX_CALL_DEPTH};
-#[cfg(feature = "link")]
-pub use section::{Section, SectionKind};
 pub use std_helpers::{
     BPF_FUNC_GET_PRANDOM_U32, BPF_FUNC_KTIME_GET_NS, BPF_FUNC_MAP_DELETE_ELEM, BPF_FUNC_MAP_LOOKUP_ELEM,
     BPF_FUNC_MAP_UPDATE_ELEM, BPF_FUNC_TRACE_PRINTK,
 };
-#[cfg(feature = "link")]
-pub use symbol::{Export, Symbol};
 pub use sync::TryLockGuard;
 pub use vm::{Vm, VmConfig, DEFAULT_INSTRUCTION_LIMIT, DEFAULT_MEMORY_LIMIT};

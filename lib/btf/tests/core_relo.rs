@@ -59,14 +59,14 @@ const CALL: u8 = 0x85; // BPF_JMP | BPF_CALL
 #[test]
 fn moved_field_offset() {
     let mut local = BtfBuilder::new();
-    let int_ty = local.int("int", 4, true);
+    let int_ty = local.add_int("int", 4, true);
     let event = local.add_struct("event", 8);
     local.member(event, "ts", 0, int_ty);
     local.member(event, "pid", 4, int_ty);
     let r = relo(&mut local, event, "0:1", CoreReloKind::FieldByteOffset);
 
     let mut target = BtfBuilder::new();
-    let t_int = target.int("int", 4, true);
+    let t_int = target.add_int("int", 4, true);
     // Host's "event" has an extra field between ts and pid, pushing pid from byte 4 to byte 8.
     let t_event = target.add_struct("event", 12);
     target.member(t_event, "ts", 0, t_int);
@@ -84,13 +84,13 @@ fn moved_field_offset() {
 #[test]
 fn nested_anonymous_member() {
     let mut local = BtfBuilder::new();
-    let int_ty = local.int("int", 4, true);
+    let int_ty = local.add_int("int", 4, true);
     let s = local.add_struct("anonish", 4);
     local.member(s, "val", 0, int_ty);
     let r = relo(&mut local, s, "0:0", CoreReloKind::FieldByteOffset);
 
     let mut target = BtfBuilder::new();
-    let t_int = target.int("int", 4, true);
+    let t_int = target.add_int("int", 4, true);
     // `val` lives inside an anonymous union starting at byte 4, alongside `padding`.
     let anon_union = target.add_union("", 4);
     target.member(anon_union, "padding", 0, t_int);
@@ -108,16 +108,16 @@ fn nested_anonymous_member() {
 #[test]
 fn array_element_offset() {
     let mut local = BtfBuilder::new();
-    let int_ty = local.int("int", 4, true);
-    let arr = local.array(int_ty, 4);
+    let int_ty = local.add_int("int", 4, true);
+    let arr = local.add_array(int_ty, 4);
     let s = local.add_struct("withArr", 20);
     local.member(s, "before", 0, int_ty);
     local.member(s, "items", 4, arr);
     let r = relo(&mut local, s, "0:1:2", CoreReloKind::FieldByteOffset);
 
     let mut target = BtfBuilder::new();
-    let t_int = target.int("int", 4, true);
-    let t_arr = target.array(t_int, 4);
+    let t_int = target.add_int("int", 4, true);
+    let t_arr = target.add_array(t_int, 4);
     // Host inserted a padding field before the array, moving it from byte 4 to byte 8.
     let t_with_arr = target.add_struct("withArr", 24);
     target.member(t_with_arr, "before", 0, t_int);
@@ -133,7 +133,7 @@ fn array_element_offset() {
 #[test]
 fn bitfield_signed_and_shifts() {
     let mut local = BtfBuilder::new();
-    let int_ty = local.int("int", 4, true);
+    let int_ty = local.add_int("int", 4, true);
     // `v` occupies bits [3, 8) of a 4-byte int: byte_sz=4, byte_off=0.
     let s = local.add_struct("flags", 4);
     local.bitfield_member(s, "v", 3, 5, int_ty);
@@ -142,7 +142,7 @@ fn bitfield_signed_and_shifts() {
     let r_lshift = relo(&mut local, s, "0:0", CoreReloKind::FieldLShiftU64);
 
     let mut target = BtfBuilder::new();
-    let t_int = target.int("int", 4, true);
+    let t_int = target.add_int("int", 4, true);
     // `v` occupies bits [20, 25) of a 4-byte int: byte_sz=4, byte_off=0.
     let t_flags = target.add_struct("flags", 4);
     target.bitfield_member(t_flags, "v", 20, 5, t_int);
@@ -170,8 +170,8 @@ fn bitfield_signed_and_shifts() {
 #[test]
 fn size_change_adjusts_or_poisons_memory_access() {
     let mut local = BtfBuilder::new();
-    let u32_ty = local.int("unsigned int", 4, false);
-    let i32_ty = local.int("int", 4, true);
+    let u32_ty = local.add_int("unsigned int", 4, false);
+    let i32_ty = local.add_int("int", 4, true);
     let safe = local.add_struct("safe", 4);
     local.member(safe, "count", 0, u32_ty);
     let unsafe_ = local.add_struct("unsafe", 4);
@@ -180,8 +180,8 @@ fn size_change_adjusts_or_poisons_memory_access() {
     let r_unsafe = relo(&mut local, unsafe_, "0:0", CoreReloKind::FieldByteOffset);
 
     let mut target = BtfBuilder::new();
-    let u64_ty = target.int("unsigned long", 8, false);
-    let i64_ty = target.int("long", 8, true);
+    let u64_ty = target.add_int("unsigned long", 8, false);
+    let i64_ty = target.add_int("long", 8, true);
     let t_safe = target.add_struct("safe", 8);
     target.member(t_safe, "count", 0, u64_ty);
     let t_unsafe = target.add_struct("unsafe", 8);
@@ -213,14 +213,14 @@ fn size_change_adjusts_or_poisons_memory_access() {
 #[test]
 fn bitfield_change_poisons_memory_access() {
     let mut local = BtfBuilder::new();
-    let u32_ty = local.int("unsigned int", 4, false);
+    let u32_ty = local.add_int("unsigned int", 4, false);
     let s = local.add_struct("opts", 8);
     local.member(s, "len", 0, u32_ty);
     local.member(s, "flags", 4, u32_ty);
     let r = relo(&mut local, s, "0:1", CoreReloKind::FieldByteOffset);
 
     let mut target = BtfBuilder::new();
-    let t_u32 = target.int("unsigned int", 4, false);
+    let t_u32 = target.add_int("unsigned int", 4, false);
     let t_s = target.add_struct("opts", 8);
     target.member(t_s, "len", 0, t_u32);
     target.bitfield_member(t_s, "flags", 32, 3, t_u32);
@@ -239,7 +239,7 @@ fn bitfield_change_poisons_memory_access() {
 #[test]
 fn long_access_string_is_too_deep() {
     let mut local = BtfBuilder::new();
-    let int_ty = local.int("int", 4, true);
+    let int_ty = local.add_int("int", 4, true);
     let s = local.add_struct("deep", 4);
     local.member(s, "v", 0, int_ty);
     let r = relo(&mut local, s, &format!("{}x", "0:".repeat(64)), CoreReloKind::FieldByteOffset);
@@ -255,13 +255,13 @@ fn long_access_string_is_too_deep() {
 #[test]
 fn flavor_suffix_matching() {
     let mut local = BtfBuilder::new();
-    let int_ty = local.int("int", 4, true);
+    let int_ty = local.add_int("int", 4, true);
     let cfg = local.add_struct("cfg", 4);
     local.member(cfg, "limit", 0, int_ty);
     let r = relo(&mut local, cfg, "0:0", CoreReloKind::FieldByteOffset);
 
     let mut target = BtfBuilder::new();
-    let t_int = target.int("int", 4, true);
+    let t_int = target.add_int("int", 4, true);
     let t_cfg = target.add_struct("cfg___v2", 8);
     target.member(t_cfg, "pad", 0, t_int);
     target.member(t_cfg, "limit", 4, t_int);
@@ -275,13 +275,13 @@ fn flavor_suffix_matching() {
 #[test]
 fn ambiguous_candidates_error() {
     let mut local = BtfBuilder::new();
-    let int_ty = local.int("int", 4, true);
+    let int_ty = local.add_int("int", 4, true);
     let cfg = local.add_struct("cfg", 4);
     local.member(cfg, "limit", 0, int_ty);
     let r = relo(&mut local, cfg, "0:0", CoreReloKind::FieldByteOffset);
 
     let mut target = BtfBuilder::new();
-    let t_int = target.int("int", 4, true);
+    let t_int = target.add_int("int", 4, true);
     let t_cfg = target.add_struct("cfg", 4);
     target.member(t_cfg, "limit", 0, t_int);
     let t_cfg_dup = target.add_struct("cfg___dup", 8);
@@ -318,14 +318,14 @@ fn enum_value_relocation() {
 #[test]
 fn type_id_target_relocation() {
     let mut local = BtfBuilder::new();
-    let int_ty = local.int("int", 4, true);
+    let int_ty = local.add_int("int", 4, true);
     let cfg = local.add_struct("cfg", 4);
     local.member(cfg, "limit", 0, int_ty);
     let r = relo(&mut local, cfg, "0", CoreReloKind::TypeIdTarget);
 
     let mut target = BtfBuilder::new();
-    let t_int = target.int("int", 4, true);
-    let _padding = target.int("padding filler", 1, false);
+    let t_int = target.add_int("int", 4, true);
+    let _padding = target.add_int("padding filler", 1, false);
     let t_cfg = target.add_struct("cfg", 4);
     target.member(t_cfg, "limit", 0, t_int);
 
@@ -340,13 +340,13 @@ fn type_id_target_relocation() {
 #[test]
 fn type_matches_true_and_false() {
     let mut local = BtfBuilder::new();
-    let int_ty = local.int("int", 4, true);
+    let int_ty = local.add_int("int", 4, true);
     let a = local.add_struct("a", 4);
     local.member(a, "x", 0, int_ty);
     let r = relo(&mut local, a, "0", CoreReloKind::TypeMatches);
 
     let mut superset = BtfBuilder::new();
-    let s_int = superset.int("int", 4, true);
+    let s_int = superset.add_int("int", 4, true);
     let s_a = superset.add_struct("a", 8);
     superset.member(s_a, "x", 0, s_int);
     superset.member(s_a, "y", 4, s_int);
@@ -356,7 +356,7 @@ fn type_matches_true_and_false() {
     assert_eq!(imm_of(insns[0]), 1);
 
     let mut mismatched = BtfBuilder::new();
-    let m_int = mismatched.int("int", 4, true);
+    let m_int = mismatched.add_int("int", 4, true);
     let m_a = mismatched.add_struct("a", 4);
     mismatched.member(m_a, "z", 0, m_int);
 
@@ -371,7 +371,7 @@ fn type_matches_true_and_false() {
 #[test]
 fn missing_type_poisons_or_reads_as_absent() {
     let mut local = BtfBuilder::new();
-    let int_ty = local.int("int", 4, true);
+    let int_ty = local.add_int("int", 4, true);
     let gone = local.add_struct("gone", 4);
     local.member(gone, "field", 0, int_ty);
     let r_offset = relo(&mut local, gone, "0:0", CoreReloKind::FieldByteOffset);
@@ -414,13 +414,13 @@ fn missing_type_poisons_or_reads_as_absent() {
 #[test]
 fn type_size_follows_target() {
     let mut local = BtfBuilder::new();
-    let int_ty = local.int("int", 4, true);
+    let int_ty = local.add_int("int", 4, true);
     let event = local.add_struct("event", 4);
     local.member(event, "pid", 0, int_ty);
     let r = relo(&mut local, event, "0", CoreReloKind::TypeSize);
 
     let mut target = BtfBuilder::new();
-    let t_int = target.int("int", 4, true);
+    let t_int = target.add_int("int", 4, true);
     let t_event = target.add_struct("event", 8);
     target.member(t_event, "flags", 0, t_int);
     target.member(t_event, "pid", 4, t_int);
@@ -436,8 +436,8 @@ fn type_size_follows_target() {
 #[test]
 fn array_field_byte_size_multiplies_by_length() {
     let mut local = BtfBuilder::new();
-    let int_ty = local.int("int", 4, true);
-    let arr = local.array(int_ty, 4);
+    let int_ty = local.add_int("int", 4, true);
+    let arr = local.add_array(int_ty, 4);
     let s = local.add_struct("withArr", 16);
     local.member(s, "arr", 0, arr);
     let r = relo(&mut local, s, "0:0", CoreReloKind::FieldByteSize);
@@ -453,9 +453,9 @@ fn array_field_byte_size_multiplies_by_length() {
 #[test]
 fn two_dimensional_array_offset() {
     let mut local = BtfBuilder::new();
-    let int_ty = local.int("int", 4, true);
-    let inner = local.array(int_ty, 4);
-    let outer = local.array(inner, 3);
+    let int_ty = local.add_int("int", 4, true);
+    let inner = local.add_array(int_ty, 4);
+    let outer = local.add_array(inner, 3);
     let s = local.add_struct("with2d", 52);
     local.member(s, "before", 0, int_ty);
     local.member(s, "grid", 4, outer);

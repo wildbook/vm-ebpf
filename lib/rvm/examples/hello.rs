@@ -67,9 +67,9 @@ fn call_helper_without_arguments(vm: &Vm) -> Result<(), Box<dyn Error>> {
 }
 
 /// Load `asm` as the program's `main` and call it with `args`.
-fn run(mut asm: Assembler, vm: &Vm, args: &[u64]) -> Result<u64, Box<dyn Error>> {
+fn run(asm: Assembler, vm: &Vm, args: &[u64]) -> Result<u64, Box<dyn Error>> {
     let image = Image::from_code(asm.assemble()?);
-    Ok(vm.load(image)?.call("main", args)?)
+    Ok(vm.load_image(image)?.call("main", args)?)
 }
 
 fn expect(result: u64, expected: u64) -> Result<(), Box<dyn Error>> {

@@ -1,5 +1,5 @@
-//! Loads `bpf/prebuilt/examples/example.o`, prints what `Module::from_elf` and `Vm::load_modules` produce, and calls
-//! its exported functions. Exits with an error when a call fails or returns the wrong value.
+//! Loads `bpf/prebuilt/examples/example.o`, prints the parsed `Module` and the function table of the linked program,
+//! and calls its exported functions. Exits with an error when a call fails or returns the wrong value.
 
 use std::mem::offset_of;
 
@@ -19,9 +19,9 @@ fn main() -> Result<()> {
 
     let vm = Vm::new();
 
-    println!("\n=== Parsing ELF ===");
+    println!("\n=== Module ===");
     let module = Module::from_elf(&elf_bytes)?;
-    print_module_info(&module);
+    print!("{module}");
 
     println!("\n=== Linking ===");
     let mut program = vm.load_modules(&[&module])?;
@@ -56,53 +56,10 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Print section, export, import and relocation info from a parsed `rvm::Module`.
-fn print_module_info(module: &Module) {
-    println!("\n=== Section map ===");
-    for section in &module.sections {
-        let exec = if section.kind == rvm::SectionKind::Code {
-            " [EXEC]"
-        } else {
-            ""
-        };
-        println!("  {section}{exec}");
-    }
-
-    println!("\n=== Exports ===");
-    let mut exports: Vec<_> = module.exports.iter().collect();
-    exports.sort_unstable_by_key(|(name, _)| *name);
-    for (name, export) in exports {
-        let section_idx = export.section_idx;
-        let offset = export.offset;
-        let suffix = if export.is_function { " (func)" } else { "" };
-        println!("  {name} @ section[{section_idx}]+0x{offset:x}{suffix}");
-    }
-
-    if !module.imports.is_empty() {
-        println!("\n=== Imports ===");
-        for import in &module.imports {
-            println!("  {import}");
-        }
-    }
-
-    println!("\n=== Relocations ===");
-    for reloc in &module.relocations {
-        let symbol_name = module
-            .symbol_by_idx(reloc.symbol_idx)
-            .map(|s| s.name.as_str())
-            .unwrap_or("<unknown>");
-        let section_idx = reloc.section_idx;
-        let offset = reloc.offset;
-        let rel_type = reloc.rel_type;
-        let addend = reloc.addend;
-        println!("  type={rel_type} section[{section_idx}]+0x{offset:x} -> {symbol_name} (addend={addend})");
-    }
-}
-
 /// Print the linked program's function table.
 fn print_function_table(program: &Program) {
     println!("\n=== Function table ===");
-    let mut functions: Vec<_> = program.functions().collect();
+    let mut functions: Vec<_> = program.functions().iter().collect();
     functions.sort_by_key(|(_, f)| f.pc);
     for (name, function) in functions {
         let pc = function.pc;
@@ -167,7 +124,7 @@ mod tests {
     #[test]
     fn context_structs_match_the_program() {
         let module = Module::from_elf(&std::fs::read(ELF_PATH).unwrap()).unwrap();
-        let btf = Btf::parse(module.btf_data.as_deref().unwrap()).unwrap();
+        let btf = Btf::parse(module.btf().unwrap()).unwrap();
 
         let input_ctx = vec![
             ("value_a", offset_of!(InputCtx, value_a)),

@@ -1,6 +1,10 @@
 //! Cross-module linking: externs, numeric helpers, and hot-reloading a helper.
 
-use rvm::{LinkError, Module, Relocation, Section, SectionKind, Symbol, Vm, VmConfig, VmError, DEFAULT_MEMORY_LIMIT};
+use std::mem::{offset_of, size_of};
+
+use constelf::raw::{shf, sht, Elf64Ehdr, Elf64Rel, Elf64Shdr, Elf64Sym};
+use constelf::{ElfFile, ElfRelocs};
+use rvm::{LinkError, Module, Vm, VmConfig, VmError, DEFAULT_MEMORY_LIMIT};
 
 use crate::common::object;
 
@@ -8,7 +12,7 @@ use crate::common::object;
 fn full_vm() -> Vm {
     let vm = Vm::new();
     vm.register_helper(100, |x: u64| x * 2);
-    vm.register_fn("host_add", |(a, b): (u64, u64)| a + b);
+    vm.register_extern("host_add", |(a, b): (u64, u64)| a + b);
     vm
 }
 
@@ -32,11 +36,11 @@ fn link_failures() {
         vm.register_helper(100, |x: u64| x * 2);
     }
     fn missing_helper(vm: &Vm) {
-        vm.register_fn("host_add", |(a, b): (u64, u64)| a + b);
+        vm.register_extern("host_add", |(a, b): (u64, u64)| a + b);
     }
     fn arity_mismatch(vm: &Vm) {
         vm.register_helper(100, |x: u64| x * 2);
-        vm.register_fn("host_add", |x: u64| x);
+        vm.register_extern("host_add", |x: u64| x);
     }
 
     type Case = (fn(&Vm), fn(&VmError) -> bool);
@@ -81,7 +85,7 @@ fn replacing_extern_rebinds_linked_calls() {
     let vm = full_vm();
     let mut program = link(&vm).unwrap();
     assert_eq!(program.call("run", &[7]).unwrap(), 21 + 14);
-    vm.register_fn("host_add", |(a, b): (u64, u64)| a * b);
+    vm.register_extern("host_add", |(a, b): (u64, u64)| a * b);
     assert_eq!(program.call("run", &[7]).unwrap(), 21 * 14);
 }
 
@@ -96,44 +100,46 @@ fn global_named_like_a_map_is_data() {
     assert_eq!(program.call("bump", &[]).unwrap(), 1);
 }
 
-/// A relocation must patch whole instructions inside its own section, not the next section or half an `imm`.
+/// A relocation must patch a whole instruction inside its own section. One past the end of the section fails the
+/// parse, which reads the addend there, and one at half an `imm` fails the link.
 #[test]
 fn relocation_outside_its_section_fails() {
-    let parse = || Module::from_elf(&object("tests/link_main.o")).unwrap();
+    let elf = object("tests/link_main.o");
     let lib = Module::from_elf(&object("tests/link_lib.o")).unwrap();
-    let main = parse();
-    let at = main
-        .relocations
-        .iter()
-        .position(|r| main.sections[r.section_idx].kind == SectionKind::Code)
+
+    // the first relocation of a code section: the file offset of its `r_offset`, its value, and the section's size
+    let (at, offset, size) = ElfFile::new(&elf)
+        .unwrap()
+        .relocs()
+        .unwrap()
+        .find_map(|chunk| {
+            let (source, target) = (chunk.source(), chunk.target());
+            let ElfRelocs::Rel([first, ..]) = chunk.relocs().unwrap() else {
+                return None;
+            };
+            let is_code = target.sh_flags & u64::from(shf::EXECINSTR) != 0;
+            is_code.then_some((source.sh_offset as usize, first.r_offset, target.sh_size))
+        })
         .unwrap();
-    let size = main.sections[main.relocations[at].section_idx].size;
-    for offset in [size, main.relocations[at].offset + 4] {
-        let mut main = parse();
-        main.relocations[at].offset = offset;
-        let err = full_vm().load_modules(&[&main, &lib]).unwrap_err();
-        assert!(matches!(err, VmError::Link(LinkError::InvalidReference(_))), "offset {offset}: {err}");
-    }
+    let load = |offset: u64| {
+        let mut elf = elf.clone();
+        elf[at..][..8].copy_from_slice(&offset.to_le_bytes());
+        let main = Module::from_elf(&elf)?;
+        full_vm().load_modules(&[&main, &lib])
+    };
+
+    assert!(matches!(load(size).err(), Some(VmError::Elf(_))));
+    let err = load(offset + 4).err().unwrap();
+    assert!(matches!(err, VmError::Link(LinkError::InvalidReference(_))), "{err}");
 }
 
 /// An unreadable `.BTF` fails the parse instead of dropping CO-RE and BTF maps.
 #[test]
 fn unreadable_btf_fails() {
     let mut elf = object("examples/example.o");
-    let u16_at = |elf: &[u8], at: usize| u16::from_le_bytes(elf[at..][..2].try_into().unwrap()) as usize;
-    let u64_at = |elf: &[u8], at: usize| u64::from_le_bytes(elf[at..][..8].try_into().unwrap()) as usize;
-    let (shoff, shentsize, shnum, shstrndx) =
-        (u64_at(&elf, 0x28), u16_at(&elf, 0x3A), u16_at(&elf, 0x3C), u16_at(&elf, 0x3E));
-    let header = |idx: usize| shoff + idx * shentsize;
-    let names = u64_at(&elf, header(shstrndx) + 0x18);
-    let btf = (0..shnum)
-        .find(|&idx| {
-            let name = names + u32::from_le_bytes(elf[header(idx)..][..4].try_into().unwrap()) as usize;
-            elf[name..].starts_with(b".BTF\0")
-        })
-        .unwrap();
+    let btf = section_header(&elf, ".BTF");
     // sh_offset past the end of the file
-    elf[header(btf) + 0x18..][..8].copy_from_slice(&u64::MAX.to_le_bytes());
+    set(&mut elf, btf + offset_of!(Elf64Shdr, sh_offset), u64::MAX.to_le_bytes());
     assert!(Module::from_elf(&elf).is_err());
 }
 
@@ -149,60 +155,118 @@ fn layout_stays_within_memory_limit() {
         .unwrap()
     };
 
-    let mut module = Module::from_elf(&object("examples/example.o")).unwrap();
-    module.sections.push(Section {
-        name: ".bss.big".into(),
-        kind: SectionKind::Bss,
-        data: Vec::new(),
-        size: 64 << 20,
-        align: 8,
-        elf_index: usize::MAX,
-    });
-    let image = Vm::new().prepare_modules(&[&module]).unwrap();
+    let mut elf = object("tests/link_lib.o");
+    let bss_size = section_header(&elf, ".bss") + offset_of!(Elf64Shdr, sh_size);
+    set(&mut elf, bss_size, (64u64 << 20).to_le_bytes());
+    let image = Vm::new().prepare_elf(&elf).unwrap();
     assert!(image.data_len >= 64 << 20 && image.data.capacity() < 1 << 20, "{}", image.data.capacity());
-    module.sections.last_mut().unwrap().size = 1 << 30;
-    let err = Vm::new().prepare_modules(&[&module]).unwrap_err();
+    set(&mut elf, bss_size, (1u64 << 30).to_le_bytes());
+    let err = Vm::new().prepare_elf(&elf).unwrap_err();
     assert!(matches!(err, VmError::MemoryLimit(DEFAULT_MEMORY_LIMIT)), "{err}");
 
     // 64 code sections that each load 64 tables: 4096 copies from 128 sections
-    let mut module = Module::from_elf(&object("tests/func_ptr.o")).unwrap();
-    let base = Vm::new().prepare_modules(&[&module]).unwrap();
-    let base = base.code.len() + base.rodata_len + base.data_len;
-    let (reloc, table) = module
-        .relocations
-        .iter()
-        .find_map(|r| {
-            let table = module.symbol_by_idx(r.symbol_idx)?.section_idx?;
-            (module.sections[table].kind == SectionKind::JumpTable).then(|| (r.clone(), table))
+    let elf = object("tests/func_ptr.o");
+    let size = |elf: &[u8]| {
+        let image = Vm::new().prepare_elf(elf).unwrap();
+        image.code.len() + image.rodata_len + image.data_len
+    };
+    let base = size(&elf);
+    let (elf, code_size, table_size) = repeat_jump_tables(&elf, 64);
+    let copies = 64 * 64 * table_size;
+    assert!(size(&elf) >= base + 64 * code_size + copies);
+    let limit = base + 64 * code_size + copies / 2;
+    let err = limited(limit).prepare_elf(&elf).unwrap_err();
+    assert!(matches!(err, VmError::MemoryLimit(_)), "{err}");
+}
+
+/// `elf` with `n` more `.jumptables` sections and `n` more copies of the code section that loads a table, where every
+/// code copy loads every new table, and the sizes of that code section and of the table. The new sections share the
+/// file bytes of the originals.
+fn repeat_jump_tables(elf: &[u8], n: usize) -> (Vec<u8>, usize, usize) {
+    const SHDR: usize = size_of::<Elf64Shdr>();
+
+    let file = ElfFile::new(elf).unwrap();
+    let sections = file.sections().unwrap();
+    let headers = sections.headers();
+    let symbols = sections.symtab().unwrap().raw;
+    let table_idx = section_index(elf, ".jumptables");
+    let symtab_idx = headers.iter().position(|h| h.sh_type == sht::SYMTAB).unwrap();
+
+    // a relocation that loads the table, and the code section it patches
+    let (code_idx, rel) = file
+        .relocs()
+        .unwrap()
+        .find_map(|chunk| {
+            let ElfRelocs::Rel(relocs) = chunk.relocs().unwrap() else {
+                return None;
+            };
+            let loads_table = |r: &&Elf64Rel| symbols[r.sym() as usize].st_shndx as usize == table_idx;
+            Some((chunk.target_idx(), *relocs.iter().find(loads_table)?))
         })
         .unwrap();
-    let (code, table) = (module.sections[reloc.section_idx].clone(), module.sections[table].clone());
-    let symbols: Vec<usize> = (0..64)
-        .map(|_| {
-            module.sections.push(table.clone());
-            let section_idx = Some(module.sections.len() - 1);
-            module.symbols.push(Symbol {
-                name: String::new(),
-                section_idx,
-                value: 0,
-            });
-            module.symbols.len() - 1
-        })
-        .collect();
-    for _ in 0..64 {
-        module.sections.push(code.clone());
-        let section_idx = module.sections.len() - 1;
-        for &symbol_idx in &symbols {
-            module.relocations.push(Relocation {
-                section_idx,
-                symbol_idx,
-                ..reloc.clone()
-            });
-        }
+    let first_table = headers.len();
+    let first_code = first_table + n;
+    let mut out = elf.to_vec();
+
+    // the symbol table, with a symbol for each new table
+    let symtab_at = out.len();
+    out.extend_from_slice(sections.bytes(&headers[symtab_idx]).unwrap());
+    for i in 0..n {
+        let mut symbol = [0; size_of::<Elf64Sym>()];
+        set(&mut symbol, offset_of!(Elf64Sym, st_shndx), ((first_table + i) as u16).to_le_bytes());
+        out.extend_from_slice(&symbol);
     }
-    let copies = 64 * 64 * table.size as usize;
-    let err = limited(base + 64 * code.size as usize + copies / 2)
-        .prepare_modules(&[&module])
-        .unwrap_err();
-    assert!(matches!(err, VmError::MemoryLimit(_)), "{err}");
+    let symtab_len = out.len() - symtab_at;
+
+    // one relocation section for every code copy to share: `rel` against each new symbol
+    let rels_at = out.len();
+    for i in 0..n {
+        let info = ((symbols.len() + i) as u64) << 32 | u64::from(rel.typ());
+        out.extend_from_slice(&{ rel.r_offset }.to_le_bytes());
+        out.extend_from_slice(&info.to_le_bytes());
+    }
+    let rels_len = out.len() - rels_at;
+
+    let old_headers = file.header().e_shoff as usize;
+    let header = |idx: usize| elf[old_headers..][idx * SHDR..][..SHDR].to_vec();
+    let new_headers = out.len();
+    out.extend_from_slice(&elf[old_headers..][..headers.len() * SHDR]);
+    let symtab = new_headers + symtab_idx * SHDR;
+    set(&mut out, symtab + offset_of!(Elf64Shdr, sh_offset), (symtab_at as u64).to_le_bytes());
+    set(&mut out, symtab + offset_of!(Elf64Shdr, sh_size), (symtab_len as u64).to_le_bytes());
+    out.extend_from_slice(&header(table_idx).repeat(n));
+    out.extend_from_slice(&header(code_idx).repeat(n));
+    for i in 0..n {
+        let mut rels = [0; SHDR];
+        set(&mut rels, offset_of!(Elf64Shdr, sh_type), sht::REL.to_le_bytes());
+        set(&mut rels, offset_of!(Elf64Shdr, sh_offset), (rels_at as u64).to_le_bytes());
+        set(&mut rels, offset_of!(Elf64Shdr, sh_size), (rels_len as u64).to_le_bytes());
+        set(&mut rels, offset_of!(Elf64Shdr, sh_link), (symtab_idx as u32).to_le_bytes());
+        set(&mut rels, offset_of!(Elf64Shdr, sh_info), ((first_code + i) as u32).to_le_bytes());
+        out.extend_from_slice(&rels);
+    }
+    let count = (headers.len() + 3 * n) as u16;
+    set(&mut out, offset_of!(Elf64Ehdr, e_shoff), (new_headers as u64).to_le_bytes());
+    set(&mut out, offset_of!(Elf64Ehdr, e_shnum), count.to_le_bytes());
+
+    (out, headers[code_idx].sh_size as usize, headers[table_idx].sh_size as usize)
+}
+
+/// Index of the section called `name`.
+fn section_index(elf: &[u8], name: &str) -> usize {
+    let sections = ElfFile::new(elf).unwrap().sections().unwrap();
+    sections
+        .iter()
+        .position(|s| s.name().unwrap().to_bytes() == name.as_bytes())
+        .unwrap()
+}
+
+/// File offset of the header of the section called `name`.
+fn section_header(elf: &[u8], name: &str) -> usize {
+    let headers = ElfFile::new(elf).unwrap().header().e_shoff as usize;
+    headers + section_index(elf, name) * size_of::<Elf64Shdr>()
+}
+
+fn set<const N: usize>(bytes: &mut [u8], at: usize, value: [u8; N]) {
+    bytes[at..][..N].copy_from_slice(&value);
 }

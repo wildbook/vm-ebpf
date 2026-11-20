@@ -1,11 +1,9 @@
 //! A parsed eBPF ELF file: its loadable sections, symbols, exports, imports and relocations, for the linker.
 
-use constelf::cstr_at;
-use constelf::err::ElfError;
-use constelf::file::ElfFile;
+use std::fmt;
+
 use constelf::raw::{reloc, shf, sht, stb, stt};
-use constelf::relocs::ElfRelocsChunk;
-use constelf::sections::ElfSections;
+use constelf::{cstr_at, ElfError, ElfFile, ElfRelocs, ElfSections};
 use hashbrown::HashMap;
 
 use crate::error::{LinkError, Result};
@@ -13,44 +11,29 @@ use crate::image::INSN_SIZE;
 use crate::section::{section_kind_from_name, Section, SectionKind, LEGACY_MAPS_SECTION, MAPS_SECTION};
 use crate::symbol::{Export, Symbol};
 
-/// A relocation in one of the module's sections.
-#[derive(Debug, Clone)]
-pub struct Relocation {
-    /// Index into [`Module::sections`] of the section the relocation patches.
-    pub section_idx: usize,
-    /// Byte offset of the patch within that section.
-    pub offset: u64,
-    /// Index into [`Module::symbols`].
-    pub symbol_idx: usize,
-    /// `R_BPF_*` type.
-    pub rel_type: u32,
-    /// Byte offset added to the symbol address. For REL relocations this is decoded from the instruction's `imm` at
-    /// parse time.
-    pub addend: i64,
-}
-
-/// A parsed eBPF ELF module.
+/// A parsed eBPF ELF module, for [`Vm::prepare_modules`](crate::Vm::prepare_modules) and
+/// [`Vm::load_modules`](crate::Vm::load_modules). Its `Display` lists the sections, exports, imports and relocations.
 #[derive(Debug, Default)]
 pub struct Module {
     /// The allocated sections and `.jumptables`, in ELF order.
-    pub sections: Vec<Section>,
+    pub(crate) sections: Vec<Section>,
 
     /// Indexed like the ELF symbol table.
-    pub symbols: Vec<Symbol>,
+    pub(crate) symbols: Vec<Symbol>,
 
     /// Defined global symbols by name.
-    pub exports: HashMap<String, Export>,
+    pub(crate) exports: HashMap<String, Export>,
 
     /// Names of undefined global symbols.
-    pub imports: Vec<String>,
+    pub(crate) imports: Vec<String>,
 
-    pub relocations: Vec<Relocation>,
+    pub(crate) relocations: Vec<Relocation>,
 
     /// Contents of `.BTF`.
-    pub btf_data: Option<Vec<u8>>,
+    pub(crate) btf_data: Option<Vec<u8>>,
 
     /// Contents of `.BTF.ext`.
-    pub btf_ext_data: Option<Vec<u8>>,
+    pub(crate) btf_ext_data: Option<Vec<u8>>,
 }
 
 impl Module {
@@ -64,6 +47,11 @@ impl Module {
         module.parse_symbols(elf_sections)?;
         module.parse_relocations(elf)?;
         Ok(module)
+    }
+
+    /// The contents of the `.BTF` section, which [`BtfBuilder::append_btf`](crate::BtfBuilder::append_btf) takes.
+    pub fn btf(&self) -> Option<&[u8]> {
+        self.btf_data.as_deref()
     }
 
     /// Collect the loadable sections and the raw BTF and BTF.ext blobs.
@@ -184,7 +172,7 @@ impl Module {
             };
 
             match chunk.relocs()? {
-                ElfRelocsChunk::Rel(relocs) => {
+                ElfRelocs::Rel(relocs) => {
                     let data = &self.sections[section_idx].data;
                     for r in relocs {
                         let addend = rel_implicit_addend(data, r.r_offset, r.typ()).ok_or(ElfError::InvalidData)?;
@@ -197,7 +185,7 @@ impl Module {
                         });
                     }
                 }
-                ElfRelocsChunk::Rela(relocs) => {
+                ElfRelocs::Rela(relocs) => {
                     for r in relocs {
                         self.relocations.push(Relocation {
                             section_idx,
@@ -218,15 +206,65 @@ impl Module {
         self.sections.iter().position(|s| s.elf_index == elf_index)
     }
 
-    /// The first symbol called `name`.
-    pub fn symbol(&self, name: &str) -> Option<&Symbol> {
-        self.symbols.iter().find(|s| s.name == name)
-    }
-
     /// The symbol at `idx` in the ELF symbol table.
-    pub fn symbol_by_idx(&self, idx: usize) -> Option<&Symbol> {
+    pub(crate) fn symbol_by_idx(&self, idx: usize) -> Option<&Symbol> {
         self.symbols.get(idx)
     }
+}
+
+impl fmt::Display for Module {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "sections:")?;
+        for (idx, section) in self.sections.iter().enumerate() {
+            writeln!(f, "  [{idx}] {section}")?;
+        }
+
+        writeln!(f, "exports:")?;
+        let mut exports: Vec<_> = self.exports.iter().collect();
+        exports.sort_unstable_by_key(|(name, _)| *name);
+        for (name, export) in exports {
+            let Export {
+                section_idx, offset, ..
+            } = export;
+            let suffix = if export.is_function { " (func)" } else { "" };
+            writeln!(f, "  {name} @ section[{section_idx}]+0x{offset:x}{suffix}")?;
+        }
+
+        writeln!(f, "imports:")?;
+        for import in &self.imports {
+            writeln!(f, "  {import}")?;
+        }
+
+        writeln!(f, "relocations:")?;
+        for reloc in &self.relocations {
+            let Relocation {
+                section_idx,
+                offset,
+                rel_type,
+                addend,
+                ..
+            } = reloc;
+            let symbol = self.symbol_by_idx(reloc.symbol_idx).map_or("<unknown>", |s| &s.name);
+            writeln!(f, "  type={rel_type} section[{section_idx}]+0x{offset:x} -> {symbol} (addend={addend})")?;
+        }
+        Ok(())
+    }
+}
+
+/// A relocation in one of the module's sections.
+#[derive(Debug, Clone)]
+pub struct Relocation {
+    /// Index into [`Module::sections`] of the section the relocation patches.
+    pub section_idx: usize,
+    /// Byte offset of the patch within that section.
+    pub offset: u64,
+    /// Index into [`Module::symbols`].
+    pub symbol_idx: usize,
+    /// `R_BPF_*` type.
+    pub rel_type: u32,
+    /// Byte offset added to the symbol address. For REL relocations this is decoded from the instruction's `imm` at
+    /// parse time.
+    pub addend: i64,
 }
 
 /// Byte addend that a REL relocation stores in the place it patches.

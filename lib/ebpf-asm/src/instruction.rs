@@ -46,12 +46,6 @@ impl fmt::Display for Instruction {
 pub struct RawInstruction(pub u64);
 
 impl RawInstruction {
-    /// Wrap a raw instruction word.
-    #[inline]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
     /// Create from parts.
     #[inline]
     pub const fn from_parts(opcode: u8, dst: u8, src: u8, offset: i16, imm: i32) -> Self {

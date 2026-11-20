@@ -4,7 +4,7 @@
 //! program couldn't load from itself.
 
 use super::Maps;
-use crate::helper::{HelperContext, HelperRegistry};
+use crate::helper::{HelperContext, HelperRegistry, HostFn};
 use crate::memory::Perms;
 use crate::std_helpers::{BPF_FUNC_MAP_DELETE_ELEM, BPF_FUNC_MAP_LOOKUP_ELEM, BPF_FUNC_MAP_UPDATE_ELEM, EINVAL};
 
@@ -14,10 +14,10 @@ pub const EEXIST: i64 = 17;
 
 /// Bind the map helpers to the built-in map implementation.
 pub fn register_helpers(helpers: &mut HelperRegistry) {
-    // each fn item has its own type, so each slot calls its body directly
-    helpers.register_helper_raw(BPF_FUNC_MAP_LOOKUP_ELEM, lookup_elem);
-    helpers.register_helper_raw(BPF_FUNC_MAP_UPDATE_ELEM, update_elem);
-    helpers.register_helper_raw(BPF_FUNC_MAP_DELETE_ELEM, delete_elem);
+    // each closure has its own type, so each slot calls its body directly
+    helpers.put_id(BPF_FUNC_MAP_LOOKUP_ELEM, HostFn::raw(|ctx| Ok(lookup_elem(ctx) as u64)));
+    helpers.put_id(BPF_FUNC_MAP_UPDATE_ELEM, HostFn::raw(|ctx| Ok(update_elem(ctx) as u64)));
+    helpers.put_id(BPF_FUNC_MAP_DELETE_ELEM, HostFn::raw(|ctx| Ok(delete_elem(ctx) as u64)));
 }
 
 fn lookup_elem(ctx: &mut HelperContext) -> i64 {

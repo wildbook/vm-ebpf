@@ -57,6 +57,25 @@ pub struct Func {
     pc: u64,
 }
 
+/// What a call with an instruction limit of its own returns; see [`Program::call_func_with_limit`].
+#[derive(Debug)]
+pub struct LimitedCall {
+    /// The function's r0, or why the call failed.
+    pub result: Result<u64>,
+    /// The instructions the call ran, those it ran in other plugins through their exports included.
+    pub instructions: u64,
+}
+
+impl LimitedCall {
+    /// A call that failed before it ran an instruction.
+    pub(crate) fn failed(error: VmError) -> Self {
+        Self {
+            result: Err(error),
+            instructions: 0,
+        }
+    }
+}
+
 /// A linked eBPF program ready for execution.
 ///
 /// Holds the code (outside guest memory), guest memory regions (stack, data), and function table. Use `call()` to
@@ -145,21 +164,15 @@ impl Program {
         Ok(MapRef::new(maps, &mut self.memory, handle))
     }
 
-    /// The exported functions, sorted by name. A function's position here is its index for [`Program::func_at`].
-    pub fn functions(&self) -> impl ExactSizeIterator<Item = (&str, &FunctionInfo)> {
-        self.functions.list.iter().map(|(name, info)| (name.as_str(), info))
+    /// The exported functions, sorted by name.
+    pub fn functions(&self) -> &[(String, FunctionInfo)] {
+        &self.functions.list
     }
 
     /// The entry of the exported function called `name` in [`Program::functions`].
     pub fn function_info(&self, name: &str) -> Option<&FunctionInfo> {
         let index = self.functions.find(name)?.index;
         Some(&self.functions.list.get(index)?.1)
-    }
-
-    /// The index of the function called `name` in [`Program::functions`].
-    #[inline]
-    pub fn function_index(&self, name: &str) -> Option<usize> {
-        Some(self.functions.find(name)?.index)
     }
 
     /// Call a function by name; arguments go in r1-r5.
@@ -176,17 +189,6 @@ impl Program {
             return Err(function_not_found(name));
         };
         Ok(Func { program: self.id, pc })
-    }
-
-    /// The function at `index` in [`Program::functions`], for [`Program::call_func`]; `None` if `index` is out of
-    /// range.
-    #[inline]
-    pub fn func_at(&self, index: usize) -> Option<Func> {
-        let (_, info) = self.functions.list.get(index)?;
-        Some(Func {
-            program: self.id,
-            pc: info.pc,
-        })
     }
 
     /// The function called `name` and its table entry.
@@ -215,20 +217,23 @@ impl Program {
     }
 
     /// [`call_func`](Self::call_func) with an instruction limit of its own instead of
-    /// [`VmConfig::instruction_limit`], 0 for none. Returns the result and the instructions the call ran, those it ran
-    /// in other plugins through their exports included. Without the `fuel` feature, nothing counts them: it returns
-    /// 0, and a non-zero `limit` fails with [`VmError::FuelNotEnabled`].
-    pub fn call_func_with_limit(&mut self, func: Func, args: &[u64], limit: u64) -> (Result<u64>, u64) {
+    /// [`VmConfig::instruction_limit`], 0 for none, which also reports the instructions the call ran. Without the
+    /// `fuel` feature, nothing counts them: the count is 0, and a non-zero `limit` fails with
+    /// [`VmError::FuelNotEnabled`].
+    pub fn call_func_with_limit(&mut self, func: Func, args: &[u64], limit: u64) -> LimitedCall {
         if !self.owns(func) {
-            return (Err(VmError::ForeignFunc), 0);
+            return LimitedCall::failed(VmError::ForeignFunc);
         }
         if !rvm_core::METERED && limit != 0 {
-            return (Err(VmError::FuelNotEnabled), 0);
+            return LimitedCall::failed(VmError::FuelNotEnabled);
         }
         let start = fuel_for(limit);
         let mut fuel = start;
         let result = self.call_pc_fueled(func.pc, args, &mut fuel);
-        (result, start - fuel)
+        LimitedCall {
+            result,
+            instructions: start - fuel,
+        }
     }
 
     /// [`call_func`](Self::call_func) for a host function that runs inside another call, which has `fuel` left: the

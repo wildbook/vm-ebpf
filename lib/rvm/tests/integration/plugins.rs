@@ -4,7 +4,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rvm::{HelperError, Image, Import, LinkError, Program, Vm, VmError, WeakPlugin};
+use rvm::{HostError, Image, Import, LimitedCall, LinkError, Plugin, Program, ValueSpacing, Vm, VmError, WeakPlugin};
 
 use crate::common::object;
 
@@ -13,50 +13,50 @@ use crate::common::object;
 #[test]
 fn instruction_limit_covers_plugin_calls() {
     use ebpf_asm::{Assembler, R0, R1, R6};
-    use rvm::{ExecError, Plugin, VmConfig, DEFAULT_INSTRUCTION_LIMIT};
+    use rvm::{ExecError, VmConfig, DEFAULT_INSTRUCTION_LIMIT};
 
     const SPINS: i32 = 200_000;
     const CALLS: i32 = 50;
 
     // spin(n): count n down to 0, 2 n + 2 instructions
     let mut asm = Assembler::new();
-    let spin = asm.create_label();
-    asm.set_label(&spin).unwrap();
-    asm.sub64_imm(R1, 1).jne_imm(R1, 0, &spin);
+    let spin = asm.label();
+    asm.bind(spin);
+    asm.sub64_imm(R1, 1).jne_imm(R1, 0, spin);
     asm.mov64_imm(R0, 1).exit();
     let vm = Vm::with_config(VmConfig {
         instruction_limit: DEFAULT_INSTRUCTION_LIMIT,
         ..VmConfig::default()
     })
     .unwrap();
-    let callee = Plugin::new("callee", vm.load(Image::from_code(asm.assemble().unwrap())).unwrap());
+    let callee = Plugin::new("callee", vm.load_image(Image::from_code(asm.assemble().unwrap())).unwrap());
     vm.export(&callee, "main").unwrap();
 
     // main: call main(SPINS) in the callee CALLS times, 4 CALLS + 3 instructions of its own
     let mut asm = Assembler::new();
-    let again = asm.create_label();
+    let again = asm.label();
     asm.mov64_imm(R6, CALLS);
-    asm.set_label(&again).unwrap();
-    asm.mov64_imm(R1, SPINS).call(0).sub64_imm(R6, 1).jne_imm(R6, 0, &again);
+    asm.bind(again);
+    asm.mov64_imm(R1, SPINS).call(0).sub64_imm(R6, 1).jne_imm(R6, 0, again);
     asm.mov64_imm(R0, 0).exit();
     let mut image = Image::from_code(asm.assemble().unwrap());
     image.externs.push((2, Import::Name("main".into())));
-    let mut caller = vm.load(image).unwrap();
+    let mut caller = vm.load_image(image).unwrap();
 
     // the third call into the callee runs out of what the first two left
     let err = caller.call("main", &[]).unwrap_err();
-    let VmError::Helper(HelperError::Plugin { error, .. }) = &err else {
+    let VmError::Host(HostError::Plugin { error, .. }) = &err else {
         panic!("{err}")
     };
-    assert!(matches!(**error, VmError::Exec(ExecError::InstructionLimit(_))), "{err}");
+    assert!(matches!(**error, VmError::Exec(ExecError::InstructionLimit { .. })), "{err}");
 
     let main = caller.func("main").unwrap();
-    let (result, used) = caller.call_func_with_limit(main, &[], 0);
+    let LimitedCall { result, instructions } = caller.call_func_with_limit(main, &[], 0);
     let total = (4 * CALLS + 3 + CALLS * (2 * SPINS + 2)) as u64;
-    assert_eq!((result.unwrap(), used), (0, total));
-    let (result, used) = caller.call_func_with_limit(main, &[], DEFAULT_INSTRUCTION_LIMIT);
+    assert_eq!((result.unwrap(), instructions), (0, total));
+    let LimitedCall { result, instructions } = caller.call_func_with_limit(main, &[], DEFAULT_INSTRUCTION_LIMIT);
     assert!(result.is_err());
-    assert_eq!(used, DEFAULT_INSTRUCTION_LIMIT);
+    assert_eq!(instructions, DEFAULT_INSTRUCTION_LIMIT);
 }
 
 #[test]
@@ -65,12 +65,12 @@ fn default_has_no_instruction_limit() {
 
     // 2 n + 3 instructions for n = DEFAULT_INSTRUCTION_LIMIT
     let mut asm = Assembler::new();
-    let spin = asm.create_label();
+    let spin = asm.label();
     asm.mov64_imm(R1, rvm::DEFAULT_INSTRUCTION_LIMIT as i32);
-    asm.set_label(&spin).unwrap();
-    asm.sub64_imm(R1, 1).jne_imm(R1, 0, &spin);
+    asm.bind(spin);
+    asm.sub64_imm(R1, 1).jne_imm(R1, 0, spin);
     asm.mov64_imm(R0, 1).exit();
-    let mut program = Vm::new().load(Image::from_code(asm.assemble().unwrap())).unwrap();
+    let mut program = Vm::new().load_image(Image::from_code(asm.assemble().unwrap())).unwrap();
     assert_eq!(program.call("main", &[]).unwrap(), 1);
 }
 
@@ -88,28 +88,28 @@ fn instruction_limit_needs_fuel() {
 
     let mut asm = Assembler::new();
     asm.mov64_imm(R0, 1).exit();
-    let mut program = Vm::new().load(Image::from_code(asm.assemble().unwrap())).unwrap();
+    let mut program = Vm::new().load_image(Image::from_code(asm.assemble().unwrap())).unwrap();
     let main = program.func("main").unwrap();
-    let (result, used) = program.call_func_with_limit(main, &[], 1);
+    let LimitedCall { result, instructions } = program.call_func_with_limit(main, &[], 1);
     assert!(matches!(result, Err(VmError::FuelNotEnabled)), "{result:?}");
-    assert_eq!(used, 0);
-    assert_eq!(program.call_func_with_limit(main, &[], 0).0.unwrap(), 1);
+    assert_eq!(instructions, 0);
+    assert_eq!(program.call_func_with_limit(main, &[], 0).result.unwrap(), 1);
 }
 
 #[test]
 fn plugin_calls_export_and_survives_reload() {
     let vm = Vm::new();
-    vm.register_fn("host_reenter", |x: u64| x);
+    vm.register_extern("host_reenter", |x: u64| x);
 
     // B imports a_scale, so it links only after A exports it.
     assert!(matches!(
-        vm.load_plugin("b", &object("tests/plugin_b.o")).unwrap_err(),
+        vm.load_elf(&object("tests/plugin_b.o")).unwrap_err(),
         VmError::Link(LinkError::UnresolvedSymbol(name)) if name == "a_scale"
     ));
 
-    let a = vm.load_plugin("a", &object("tests/plugin_a.o")).unwrap();
+    let a = Plugin::new("a", vm.load_elf(&object("tests/plugin_a.o")).unwrap());
     vm.export(&a, "a_scale").unwrap();
-    let b = vm.load_plugin("b", &object("tests/plugin_b.o")).unwrap();
+    let b = Plugin::new("b", vm.load_elf(&object("tests/plugin_b.o")).unwrap());
     assert_eq!(b.call("b_run", &[5]).unwrap(), 11);
     let scale = a.lock().unwrap().func("a_scale").unwrap();
     let direct = a.lock().unwrap().call_func(scale, &[5]).unwrap();
@@ -125,7 +125,7 @@ fn plugin_calls_export_and_survives_reload() {
 #[test]
 fn plugin_func_follows_replace() {
     let vm = Vm::new();
-    let a = vm.load_plugin("a", &object("tests/plugin_a.o")).unwrap();
+    let a = Plugin::new("a", vm.load_elf(&object("tests/plugin_a.o")).unwrap());
     let scale = a.func("a_scale").unwrap();
     assert_eq!(scale.call(&[5]).unwrap(), 10);
 
@@ -146,7 +146,7 @@ fn plugin_func_follows_replace() {
 #[test]
 fn reentrant_call_and_replace_fail_instead_of_deadlocking() {
     let vm = Vm::new();
-    let a = vm.load_plugin("a", &object("tests/plugin_a.o")).unwrap();
+    let a = Plugin::new("a", vm.load_elf(&object("tests/plugin_a.o")).unwrap());
     vm.export(&a, "a_scale").unwrap();
 
     // host_reenter calls back into b, and tries to replace it, while b is running. It holds b weakly: a strong handle
@@ -156,20 +156,20 @@ fn reentrant_call_and_replace_fail_instead_of_deadlocking() {
     let spare: Arc<Mutex<Option<Program>>> = Arc::default();
     let busy = Arc::new(Mutex::new((false, false)));
     let (slot, next, seen) = (b_slot.clone(), spare.clone(), busy.clone());
-    vm.register_fn("host_reenter", move |x: u64| {
+    vm.register_extern("host_reenter", move |x: u64| {
         let b = slot.get().unwrap().upgrade().unwrap();
         let call = b.call("b_run", &[x]);
         let replace = b.replace(next.lock().unwrap().take().unwrap());
         *seen.lock().unwrap() = (is_busy(call.as_ref().err()), is_busy(replace.as_ref().err()));
         call
     });
-    let b = vm.load_plugin("b", &object("tests/plugin_b.o")).unwrap();
+    let b = Plugin::new("b", vm.load_elf(&object("tests/plugin_b.o")).unwrap());
     b_slot.set(b.downgrade()).unwrap();
     *spare.lock().unwrap() = Some(vm.load_elf(&object("tests/plugin_b.o")).unwrap());
 
     // the host function returns the nested call's error, which fails the outer call
     let err = b.call("b_reenter", &[5]).unwrap_err();
-    let VmError::Helper(HelperError::Host(inner)) = &err else {
+    let VmError::Host(HostError::Failed(inner)) = &err else {
         panic!("{err}")
     };
     assert!(is_busy(inner.downcast_ref()), "{err}");
@@ -180,14 +180,14 @@ fn reentrant_call_and_replace_fail_instead_of_deadlocking() {
 #[test]
 fn shared_map_is_one_instance_across_plugins() {
     let vm = Vm::new();
-    let x = vm.load_plugin("x", &object("tests/shared_counter.o")).unwrap();
-    let y = vm.load_plugin("y", &object("tests/shared_counter.o")).unwrap();
+    let x = Plugin::new("x", vm.load_elf(&object("tests/shared_counter.o")).unwrap());
+    let y = Plugin::new("y", vm.load_elf(&object("tests/shared_counter.o")).unwrap());
     assert_eq!((x.call("bump", &[]).unwrap(), y.call("bump", &[]).unwrap()), (1, 1)); // private
 
     // SAFETY: the plugins run on this thread only.
-    unsafe { vm.share_map("hits", true) };
-    let x = vm.load_plugin("x", &object("tests/shared_counter.o")).unwrap();
-    let y = vm.load_plugin("y", &object("tests/shared_counter.o")).unwrap();
+    unsafe { vm.share_map("hits", ValueSpacing::CacheLine) };
+    let x = Plugin::new("x", vm.load_elf(&object("tests/shared_counter.o")).unwrap());
+    let y = Plugin::new("y", vm.load_elf(&object("tests/shared_counter.o")).unwrap());
     assert_eq!(x.call("bump", &[]).unwrap(), 1);
     assert_eq!(y.call("bump", &[]).unwrap(), 2);
     let mut x = x.lock().unwrap();
@@ -200,7 +200,7 @@ fn shared_map_is_one_instance_across_plugins() {
     assert_eq!(y.call("bump", &[]).unwrap(), 10);
 
     assert!(matches!(
-        vm.load_plugin("z", &object("tests/shared_counter_u32.o")).unwrap_err(),
+        vm.load_elf(&object("tests/shared_counter_u32.o")).unwrap_err(),
         VmError::Link(LinkError::MapMismatch(name)) if name == "hits"
     ));
 }
@@ -211,8 +211,8 @@ fn shared_map_atomics_across_threads() {
     const N: u64 = 10_000;
     let vm = Vm::new();
     // SAFETY: `bump` only touches the value with an atomic add.
-    unsafe { vm.share_map("hits", true) };
-    let plugins = ["x", "y"].map(|name| vm.load_plugin(name, &object("tests/shared_counter.o")).unwrap());
+    unsafe { vm.share_map("hits", ValueSpacing::CacheLine) };
+    let plugins = ["x", "y"].map(|name| Plugin::new(name, vm.load_elf(&object("tests/shared_counter.o")).unwrap()));
 
     std::thread::scope(|s| {
         for plugin in &plugins {
@@ -231,8 +231,8 @@ fn shared_region_is_visible_to_every_plugin() {
     let ro = unsafe { vm.share_region(rvm::FIRST_FREE_REGION + 1, 64, rvm::Perms::R) }.unwrap();
     assert!(unsafe { vm.share_region(rvm::FIRST_FREE_REGION, 64, rvm::Perms::RW) }.is_err());
 
-    let x = vm.load_plugin("x", &object("tests/shared_region.o")).unwrap();
-    let y = vm.load_plugin("y", &object("tests/shared_region.o")).unwrap();
+    let x = Plugin::new("x", vm.load_elf(&object("tests/shared_region.o")).unwrap());
+    let y = Plugin::new("y", vm.load_elf(&object("tests/shared_region.o")).unwrap());
     let slot = rw.base() + 8;
     x.call("put", &[slot, 42]).unwrap();
     assert_eq!(y.call("get", &[slot]).unwrap(), 42);
@@ -252,7 +252,8 @@ fn shared_region_acquire_release() {
     let vm = Vm::new();
     // SAFETY: each plugin touches the payload only after a load-acquire shows the other one is done with it.
     let region = unsafe { vm.share_region(rvm::FIRST_FREE_REGION, 128, rvm::Perms::RW) }.unwrap();
-    let [producer, consumer] = ["x", "y"].map(|name| vm.load_plugin(name, &object("tests/acq_rel.o")).unwrap());
+    let [producer, consumer] =
+        ["x", "y"].map(|name| Plugin::new(name, vm.load_elf(&object("tests/acq_rel.o")).unwrap()));
     let mailbox = region.base();
 
     std::thread::scope(|s| {
@@ -286,11 +287,11 @@ fn shared_region_acquire_release() {
 #[test]
 fn borrowed_buffers() {
     let vm = Vm::new();
-    let callee = vm.load_plugin("callee", &object("tests/borrow_callee.o")).unwrap();
+    let callee = Plugin::new("callee", vm.load_elf(&object("tests/borrow_callee.o")).unwrap());
     for func in ["sum", "fill", "poke"] {
         vm.export(&callee, func).unwrap();
     }
-    let caller = vm.load_plugin("caller", &object("tests/borrow_caller.o")).unwrap();
+    let caller = Plugin::new("caller", vm.load_elf(&object("tests/borrow_caller.o")).unwrap());
 
     // sum reads the caller's array, fill writes it back: 10 * 1000 + 7 + 7
     assert_eq!(caller.call("run", &[]).unwrap(), 10_014);
@@ -315,7 +316,7 @@ fn borrowed_buffers() {
     ];
     let mut image = Image::from_code(code.to_vec());
     image.externs.push((2, Import::Name("sum".into())));
-    assert_eq!(vm.load(image).unwrap().call("main", &[]).unwrap(), 0);
+    assert_eq!(vm.load_image(image).unwrap().call("main", &[]).unwrap(), 0);
 }
 
 /// A host function that panics during a call with a borrowed buffer leaves the buffer unmapped and both plugins
@@ -325,13 +326,13 @@ fn panic_during_borrowed_call() {
     let vm = Vm::new();
     let fail = Arc::new(AtomicBool::new(true));
     let failing = fail.clone();
-    vm.register_fn("host_peek", move |first: u64| {
+    vm.register_extern("host_peek", move |first: u64| {
         assert!(!failing.load(Ordering::Relaxed), "host_peek failed");
         first
     });
-    let callee = vm.load_plugin("callee", &object("tests/borrow_host.o")).unwrap();
+    let callee = Plugin::new("callee", vm.load_elf(&object("tests/borrow_host.o")).unwrap());
     vm.export(&callee, "peek").unwrap();
-    let caller = vm.load_plugin("caller", &object("tests/borrow_host_caller.o")).unwrap();
+    let caller = Plugin::new("caller", vm.load_elf(&object("tests/borrow_host_caller.o")).unwrap());
 
     assert!(catch_unwind(AssertUnwindSafe(|| caller.call("run", &[]))).is_err());
     let slot = rvm::region_base(rvm::BORROW_FIRST_REGION);

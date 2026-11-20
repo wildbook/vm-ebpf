@@ -18,8 +18,8 @@ foldhash  = { version = "0.2.0", default-features = false }
 # These comments are the feature reference; the README and the crate docs link here.
 [features]
 default = ["link", "fuel", "maps"]
-# ELF parsing, BTF, CO-RE and the linker: `Module`, `HostTypes`, `Vm::with_types`, `Vm::prepare`, `Vm::load_elf`,
-# `Vm::link` and `Vm::load_plugin`. Without it, rvm loads prepared images only.
+# ELF parsing, BTF, CO-RE and the linker: `Module`, `HostTypes`, `Vm::with_types`, `Vm::prepare_elf`,
+# `Vm::prepare_modules`, `Vm::load_elf` and `Vm::load_modules`. Without it, rvm loads prepared images only.
 link = ["dep:constelf", "dep:btf"]
 # Enforces `VmConfig::instruction_limit`. Without it, the interpreter doesn't count instructions, and a non-zero limit
 # fails with `VmError::FuelNotEnabled`.
@@ -32,6 +32,7 @@ fixed-hash-seed = []
 
 [dev-dependencies]
 btf       = { workspace = true }
+constelf  = { workspace = true }
 criterion = "0.7"
 ebpf-asm  = { workspace = true }
 

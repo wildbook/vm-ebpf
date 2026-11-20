@@ -1,6 +1,6 @@
 //! Reading map definitions from a module's BTF.
 
-use btf::{Btf, BtfTypeInfo};
+use btf::{Btf, BtfType};
 
 use super::{check_def, MapDef, MapKind};
 use crate::error::{LinkError, Result, VmError};
@@ -19,7 +19,7 @@ pub fn map_defs(module: &Module, btf: Option<&Btf<'_>>) -> Result<Vec<MapDef>> {
 
     let mut defs = Vec::new();
     for (_, ty) in btf.types() {
-        let BtfTypeInfo::DataSec {
+        let BtfType::DataSec {
             name: MAPS_SECTION,
             vars,
             ..
@@ -28,7 +28,7 @@ pub fn map_defs(module: &Module, btf: Option<&Btf<'_>>) -> Result<Vec<MapDef>> {
             continue;
         };
         for var in vars {
-            let Some(BtfTypeInfo::Var { name, type_id, .. }) = btf.type_by_id(var.type_id) else {
+            let Some(BtfType::Var { name, type_id, .. }) = btf.type_by_id(var.type_id) else {
                 continue;
             };
             defs.push(parse_def(btf, name, *type_id)?);
@@ -41,18 +41,18 @@ pub fn map_defs(module: &Module, btf: Option<&Btf<'_>>) -> Result<Vec<MapDef>> {
 fn parse_def(btf: &Btf<'_>, name: &str, type_id: u32) -> Result<MapDef> {
     let bad = |what: &str| VmError::from(LinkError::InvalidMap(format!("map {name}: {what}")));
 
-    let Some(BtfTypeInfo::Struct { members, .. }) = resolve(btf, type_id) else {
+    let Some(BtfType::Struct { members, .. }) = resolve(btf, type_id) else {
         return Err(bad("definition is not a struct"));
     };
 
     let (mut kind, mut max_entries, mut key_size, mut value_size) = (None, None, None, None);
     for member in members {
-        let Some(BtfTypeInfo::Ptr { pointee_type }) = resolve(btf, member.type_id) else {
+        let Some(BtfType::Ptr { pointee_type }) = resolve(btf, member.type_id) else {
             return Err(bad("field is not a pointer"));
         };
         let pointee = resolve(btf, *pointee_type);
         let uint = || match pointee {
-            Some(BtfTypeInfo::Array { nelems, .. }) => Ok(*nelems),
+            Some(BtfType::Array { nelems, .. }) => Ok(*nelems),
             _ => Err(bad("expected __uint")),
         };
         match member.name {
@@ -86,7 +86,7 @@ fn parse_def(btf: &Btf<'_>, name: &str, type_id: u32) -> Result<MapDef> {
     Ok(def)
 }
 
-fn resolve<'a, 'b>(btf: &'b Btf<'a>, id: u32) -> Option<&'b BtfTypeInfo<'a>> {
+fn resolve<'a, 'b>(btf: &'b Btf<'a>, id: u32) -> Option<&'b BtfType<'a>> {
     btf.resolve_type(id).map(|(_, ty)| ty)
 }
 

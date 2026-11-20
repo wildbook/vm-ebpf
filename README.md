@@ -53,7 +53,7 @@ With the `fuel` feature (on by default), a call that runs more than
 `VmConfig::instruction_limit` instructions fails with
 `ExecError::InstructionLimit`. The default limit is 0, which means no limit;
 `rvm::DEFAULT_INSTRUCTION_LIMIT` (1,000,000) is there for hosts that want one.
-`Program::call_func_with_limit` gives one call a limit of its own and returns
+`Program::call_func_with_limit` gives one call a limit of its own and reports
 how many instructions it ran. The count is exact: the interpreter charges a
 basic block's instructions as it enters the block, and runs a block the fuel
 can't pay for one instruction at a time. In the benchmarks, guest code with the
@@ -81,10 +81,10 @@ let vm = Vm::new();
 vm.register_helper(100, |x: u64| x * 2);
 
 // Named extern, imported by the guest as `extern u64 host_add(u64, u64);`.
-vm.register_fn("host_add", |(a, b): (u64, u64)| a + b);
+vm.register_extern("host_add", |(a, b): (u64, u64)| a + b);
 
 // Named extern that reads guest memory: `extern void log(const char *, u64);`.
-vm.register_fn_with_memory("log", |mem, (msg, len): (u64, u64)| {
+vm.register_extern_with_memory("log", |mem, (msg, len): (u64, u64)| {
     println!("{}", String::from_utf8_lossy(&mem.read_vec(msg, len as usize)?));
     Ok::<_, rvm::MemoryError>(())
 });
@@ -93,16 +93,18 @@ let mut program = vm.load_elf(&elf_bytes)?;
 let result = program.call("run", &[42])?;
 ```
 
-A `register_fn_with_memory` function gets the calling program's memory as a
-`GuestMemory`. Its reads and writes copy, need the same permissions as the
-guest's own loads and stores, and return a `MemoryError` for a pointer the guest
-couldn't use. A host function that returns `Err` fails the guest call with
-`HelperError::Host`, which holds the error. The error type must convert into
-`HelperError`, as `MemoryError` and `VmError` do. To give the guest an error
-code instead, return it as an `i64`.
+Helpers and externs are the same host functions under two kinds of key, and
+each kind registers in two shapes: `register_helper` and `register_extern` take
+the arguments, `register_helper_with_memory` and `register_extern_with_memory`
+also get the calling program's memory as a `GuestMemory`. Its reads and writes
+copy, need the same permissions as the guest's own loads and stores, and return
+a `MemoryError` for a pointer the guest couldn't use. A host function that
+returns `Err` fails the guest call with `HostError::Failed`, which holds the
+error; any error type that converts into `Box<dyn Error + Send + Sync>` works.
+To give the guest an error code instead, return it as an `i64`.
 
-Registering a helper again replaces it everywhere: programs linked earlier use
-the new one from their next call.
+Registering a host function again replaces it everywhere: programs linked
+earlier use the new one from their next call.
 
 Helpers that touch host state are opt-in: `Vm::enable_time` adds `ktime_get_ns`,
 `Vm::enable_random` adds `get_prandom_u32`, and `Vm::enable_print(sink)` adds
@@ -120,8 +122,8 @@ registered. It also fails if an extern's argument count in the module's BTF
 differs from the arity of the host function registered under that name; exports
 from plugins and variadic prototypes aren't checked. Calls with more than five
 arguments fail with `VmError::TooManyArgs`. The only call resolved at run
-time is `callx` to a helper ID, which fails with `UnknownHelper` if no helper
-has that ID.
+time is `callx` to a helper ID, which fails with `ExecError::UnknownHelper` if
+no helper has that ID.
 
 ## CO-RE
 
@@ -137,14 +139,15 @@ vm.with_types(|types| rvm::host_struct!(types, Entity as "entity" { id, hp, pos 
 
 ## Prepared images
 
-`Vm::prepare(&elf)` (or `Vm::prepare_modules`) links ahead of time and returns an
+`Vm::prepare_elf(&elf)` (or `Vm::prepare_modules`) links ahead of time and returns an
 `rvm::Image`: the final code, initial data, map declarations, exports and the
-calls to bind. `Image::to_bytes` serializes it, and `Vm::load_image(&bytes)`
-loads it into any VM that registers the same externs and helper IDs. An image
-loads only into the rvm version that wrote it. Loading checks every length,
-index and map definition, so images may come from untrusted files. `Vm::load`
-takes an `Image` directly, including one built by hand around raw bytecode,
-whose `call <id>` instructions reach the helpers registered under those IDs. A
+calls to bind. `Image::to_bytes` serializes it, and
+`Vm::load_image_bytes(&bytes)` loads it into any VM that registers the same
+externs and helper IDs. An image loads only into the rvm version that wrote it.
+Loading checks every length, index and map definition, so images may come from
+untrusted files. `Vm::load_image` takes an `Image`, including one built by hand
+around raw bytecode, whose `call <id>` instructions reach the helpers
+registered under those IDs. A
 host that ships images can build rvm without `link`, and without `maps` if its
 images declare none, as `bin/emu` does (see
 [`bin/emu/Cargo.toml`](bin/emu/Cargo.toml)).
@@ -184,8 +187,8 @@ rvmrt it is 9,216 bytes with 44 imports.
 
 | build | `rvmrt.dll` | added to the C host by `rvmrt.lib` |
 |---|---|---|
-| in `lib/rvmrt` | 111,616 B, 31 imports from 3 DLLs | 102,400 B, 8 imports |
-| at the root | 198,656 B, 58 imports from 6 DLLs | 188,416 B, 33 imports |
+| in `lib/rvmrt` | 113,152 B, 31 imports from 3 DLLs | 105,984 B, 8 imports |
+| at the root | 200,192 B, 58 imports from 6 DLLs | 193,024 B, 33 imports |
 
 The 8 imports are the process heap (`GetProcessHeap`, `HeapAlloc`, `HeapFree`,
 `HeapReAlloc`), `memcmp`, `memmove`, and `GetCurrentProcess` with
@@ -193,7 +196,8 @@ The 8 imports are the process heap (`GetProcessHeap`, `HeapAlloc`, `HeapFree`,
 
 ## Plugins
 
-`Vm::load_plugin` links a program behind a lock, and `Vm::export(&plugin, "f")`
+`Plugin::new(name, program)` puts a loaded program behind a lock, and
+`Vm::export(&plugin, "f")`
 publishes its function `f` as a named extern for programs linked afterwards. The
 call runs in the exporting plugin with its own memory and maps, so plain
 pointers mean nothing on the other side. `Plugin::replace` swaps in a new build,
@@ -201,7 +205,7 @@ which importers use from their next call. `Plugin::func` returns a handle that
 looks the function up again in the new build. A plugin runs one call at a time:
 calling into it, or replacing it, while a call runs fails with
 `VmError::PluginBusy` instead of blocking. When the call comes through another
-plugin's import, the importer's caller gets `HelperError::Plugin`, which names
+plugin's import, the importer's caller gets `HostError::Plugin`, which names
 the export and wraps the inner `VmError`.
 
 An export can borrow a buffer from its caller for one call by tagging the
@@ -265,11 +269,12 @@ and refuses shared maps; `get_as` copies. `MapRef::entries` iterates without
 allocating: every element of an array map, or the present keys of a hash map.
 For a shared hash map it holds the key index read-locked until dropped.
 
-`Vm::share_map(name, pad_values)` makes maps of that name one instance across
+`Vm::share_map(name, spacing)` makes maps of that name one instance across
 every program linked afterwards, at the same guest address in each. The first
 program to declare it creates it, and a later declaration with a different
-layout fails the link. `pad_values` puts each value on its own cache line. It
-has the same unsafe contract as `share_region`.
+layout fails the link. `ValueSpacing::CacheLine` puts each value on its own
+cache line, and `ValueSpacing::Packed` aligns each to 8 bytes. It has the same
+unsafe contract as `share_region`.
 
 ## Instruction set
 

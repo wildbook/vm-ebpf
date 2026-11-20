@@ -422,7 +422,8 @@ impl MemoryBudget {
     }
 }
 
-/// The calling program's memory as a host function registered with [`crate::Vm::register_fn_with_memory`] sees it.
+/// The calling program's memory as a host function registered with
+/// [`Vm::register_extern_with_memory`](crate::Vm::register_extern_with_memory) sees it.
 ///
 /// Every access needs the guest's permissions on the region, so a pointer passed to a host function reaches no more
 /// than the guest's own loads and stores would. Accesses copy, so no reference into guest memory outlives the call that
@@ -904,14 +905,16 @@ mod tests {
         use ebpf_asm::{Assembler, R0, R10, R2, R3, R6, R7};
 
         use crate::executor::Executor;
-        use crate::helper::{HelperContext, HelperRegistry};
+        use crate::helper::{HelperContext, HelperRegistry, HostFn};
         use crate::layout::{FIRST_FREE_REGION, STACK_REGION};
         use crate::vm::VmConfig;
 
         let mut helpers = HelperRegistry::default();
-        helpers.register_helper_raw(1, |ctx: &mut HelperContext| {
+        let remap = |ctx: &mut HelperContext| {
             ctx.memory.map_bytes_any(FIRST_FREE_REGION, &[9], 8, Perms::RW).unwrap();
-        });
+            Ok(0)
+        };
+        helpers.put_id(1, HostFn::raw(remap));
         let mut mem = VmMemory::new();
         let base = mem.map_bytes_any(FIRST_FREE_REGION, &[7], 8, Perms::RW).unwrap();
         let config = VmConfig::default();

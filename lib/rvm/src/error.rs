@@ -17,7 +17,7 @@ pub type Result<T> = std::result::Result<T, VmError>;
 #[non_exhaustive]
 pub enum VmError {
     #[cfg(feature = "link")]
-    Elf(constelf::err::ElfError),
+    Elf(constelf::ElfError),
 
     #[cfg(feature = "link")]
     Btf(btf::BtfError),
@@ -29,7 +29,7 @@ pub enum VmError {
 
     Exec(ExecError),
 
-    Helper(HelperError),
+    Host(HostError),
 
     Memory(MemoryError),
 
@@ -88,7 +88,7 @@ impl fmt::Display for VmError {
             Self::InvalidImage(msg) => write!(f, "invalid image: {msg}"),
             Self::Link(e) => write!(f, "link error: {e}"),
             Self::Exec(e) => write!(f, "execution error: {e}"),
-            Self::Helper(e) => write!(f, "helper error: {e}"),
+            Self::Host(e) => write!(f, "{e}"),
             Self::Memory(e) => write!(f, "memory error: {e}"),
             #[cfg(feature = "maps")]
             Self::Map(e) => write!(f, "map error: {e}"),
@@ -123,8 +123,8 @@ impl fmt::Display for VmError {
 impl std::error::Error for VmError {}
 
 #[cfg(feature = "link")]
-impl From<constelf::err::ElfError> for VmError {
-    fn from(e: constelf::err::ElfError) -> Self {
+impl From<constelf::ElfError> for VmError {
+    fn from(e: constelf::ElfError) -> Self {
         Self::Elf(e)
     }
 }
@@ -148,9 +148,9 @@ impl From<ExecError> for VmError {
     }
 }
 
-impl From<HelperError> for VmError {
-    fn from(e: HelperError) -> Self {
-        Self::Helper(e)
+impl From<HostError> for VmError {
+    fn from(e: HostError) -> Self {
+        Self::Host(e)
     }
 }
 
@@ -220,39 +220,47 @@ impl std::error::Error for LinkError {}
 #[non_exhaustive]
 pub enum ExecError {
     /// An invalid or reserved instruction.
-    CpuFault { pc: u64 },
-    /// A load or store outside the mapped regions or their permissions.
-    MemoryFault { pc: u64, error: MemoryError },
+    InvalidInstruction { pc: u64 },
     /// A valid instruction that rvm doesn't implement.
     Unimplemented { pc: u64 },
-    /// The call ran the instruction limit (the value) without finishing.
-    InstructionLimit(u64),
+    /// A load or store outside the mapped regions or their permissions.
+    MemoryFault { pc: u64, error: MemoryError },
+    /// The call ran `limit` instructions without finishing.
+    InstructionLimit { limit: u64 },
     /// The call at `pc` exceeds [`MAX_CALL_DEPTH`](crate::MAX_CALL_DEPTH) nested calls, or finds `r10` lower than
     /// [`VmConfig::frame_size`](crate::VmConfig::frame_size).
     StackOverflow { pc: u64 },
-    /// Execution reached an instruction index outside the code.
-    InvalidPc(u64),
+    /// Execution reached `pc`, an instruction index outside the code.
+    InvalidPc { pc: u64 },
     /// Ran an instruction whose CO-RE relocation the host couldn't resolve.
     UnresolvedCoreRelo { pc: u64 },
     /// `callx` or `gotox` at `pc` targeted something other than an instruction in the program (or, for `callx`, a
     /// helper ID).
     BadCodeAddress { pc: u64, target: u64 },
+    /// A call to helper `id`, which isn't registered. Linking catches these; raw bytecode and `callx` reach it.
+    UnknownHelper { pc: u64, id: u32 },
+    /// A call to a named extern in a slot the VM's table lacks, which only raw bytecode can contain.
+    UnknownExtern { pc: u64, slot: u32 },
 }
 
 impl fmt::Display for ExecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CpuFault { pc } => write!(f, "instruction {pc} is invalid"),
-            Self::MemoryFault { pc, error } => write!(f, "memory fault at instruction {pc}: {error}"),
+            Self::InvalidInstruction { pc } => write!(f, "instruction {pc} is invalid"),
             Self::Unimplemented { pc } => write!(f, "instruction {pc} is not implemented"),
-            Self::InstructionLimit(count) => write!(f, "instruction limit exceeded: {count}"),
+            Self::MemoryFault { pc, error } => write!(f, "memory fault at instruction {pc}: {error}"),
+            Self::InstructionLimit { limit } => write!(f, "the call ran its limit of {limit} instructions"),
             Self::StackOverflow { pc } => write!(f, "the call at instruction {pc} overflows the call stack"),
-            Self::InvalidPc(pc) => write!(f, "invalid program counter: {pc}"),
+            Self::InvalidPc { pc } => write!(f, "execution left the code at instruction index {pc}"),
             Self::UnresolvedCoreRelo { pc } => {
                 write!(f, "instruction {pc} uses a type or field the host doesn't have (CO-RE)")
             }
             Self::BadCodeAddress { pc, target } => {
                 write!(f, "instruction {pc} branches to {target:#x}, which is not an instruction in the program")
+            }
+            Self::UnknownHelper { pc, id } => write!(f, "instruction {pc} calls helper {id}, which is not registered"),
+            Self::UnknownExtern { pc, slot } => {
+                write!(f, "instruction {pc} calls extern slot {slot}, which does not exist")
             }
         }
     }
@@ -260,22 +268,14 @@ impl fmt::Display for ExecError {
 
 impl std::error::Error for ExecError {}
 
-/// Helper function errors.
+/// A failed call from a program to a host function.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum HelperError {
-    /// Unknown helper ID.
-    UnknownHelper(u32),
-    /// Unknown extern table slot.
-    UnknownSlot(u32),
-    /// A host function asks for the caller's remaining instructions; the executor calls it again with them in
-    /// `HelperContext::host`. Never returned from a call.
-    #[doc(hidden)]
-    FuelWanted,
-    /// A host function returned `Err`. Host functions that want the guest to see an error code return it as `i64`
-    /// instead.
-    Host(Box<dyn std::error::Error + Send + Sync>),
-    /// A call into a function another plugin exports failed.
+pub enum HostError {
+    /// The host function returned this `Err`. Host functions that want the guest to see an error code return it as
+    /// `i64` instead.
+    Failed(Box<dyn std::error::Error + Send + Sync>),
+    /// A call into `func`, which `plugin` exports, failed.
     Plugin {
         plugin: String,
         func: String,
@@ -283,36 +283,16 @@ pub enum HelperError {
     },
 }
 
-impl fmt::Display for HelperError {
+impl fmt::Display for HostError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnknownHelper(id) => write!(f, "unknown helper: {id}"),
-            Self::UnknownSlot(slot) => write!(f, "unknown extern slot: {slot}"),
-            Self::FuelWanted => write!(f, "host function wants the caller's fuel"),
-            Self::Host(e) => write!(f, "host function failed: {e}"),
+            Self::Failed(e) => write!(f, "host function failed: {e}"),
             Self::Plugin { plugin, func, error } => write!(f, "{plugin}::{func}: {error}"),
         }
     }
 }
 
-impl std::error::Error for HelperError {}
-
-// Host functions convert their errors on the failure path only; keep that code out of the call path.
-impl From<MemoryError> for HelperError {
-    #[cold]
-    #[inline(never)]
-    fn from(e: MemoryError) -> Self {
-        Self::Host(Box::new(e))
-    }
-}
-
-impl From<VmError> for HelperError {
-    #[cold]
-    #[inline(never)]
-    fn from(e: VmError) -> Self {
-        Self::Host(Box::new(e))
-    }
-}
+impl std::error::Error for HostError {}
 
 /// Guest memory access outside the mapped regions or their permissions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

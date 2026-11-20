@@ -1,4 +1,4 @@
-use crate::err::{ElfError, ErrHeader};
+use crate::err::ElfError;
 use crate::{ensure, ensure_matches, raw, tryres, ElfResult};
 
 impl raw::Elf64Sym {
@@ -35,12 +35,12 @@ impl raw::Elf64Rela {
 
 impl raw::ElfIdent {
     pub const fn validate(&self) -> ElfResult {
-        ensure_matches!(ElfError::Header(ErrHeader::Ident), &self.ei_magic, b"\x7fELF");
-        ensure_matches!(ElfError::Header(ErrHeader::Ident), self.ei_class, raw::ELFCLASS64);
-        ensure_matches!(ElfError::Header(ErrHeader::Ident), self.ei_data, raw::ELFDATA2LSB);
-        ensure_matches!(ElfError::Header(ErrHeader::Ident), self.ei_version, raw::E_CURRENT);
-        ensure_matches!(ElfError::Header(ErrHeader::Ident), self.ei_osabi, raw::ELFOSABI_NONE);
-        ensure_matches!(ElfError::Header(ErrHeader::Ident), self.ei_abiversion, 0);
+        ensure_matches!(ElfError::BadIdent, &self.ei_magic, b"\x7fELF");
+        ensure_matches!(ElfError::BadIdent, self.ei_class, raw::ELFCLASS64);
+        ensure_matches!(ElfError::BadIdent, self.ei_data, raw::ELFDATA2LSB);
+        ensure_matches!(ElfError::BadIdent, self.ei_version, raw::E_CURRENT);
+        ensure_matches!(ElfError::BadIdent, self.ei_osabi, raw::ELFOSABI_NONE);
+        ensure_matches!(ElfError::BadIdent, self.ei_abiversion, 0);
 
         Ok(())
     }
@@ -49,9 +49,9 @@ impl raw::ElfIdent {
 impl raw::Elf64Ehdr {
     pub const fn validate(&self) -> ElfResult {
         tryres!(self.e_ident.validate());
-        ensure!(ElfError::Header(ErrHeader::Header), self.e_type == raw::ET_REL);
-        ensure!(ElfError::Header(ErrHeader::Header), self.e_machine == raw::EM_BPF);
-        ensure!(ElfError::Header(ErrHeader::Header), self.e_version == raw::EV_CURRENT);
+        ensure!(ElfError::NotBpfObject, self.e_type == raw::ET_REL);
+        ensure!(ElfError::NotBpfObject, self.e_machine == raw::EM_BPF);
+        ensure!(ElfError::NotBpfObject, self.e_version == raw::EV_CURRENT);
 
         Ok(())
     }

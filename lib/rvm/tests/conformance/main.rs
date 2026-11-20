@@ -45,7 +45,7 @@ fn run_one(text: &str) -> Result<(), String> {
     // helper 5 is `unwind` in the classic interpreter test ABI; call_unwind_fail.data and callx.data only check that
     // calling it doesn't abort the program
     vm.register_helper(5, |_: ()| 0u64);
-    let mut program = vm.load(Image::from_code(case.code)).map_err(|e| e.to_string())?;
+    let mut program = vm.load_image(Image::from_code(case.code)).map_err(|e| e.to_string())?;
     let mem_ptr = program
         .memory_mut()
         .map_bytes(FIRST_FREE_REGION, &case.mem, case.mem.len(), Perms::RW)

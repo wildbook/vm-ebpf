@@ -1,11 +1,27 @@
 //! rvm as a C library: load a prepared image, map guest memory, copy bytes in and out, and call functions by name.
 //!
-//! `include/rvmrt.h` declares these functions for C. Images come from `rvm::Vm::prepare` and `rvm::Image::to_bytes`;
-//! the runtime has no helpers and no maps, and it limits each call to `rvm::DEFAULT_INSTRUCTION_LIMIT` instructions.
+//! `include/rvmrt.h` declares these functions for C. Images come from `rvm::Vm::prepare_elf` and
+//! `rvm::Image::to_bytes`; the runtime has no helpers and no maps, and it limits each call to
+//! `rvm::DEFAULT_INSTRUCTION_LIMIT` instructions.
 
 use std::slice;
 
-use rvm::{ExecError, Perms, Program, Vm, VmConfig, VmError, DEFAULT_INSTRUCTION_LIMIT, FIRST_FREE_REGION};
+use rvm::{ExecError, Func, Perms, Program, Vm, VmConfig, VmError, DEFAULT_INSTRUCTION_LIMIT, FIRST_FREE_REGION};
+
+/// What an `rvm_program` pointer points to: a program and the handles of its functions in name order, so that a call
+/// by index looks nothing up.
+pub struct RvmProgram {
+    program: Program,
+    funcs: Vec<Func>,
+}
+
+impl RvmProgram {
+    fn new(program: Program) -> Self {
+        let handle = |(name, _): &(String, _)| program.func(name).expect("a listed function");
+        let funcs = program.functions().iter().map(handle).collect();
+        Self { program, funcs }
+    }
+}
 
 /// Result of every call that can fail; `rvm_status` in the header.
 #[repr(C)]
@@ -37,9 +53,10 @@ impl Status {
             VmError::Link(_) => Self::Link,
             VmError::FunctionNotFound { .. } => Self::NotFound,
             VmError::TooManyArgs(_) | VmError::InvalidArgument(_) => Self::Argument,
-            VmError::Exec(ExecError::InstructionLimit(_)) => Self::Limit,
+            VmError::Exec(ExecError::InstructionLimit { .. }) => Self::Limit,
+            VmError::Exec(ExecError::UnknownHelper { .. } | ExecError::UnknownExtern { .. }) => Self::Helper,
             VmError::Exec(_) | VmError::Memory(_) => Self::Fault,
-            VmError::Helper(_) => Self::Helper,
+            VmError::Host(_) => Self::Helper,
             _ => Self::Other,
         }
     }
@@ -51,15 +68,15 @@ impl Status {
 ///
 /// `image` must point to `len` readable bytes, and `program` must be valid for writes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rvm_load(image: *const u8, len: usize, program: *mut *mut Program) -> Status {
+pub unsafe extern "C" fn rvm_load(image: *const u8, len: usize, program: *mut *mut RvmProgram) -> Status {
     let bytes = unsafe { slice_or_empty(image, len) };
     let config = VmConfig {
         instruction_limit: DEFAULT_INSTRUCTION_LIMIT,
         ..VmConfig::default()
     };
     let loaded = Vm::with_config(config)
-        .and_then(|vm| vm.load_image(bytes))
-        .map(|p| Box::into_raw(Box::new(p)));
+        .and_then(|vm| vm.load_image_bytes(bytes))
+        .map(|p| Box::into_raw(Box::new(RvmProgram::new(p))));
     unsafe { finish(loaded, program) }
 }
 
@@ -69,7 +86,7 @@ pub unsafe extern "C" fn rvm_load(image: *const u8, len: usize, program: *mut *m
 ///
 /// `program` must be null or a program from [`rvm_load`] that is not freed yet.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rvm_free(program: *mut Program) {
+pub unsafe extern "C" fn rvm_free(program: *mut RvmProgram) {
     if !program.is_null() {
         drop(unsafe { Box::from_raw(program) });
     }
@@ -82,8 +99,8 @@ pub unsafe extern "C" fn rvm_free(program: *mut Program) {
 ///
 /// `program` must be a live program from [`rvm_load`], and `addr` must be valid for writes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rvm_map(program: *mut Program, region: usize, len: usize, addr: *mut u64) -> Status {
-    let program = unsafe { &mut *program };
+pub unsafe extern "C" fn rvm_map(program: *mut RvmProgram, region: usize, len: usize, addr: *mut u64) -> Status {
+    let program = unsafe { &mut (*program).program };
     let idx = FIRST_FREE_REGION.saturating_add(region);
     unsafe { finish(program.memory_mut().map(idx, len, Perms::RW), addr) }
 }
@@ -95,8 +112,8 @@ pub unsafe extern "C" fn rvm_map(program: *mut Program, region: usize, len: usiz
 ///
 /// `program` must be a live program from [`rvm_load`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rvm_unmap(program: *mut Program, region: usize) -> Status {
-    let program = unsafe { &mut *program };
+pub unsafe extern "C" fn rvm_unmap(program: *mut RvmProgram, region: usize) -> Status {
+    let program = unsafe { &mut (*program).program };
     let idx = FIRST_FREE_REGION.saturating_add(region);
     unsafe { finish(program.memory_mut().unmap(idx), &mut ()) }
 }
@@ -108,8 +125,8 @@ pub unsafe extern "C" fn rvm_unmap(program: *mut Program, region: usize) -> Stat
 /// `program` must be a live program from [`rvm_load`], and `buf` must point to `len` writable bytes. `buf` may be null
 /// when `len` is 0.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rvm_read(program: *const Program, addr: u64, buf: *mut u8, len: usize) -> Status {
-    let program = unsafe { &*program };
+pub unsafe extern "C" fn rvm_read(program: *const RvmProgram, addr: u64, buf: *mut u8, len: usize) -> Status {
+    let program = unsafe { &(*program).program };
     if len == 0 {
         return Status::Ok;
     }
@@ -128,8 +145,8 @@ pub unsafe extern "C" fn rvm_read(program: *const Program, addr: u64, buf: *mut 
 /// `program` must be a live program from [`rvm_load`], and `buf` must point to `len` readable bytes. `buf` may be null
 /// when `len` is 0.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rvm_write(program: *mut Program, addr: u64, buf: *const u8, len: usize) -> Status {
-    let program = unsafe { &mut *program };
+pub unsafe extern "C" fn rvm_write(program: *mut RvmProgram, addr: u64, buf: *const u8, len: usize) -> Status {
+    let program = unsafe { &mut (*program).program };
     if len == 0 {
         return Status::Ok;
     }
@@ -149,14 +166,14 @@ pub unsafe extern "C" fn rvm_write(program: *mut Program, addr: u64, buf: *const
 /// `nargs` values, and `ret` must be valid for writes. `name` and `args` may be null when their length is 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rvm_call(
-    program: *mut Program,
+    program: *mut RvmProgram,
     name: *const u8,
     name_len: usize,
     args: *const u64,
     nargs: usize,
     ret: *mut u64,
 ) -> Status {
-    let program = unsafe { &mut *program };
+    let program = unsafe { &mut (*program).program };
     let Some(name) = (unsafe { str_or_none(name, name_len) }) else {
         return Status::Argument;
     };
@@ -172,16 +189,16 @@ pub unsafe extern "C" fn rvm_call(
 /// must be valid for writes. `name` may be null when `name_len` is 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rvm_func(
-    program: *const Program,
+    program: *const RvmProgram,
     name: *const u8,
     name_len: usize,
     index: *mut usize,
 ) -> Status {
-    let program = unsafe { &*program };
+    let functions = unsafe { &*program }.program.functions();
     let Some(name) = (unsafe { str_or_none(name, name_len) }) else {
         return Status::Argument;
     };
-    let Some(found) = program.function_index(name) else {
+    let Ok(found) = functions.binary_search_by(|(listed, _)| listed.as_str().cmp(name)) else {
         return Status::NotFound;
     };
     unsafe { index.write(found) };
@@ -196,14 +213,14 @@ pub unsafe extern "C" fn rvm_func(
 /// for writes. `args` may be null when `nargs` is 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rvm_call_func(
-    program: *mut Program,
+    program: *mut RvmProgram,
     index: usize,
     args: *const u64,
     nargs: usize,
     ret: *mut u64,
 ) -> Status {
-    let program = unsafe { &mut *program };
-    let Some(func) = program.func_at(index) else {
+    let RvmProgram { program, funcs } = unsafe { &mut *program };
+    let Some(&func) = funcs.get(index) else {
         return Status::NotFound;
     };
     let args = unsafe { slice_or_empty(args, nargs) };
@@ -216,8 +233,8 @@ pub unsafe extern "C" fn rvm_call_func(
 ///
 /// `program` must be a live program from [`rvm_load`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rvm_function_count(program: *const Program) -> usize {
-    unsafe { &*program }.functions().len()
+pub unsafe extern "C" fn rvm_function_count(program: *const RvmProgram) -> usize {
+    unsafe { &*program }.funcs.len()
 }
 
 /// Stores the name of the function at `index`, which stays valid until the program is freed, in `*name` and
@@ -228,13 +245,13 @@ pub unsafe extern "C" fn rvm_function_count(program: *const Program) -> usize {
 /// `program` must be a live program from [`rvm_load`], and `name` and `name_len` must be valid for writes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rvm_function_name(
-    program: *const Program,
+    program: *const RvmProgram,
     index: usize,
     name: *mut *const u8,
     name_len: *mut usize,
 ) -> Status {
-    let program = unsafe { &*program };
-    let Some((found, _)) = program.functions().nth(index) else {
+    let functions = unsafe { &*program }.program.functions();
+    let Some((found, _)) = functions.get(index) else {
         return Status::NotFound;
     };
     unsafe {

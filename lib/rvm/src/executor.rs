@@ -4,8 +4,8 @@ use std::fmt;
 
 use rvm_core::{run, CallStack, Callee, Code, Context, Flow, Host, METERED};
 
-use crate::error::{ExecError, HelperError, MemoryError, Result, VmError};
-use crate::helper::{HelperRegistry, HostState};
+use crate::error::{ExecError, MemoryError, Result, VmError};
+use crate::helper::{HelperRegistry, HostState, Stop};
 use crate::image::INSN_SIZE;
 use crate::layout::CODE_REGION;
 #[cfg(feature = "maps")]
@@ -42,7 +42,7 @@ impl Executor {
         let host = HostCalls {
             registry: helpers,
             state: HostState::default(),
-            error: None,
+            stop: None,
         };
         Self {
             calls: CallStack::new(config.frame_size, host),
@@ -189,10 +189,10 @@ fn call_with_fuel(
 ) -> Result<u64> {
     let host = &mut calls.host;
     host.state.fuel = Some(*fuel);
-    let mut error = None;
-    let r0 = host.registry.call_slot(slot, ctx, &mut host.state, &mut error);
+    let mut stop = None;
+    let r0 = host.registry.call_slot(slot, ctx, &mut host.state, &mut stop);
     *fuel = host.state.fuel.take().expect("fuel stays while the function runs");
-    ctx.regs[0] = r0.ok_or_else(|| error.expect("failed host call left no error"))?;
+    ctx.regs[0] = r0.ok_or_else(|| failure(stop.expect("stopped host call left no reason"), pc))?;
     Ok(pc + 1)
 }
 
@@ -204,15 +204,18 @@ fn resume(flow: Flow<u64>, pc: u64, code: &Code, calls: &mut CallStack<HostCalls
         Flow::StackOverflow => Err(ExecError::StackOverflow { pc }.into()),
         // a call the linker planted for an unresolved CO-RE relocation
         Flow::CallHelper(CORE_POISON_HELPER) => Err(ExecError::UnresolvedCoreRelo { pc }.into()),
-        Flow::CallHelper(_) | Flow::CallKfunc(_) => Err(calls.host.take_error().into()),
-        Flow::OutOfFuel => Err(ExecError::InstructionLimit(limit).into()),
-        Flow::BadPc => Err(ExecError::InvalidPc(pc).into()),
-        Flow::FailCpu => Err(ExecError::CpuFault { pc }.into()),
+        Flow::CallHelper(_) | Flow::CallKfunc(_) => {
+            let stop = calls.host.stop.take().expect("stopped host call left no reason");
+            Err(failure(stop, pc))
+        }
+        Flow::OutOfFuel => Err(ExecError::InstructionLimit { limit }.into()),
+        Flow::BadPc => Err(ExecError::InvalidPc { pc }.into()),
+        Flow::FailCpu => Err(ExecError::InvalidInstruction { pc }.into()),
         Flow::FailMem(addr) => Err(memory_fault(pc, addr, code)),
         Flow::Missing => Err(ExecError::Unimplemented { pc }.into()),
         // a host call `HostCalls::callx` ran failed, or the target addresses neither a function nor a helper
-        Flow::CallIndirect(target) => match calls.host.error.take() {
-            Some(error) => Err(error.into()),
+        Flow::CallIndirect(target) => match calls.host.stop.take() {
+            Some(stop) => Err(failure(stop, pc)),
             None => Err(ExecError::BadCodeAddress { pc, target }.into()),
         },
         Flow::JumpIndirect(target) => jump_indirect(target, pc, code),
@@ -221,27 +224,30 @@ fn resume(flow: Flow<u64>, pc: u64, code: &Code, calls: &mut CallStack<HostCalls
     }
 }
 
+/// The error of the call at `pc` that `stop` stopped.
+fn failure(stop: Stop, pc: u64) -> VmError {
+    match stop {
+        Stop::Failed(error) => error.into(),
+        Stop::UnknownHelper(id) => ExecError::UnknownHelper { pc, id }.into(),
+        Stop::UnknownSlot(slot) => ExecError::UnknownExtern { pc, slot }.into(),
+        Stop::FuelWanted => unreachable!("`run_on` answers fuel requests"),
+    }
+}
+
 /// The extern table and the state that helper, kfunc and `callx` calls reach from inside [`run`].
 struct HostCalls {
     registry: HelperRegistry,
     state: HostState,
-    /// Why the call that stopped [`run`] failed, until the executor takes it. [`HelperError::FuelWanted`] asks for the
-    /// caller's fuel, and the executor calls the function again with it.
-    error: Option<HelperError>,
+    /// Why the host call that stopped [`run`] did, until the executor takes it.
+    stop: Option<Stop>,
 }
 
 impl HostCalls {
-    /// The error of the helper or kfunc call that stopped [`run`].
-    #[cold]
-    fn take_error(&mut self) -> HelperError {
-        self.error.take().expect("failed host call left no error")
-    }
-
     /// The extern-table slot of the host function that stopped [`run`] with `flow` asking for the caller's fuel, if
     /// it did; takes the request.
     #[cold]
     fn take_fuel_wanted(&mut self, flow: &Flow<u64>) -> Option<u32> {
-        if !matches!(self.error, Some(HelperError::FuelWanted)) {
+        if !matches!(self.stop, Some(Stop::FuelWanted)) {
             return None;
         }
         let slot = match *flow {
@@ -250,7 +256,7 @@ impl HostCalls {
             Flow::CallIndirect(target) => u32::try_from(target).ok().and_then(|id| self.registry.slot_of_id(id)),
             _ => None,
         }?;
-        self.error = None;
+        self.stop = None;
         Some(slot)
     }
 }
@@ -264,7 +270,7 @@ impl Host<&mut VmMemory> for HostCalls {
             return None;
         }
         let Some(slot) = self.registry.slot_of_id(id) else {
-            self.error = Some(HelperError::UnknownHelper(id));
+            self.stop = Some(Stop::UnknownHelper(id));
             return None;
         };
         self.kfunc(ctx, slot)
@@ -272,7 +278,7 @@ impl Host<&mut VmMemory> for HostCalls {
 
     #[inline]
     fn kfunc(&mut self, ctx: &mut Context<&mut VmMemory>, slot: u32) -> Option<u64> {
-        self.registry.call_slot(slot, ctx, &mut self.state, &mut self.error)
+        self.registry.call_slot(slot, ctx, &mut self.state, &mut self.stop)
     }
 
     // A code address names a guest function, which `run` checks against the code. A helper's address is its ID, as in
@@ -284,7 +290,7 @@ impl Host<&mut VmMemory> for HostCalls {
         }
         let id = u32::try_from(target).ok()?;
         let Some(slot) = self.registry.slot_of_id(id) else {
-            self.error = Some(HelperError::UnknownHelper(id));
+            self.stop = Some(Stop::UnknownHelper(id));
             return None;
         };
         self.kfunc(ctx, slot).map(Callee::Host)
@@ -330,7 +336,8 @@ mod tests {
     use rvm_core::decode_instructions;
 
     use super::*;
-    use crate::helper::HelperContext;
+    use crate::error::HostError;
+    use crate::helper::{HelperContext, HostFn};
     use crate::layout::STACK_REGION;
     use crate::memory::{GuestMemory, Perms};
 
@@ -342,7 +349,7 @@ mod tests {
         Executor::new(helpers.clone(), stack_top, config).call(&code, &mut memory, 0, &[])
     }
 
-    fn run(asm: &mut Assembler) -> Result<u64> {
+    fn run(asm: &Assembler) -> Result<u64> {
         run_with(&asm.assemble().unwrap(), &HelperRegistry::default(), VmMemory::new(), &VmConfig::default())
     }
 
@@ -350,7 +357,7 @@ mod tests {
     fn running_off_code_end_is_invalid_pc() {
         let mut asm = Assembler::new();
         asm.mov64_imm(R0, 1);
-        assert!(matches!(run(&mut asm), Err(VmError::Exec(ExecError::InvalidPc(1)))));
+        assert!(matches!(run(&asm), Err(VmError::Exec(ExecError::InvalidPc { pc: 1 }))));
     }
 
     /// Load-acquire writes its `dst`, and r10 is read-only.
@@ -358,21 +365,21 @@ mod tests {
     fn load_acquire_into_r10_faults() {
         let mut asm = Assembler::new();
         asm.mov64(R1, R10).load_acquire64(R10, R1, -8).exit();
-        assert!(matches!(run(&mut asm), Err(VmError::Exec(ExecError::CpuFault { pc: 1 }))));
+        assert!(matches!(run(&asm), Err(VmError::Exec(ExecError::InvalidInstruction { pc: 1 }))));
     }
 
     /// The access size comes from the faulting instruction, which may sit inside a superinstruction or be an r10
     /// access, whose first slots hold rewritten opcode bytes.
     #[test]
     fn memory_fault_reports_access_size() {
-        let fault = |asm: &mut Assembler| match run(asm) {
+        let fault = |asm: &Assembler| match run(asm) {
             Err(VmError::Exec(ExecError::MemoryFault { pc, error })) => (pc, error.size),
             other => panic!("{other:?}"),
         };
 
         let mut asm = Assembler::new();
         asm.mov64_imm(R1, 0).ldxh(R0, R1, 0).exit();
-        assert_eq!(fault(&mut asm), (1, 2));
+        assert_eq!(fault(&asm), (1, 2));
 
         // mov, add, ldxw: one superinstruction
         let mut asm = Assembler::new();
@@ -382,34 +389,34 @@ mod tests {
             .add64(R1, R3)
             .ldxw(R0, R1, 0)
             .exit();
-        assert_eq!(fault(&mut asm), (4, 4));
+        assert_eq!(fault(&asm), (4, 4));
 
         // above the stack top
         let mut asm = Assembler::new();
         asm.stxdw(R10, 8, R1).exit();
-        assert_eq!(fault(&mut asm), (0, 8));
+        assert_eq!(fault(&asm), (0, 8));
     }
 
     #[test]
     fn stack_overflow_deep_recursion() {
         let mut asm = Assembler::new();
-        let func_start = asm.create_label();
-        asm.set_label(&func_start).unwrap();
-        asm.call_local(&func_start);
+        let func_start = asm.label();
+        asm.bind(func_start);
+        asm.call_local(func_start);
         asm.exit();
-        assert!(matches!(run(&mut asm), Err(VmError::Exec(ExecError::StackOverflow { .. }))));
+        assert!(matches!(run(&asm), Err(VmError::Exec(ExecError::StackOverflow { .. }))));
     }
 
     // helper calls run inside the handler chain; this is the lib test that takes Miri through that path
     #[test]
     fn helper_calls() {
         let mut helpers = HelperRegistry::default();
-        helpers.register_helper_raw(1, |ctx: &mut HelperContext| {
+        let store_and_double = |ctx: &mut HelperContext| {
             ctx.memory.write(ctx.args.r2, 7u64).unwrap();
-            ctx.args.r1 * 2
-        });
-        let run =
-            |asm: &mut Assembler| run_with(&asm.assemble().unwrap(), &helpers, VmMemory::new(), &VmConfig::default());
+            Ok(ctx.args.r1 * 2)
+        };
+        helpers.put_id(1, HostFn::raw(store_and_double));
+        let run = |asm: &Assembler| run_with(&asm.assemble().unwrap(), &helpers, VmMemory::new(), &VmConfig::default());
 
         // the helper's r0 and its store are visible to the next instructions
         let mut asm = Assembler::new();
@@ -421,7 +428,7 @@ mod tests {
         asm.ldxdw(R0, R10, -8);
         asm.add64(R0, R6);
         asm.exit();
-        assert_eq!(run(&mut asm).unwrap(), 49);
+        assert_eq!(run(&asm).unwrap(), 49);
 
         let mut asm = Assembler::new();
         asm.mov64(R2, R10);
@@ -429,16 +436,15 @@ mod tests {
         asm.call(1);
         asm.call(2);
         asm.exit();
-        assert!(matches!(run(&mut asm), Err(VmError::Helper(HelperError::UnknownHelper(2)))));
+        assert!(matches!(run(&asm), Err(VmError::Exec(ExecError::UnknownHelper { pc: 3, id: 2 }))));
     }
 
     // `callx` runs inside the handler chain too; this is the lib test that takes Miri through that path
     #[test]
     fn callx_calls() {
         let mut helpers = HelperRegistry::default();
-        helpers.register_helper_raw(1, |ctx: &mut HelperContext| ctx.args.r1 * 2);
-        let run =
-            |asm: &mut Assembler| run_with(&asm.assemble().unwrap(), &helpers, VmMemory::new(), &VmConfig::default());
+        helpers.put_id(1, HostFn::typed(|x: u64| x * 2));
+        let run = |asm: &Assembler| run_with(&asm.assemble().unwrap(), &helpers, VmMemory::new(), &VmConfig::default());
         let addr = |pc: u64| (region_base(CODE_REGION) + pc * INSN_SIZE) as i64;
 
         // the function at pc 8 returns r1 + 1, then helper 1 doubles it
@@ -446,27 +452,28 @@ mod tests {
         asm.lddw(R2, addr(8)).mov64_imm(R1, 20).callx(R2);
         asm.mov64(R1, R0).mov64_imm(R3, 1).callx(R3).exit();
         asm.mov64(R0, R1).add64_imm(R0, 1).exit();
-        assert_eq!(run(&mut asm).unwrap(), 42);
+        assert_eq!(run(&asm).unwrap(), 42);
 
         let mut asm = Assembler::new();
         asm.mov64_imm(R1, 2).callx(R1).exit();
-        assert!(matches!(run(&mut asm), Err(VmError::Helper(HelperError::UnknownHelper(2)))));
+        assert!(matches!(run(&asm), Err(VmError::Exec(ExecError::UnknownHelper { pc: 1, id: 2 }))));
 
         // the function at pc 0 calls itself until the frames run out
         let mut asm = Assembler::new();
         asm.lddw(R1, addr(0)).callx(R1).exit();
-        assert!(matches!(run(&mut asm), Err(VmError::Exec(ExecError::StackOverflow { pc: 2 }))));
+        assert!(matches!(run(&asm), Err(VmError::Exec(ExecError::StackOverflow { pc: 2 }))));
     }
 
     // a host function with memory access runs inside the handler chain too, and an `Err` from it fails the guest call
     #[test]
     fn memory_fn() {
         let mut helpers = HelperRegistry::default();
-        helpers.register_fn_with_memory("bump", |mem: &mut GuestMemory, addr: u64| {
+        let bump = |mem: &mut GuestMemory, addr: u64| {
             let old = mem.read::<u64>(addr)?;
             mem.write(addr, old + 1)?;
             Ok::<_, MemoryError>(old)
-        });
+        };
+        helpers.put_name("bump".into(), HostFn::with_memory(bump));
         let run = |addr: Option<u64>| {
             let mut asm = Assembler::new();
             asm.stdw(R10, -8, 41);
@@ -496,7 +503,7 @@ mod tests {
         // an unmapped address, and a read-only region that can be read but not written
         for addr in [0, region_base(2)] {
             let err = run(Some(addr)).unwrap_err();
-            let VmError::Helper(HelperError::Host(e)) = &err else {
+            let VmError::Host(HostError::Failed(e)) = &err else {
                 panic!("{err:?}")
             };
             assert_eq!(e.downcast_ref::<MemoryError>(), Some(&MemoryError { addr, size: 8 }));

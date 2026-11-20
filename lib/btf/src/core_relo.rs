@@ -8,7 +8,7 @@ use crate::ext::{CoreRelo, CoreReloKind};
 use crate::parse::{Btf, MAX_RESOLVE_DEPTH};
 use crate::patch::patch_instruction;
 use crate::raw::{BtfKind, BTF_INT_SIGNED};
-use crate::types::{BtfTypeInfo, Member};
+use crate::types::{BtfType, Member};
 
 /// Error during CO-RE relocation application.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,7 +102,7 @@ pub fn apply_core_relocations(
         let res = resolve_relocation(local, target, relo)?;
         if patch_instruction(insns, relo, &res)? {
             let access_str = local.strings().get(relo.access_str_off).unwrap_or("");
-            let type_name = local.type_by_id(relo.type_id).and_then(BtfTypeInfo::name).unwrap_or("");
+            let type_name = local.type_by_id(relo.type_id).and_then(BtfType::name).unwrap_or("");
             let (type_name, access_str) = (type_name.to_string(), access_str.to_string());
             let error = if res.poison {
                 CoreReloError::NoMatchingTarget { type_name, access_str }
@@ -220,7 +220,7 @@ fn resolve_relocation(local: &Btf<'_>, target: &Btf<'_>, relo: &CoreRelo) -> Res
             let new_t = target
                 .type_by_id(new_tid)
                 .ok_or(CoreReloError::InvalidTypeId(new_tid))?;
-            let safe_adjust = (matches!(orig_t, BtfTypeInfo::Ptr { .. }) && matches!(new_t, BtfTypeInfo::Ptr { .. }))
+            let safe_adjust = (matches!(orig_t, BtfType::Ptr { .. }) && matches!(new_t, BtfType::Ptr { .. }))
                 || (is_unsigned_int(orig_t) && is_unsigned_int(new_t));
             !safe_adjust
         }
@@ -240,8 +240,8 @@ fn resolve_relocation(local: &Btf<'_>, target: &Btf<'_>, relo: &CoreRelo) -> Res
     })
 }
 
-fn is_unsigned_int(t: &BtfTypeInfo<'_>) -> bool {
-    matches!(t, BtfTypeInfo::Int { encoding, .. } if encoding & BTF_INT_SIGNED == 0)
+fn is_unsigned_int(t: &BtfType<'_>) -> bool {
+    matches!(t, BtfType::Int { encoding, .. } if encoding & BTF_INT_SIGNED == 0)
 }
 
 /// One step of a resolved access path: a named struct/union field, or an unnamed array index (including the implicit
@@ -309,7 +309,7 @@ fn parse_spec(local: &Btf<'_>, relo: &CoreRelo, access_str: &str) -> Result<Spec
             return Err(invalid_access(access_str));
         }
         let name = match root_t {
-            BtfTypeInfo::Enum { variants, .. } => variants.get(root_idx as usize).map(|v| v.name),
+            BtfType::Enum { variants, .. } => variants.get(root_idx as usize).map(|v| v.name),
             _ => return Err(invalid_access(access_str)),
         }
         .ok_or_else(|| invalid_access(access_str))?;
@@ -336,7 +336,7 @@ fn parse_spec(local: &Btf<'_>, relo: &CoreRelo, access_str: &str) -> Result<Spec
         let (nid, t) = local.resolve_type(id).ok_or_else(|| invalid_access(access_str))?;
         id = nid;
         match t {
-            BtfTypeInfo::Struct { members, .. } | BtfTypeInfo::Union { members, .. } => {
+            BtfType::Struct { members, .. } | BtfType::Union { members, .. } => {
                 let m = members.get(idx as usize).ok_or_else(|| invalid_access(access_str))?;
                 bit_offset = bit_offset
                     .checked_add(u64::from(m.bit_offset))
@@ -350,7 +350,7 @@ fn parse_spec(local: &Btf<'_>, relo: &CoreRelo, access_str: &str) -> Result<Spec
                 }
                 id = m.type_id;
             }
-            BtfTypeInfo::Array { elem_type, nelems, .. } => {
+            BtfType::Array { elem_type, nelems, .. } => {
                 let (eid, _) = local
                     .resolve_type(*elem_type)
                     .ok_or_else(|| invalid_access(access_str))?;
@@ -468,7 +468,7 @@ fn spec_match(
         }
 
         if i > 0 {
-            let BtfTypeInfo::Array { elem_type, nelems, .. } = tt else {
+            let BtfType::Array { elem_type, nelems, .. } = tt else {
                 return Ok(None);
             };
             let flex = is_flex_array(target, spec.accessors.last(), *nelems);
@@ -508,7 +508,7 @@ fn match_enumval(local_spec: &Spec, target: &Btf<'_>, cand_id: u32) -> Result<Op
         .resolve_type(cand_id)
         .ok_or(CoreReloError::InvalidTypeId(cand_id))?;
     let names: Vec<&str> = match t {
-        BtfTypeInfo::Enum { variants, .. } => variants.iter().map(|v| v.name).collect(),
+        BtfType::Enum { variants, .. } => variants.iter().map(|v| v.name).collect(),
         _ => return Ok(None),
     };
 
@@ -683,8 +683,8 @@ fn calc_field_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<Hal
         CoreReloKind::FieldByteSize => Ok(Half::new(u64::from(byte_sz), validate)),
         CoreReloKind::FieldSigned => {
             let signed = match field_t {
-                BtfTypeInfo::Enum { is_signed, .. } => *is_signed,
-                BtfTypeInfo::Int { encoding, .. } => encoding & BTF_INT_SIGNED != 0,
+                BtfType::Enum { is_signed, .. } => *is_signed,
+                BtfType::Int { encoding, .. } => encoding & BTF_INT_SIGNED != 0,
                 _ => false,
             };
             Ok(Half::new(u64::from(signed), true))
@@ -733,7 +733,7 @@ fn calc_enumval_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<H
                 .type_by_id(acc.type_id)
                 .ok_or(CoreReloError::InvalidTypeId(acc.type_id))?;
             let val = match t {
-                BtfTypeInfo::Enum { variants, .. } => variants.get(acc.idx as usize).map(|v| v.value as u64),
+                BtfType::Enum { variants, .. } => variants.get(acc.idx as usize).map(|v| v.value as u64),
                 _ => None,
             }
             .ok_or(CoreReloError::InvalidTypeId(acc.type_id))?;
@@ -748,7 +748,7 @@ fn calc_enumval_half(kind: CoreReloKind, spec: &Spec, btf: &Btf<'_>) -> Result<H
 fn unwrap_arrays(btf: &Btf<'_>, id: u32) -> Result<u32, CoreReloError> {
     let (mut id, mut t) = btf.resolve_type(id).ok_or(CoreReloError::InvalidTypeId(id))?;
     for _ in 0..=MAX_RESOLVE_DEPTH {
-        let BtfTypeInfo::Array { elem_type, .. } = t else {
+        let BtfType::Array { elem_type, .. } = t else {
             return Ok(id);
         };
         (id, t) = btf
@@ -763,9 +763,9 @@ fn resolve_size(btf: &Btf<'_>, id: u32) -> Result<u64, CoreReloError> {
     btf.resolve_size(id).ok_or(CoreReloError::InvalidTypeId(id))
 }
 
-fn members_of<'a, 'b>(t: &'b BtfTypeInfo<'a>) -> Option<&'b [Member<'a>]> {
+fn members_of<'a, 'b>(t: &'b BtfType<'a>) -> Option<&'b [Member<'a>]> {
     match t {
-        BtfTypeInfo::Struct { members, .. } | BtfTypeInfo::Union { members, .. } => Some(members),
+        BtfType::Struct { members, .. } | BtfType::Union { members, .. } => Some(members),
         _ => None,
     }
 }
@@ -846,12 +846,12 @@ fn fields_are_compat(
         }
 
         match lt {
-            BtfTypeInfo::Ptr { .. } | BtfTypeInfo::Float { .. } => return Ok(true),
-            BtfTypeInfo::Fwd { name, .. } | BtfTypeInfo::Enum { name, .. } => {
+            BtfType::Ptr { .. } | BtfType::Float { .. } => return Ok(true),
+            BtfType::Fwd { name, .. } | BtfType::Enum { name, .. } => {
                 return Ok(fwd_or_enum_names_match(name, tt.name().unwrap_or("")));
             }
-            BtfTypeInfo::Int { offset, .. } => {
-                let BtfTypeInfo::Int {
+            BtfType::Int { offset, .. } => {
+                let BtfType::Int {
                     offset: targ_offset, ..
                 } = tt
                 else {
@@ -859,8 +859,8 @@ fn fields_are_compat(
                 };
                 return Ok(*offset == 0 && *targ_offset == 0);
             }
-            BtfTypeInfo::Array { elem_type, .. } => {
-                let BtfTypeInfo::Array {
+            BtfType::Array { elem_type, .. } => {
+                let BtfType::Array {
                     elem_type: targ_elem, ..
                 } = tt
                 else {
@@ -914,13 +914,13 @@ fn types_are_compat_at(
         }
 
         match lt {
-            BtfTypeInfo::Void
-            | BtfTypeInfo::Struct { .. }
-            | BtfTypeInfo::Union { .. }
-            | BtfTypeInfo::Enum { .. }
-            | BtfTypeInfo::Fwd { .. } => return Ok(true),
-            BtfTypeInfo::Int { offset, .. } => {
-                let BtfTypeInfo::Int {
+            BtfType::Void
+            | BtfType::Struct { .. }
+            | BtfType::Union { .. }
+            | BtfType::Enum { .. }
+            | BtfType::Fwd { .. } => return Ok(true),
+            BtfType::Int { offset, .. } => {
+                let BtfType::Int {
                     offset: targ_offset, ..
                 } = tt
                 else {
@@ -928,8 +928,8 @@ fn types_are_compat_at(
                 };
                 return Ok(*offset == 0 && *targ_offset == 0);
             }
-            BtfTypeInfo::Ptr { pointee_type } => {
-                let BtfTypeInfo::Ptr {
+            BtfType::Ptr { pointee_type } => {
+                let BtfType::Ptr {
                     pointee_type: targ_pointee,
                 } = tt
                 else {
@@ -938,8 +938,8 @@ fn types_are_compat_at(
                 local_id = *pointee_type;
                 targ_id = *targ_pointee;
             }
-            BtfTypeInfo::Array { elem_type, .. } => {
-                let BtfTypeInfo::Array {
+            BtfType::Array { elem_type, .. } => {
+                let BtfType::Array {
                     elem_type: targ_elem, ..
                 } = tt
                 else {
@@ -948,8 +948,8 @@ fn types_are_compat_at(
                 local_id = *elem_type;
                 targ_id = *targ_elem;
             }
-            BtfTypeInfo::FuncProto { return_type, params } => {
-                let BtfTypeInfo::FuncProto {
+            BtfType::FuncProto { return_type, params } => {
+                let BtfType::FuncProto {
                     return_type: targ_return,
                     params: targ_params,
                 } = tt
@@ -1017,11 +1017,11 @@ fn types_match_at(
         let (lk, tk) = (lt.kind(), tt.kind());
 
         match lt {
-            BtfTypeInfo::Void => return Ok(lk == tk),
-            BtfTypeInfo::Fwd {
+            BtfType::Void => return Ok(lk == tk),
+            BtfType::Fwd {
                 is_union: local_union, ..
             } => {
-                let BtfTypeInfo::Fwd {
+                let BtfType::Fwd {
                     is_union: targ_union, ..
                 } = tt
                 else {
@@ -1033,15 +1033,15 @@ fn types_match_at(
                 };
                 return Ok(local_union == targ_union);
             }
-            BtfTypeInfo::Enum { .. } => {
+            BtfType::Enum { .. } => {
                 return Ok(is_any_enum(tk) && enums_match(lt, tt));
             }
-            BtfTypeInfo::Struct { .. } | BtfTypeInfo::Union { .. } => {
+            BtfType::Struct { .. } | BtfType::Union { .. } => {
                 if behind_ptr {
                     if lk == tk {
                         return Ok(true);
                     }
-                    let BtfTypeInfo::Fwd {
+                    let BtfType::Fwd {
                         is_union: targ_union, ..
                     } = tt
                     else {
@@ -1054,8 +1054,8 @@ fn types_match_at(
                 }
                 return composites_match(local, lt, target, tt, behind_ptr, level);
             }
-            BtfTypeInfo::Int { size, encoding, .. } => {
-                let BtfTypeInfo::Int {
+            BtfType::Int { size, encoding, .. } => {
+                let BtfType::Int {
                     size: targ_size,
                     encoding: targ_encoding,
                     ..
@@ -1065,8 +1065,8 @@ fn types_match_at(
                 };
                 return Ok(size == targ_size && (encoding & BTF_INT_SIGNED) == (targ_encoding & BTF_INT_SIGNED));
             }
-            BtfTypeInfo::Ptr { pointee_type } => {
-                let BtfTypeInfo::Ptr {
+            BtfType::Ptr { pointee_type } => {
+                let BtfType::Ptr {
                     pointee_type: targ_pointee,
                 } = tt
                 else {
@@ -1076,8 +1076,8 @@ fn types_match_at(
                 local_id = *pointee_type;
                 targ_id = *targ_pointee;
             }
-            BtfTypeInfo::Array { elem_type, nelems, .. } => {
-                let BtfTypeInfo::Array {
+            BtfType::Array { elem_type, nelems, .. } => {
+                let BtfType::Array {
                     elem_type: targ_elem,
                     nelems: targ_nelems,
                     ..
@@ -1091,8 +1091,8 @@ fn types_match_at(
                 local_id = *elem_type;
                 targ_id = *targ_elem;
             }
-            BtfTypeInfo::FuncProto { return_type, params } => {
-                let BtfTypeInfo::FuncProto {
+            BtfType::FuncProto { return_type, params } => {
+                let BtfType::FuncProto {
                     return_type: targ_return,
                     params: targ_params,
                 } = tt
@@ -1117,9 +1117,9 @@ fn types_match_at(
 
 fn composites_match(
     local: &Btf<'_>,
-    local_t: &BtfTypeInfo<'_>,
+    local_t: &BtfType<'_>,
     target: &Btf<'_>,
-    targ_t: &BtfTypeInfo<'_>,
+    targ_t: &BtfType<'_>,
     behind_ptr: bool,
     level: i32,
 ) -> Result<bool, CoreReloError> {
@@ -1146,10 +1146,10 @@ fn composites_match(
     Ok(true)
 }
 
-fn enums_match(local_t: &BtfTypeInfo<'_>, targ_t: &BtfTypeInfo<'_>) -> bool {
-    fn parts<'a>(t: &'a BtfTypeInfo<'_>) -> Option<(u32, Vec<&'a str>)> {
+fn enums_match(local_t: &BtfType<'_>, targ_t: &BtfType<'_>) -> bool {
+    fn parts<'a>(t: &'a BtfType<'_>) -> Option<(u32, Vec<&'a str>)> {
         match t {
-            BtfTypeInfo::Enum { size, variants, .. } => Some((*size, variants.iter().map(|v| v.name).collect())),
+            BtfType::Enum { size, variants, .. } => Some((*size, variants.iter().map(|v| v.name).collect())),
             _ => None,
         }
     }

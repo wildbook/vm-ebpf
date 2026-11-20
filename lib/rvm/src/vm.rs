@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::{Result, VmError};
 use crate::executor::DEFAULT_FRAME_SIZE;
-use crate::helper::{FromArgs, IntoReturn, SharedHelpers};
+use crate::helper::{FromArgs, HostFn, IntoReturn, SharedHelpers};
 #[cfg(feature = "link")]
 use crate::host_type::HostTypes;
 use crate::image::{self, Image};
@@ -16,7 +16,7 @@ use crate::layout::{BORROW_FIRST_REGION, FIRST_FREE_REGION};
 #[cfg(feature = "link")]
 use crate::linker;
 #[cfg(feature = "maps")]
-use crate::maps::{self, SharedMaps};
+use crate::maps::{self, SharedMaps, ValueSpacing};
 use crate::memory::{GuestMemory, Perms, SharedBuffer, SharedRegion, VmMemory, MAX_REGION_LEN};
 #[cfg(feature = "link")]
 use crate::module::Module;
@@ -108,22 +108,18 @@ impl Vm {
         }
     }
 
-    // Helper registration: changes reach programs linked earlier at their next call. Replacing a function keeps its
-    // slot, so linked call sites stay valid.
+    // Host functions: changes reach programs linked earlier at their next call. Replacing a function keeps its slot,
+    // so linked call sites stay valid.
 
-    /// Register a helper function with type-safe argument extraction. With the `maps` feature, IDs 1 to 3 replace the
-    /// built-in map helpers.
+    /// Register a host function that programs call by helper ID (`call <id>`). `func` takes the arguments as a `u64`,
+    /// a tuple of up to five, or `()`. With the `maps` feature, IDs 1 to 3 replace the built-in map helpers.
     ///
     /// # Example
     ///
-    /// ```ignore
-    /// // Single argument
+    /// ```
+    /// let vm = rvm::Vm::new();
     /// vm.register_helper(100, |x: u64| x * 2);
-    ///
-    /// // Multiple arguments
     /// vm.register_helper(101, |(a, b): (u64, u64)| a + b);
-    ///
-    /// // No arguments
     /// vm.register_helper(102, |_: ()| 42u64);
     /// ```
     pub fn register_helper<F, A, R>(&self, id: u32, func: F)
@@ -132,40 +128,62 @@ impl Vm {
         A: FromArgs + 'static,
         R: IntoReturn + 'static,
     {
-        self.helpers.update(|h| h.register_helper(id, func));
+        self.helpers.update(|h| h.put_id(id, HostFn::typed(func)));
     }
 
-    /// Register an extern function that programs import by name (`extern u64 name(...);` in C). Unresolved names fail
-    /// at link time.
-    pub fn register_fn<F, A, R>(&self, name: impl Into<String>, func: F)
-    where
-        F: Fn(A) -> R + Send + Sync + 'static,
-        A: FromArgs + 'static,
-        R: IntoReturn + 'static,
-    {
-        self.helpers.update(|h| h.register_fn(name, func));
-    }
-
-    /// Register an extern function that reads or writes the calling program's memory, such as
-    /// `void log(const char *msg, u64 len);` in C. `func` gets the program's memory, where every access needs the
-    /// guest's permissions and fails on a bad pointer, followed by the typed arguments.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// vm.register_fn_with_memory("log", |mem, (msg, len): (u64, u64)| {
-    ///     let msg = mem.read_vec(msg, len as usize)?;
-    ///     println!("{}", String::from_utf8_lossy(&msg));
-    ///     Ok::<_, rvm::MemoryError>(())
-    /// });
-    /// ```
-    pub fn register_fn_with_memory<F, A, R>(&self, name: impl Into<String>, func: F)
+    /// [`register_helper`](Self::register_helper) for a function that reads or writes the calling program's memory;
+    /// see [`register_extern_with_memory`](Self::register_extern_with_memory).
+    pub fn register_helper_with_memory<F, A, R>(&self, id: u32, func: F)
     where
         F: Fn(&mut GuestMemory, A) -> R + Send + Sync + 'static,
         A: FromArgs + 'static,
         R: IntoReturn + 'static,
     {
-        self.helpers.update(|h| h.register_fn_with_memory(name, func));
+        self.helpers.update(|h| h.put_id(id, HostFn::with_memory(func)));
+    }
+
+    /// Register a host function that programs import by name (`extern u64 name(u64 a, u64 b);` in C). `func` takes
+    /// the arguments as a `u64`, a tuple of up to five, or `()`. A program that imports a name the VM lacks fails to
+    /// link.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// let vm = rvm::Vm::new();
+    /// vm.register_extern("host_add", |(a, b): (u64, u64)| a + b);
+    /// ```
+    pub fn register_extern<F, A, R>(&self, name: impl Into<String>, func: F)
+    where
+        F: Fn(A) -> R + Send + Sync + 'static,
+        A: FromArgs + 'static,
+        R: IntoReturn + 'static,
+    {
+        self.helpers.update(|h| h.put_name(name.into(), HostFn::typed(func)));
+    }
+
+    /// [`register_extern`](Self::register_extern) for a function that reads or writes the calling program's memory,
+    /// such as `void log(const char *msg, u64 len);` in C. `func` gets the program's memory, where every access needs
+    /// the guest's permissions and fails on a bad pointer, followed by the arguments. An `Err` from `func` fails the
+    /// program's call with [`HostError::Failed`](crate::HostError::Failed).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// let vm = rvm::Vm::new();
+    /// vm.register_extern_with_memory("log", |mem, (msg, len): (u64, u64)| {
+    ///     let msg = mem.read_vec(msg, len as usize)?;
+    ///     println!("{}", String::from_utf8_lossy(&msg));
+    ///     Ok::<_, rvm::MemoryError>(())
+    /// });
+    /// ```
+    pub fn register_extern_with_memory<F, A, R>(&self, name: impl Into<String>, func: F)
+    where
+        F: Fn(&mut GuestMemory, A) -> R + Send + Sync + 'static,
+        A: FromArgs + 'static,
+        R: IntoReturn + 'static,
+    {
+        self.helpers
+            .update(|h| h.put_name(name.into(), HostFn::with_memory(func)));
     }
 
     /// Enable `ktime_get_ns` (helper 5).
@@ -184,8 +202,7 @@ impl Vm {
     }
 
     /// Share maps called `name` between every program linked afterwards: they bind to one instance, created by the
-    /// first program that declares it, and later declarations must match its layout. `pad_values` puts each value on
-    /// its own cache line, so atomics on neighbouring values from different threads don't contend.
+    /// first program that declares it, and later declarations must match its layout.
     ///
     /// Values live at the same guest address in every program, from region [`crate::SHARED_MAPS_FIRST_REGION`] up.
     ///
@@ -193,8 +210,8 @@ impl Vm {
     ///
     /// As [`Vm::share_region`], for the maps' values.
     #[cfg(feature = "maps")]
-    pub unsafe fn share_map(&self, name: &str, pad_values: bool) {
-        self.shared.maps.declare(name, pad_values);
+    pub unsafe fn share_map(&self, name: &str, spacing: ValueSpacing) {
+        self.shared.maps.declare(name, spacing);
     }
 
     /// Allocate `len` zeroed bytes and map them as region `region` into every program linked afterwards, so plugins can
@@ -212,13 +229,8 @@ impl Vm {
         self.shared.regions.add(region, len, perms)
     }
 
-    /// Load an image written by [`Image::to_bytes`] as a program; [`Vm::load`] with the parsed image.
-    pub fn load_image(&self, bytes: &[u8]) -> Result<Program> {
-        image::load_bytes(bytes, &self.helpers, &self.shared, &self.config)
-    }
-
-    /// Load an image as a program: from `Vm::prepare`, [`Image::from_bytes`], or built by hand around raw bytecode,
-    /// whose `call <id>` instructions reach the helpers registered here by ID.
+    /// Load an image as a program: from [`Vm::prepare_elf`](Self::prepare_elf), [`Image::from_bytes`], or built by
+    /// hand around raw bytecode, whose `call <id>` instructions reach the helpers registered here by ID.
     ///
     /// Binds the image's extern calls by name or helper ID in this VM, allocates its memory and maps, and maps the maps
     /// and regions this VM shares. Fails on a malformed image or an extern this VM lacks.
@@ -230,12 +242,18 @@ impl Vm {
     ///
     /// // r0 = r1 + 10
     /// let code = [0xbf, 0x10, 0, 0, 0, 0, 0, 0, 0x07, 0, 0, 0, 10, 0, 0, 0, 0x95, 0, 0, 0, 0, 0, 0, 0];
-    /// let mut program = Vm::new().load(Image::from_code(code.to_vec()))?;
+    /// let mut program = Vm::new().load_image(Image::from_code(code.to_vec()))?;
     /// assert_eq!(program.call("main", &[32])?, 42);
     /// # Ok::<_, rvm::VmError>(())
     /// ```
-    pub fn load(&self, image: Image) -> Result<Program> {
+    pub fn load_image(&self, image: Image) -> Result<Program> {
         image::load(image, &self.helpers, &self.shared, &self.config)
+    }
+
+    /// [`load_image`](Self::load_image) straight from the bytes [`Image::to_bytes`] wrote, without the copy that
+    /// [`Image::from_bytes`] makes.
+    pub fn load_image_bytes(&self, bytes: &[u8]) -> Result<Program> {
+        image::load_bytes(bytes, &self.helpers, &self.shared, &self.config)
     }
 
     /// Publish `func` from `plugin` as an extern of the same name.
@@ -243,8 +261,8 @@ impl Vm {
     /// Programs linked afterwards can import it; programs that already import it pick up the new target at their next
     /// call.
     pub fn export(&self, plugin: &Plugin, func: &str) -> Result<()> {
-        let helper = plugin.export_fn(func)?;
-        self.helpers.update(|h| h.register_fn_raw(func, helper));
+        let export = HostFn::raw(plugin.export_fn(func)?);
+        self.helpers.update(|h| h.put_name(func.to_string(), export));
         Ok(())
     }
 }
@@ -272,11 +290,12 @@ impl Vm {
         f(&mut self.types.lock().borrow_mut())
     }
 
-    /// Link one ELF file into an image, to load later with [`Vm::load`] or, written out, [`Vm::load_image`].
+    /// Link one ELF file into an image, to load later with [`Vm::load_image`] or, written out,
+    /// [`Vm::load_image_bytes`].
     ///
     /// Externs and helper IDs must be registered here as they will be in the loading VM, so the link checks signatures
     /// and fails on unknown names early; CO-RE resolves against the types from [`Vm::with_types`].
-    pub fn prepare(&self, elf_bytes: &[u8]) -> Result<Image> {
+    pub fn prepare_elf(&self, elf_bytes: &[u8]) -> Result<Image> {
         let module = Module::from_elf(elf_bytes)?;
         self.prepare_modules(&[&module])
     }
@@ -288,7 +307,7 @@ impl Vm {
         linker::link(&self.helpers.read(), &types, modules, self.config.memory_limit)
     }
 
-    /// Link modules into an executable program: [`Vm::prepare_modules`], then [`Vm::load`].
+    /// Link modules into an executable program: [`Vm::prepare_modules`], then [`Vm::load_image`].
     ///
     /// # Example
     ///
@@ -298,10 +317,10 @@ impl Vm {
     /// let program = vm.load_modules(&[&utils, &main])?;
     /// ```
     pub fn load_modules(&self, modules: &[&Module]) -> Result<Program> {
-        self.load(self.prepare_modules(modules)?)
+        self.load_image(self.prepare_modules(modules)?)
     }
 
-    /// Parse and link a single ELF file into a program: [`Vm::prepare`], then [`Vm::load`].
+    /// Parse and link a single ELF file into a program: [`Vm::prepare_elf`], then [`Vm::load_image`].
     ///
     /// # Example
     ///
@@ -310,12 +329,7 @@ impl Vm {
     /// let result = program.call("main", &[])?;
     /// ```
     pub fn load_elf(&self, elf_bytes: &[u8]) -> Result<Program> {
-        self.load(self.prepare(elf_bytes)?)
-    }
-
-    /// Load an ELF file as a plugin that other programs can call into: [`Vm::load_elf`], then [`Plugin::new`].
-    pub fn load_plugin(&self, name: &str, elf_bytes: &[u8]) -> Result<Plugin> {
-        Ok(Plugin::new(name, self.load_elf(elf_bytes)?))
+        self.load_image(self.prepare_elf(elf_bytes)?)
     }
 }
 

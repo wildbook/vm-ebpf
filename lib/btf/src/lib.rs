@@ -9,8 +9,8 @@
 //!
 //! // the host describes its struct layout as BTF
 //! let mut host = BtfBuilder::new();
-//! let u64_t = host.int("u64", 8, false);
-//! let u32_t = host.int("u32", 4, false);
+//! let u64_t = host.add_int("u64", 8, false);
+//! let u32_t = host.add_int("u32", 4, false);
 //! let event = host.add_struct("my_event", 24);
 //! host.member(event, "timestamp", 0, u64_t);
 //! host.member(event, "pid", 8, u32_t);
@@ -42,4 +42,4 @@ pub use parse::{Btf, BtfError};
 pub use patch::CORE_POISON_HELPER;
 pub use raw::{BtfKind, BTF_FUNC_EXTERN, BTF_FUNC_GLOBAL, BTF_FUNC_STATIC, BTF_INT_SIGNED};
 pub use strings::BtfStrings;
-pub use types::{BtfTypeInfo, EnumValue, Member, Param, VarSecInfo};
+pub use types::{BtfType, EnumValue, Member, Param, VarSecInfo};

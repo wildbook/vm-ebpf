@@ -88,8 +88,8 @@ fn may_goto_never_jumps() {
 fn core_relocations_follow_host_layout() {
     let vm = Vm::new();
     vm.with_types(|types| {
-        let u64_t = types.int("u64", 8, false);
-        let u32_t = types.int("u32", 4, false);
+        let u64_t = types.add_int("u64", 8, false);
+        let u32_t = types.add_int("u32", 4, false);
         let event_ty = types.add_struct("event", 16);
         types.member(event_ty, "timestamp", 0, u64_t);
         types.member(event_ty, "pid", 12, u32_t);
@@ -111,7 +111,7 @@ fn core_relocations_follow_host_layout() {
 fn core_relocations_follow_appended_host_btf() {
     let host_module = rvm::Module::from_elf(&object("tests/host_event.o")).unwrap();
     let vm = Vm::new();
-    vm.with_types(|types| types.append_btf(host_module.btf_data.as_ref().unwrap()).unwrap());
+    vm.with_types(|types| types.append_btf(host_module.btf().unwrap()).unwrap());
     let mut program = vm.load_elf(&object("tests/core_guard.o")).unwrap();
 
     // Host layout: flags(0), pid(4), timestamp(8); every field present, reordered.
