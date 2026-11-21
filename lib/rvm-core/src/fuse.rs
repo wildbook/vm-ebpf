@@ -7,7 +7,8 @@
 //! - it lies in one of the blocks that fuel is charged for ([`fuel`](crate::fuel)), and where the fuel runs out inside
 //!   its block, its instructions run one at a time;
 //! - an instruction that faults stops execution at its own pc, with the effects of the instructions before it;
-//! - a load or store that misses its data window ([`windows::data_step`]) continues the sequence unfused from itself.
+//! - a load or store that misses its window ([`windows::data_step`]) continues the sequence unfused from itself, through
+//!   the handler of that access alone.
 //!
 //! The pass also gives the loads and stores through r10 that [`windows::stack_access`] runs their bytes.
 

@@ -10,8 +10,8 @@
 //! - [`data_access`] runs the accesses through any other register, and those of 1 and 2 bytes through r10, which keep
 //!   their opcode byte ([`install`]). It checks the window around the last address of its size class that missed (1
 //!   and 2 byte accesses also the one before) and then, for pointers into the stack, the window around r10.
-//! - [`data_step`] runs the accesses of superinstructions in the data window of their size class. A superinstruction
-//!   continues unfused at an access that misses it.
+//! - [`data_step`] runs the accesses of superinstructions: those through r10 in the window around r10, the others in
+//!   the data window of their size class. A superinstruction continues unfused at an access that misses it.
 
 use std::num::NonZeroU8;
 use std::ptr;
@@ -205,9 +205,10 @@ pub const fn windowed(op: u8) -> bool {
     opc.is_access() && matches!(opc.mem_mode(), MemMode::Mem)
 }
 
-/// Runs the [`windowed`] load or store `insn` of a superinstruction on the registers `regs` in the data window, as
-/// [`data_access`] runs one that hits it. Returns false, changing nothing, if the access doesn't fit there: the
-/// superinstruction then continues unfused at the access, whose handler tries the other windows.
+/// Runs the [`windowed`] load or store `insn` of a superinstruction on the registers `regs`, as [`stack_access`] runs
+/// one through r10 and [`data_access`] one through another register that hits the data window. Returns false,
+/// changing nothing, if the access doesn't fit there: the superinstruction then continues unfused at the access, whose
+/// handler tries the other windows.
 #[inline(always)]
 pub fn data_step<R: Regs>(windows: &Windows, regs: &mut R, insn: impl Fields) -> bool {
     let opc = insn.opcode();
@@ -217,7 +218,12 @@ pub fn data_step<R: Regs>(windows: &Windows, regs: &mut R, insn: impl Fields) ->
         _ => (insn.dst_reg(), i64::from(insn.imm()) as u64),
     };
     let addr = step::address(regs.get(base), insn);
-    let Some(loaded) = windows.data_for(opc).run(opc, kind(opc), addr, value) else {
+    // a superinstruction names r10 only as a constant base (`fp`), so this folds
+    let cache = match usize::from(base.get()) == FP {
+        true => &windows.stack,
+        false => windows.data_for(opc),
+    };
+    let Some(loaded) = cache.run(opc, kind(opc), addr, value) else {
         return false;
     };
     if let Class::Ldx = opc.class() {
@@ -279,6 +285,14 @@ const STACK_BYTES: [Option<NonZeroU8>; 256] = {
     const_for!((byte, opcode) in STACK_ACCESSES => table[opcode as usize] = NonZeroU8::new(byte));
     table
 };
+
+/// The byte of the r10 access with opcode `op`.
+pub const fn stack_byte_of(op: u8) -> u8 {
+    match STACK_BYTES[op as usize] {
+        Some(byte) => byte.get(),
+        None => panic!("an access through r10 without a byte of its own"),
+    }
+}
 
 /// The r10 access byte for `insn`, if it is a load or store through r10 that has one.
 pub fn stack_byte(insn: Instruction) -> Option<u8> {

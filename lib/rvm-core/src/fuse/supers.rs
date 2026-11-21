@@ -1,11 +1,12 @@
 //! The superinstruction table, and the [`Super`] that the compiler derives from each of its lines.
 
 use super::handler::fused;
+use crate::context::FP;
 use crate::dispatch::Handler;
 use crate::fuel::{Fuel, Unmetered};
 use crate::opcode::{AluOpc, Class, JmpOpc, MemMode, MemSize, OpCode, Source, LD_IMM64};
 use crate::slot::{Fields, Reg};
-use crate::{Host, Instruction, Memory};
+use crate::{windows, Host, Instruction, Memory};
 
 macro_rules! superinstructions {
     ($($byte:literal: $($op:ident $($operand:tt),*);+;)*) => {
@@ -48,9 +49,10 @@ macro_rules! operand {
 // Each line gives the opcode byte of a superinstruction and its sequence in eBPF assembler syntax, with roles in place
 // of registers. A sequence fuses where each role stands for one register throughout and different roles for different
 // registers. `_` stands for whatever its slot holds: an immediate, an offset, a jump target, or a register that no role
-// names, which only the last instruction may have. Every field a line doesn't mention is zero. `lddw` is LD_IMM64 with
-// `src_reg` 0, whose second slot `Code::new` leaves only where it holds the upper half of the immediate and nothing
-// else. Longer sequences come first, so that they win over their prefixes.
+// names, which only the last instruction may have. `fp` is r10 as the base of a 4 or 8 byte load or store. Every field
+// a line doesn't mention is zero. `lddw` is LD_IMM64 with `src_reg` 0, whose second slot `Code::new` leaves only where
+// it holds the upper half of the immediate and nothing else. Longer sequences come first, so that they win over their
+// prefixes.
 superinstructions! {
     // rotate: t = x >> k | x << (32 - k), into x or y
     0xd0: mov32 t, x; rsh32 t, _; lsh32 x, _; mov32 y, x; or32 y, t;
@@ -82,6 +84,10 @@ superinstructions! {
     0x86: add64 a, _; add64 _, _;
     // the address of an element of a global array
     0xf7: lddw a, _; add64 a, b;
+    // spill traffic: a reload and an operation, or a load and a spill, over any registers
+    0x19: ldxdw a, [fp + _]; mul64 b, c;
+    0x1a: ldxw a, [fp + _]; add32 b, c;
+    0x1b: ldxw a, [b + _]; stxw [fp + _], c;
 }
 
 /// For each opcode byte, the index in [`SUPERS`] of its superinstruction: `u8::MAX` if it has none.
@@ -111,6 +117,14 @@ pub struct Super {
     spreads: [u64; MAX_ROLES],
     /// The bits of the register fields that aren't `_`, in the register bytes.
     register_bits: u64,
+    /// r10 in each register field that names `fp`, in the register bytes.
+    fixed: u64,
+    /// The roles that name the base of a load or store and that no instruction writes, one bit each. None of them
+    /// stands for r10, so that every access through r10 that a superinstruction runs is an `fp` one, which tries the
+    /// window around r10 first. A role that an instruction writes isn't r10 anyway: `Code::new` fails writes to r10.
+    bases: u8,
+    /// The roles `encode` compares: all of them, or none for a direct sequence, whose roles tie no register to another.
+    compared: u8,
 
     /// The roles the sequence reads before it writes them, one bit each.
     pub loads: u8,
@@ -124,6 +138,10 @@ pub struct Super {
     /// The slot of the instruction whose `dst_reg` is the register operand `_`, if the sequence has one. In a source
     /// operand, `_` is an immediate.
     pub free_at: Option<u8>,
+    /// Whether the sequence names each role once. A role named once ties its register to no other, and a variable
+    /// would hold its value for one use, so such a sequence fuses whatever registers its slots name, the same register
+    /// for several roles among them, and runs on the registers themselves: it loads and saves no role.
+    pub direct: bool,
 }
 
 /// The most slots a superinstruction's sequence fills.
@@ -146,11 +164,15 @@ impl Super {
             masks: [0; MAX_LEN],
             spreads: [0; MAX_ROLES],
             register_bits: 0,
+            fixed: 0,
+            bases: 0,
+            compared: 0,
             loads: 0,
             writes: 0,
             save_at: 0,
             unsaved: [0; MAX_LEN],
             free_at: None,
+            direct: true,
         };
         let mut names = Names {
             names: [""; MAX_ROLES],
@@ -194,25 +216,44 @@ impl Super {
                 if !matches!(field, Field::Any) {
                     sup.register_bits |= 0xF << shift;
                 }
-                if let Field::Role(role) = field {
-                    sup.spreads[role as usize] |= 1 << shift;
+                match field {
+                    Field::Role(role) => sup.spreads[role as usize] |= 1 << shift,
+                    Field::Fp => sup.fixed |= (FP as u64) << shift,
+                    Field::Zero | Field::Any => {}
                 }
             });
-        });
-
-        const_for!(k in 0..len => {
-            let part = sup.parts[k];
-            const_for!(role in 0..sup.roles => {
-                if part.reads(role) && sup.writes & 1 << role == 0 {
-                    sup.loads |= 1 << role;
-                }
-            });
-            sup.unsaved[k] = sup.writes;
-            if let Field::Role(role) = part.written() {
-                sup.writes |= 1 << role;
-                sup.save_at = (k + part.slots()) as u8;
+            if let Field::Role(role) = part.base() {
+                sup.bases |= 1 << role;
             }
         });
+        const_for!(k in 0..len => {
+            if let Field::Role(role) = sup.parts[k].written() {
+                sup.bases &= !(1 << role);
+            }
+        });
+
+        const_for!(role in 0..sup.roles => sup.direct &= sup.spreads[role as usize].count_ones() == 1);
+        if sup.direct {
+            const_for!(role in 0..sup.roles => sup.register_bits &= !(0xF * sup.spreads[role as usize]));
+        } else {
+            sup.compared = sup.roles;
+        }
+        // the roles `fused` keeps in variables
+        if !sup.direct {
+            const_for!(k in 0..len => {
+                let part = sup.parts[k];
+                const_for!(role in 0..sup.roles => {
+                    if part.reads(role) && sup.writes & 1 << role == 0 {
+                        sup.loads |= 1 << role;
+                    }
+                });
+                sup.unsaved[k] = sup.writes;
+                if let Field::Role(role) = part.written() {
+                    sup.writes |= 1 << role;
+                    sup.save_at = (k + part.slots()) as u8;
+                }
+            });
+        }
         // the written roles are back in their registers from `save_at` on
         const_for!(k in sup.save_at as usize..len => sup.unsaved[k] = 0);
 
@@ -275,6 +316,16 @@ impl Super {
         self.opcode(1 + self.is_data(1) as usize)
     }
 
+    /// The opcode byte whose handler runs the load or store at slot `k` of the sequence alone: that of the r10
+    /// access ([`windows::stack_byte_of`]) if its base is `fp`, else its own.
+    pub const fn access_byte(self, k: usize) -> u8 {
+        let part = self.parts[k];
+        match part.base() {
+            Field::Fp => windows::stack_byte_of(part.op),
+            _ => part.op,
+        }
+    }
+
     /// The first instruction of the sequence whose first slot holds `slot`.
     #[inline(always)]
     pub fn first_of(self, slot: Instruction) -> Instruction {
@@ -318,9 +369,9 @@ impl Super {
         }
 
         // the register of each role, from its home, in every register field that names the role
-        let mut expected = 0;
+        let mut expected = self.fixed;
         let mut used = 0u16;
-        for (&(k, src), spread) in self.homes.iter().zip(&self.spreads).take(usize::from(self.roles)) {
+        for (&(k, src), spread) in self.homes.iter().zip(&self.spreads).take(usize::from(self.compared)) {
             let register = registers >> (8 * k + 4 * u8::from(src)) & 0xF;
             // `fused` keeps each role in a variable of its own
             if used & 1 << register != 0 {
@@ -329,9 +380,20 @@ impl Super {
             used |= 1 << register;
             expected |= register * spread;
         }
+        if self.bases != 0 && self.base_on_stack(registers) {
+            return None;
+        }
 
         differs |= (registers ^ expected) & self.register_bits;
         (differs == 0).then(|| sequence[0].with_byte(byte))
+    }
+
+    /// Whether a role in `bases` stands for r10 in the register bytes `registers` that `encode` packs.
+    fn base_on_stack(&self, registers: u64) -> bool {
+        (0..usize::from(self.roles)).any(|role| {
+            let (k, src) = self.homes[role];
+            self.bases >> role & 1 != 0 && registers >> (8 * k + 4 * u8::from(src)) & 0xF == FP as u64
+        })
     }
 
     /// Whether the instruction at slot `k` of the sequence may branch.
@@ -365,6 +427,8 @@ enum Field {
     Role(u8),
     /// The slot: `_`.
     Any,
+    /// r10: `fp`, which only names the base of a load or store.
+    Fp,
 }
 
 impl Field {
@@ -379,6 +443,7 @@ impl Field {
             Field::Zero => Reg::R0,
             Field::Role(role) => roles[role as usize],
             Field::Any => free.unwrap_or(own),
+            Field::Fp => Reg::low(FP as u8),
         }
     }
 }
@@ -390,7 +455,7 @@ enum Operand {
     Role(&'static str),
     /// `_`.
     Any,
-    /// `[base + _]` or `[base]`: the role of the base, and whether the offset is `_`.
+    /// `[base + _]` or `[base]`: the role of the base, or `fp`, and whether the offset is `_`.
     Mem(&'static str, bool),
 }
 
@@ -403,6 +468,7 @@ struct Names {
 impl Names {
     /// The field of the role `name`. Role names, like mnemonics, ignore case.
     const fn role(&mut self, name: &'static str) -> Field {
+        assert!(!name.eq_ignore_ascii_case("fp"), "`fp` other than as the base of a load or store");
         const_for!(role in 0..self.len => {
             if self.names[role as usize].eq_ignore_ascii_case(name) {
                 return Field::Role(role);
@@ -413,6 +479,14 @@ impl Names {
         self.names[role as usize] = name;
         self.len += 1;
         Field::Role(role)
+    }
+
+    /// The field of the base of a memory operand: r10 for `fp`, else a role.
+    const fn base(&mut self, name: &'static str) -> Field {
+        match name.eq_ignore_ascii_case("fp") {
+            true => Field::Fp,
+            false => self.role(name),
+        }
     }
 
     /// The field of the register operand `operand`.
@@ -484,14 +558,14 @@ impl Part {
             match opc.class() {
                 Class::Ldx => {
                     part.dst = names.register(register);
-                    part.src = names.role(base);
+                    part.src = names.base(base);
                 }
                 Class::St => {
-                    part.dst = names.role(base);
+                    part.dst = names.base(base);
                     part.imm = Field::Any;
                 }
                 _ => {
-                    part.dst = names.role(base);
+                    part.dst = names.base(base);
                     part.src = names.register(register);
                 }
             }
@@ -551,6 +625,15 @@ impl Part {
     const fn written(self) -> Field {
         match OpCode(self.op).class() {
             Class::Alu32 | Class::Alu64 | Class::Ldx | Class::Ld => self.dst,
+            _ => Field::Zero,
+        }
+    }
+
+    /// The field of the base register, for a load or store.
+    const fn base(self) -> Field {
+        match OpCode(self.op).class() {
+            Class::Ldx => self.src,
+            Class::St | Class::Stx => self.dst,
             _ => Field::Zero,
         }
     }

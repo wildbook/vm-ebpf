@@ -2,6 +2,7 @@
 
 use super::supers::{Super, MAX_LEN, MAX_ROLES};
 use crate::code::Slots;
+use crate::context::FP;
 use crate::dispatch::{Spare, Table, SPARE};
 use crate::fuel::Fuel;
 use crate::slot::{Fields, Reg, Shape, Slot, View};
@@ -12,7 +13,8 @@ use crate::{windows, Context, Host, Interpreter, Memory};
 /// The handler of superinstruction `S`. It runs the sequence as the handlers of its instructions would, one after
 /// another, but keeps each role in a variable of its own: it loads the roles the sequence reads before it writes them,
 /// and stores the written ones back once, after the last instruction that writes one or before an instruction that
-/// stops. The sequence lies in one block, which it ends if its last instruction branches; only then does `F` matter.
+/// stops. A sequence that names each role once runs on the registers themselves ([`Super::direct`]). The sequence lies
+/// in one block, which it ends if its last instruction branches; only then does `F` matter.
 #[inline(never)]
 pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S: u8>(
     ctx: &mut Context<M>,
@@ -51,6 +53,8 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
         values: [0; MAX_ROLES],
         regs: &mut ctx.regs,
         free,
+        registers,
+        direct: sup.direct,
     };
     roles.load(registers, sup.loads);
 
@@ -79,12 +83,13 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
                 let decoded = sup.decode($k, slot_of($k), ROLE_INDEXES, Some(FREE));
                 let step = match const { windows::windowed(Super::of(S).opcode($k)) } {
                     true if windows::data_step(&interp.windows, &mut roles, decoded) => Step::Next,
-                    // the access missed the data window: the sequence continues unfused from it, as a jump into its
-                    // middle would
+                    // the access missed its window: the sequence continues unfused from it, as a jump into its middle
+                    // would, but through the handler of the access alone, since its slot may hold a superinstruction
+                    // (this one at slot 0); the slot has the access's layout either way (see `slot_of`)
                     true => {
                         roles.save(registers, sup.unsaved[$k]);
-                        let slot = sequence[$k];
-                        become table.of(slot)(ctx, code, at, interp, table, SPARE, slot)
+                        let access = table.0[usize::from(const { Super::of(S).access_byte($k) })];
+                        become access(ctx, code, at, interp, table, SPARE, sequence[$k])
                     }
                     false => step::step(&mut roles, ctx.memory, decoded),
                 };
@@ -113,11 +118,14 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
 }
 
 /// The registers of a superinstruction's sequence as [`fused`] runs it: its instructions name role `r` as register
-/// `r`, kept in `values`, and the register operand `_` as [`FREE`], which is register `free` in `regs`.
+/// `r`, kept in `values` or with `direct` in its register `registers[r]`, the register operand `_` as [`FREE`], which
+/// is register `free` in `regs`, and `fp` as r10.
 struct Roles<'a> {
     values: [u64; MAX_ROLES],
     regs: &'a mut [u64; 16],
     free: Reg,
+    registers: [Reg; MAX_ROLES],
+    direct: bool,
 }
 
 /// The register indexes [`fused`] gives the roles.
@@ -125,6 +133,9 @@ const ROLE_INDEXES: [Reg; MAX_ROLES] = [Reg::low(0), Reg::low(1), Reg::low(2), R
 
 /// The register index [`fused`] gives the register operand `_`.
 const FREE: Reg = Reg::low(15);
+
+/// r10, which a sequence only reads, as the base of `fp`.
+const FP_REG: Reg = Reg::low(FP as u8);
 
 impl Roles<'_> {
     /// Load the roles in the bit set `roles` from their registers `registers`.
@@ -148,12 +159,14 @@ impl Roles<'_> {
     }
 }
 
-// The instructions name no fixed register: `Step::parse` makes no atomics, of which `CMPXCHG` names r0.
+// The instructions name no other fixed register: `Step::parse` makes no atomics, of which `CMPXCHG` names r0.
 impl Regs for Roles<'_> {
     #[inline(always)]
     fn get(&self, reg: Reg) -> u64 {
         match reg {
             FREE => self.regs.get(self.free),
+            FP_REG => self.regs.get(FP_REG),
+            role if self.direct => self.regs.get(self.registers[usize::from(role.get())]),
             role => self.values[usize::from(role.get())],
         }
     }
@@ -162,6 +175,7 @@ impl Regs for Roles<'_> {
     fn set(&mut self, reg: Reg, value: u64) {
         match reg {
             FREE => self.regs.set(self.free, value),
+            role if self.direct => self.regs.set(self.registers[usize::from(role.get())], value),
             role => self.values[usize::from(role.get())] = value,
         }
     }

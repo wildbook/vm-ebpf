@@ -192,10 +192,10 @@ rvmrt it is 9,216 bytes with 44 imports.
 
 | build | `rvmrt.dll` | added to the C host by `rvmrt.lib` |
 |---|---|---|
-| in `lib/rvmrt` | 101,376 B, 31 imports from 3 DLLs | 94,720 B, 8 imports |
-| at the root | 187,392 B, 58 imports from 6 DLLs | 180,736 B, 33 imports |
-| in `lib/rvmrt`, without `fuel` | 82,944 B, 31 imports from 3 DLLs | 75,776 B, 8 imports |
-| at the root, without `fuel` | 168,960 B, 58 imports from 6 DLLs | 161,792 B, 33 imports |
+| in `lib/rvmrt` | 102,912 B, 31 imports from 3 DLLs | 95,744 B, 8 imports |
+| at the root | 188,928 B, 58 imports from 6 DLLs | 181,760 B, 33 imports |
+| in `lib/rvmrt`, without `fuel` | 84,480 B, 31 imports from 3 DLLs | 76,800 B, 8 imports |
+| at the root, without `fuel` | 169,984 B, 58 imports from 6 DLLs | 162,816 B, 33 imports |
 
 The rows without `fuel` drop the feature from `lib/rvmrt/Cargo.toml` and the
 instruction limit from the runtime's configuration. The 8 imports are the
