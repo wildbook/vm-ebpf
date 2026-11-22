@@ -10,6 +10,7 @@ cargo build --release
 cargo run --bin loader                         # loads and calls bpf/prebuilt/examples/example.o
 cargo run --bin emu                            # runs the same object, prepared into an image at build time
 cargo run -p rvm --example modding             # game mods as plugins: CO-RE, exports, borrows, shared maps, hot reload
+cargo run -p rvm --example hot_reload          # replaces a running plugin and checks what the reload kept
 cargo run -p rvm --example msgpack_logs        # streams MessagePack logs through a parser plugin into maps
 cargo run -p rvm --example core_reloc          # one object against two struct layouts
 cargo run -p rvm --example hello               # hand-assembled bytecode with host helpers, loaded as an Image, no ELF

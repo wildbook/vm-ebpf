@@ -54,6 +54,10 @@ required-features = ["link", "maps"]
 name = "core_reloc"
 required-features = ["link"]
 
+[[example]]
+name = "hot_reload"
+required-features = ["link", "maps"]
+
 # `test = true` runs the examples' layout checks under `cargo test`
 [[example]]
 name = "modding"
