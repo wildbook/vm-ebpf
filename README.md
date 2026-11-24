@@ -83,9 +83,9 @@ plugin could not use itself. An `Err` from a host function fails the plugin call
 plugin an error code instead, return it as an integer.
 
 Loading fails when a plugin uses a name or helper ID that the host has not registered, or when the C declaration of
-an extern has a different argument count than the host function. A missing host function is a load error, not a
-crash in the middle of a call. Registering a function again replaces it, also for plugins loaded earlier, from their
-next call.
+an extern passes a different number of registers than the host function takes: a struct of 9 to 16 bytes passes two,
+and a struct return passes the result's address first. A missing host function is a load error, not a crash in the
+middle of a call. Registering a function again replaces it, also for plugins loaded earlier, from their next call.
 
 The host decides what a plugin can reach. The only built-in helpers are the map helpers. `Vm::enable_time`,
 `Vm::enable_random` and `Vm::enable_print` add `bpf_ktime_get_ns`, `bpf_get_prandom_u32` and `bpf_trace_printk`.

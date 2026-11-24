@@ -146,6 +146,11 @@ impl Vm {
     /// the arguments as a `u64`, a tuple of up to five, or `()`. A program that imports a name the VM lacks fails to
     /// link.
     ///
+    /// Each argument is one register, and linking checks their number against the extern's BTF. A struct of up to 8
+    /// bytes arrives in one register and one of 9 to 16 bytes in two, little endian; a function that returns a
+    /// struct gets the guest address to write it to first, which needs
+    /// [`register_extern_with_memory`](Self::register_extern_with_memory).
+    ///
     /// # Example
     ///
     /// ```

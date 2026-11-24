@@ -48,7 +48,7 @@ fn images_run_like_elf() {
         (&["tests/shared_region.o"], &[("put", &[slot, 42]), ("get", &[slot])]),
         (&["tests/plugin_a_v1.o"], &[("a_scale", &[5])]),
         (&["tests/plugin_b.o"], &[("b_run", &[5])]),
-        (&["tests/borrow_caller.o"], &[("run", &[])]),
+        (&["tests/borrow_caller.o"], &[("run", &[]), ("run_keyed", &[])]),
         (&["tests/link_main.o", "tests/link_lib.o"], &[("run", &[7]), ("lib_scale", &[5])]),
     ];
 

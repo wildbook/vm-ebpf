@@ -1,6 +1,7 @@
 //! Cross-module linking: externs, numeric helpers, and hot-reloading a helper.
 
 use std::mem::{offset_of, size_of};
+use std::sync::{Arc, Mutex};
 
 use constelf::raw::{shf, sht, Elf64Ehdr, Elf64Rel, Elf64Shdr, Elf64Sym};
 use constelf::{ElfFile, ElfRelocs};
@@ -67,6 +68,108 @@ fn link_failures() {
         setup(&vm);
         let err = link(&vm).unwrap_err();
         assert!(check(&err), "{err}");
+    }
+}
+
+/// An extern in `tests/struct_args.c` with the parameters its BTF declares, the argument registers clang passes it,
+/// and the values its `call_<name>` function puts in those registers.
+struct Shape {
+    object: &'static str,
+    name: &'static str,
+    params: u8,
+    registers: u8,
+    /// Values from r1 on, or from r2 on when r1 is the hidden pointer to the struct a call returns.
+    args: &'static [u64],
+    returns_struct: bool,
+}
+
+/// Linking compares the argument registers an extern takes with the host function's arguments, not its BTF
+/// parameters, and the host function gets those registers.
+#[test]
+fn struct_shapes_count_registers() {
+    const fn shape(name: &'static str, params: u8, registers: u8, args: &'static [u64]) -> Shape {
+        Shape {
+            object: "tests/struct_args.o",
+            name,
+            params,
+            registers,
+            args,
+            returns_struct: false,
+        }
+    }
+    const fn returning(name: &'static str, params: u8, registers: u8, args: &'static [u64]) -> Shape {
+        Shape {
+            returns_struct: true,
+            ..shape(name, params, registers, args)
+        }
+    }
+    let shapes = [
+        shape("scalars", 3, 3, &[1, 2, 0]),
+        // a 3-byte struct packed into r1
+        shape("s3_arg", 2, 2, &[0x03_0201, 4]),
+        shape("s8_arg", 2, 2, &[0x2_0000_0001, 3]),
+        // bytes 0 to 7 in r1, 8 to 11 in r2
+        shape("s12_arg", 2, 3, &[0x2_0000_0001, 3, 4]),
+        shape("s16_arg", 2, 3, &[1, 2, 3]),
+        shape("pair_arg", 2, 3, &[1, 2, 3]),
+        shape("two_s16", 3, 5, &[1, 2, 3, 4, 5]),
+        returning("s8_ret", 1, 2, &[1]),
+        returning("s24_ret", 1, 2, &[1]),
+        Shape {
+            object: "tests/struct_args_six.o",
+            ..shape("six", 4, 6, &[])
+        },
+    ];
+
+    for shape in &shapes {
+        let module = Module::from_elf(&object(shape.object)).unwrap();
+        for arity in [shape.params, shape.registers.min(5)] {
+            let vm = Vm::new();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            for other in shapes.iter().filter(|s| s.object == shape.object) {
+                register_recording(&vm, other.name, other.registers.min(5), &seen);
+            }
+            register_recording(&vm, shape.name, arity, &seen);
+            let linked = vm.load_modules(&[&module]);
+            let context = format!("{} with {arity} host arguments", shape.name);
+
+            if shape.registers > 5 {
+                let err = linked.err().unwrap();
+                let expected = LinkError::TooManyRegisters {
+                    name: shape.name.into(),
+                    registers: shape.registers.into(),
+                };
+                assert!(matches!(&err, VmError::Link(e) if *e == expected), "{context}: {err}");
+            } else if arity != shape.registers {
+                let err = linked.err().unwrap();
+                let expected = LinkError::SignatureMismatch {
+                    name: shape.name.into(),
+                    declared: shape.registers.into(),
+                    host: arity,
+                };
+                assert!(matches!(&err, VmError::Link(e) if *e == expected), "{context}: {err}");
+            } else {
+                let mut program = linked.unwrap_or_else(|e| panic!("{context}: {e}"));
+                program.call(&format!("call_{}", shape.name), &[]).unwrap();
+                let seen = seen.lock().unwrap();
+                let args = &seen[usize::from(shape.returns_struct)..];
+                assert_eq!(args, shape.args, "{context}");
+            }
+        }
+    }
+}
+
+/// Register `name` as an extern of `arity` arguments that stores them in `seen`.
+fn register_recording(vm: &Vm, name: &str, arity: u8, seen: &Arc<Mutex<Vec<u64>>>) {
+    let seen = seen.clone();
+    let record = move |args: &[u64]| *seen.lock().unwrap() = args.to_vec();
+    match arity {
+        1 => vm.register_extern(name, move |a: u64| record(&[a])),
+        2 => vm.register_extern(name, move |(a, b): (u64, u64)| record(&[a, b])),
+        3 => vm.register_extern(name, move |(a, b, c): (u64, u64, u64)| record(&[a, b, c])),
+        4 => vm.register_extern(name, move |(a, b, c, d): (u64, u64, u64, u64)| record(&[a, b, c, d])),
+        5 => vm.register_extern(name, move |(a, b, c, d, e): (u64, u64, u64, u64, u64)| record(&[a, b, c, d, e])),
+        _ => unreachable!("arity {arity}"),
     }
 }
 

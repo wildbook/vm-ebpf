@@ -23,3 +23,10 @@ u64 poke(u64 *buf BORROW_RO(1), u64 len) {
     *(volatile u64 *)buf = len;
     return 0;
 }
+
+struct key { u64 a, b; };
+
+/* `key` takes r1 and r2, so the buffer arrives in r3 and its length in r4. */
+u64 sum_keyed(struct key key, const u64 *buf BORROW_RO(2), u64 len) {
+    return key.a + key.b + sum(buf, len);
+}

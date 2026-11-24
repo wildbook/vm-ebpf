@@ -287,13 +287,15 @@ fn shared_region_acquire_release() {
 fn borrowed_buffers() {
     let vm = Vm::new();
     let callee = Plugin::new("callee", vm.load_elf(&object("tests/borrow_callee.o")).unwrap());
-    for func in ["sum", "fill", "poke"] {
+    for func in ["sum", "fill", "poke", "sum_keyed"] {
         vm.export(&callee, func).unwrap();
     }
     let caller = Plugin::new("caller", vm.load_elf(&object("tests/borrow_caller.o")).unwrap());
 
     // sum reads the caller's array, fill writes it back: 10 * 1000 + 7 + 7
     assert_eq!(caller.call("run", &[]).unwrap(), 10_014);
+    // a 16-byte struct ahead of the buffer moves it and its length up one register
+    assert_eq!(caller.call("run_keyed", &[]).unwrap(), 10 + 20 + 10);
 
     // a length past the caller's memory fails before the callee runs
     let err = caller.call("overrun", &[]).unwrap_err().to_string();

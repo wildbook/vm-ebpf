@@ -24,3 +24,12 @@ u64 write_ro(void) {
     volatile u64 arr[1] = {0};
     return poke((u64 *)arr, sizeof(arr));
 }
+
+struct key { u64 a, b; };
+extern u64 sum_keyed(struct key key, const u64 *buf, u64 len);
+
+/* 10 + 20 + sum(1..4) */
+u64 run_keyed(void) {
+    volatile u64 arr[4] = {1, 2, 3, 4};
+    return sum_keyed((struct key){10, 20}, (const u64 *)arr, sizeof(arr));
+}

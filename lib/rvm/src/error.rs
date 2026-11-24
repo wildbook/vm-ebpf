@@ -185,8 +185,11 @@ pub enum LinkError {
     UnresolvedSymbol(String),
     /// A call to a helper ID that isn't registered.
     UnknownHelper(u32),
-    /// An extern's declared parameter count differs from the host function's.
+    /// An extern declares a different number of argument registers than the host function takes. `declared` counts
+    /// registers, not parameters: a struct of 9 to 16 bytes takes two, and a struct return adds a result pointer.
     SignatureMismatch { name: String, declared: usize, host: u8 },
+    /// A host-bound extern needs more argument registers than the five eBPF has.
+    TooManyRegisters { name: String, registers: usize },
     /// A program declares a shared map with a different layout than the existing one.
     #[cfg(feature = "maps")]
     MapMismatch(String),
@@ -211,7 +214,10 @@ impl fmt::Display for LinkError {
                 None => write!(f, "call to unregistered helper {id}"),
             },
             Self::SignatureMismatch { name, declared, host } => {
-                write!(f, "extern {name} declares {declared} parameters but the host function takes {host}")
+                write!(f, "extern {name} takes {declared} argument registers but the host function takes {host}")
+            }
+            Self::TooManyRegisters { name, registers } => {
+                write!(f, "extern {name} takes {registers} argument registers, but eBPF passes at most {MAX_ARGS}")
             }
             #[cfg(feature = "maps")]
             Self::MapMismatch(name) => write!(f, "shared map {name} is declared with a different layout"),

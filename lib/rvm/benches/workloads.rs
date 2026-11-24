@@ -35,7 +35,7 @@ fn cross_plugin(c: &mut Criterion) {
     let b = Plugin::new("b", vm.load_elf(&object("tests/plugin_b.o")).unwrap());
 
     let callee = Plugin::new("callee", vm.load_elf(&object("tests/borrow_callee.o")).unwrap());
-    for func in ["sum", "fill", "poke"] {
+    for func in ["sum", "fill", "poke", "sum_keyed"] {
         vm.export(&callee, func).unwrap();
     }
     let caller = Plugin::new("caller", vm.load_elf(&object("tests/borrow_caller.o")).unwrap());

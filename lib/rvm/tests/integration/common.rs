@@ -40,7 +40,7 @@ pub fn host_vm_with(config: VmConfig) -> Vm {
     let a = Plugin::new("a", vm.load_elf(&object("tests/plugin_a_v1.o")).unwrap());
     vm.export(&a, "a_scale").unwrap();
     let callee = Plugin::new("callee", vm.load_elf(&object("tests/borrow_callee.o")).unwrap());
-    for func in ["sum", "fill", "poke"] {
+    for func in ["sum", "fill", "poke", "sum_keyed"] {
         vm.export(&callee, func).unwrap();
     }
     vm

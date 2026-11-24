@@ -9,12 +9,14 @@
 //! and loads and stores reject. Data sections go into guest memory regions; see [`crate::layout`] for the complete
 //! table.
 
+use std::ops::Range;
+
 use btf::{apply_core_relocations, Btf, BtfBuilder, BtfType, BTF_FUNC_EXTERN};
 use constelf::raw::reloc;
 use hashbrown::HashMap;
 
 use crate::error::{LinkError, Result, VmError};
-use crate::executor::CORE_POISON_HELPER;
+use crate::executor::{CORE_POISON_HELPER, MAX_ARGS};
 use crate::helper::HelperRegistry;
 use crate::image::{set_imm, set_slot_call, Image, Import, INSN_SIZE};
 use crate::layout::{CODE_REGION, DATA_REGION, RODATA_REGION};
@@ -243,8 +245,9 @@ fn lay_out_jump_tables(
     Ok(())
 }
 
-/// Compare each host-bound extern's BTF prototype with the registered function's argument count. Modules without BTF
-/// and host functions without a known arity (raw and context helpers) are not checked.
+/// Compare each host-bound extern's BTF prototype with the registered function, counting argument registers as clang
+/// passes them (see [`arg_registers`]). Fails for an extern that needs more than [`MAX_ARGS`] registers, and for a
+/// host function with a known arity that differs. Modules without BTF and variadic prototypes are not checked.
 fn check_extern_signatures(helpers: &HelperRegistry, btfs: &[Option<Btf<'_>>]) -> Result<()> {
     for btf in btfs.iter().flatten() {
         for (_, ty) in btf.types() {
@@ -256,28 +259,63 @@ fn check_extern_signatures(helpers: &HelperRegistry, btfs: &[Option<Btf<'_>>]) -
             else {
                 continue;
             };
-            let Some(host) = helpers.slot_of_name(name).and_then(|slot| helpers.arity(slot)) else {
-                continue;
-            };
-            let Some(BtfType::FuncProto { params, .. }) = btf.type_by_id(*proto_type) else {
+            let Some(slot) = helpers.slot_of_name(name) else {
                 continue;
             };
             // a trailing unnamed void parameter marks a variadic prototype
-            if params.last().is_some_and(|p| p.type_id == 0) {
+            let variadic = |proto: &BtfType| match proto {
+                BtfType::FuncProto { params, .. } => params.last().is_some_and(|p| p.type_id == 0),
+                _ => false,
+            };
+            if btf.type_by_id(*proto_type).is_some_and(variadic) {
                 continue;
             }
-            if params.len() != usize::from(host) {
-                let name = name.to_string();
-                return Err(LinkError::SignatureMismatch {
-                    name,
-                    declared: params.len(),
-                    host,
-                }
-                .into());
+
+            let name = name.to_string();
+            let Some((_, registers)) = arg_registers(btf, *proto_type) else {
+                let msg = format!("extern {name}: a parameter or return type no register holds");
+                return Err(LinkError::InvalidReference(msg).into());
+            };
+            if registers > MAX_ARGS {
+                return Err(LinkError::TooManyRegisters { name, registers }.into());
+            }
+            if let Some(host) = helpers.arity(slot).filter(|&host| usize::from(host) != registers) {
+                let declared = registers;
+                return Err(LinkError::SignatureMismatch { name, declared, host }.into());
             }
         }
     }
     Ok(())
+}
+
+/// The argument registers clang uses for each parameter of the function prototype `proto_type`, numbered from 0 for
+/// r1, and their total. A struct or union return passes a hidden result pointer in r1 ahead of the parameters. `None`
+/// for a missing prototype or a parameter or return type no register holds.
+fn arg_registers(btf: &Btf<'_>, proto_type: u32) -> Option<(Vec<Range<usize>>, usize)> {
+    let Some(BtfType::FuncProto { return_type, params }) = btf.type_by_id(proto_type) else {
+        return None;
+    };
+    let mut next = match btf.resolve_type(*return_type)?.1 {
+        BtfType::Struct { .. } | BtfType::Union { .. } => 1,
+        _ => 0,
+    };
+    let mut ranges = Vec::with_capacity(params.len());
+    for param in params {
+        let width = match btf.resolve_type(param.type_id)?.1 {
+            BtfType::Int { .. } | BtfType::Enum { .. } | BtfType::Ptr { .. } | BtfType::Float { .. } => 1,
+            // Clang packs a struct of up to 16 bytes into registers and passes nothing for an empty one. A function
+            // gets a larger one by pointer, though calls to it fail to compile.
+            BtfType::Struct { size, .. } | BtfType::Union { size, .. } => match size {
+                0 => 0,
+                9..=16 => 2,
+                _ => 1,
+            },
+            _ => return None,
+        };
+        ranges.push(next..next + width);
+        next += width;
+    }
+    Some((ranges, next))
 }
 
 /// Every module's exported symbols by name; two different definitions of one name fail.
@@ -486,7 +524,8 @@ fn build_function_table(
     Ok(functions)
 }
 
-/// `borrow:N` / `borrow_ro:N` decl tags on function parameters, by function name.
+/// `borrow:N` / `borrow_ro:N` decl tags on function parameters, by function name, with each parameter mapped to its
+/// argument register (see [`arg_registers`]). Both parameters must take one register each.
 fn function_borrows(btf: Option<&Btf<'_>>) -> Result<HashMap<String, Vec<Borrow>>> {
     let mut borrows: HashMap<String, Vec<Borrow>> = HashMap::new();
     let Some(btf) = btf else {
@@ -506,12 +545,18 @@ fn function_borrows(btf: Option<&Btf<'_>>) -> Result<HashMap<String, Vec<Borrow>
             Some(("borrow_ro", n)) => (false, n),
             _ => continue,
         };
-        let Some(BtfType::Func { name, .. }) = btf.type_by_id(*type_id) else {
+        let Some(BtfType::Func { name, proto_type, .. }) = btf.type_by_id(*type_id) else {
             continue;
         };
-        let borrow = u8::try_from(*component_idx)
+        let params = arg_registers(btf, *proto_type).map(|(params, _)| params);
+        let register = |param: usize| {
+            let range = params.as_ref()?.get(param)?;
+            u8::try_from(range.start).ok().filter(|_| range.len() == 1)
+        };
+        let borrow = usize::try_from(*component_idx)
             .ok()
-            .zip(len_arg.parse::<u8>().ok())
+            .and_then(register)
+            .zip(len_arg.parse().ok().and_then(register))
             .map(|(arg, len_arg)| Borrow { arg, len_arg, writable })
             .filter(Borrow::in_range)
             .ok_or_else(|| {

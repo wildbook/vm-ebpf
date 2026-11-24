@@ -33,11 +33,14 @@ pub struct FunctionInfo {
 /// A pointer parameter tagged `borrow:N` (writable) or `borrow_ro:N` in BTF, where parameter `N` holds the buffer's
 /// length in bytes. The callee sees the buffer at offset 0 of its own region, and a callee atomic at offset `o` counts
 /// as aligned when the caller's address plus `o` is, since both name the same bytes.
+///
+/// Both fields are argument registers, not parameter indices: after a struct return or a struct parameter of 9 to 16
+/// bytes, a parameter sits in a later register than its index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Borrow {
-    /// Index of the pointer parameter, 0 for r1.
+    /// Register of the pointer parameter, 0 for r1.
     pub arg: u8,
-    /// Index of the parameter that holds the length.
+    /// Register of the parameter that holds the length.
     pub len_arg: u8,
     /// Whether the callee may write the buffer (`borrow`) or only read it (`borrow_ro`).
     pub writable: bool,
