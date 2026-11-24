@@ -53,6 +53,14 @@ pub enum Reason<E> {
     BadPc,
     /// A local call found all [`MAX_CALL_DEPTH`] frames in use, or r10 below the frame size.
     StackOverflow,
+    /// A load or store in a memory window raised an access violation at this address, which is not mapped. Only a
+    /// guarded run stops with it ([`Interpreter::set_guard`]).
+    #[cfg(feature = "seh")]
+    RawFault(u64),
+    /// An exception left the guarded native call ([`Code::bind_guarded_native`](crate::Code::bind_guarded_native))
+    /// of the function with this index; [`Interpreter::caught`] has it.
+    #[cfg(feature = "seh")]
+    NativeException(u32),
 }
 
 /// Runs code, and keeps what lasts from one run to the next: the frames of the local calls in progress, the
@@ -79,6 +87,9 @@ pub struct Interpreter<M: Memory, H> {
     frames: [MaybeUninit<Frame>; MAX_CALL_DEPTH],
     /// The limit of the runs and the fuel of the run in progress.
     pub(crate) meter: Meter<M, H>,
+    /// The exception of the last [`Reason::NativeException`].
+    #[cfg(feature = "seh")]
+    pub(crate) caught: crate::seh::Caught,
 }
 
 /// Caller state saved across a local call.
@@ -105,6 +116,8 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
             host,
             frames: [const { MaybeUninit::uninit() }; MAX_CALL_DEPTH],
             meter: Meter::default(),
+            #[cfg(feature = "seh")]
+            caught: crate::seh::Caught::NONE,
         }
     }
 
@@ -186,7 +199,27 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
     /// exactly where charging each instruction would.
     #[cfg(feature = "fuel")]
     pub fn set_limit(&mut self, limit: Option<u64>) {
+        #[cfg(feature = "seh")]
+        let guard = self.meter.guard();
         self.meter = Meter::new(limit);
+        #[cfg(feature = "seh")]
+        self.meter.set_guard(guard);
+    }
+
+    /// Guard every [`run`](Self::run) and [`resume`](Self::resume) from now on, or none: an access violation of a
+    /// load or store that the interpreter runs in a memory window then stops the run with [`Reason::RawFault`] at
+    /// the instruction instead of ending the process ([`seh::enter`](crate::seh::enter)). Only a window over host
+    /// addresses that may be unmapped can raise one. The choice costs a run nothing, as it is the table the run
+    /// starts through; a guarded run pays for the guard's frame once.
+    #[cfg(feature = "seh")]
+    pub fn set_guard(&mut self, guard: bool) {
+        self.meter.set_guard(guard);
+    }
+
+    /// The exception that left the native call of the last [`Reason::NativeException`].
+    #[cfg(feature = "seh")]
+    pub fn caught(&self) -> crate::seh::Caught {
+        self.caught
     }
 
     /// The fuel each [`run`](Self::run) starts with, if runs are metered.

@@ -8,6 +8,9 @@
 //! dispatch needs afterwards are in registers the Windows x64 convention preserves (see
 //! [`Handler`](crate::dispatch::Handler)). It skips the windows check of other host calls, as a native function has
 //! no way to the memory of the run.
+//!
+//! With the `seh` feature, `Code::bind_guarded_native` gives a call one of the `GUARDED` bytes instead, whose handler
+//! makes the call through `seh::native`.
 
 use std::mem::transmute;
 
@@ -178,6 +181,29 @@ pub const fn byte(args: usize, checked: bool) -> u8 {
     }
 }
 
+/// In the handler of a native call: replaces each pointer among the first `$n` arguments `$a` of the function with
+/// signature `$sig` by the host address of its bytes, or stops the run with the fault of the first pointer the guest
+/// may not pass.
+macro_rules! resolve_pointers {
+    ($ctx:ident, $interp:ident, $ip:ident, $sig:ident, $a:ident, $n:expr) => {
+        let bits = $sig.0;
+        for (i, arg) in $a.iter_mut().enumerate().take($n) {
+            if bits >> (POINTERS as usize + i) & 1 == 0 {
+                continue;
+            }
+            let len = match bits >> (LENS as usize + 4 * i) & 15 {
+                0 => 1,
+                n => $ctx.regs[n as usize],
+            };
+            let write = bits >> (WRITES as usize + i) & 1 != 0;
+            match resolve(&*$ctx.memory, *arg, len, write) {
+                Ok(host) => *arg = host,
+                Err(error) => return $interp.stop.at($ip, Reason::MemoryFault(error)),
+            }
+        }
+    };
+}
+
 /// The handler of a native call with `N` arguments, which with `CHECKED` resolves the pointer arguments of the
 /// function's [`NativeSig`] first.
 #[inline(never)]
@@ -202,21 +228,7 @@ extern "rust-preserve-none" fn native_call<M: Memory, H: Host<M>, F: Fuel, const
     a[..N].copy_from_slice(&ctx.regs[1..=N]);
     if CHECKED {
         // `N` is a constant, so the loop unrolls and each shift of the signature is one too
-        let bits = sig.0;
-        for (i, arg) in a.iter_mut().enumerate().take(N) {
-            if bits >> (POINTERS as usize + i) & 1 == 0 {
-                continue;
-            }
-            let len = match bits >> (LENS as usize + 4 * i) & 15 {
-                0 => 1,
-                n => ctx.regs[n as usize],
-            };
-            let write = bits >> (WRITES as usize + i) & 1 != 0;
-            match resolve(&*ctx.memory, *arg, len, write) {
-                Ok(host) => *arg = host,
-                Err(error) => return interp.stop.at(ip, Reason::MemoryFault(error)),
-            }
-        }
+        resolve_pointers!(ctx, interp, ip, sig, a, N);
     }
 
     // SAFETY: `Code::bind_native` requires each native function a call names to take `N` arguments
@@ -255,4 +267,60 @@ unsafe fn call(func: NativeFn, n: usize, a: [u64; MAX_ARGS]) -> u64 {
             _ => transmute::<NativeFn, F5>(func)(a[0], a[1], a[2], a[3], a[4]),
         }
     }
+}
+
+/// The bytes of a guarded native call, without and with the pointer checks of [`CHECKED`]: two more bytes of
+/// instructions that always fail. One handler serves every argument count, as the call passes all five argument
+/// registers ([`seh::native`](crate::seh::native)).
+#[cfg(feature = "seh")]
+pub const GUARDED: [u8; 2] = [0x8a, 0x8b];
+
+#[cfg(feature = "seh")]
+pub const fn install_guarded<M: Memory, H: Host<M>, F: Fuel>(table: &mut [Handler<M, H>; 256]) {
+    table[GUARDED[0] as usize] = guarded_native_call::<M, H, F, false>;
+    table[GUARDED[1] as usize] = guarded_native_call::<M, H, F, true>;
+}
+
+/// The handler of a guarded native call, which with `CHECKED` resolves the pointer arguments first, as
+/// [`native_call`] does. An exception that leaves the function and that the guard accepts stops the run with
+/// [`Reason::NativeException`].
+#[cfg(feature = "seh")]
+#[inline(never)]
+extern "rust-preserve-none" fn guarded_native_call<M: Memory, H: Host<M>, F: Fuel, const CHECKED: bool>(
+    ctx: &mut Context<M>,
+    code: Slots,
+    ip: Ip,
+    interp: &mut Interpreter<M, H>,
+    table: &Table<M, H>,
+    _: Spare,
+    slot: Slot,
+) {
+    // SAFETY: a handler's ip lies below `len`, and its slot has the layout of its byte
+    let index = unsafe { ip.view(slot, const { Shape::of(GUARDED[CHECKED as usize]) }) }.imm() as u32;
+    let Some(&Native { func, sig }) = interp.host.natives().get(index as usize) else {
+        core::hint::cold_path();
+        return interp.stop.at(ip, Reason::CallKfunc(index));
+    };
+
+    // the call takes r1 to r5 where they are, or with `CHECKED` a copy with the host addresses of the pointers
+    let mut a = [0; MAX_ARGS];
+    if CHECKED {
+        a.copy_from_slice(&ctx.regs[1..][..MAX_ARGS]);
+        resolve_pointers!(ctx, interp, ip, sig, a, usize::from(sig.args()));
+    }
+    let regs = ctx.regs.as_mut_ptr();
+    let args = match CHECKED {
+        true => a.as_ptr(),
+        // SAFETY: r1 lies after r0
+        false => unsafe { regs.add(1).cast_const() },
+    };
+
+    // SAFETY: `Code::bind_guarded_native` requires each native function a call names to take its arguments in the
+    // Windows x64 convention; `args` points to five values and `regs` to r0
+    if let Some(caught) = unsafe { crate::seh::native(func, args, regs) } {
+        interp.caught = caught;
+        return interp.stop.at(ip, Reason::NativeException(index));
+    }
+
+    become_enter!(ctx, code, ip.offset(1), interp, table)
 }

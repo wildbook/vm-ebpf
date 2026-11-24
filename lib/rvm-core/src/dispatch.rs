@@ -166,6 +166,62 @@ impl<M: Memory, H: Host<M>> Tables<M, H> {
     pub const PLAIN: Table<M, H> = table::<M, H, Unmetered>();
 }
 
+/// The tables a run starts or resumes through, as the `START` of [`guarded`] names them.
+#[cfg(feature = "seh")]
+mod start {
+    pub const PLAIN: u8 = 0;
+    #[cfg(feature = "fuel")]
+    pub const STEPS: u8 = 1;
+    #[cfg(feature = "fuel")]
+    pub const METERED: u8 = 2;
+}
+
+#[cfg(feature = "seh")]
+impl<M: Memory, H: Host<M>> Tables<M, H> {
+    /// The table a guarded run starts through in place of [`PLAIN`](Self::PLAIN)
+    /// ([`Interpreter::set_guard`]): every byte has the handler [`guarded`], which runs the chain of handlers
+    /// through the plain table inside the guard. `GUARDED_STEPS` and `GUARDED_METERED` do the same for the tables
+    /// of a metered run.
+    pub const GUARDED_PLAIN: Table<M, H> = guard::<M, H, { start::PLAIN }>();
+    #[cfg(feature = "fuel")]
+    pub const GUARDED_STEPS: Table<M, H> = guard::<M, H, { start::STEPS }>();
+    #[cfg(feature = "fuel")]
+    pub const GUARDED_METERED: Table<M, H> = guard::<M, H, { start::METERED }>();
+}
+
+#[cfg(feature = "seh")]
+const fn guard<M: Memory, H: Host<M>, const START: u8>() -> Table<M, H> {
+    let guarded = guarded::<M, H, START> as Handler<M, H>;
+    Table([guarded; 256], [guarded; 256])
+}
+
+/// The handler a guarded run starts with: runs the slot through the table `START` as the run without a guard starts
+/// with it, inside [`seh::enter`](crate::seh::enter). If the guard catches the access violation of a load or
+/// store, it stops the run there with [`Reason::RawFault`](crate::Reason::RawFault).
+#[cfg(feature = "seh")]
+#[inline(never)]
+extern "rust-preserve-none" fn guarded<M: Memory, H: Host<M>, const START: u8>(
+    ctx: &mut Context<M>,
+    code: Slots,
+    ip: Ip,
+    interp: &mut Interpreter<M, H>,
+    _: &Table<M, H>,
+    _: Spare,
+    slot: Slot,
+) {
+    let table: &Table<M, H> = match START {
+        start::PLAIN => &Tables::<M, H>::PLAIN,
+        #[cfg(feature = "fuel")]
+        start::STEPS => &Tables::<M, H>::STEPS,
+        #[cfg(feature = "fuel")]
+        start::METERED => &Tables::<M, H>::METERED,
+        _ => unreachable!("no such start table"),
+    };
+    if let Some((addr, at)) = crate::seh::enter(table.of(slot), ctx, code, ip, interp, table, slot) {
+        interp.stop.at(at, crate::Reason::RawFault(addr));
+    }
+}
+
 /// The table of the runs that meter with `F`. It differs between two `F` only in the handlers that end a block.
 ///
 /// Each handler runs [`step`](crate::step::step) with its opcode as a constant, so the class, operation, source, mode
@@ -200,6 +256,10 @@ pub const fn table<M: Memory, H: Host<M>, F: Fuel>() -> Table<M, H> {
     transfer::install::<M, H, F>(&mut table);
     windows::install::<M, H>(&mut table);
     native::install::<M, H, F>(&mut table);
+    #[cfg(feature = "seh")]
+    native::install_guarded::<M, H, F>(&mut table);
+    #[cfg(feature = "seh")]
+    windows::install_guarded::<M, H>(&mut table);
     Table(table, table)
 }
 

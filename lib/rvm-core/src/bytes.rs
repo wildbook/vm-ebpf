@@ -91,6 +91,18 @@ pub const fn usual(byte: u8) -> u8 {
             return CALL;
         }
     });
+    #[cfg(feature = "seh")]
+    const_for!(native in native::GUARDED => {
+        if native == byte {
+            return CALL;
+        }
+    });
+    #[cfg(feature = "seh")]
+    const_for!((guarded, opcode) in crate::windows::GUARDED_ACCESSES => {
+        if guarded == byte {
+            return opcode;
+        }
+    });
     match (byte, Super::with_byte(byte)) {
         (MOVSX32, _) => MOV32_REG,
         (MOVSX64, _) => MOV64_REG,
@@ -116,4 +128,8 @@ const _: () = {
     claim(&mut used, MOVSX64);
     const_for!(byte in native::PLAIN => claim(&mut used, byte));
     const_for!(byte in native::CHECKED => claim(&mut used, byte));
+    #[cfg(feature = "seh")]
+    const_for!(byte in native::GUARDED => claim(&mut used, byte));
+    #[cfg(feature = "seh")]
+    const_for!((byte, _) in crate::windows::GUARDED_ACCESSES => claim(&mut used, byte));
 };

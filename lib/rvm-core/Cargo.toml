@@ -13,3 +13,7 @@ default = ["fuel"]
 # with and without the feature; it adds the metered handlers, their tables, and a `u64` per slot of each `Code` that
 # a metered run runs.
 fuel = []
+# Windows x64 only. A structured exception can stop a run instead of ending the process: one that leaves a guarded
+# native call (`Code::bind_guarded_native`), and an access violation of a load or store in a memory window during a
+# guarded run (`Interpreter::set_guard`). A run that uses neither costs what it costs without the feature.
+seh = []

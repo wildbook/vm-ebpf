@@ -42,7 +42,7 @@ impl Executor {
             state: HostState::default(),
             stop: None,
         };
-        #[cfg_attr(not(feature = "fuel"), expect(unused_mut))]
+        #[cfg_attr(not(any(feature = "fuel", feature = "seh")), expect(unused_mut))]
         let mut executor = Self {
             interp: Interpreter::new(config.frame_size, host),
             stack_top,
@@ -52,6 +52,8 @@ impl Executor {
         if config.instruction_limit != 0 {
             executor.set_limit(Some(config.instruction_limit));
         }
+        #[cfg(feature = "seh")]
+        executor.interp.set_guard(config.guards_raw());
         executor
     }
 
@@ -252,6 +254,20 @@ fn resume_at(reason: Reason<u64>, pc: u64, code: &Code, interp: &mut Interpreter
             None => Err(ExecError::BadCodeAddress { pc, target }.into()),
         },
         Reason::JumpIndirect(target) => jump_indirect(target, pc, code),
+        // the access is one that a checked access outside the regions fails the same way
+        #[cfg(feature = "seh")]
+        Reason::RawFault(addr) => Err(memory_fault(pc, addr, code)),
+        #[cfg(feature = "seh")]
+        Reason::NativeException(index) => {
+            let caught = interp.caught();
+            Err(ExecError::NativeException {
+                pc,
+                native: interp.host.registry.native_name(index).to_string(),
+                code: caught.code,
+                address: caught.address,
+            }
+            .into())
+        }
         Reason::Exit => unreachable!("the executor returns at `exit`"),
     }
 }

@@ -307,6 +307,50 @@ keeps Rust's provenance rules satisfied. Host functions that take `GuestMemory` 
 pointers the plugin can use. [`lib/rvm/examples/passthrough.rs`](lib/rvm/examples/passthrough.rs) walks a host list
 through pointer fields and shows the faults of each mode.
 
+### Catching faults
+
+A native function that follows a bad pointer raises a Windows exception, and so does a plugin that reads through a
+raw host pointer to memory that is gone. Either ends the process. With the `seh` cargo feature, on x86-64 Windows,
+the host can have the plugin's call fail instead:
+
+```rust
+let vm = Vm::with_config(VmConfig {
+    catch: Catch { native_exceptions: true, raw_faults: true },
+    ..config
+})?;
+
+match plugin.call("label_len", &[item]) {
+    // which native, the exception code (0xC0000005 for an access violation) and the instruction that raised it
+    Err(VmError::Exec(ExecError::NativeException { native, code, address, .. })) => { /* ... */ }
+    // a raw pointer to unmapped memory: the fault of any bad plugin pointer
+    Err(VmError::Exec(ExecError::MemoryFault { pc, error })) => { /* ... */ }
+    result => { /* ... */ }
+}
+```
+
+| option | catches | cost |
+|---|---|---|
+| `native_exceptions` | an exception that leaves a native function: an access violation, a stack overflow, a `RaiseException` failure, a C++ exception | about 25 host instructions per native call |
+| `raw_faults` | the access violation of a plugin load, store or atomic at a raw address that isn't mapped | about 105 host instructions per call into a plugin, and about 18 per atomic |
+
+Windows unwinds the native function's frames before the call fails, as for any exception it handles, so their
+`__finally` blocks and C++ destructors run. Afterwards the plugin and the plugins that called it are usable as after
+any failed call. A `Vm` that sets neither option pays for neither.
+
+What stays fatal:
+
+- An exception in a native function that lies in the same executable or DLL as rvm, or that called back into it
+  first. A catch discards the stack frames below it, which Rust frames don't survive, and rvm tells them by their
+  module. Natives in a system or engine DLL are covered, and with `rvmrt.dll` the natives of the host executable.
+- An exception in a host function from `register_extern`, or in code it calls.
+- A fail-fast (`abort`, a stack cookie check) and heap corruption, which Windows gives to no handler.
+- Breakpoints and single steps, which pass on to the debugger. A debugger also sees every caught exception as a
+  first-chance exception.
+
+A caught exception leaves the native function's own state as it was: a lock it held stays held. The documentation of
+`rvm::Catch` has the full contract, and [`lib/rvm/examples/catch.rs`](lib/rvm/examples/catch.rs) catches both kinds.
+In the C library, `rvm_load_with` takes the options as flags and `rvm_last_exception` reports the exception.
+
 ### Prepared images
 
 A host does not need the ELF parser and linker at run time. `Vm::prepare_elf` links a plugin ahead of time, for
@@ -356,9 +400,12 @@ Built with `cargo build --profile embedded` in `lib/rvmrt`, on x86-64 Windows:
 |---|---|---|
 | default | 119,296 bytes, 31 imports from 3 DLLs | 107,008 bytes, 8 imports |
 | without `fuel` | 97,280 bytes, 31 imports from 3 DLLs | 84,992 bytes, 8 imports |
+| with `seh` | 145,408 bytes, 32 imports from 3 DLLs | 132,608 bytes, 9 imports |
 
 The 8 imports of the static library are the process heap functions, `memcmp`, `memmove`, `GetCurrentProcess` and
-`TerminateProcess`. The build rebuilds the standard library for size, which needs the `rust-src` component.
+`TerminateProcess`; `seh` adds `_resetstkoflw`. The build rebuilds the standard library for size, which needs the
+`rust-src` component. Built with `--features seh`, the library has `rvm_load_with`, which also gives the plugin raw
+host pointers, and `rvm_last_exception` (see [Catching faults](#catching-faults)).
 
 ### Instruction limits
 
@@ -481,6 +528,7 @@ opt-level = 3
 | `link` | the ELF reader, BTF, CO-RE and the linker: `Vm::load_elf`, `Vm::prepare_elf`, `Vm::with_types` | 87 KB |
 | `fuel` | instruction limits | 19 KB |
 | `maps` | maps, the map helpers, `Vm::share_map` and `Pod` | 20 KB |
+| `seh` | `VmConfig::catch`, on x86-64 Windows: see [Catching faults](#catching-faults) | 26 KB |
 
 The size column is what rvm adds to a small Rust host on x86-64 Windows, built with the workspace's `embedded`
 profile (`cargo build --profile embedded`), which also strips symbols and panic locations. Without `maps`, an image
@@ -498,7 +546,10 @@ that declares maps fails to load. `fixed-hash-seed` makes hash maps use a fixed 
 - Native functions use the Windows x64 convention only and take integers and pointers only: no structs by value, no
   floats and no variadic functions. They run unmetered.
 - Images are tied to the rvm version that wrote them. Relink them when you update rvm.
-- The C library runs prepared images only, without host functions other than natives, maps or raw host pointers.
+- The C library runs prepared images only, without host functions other than natives and without maps. It has raw
+  host pointers only in a build with `seh`.
+- Catching faults needs x86-64 Windows and native functions outside the executable or DLL that holds rvm. With the
+  static `rvmrt.lib`, the host's own natives are inside it and are not caught.
 - rvm is not published on crates.io.
 
 ## Building and development
@@ -515,6 +566,7 @@ cargo run -p rvm --example core_reloc   # one plugin against two layouts of a ho
 cargo run -p rvm --example hello        # hand-assembled bytecode loaded as an Image, without ELF
 cargo run -p rvm --example passthrough  # a plugin that follows pointers in host structs, and the faults around them
 cargo run -p rvm --example natives      # native functions on integers and buffers, and a returned host pointer
+cargo run -p rvm --features seh --example catch   # a fault in a native and a dangling raw pointer, both caught
 ```
 
 The plugins under [`bpf/`](bpf) are checked in compiled, under `bpf/prebuilt/`, so cargo doesn't need clang. After you

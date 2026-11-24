@@ -262,6 +262,16 @@ pub enum ExecError {
     UnknownHelper { pc: u64, id: u32 },
     /// A call to a named extern in a slot the VM's table lacks, which only raw bytecode can contain.
     UnknownExtern { pc: u64, slot: u32 },
+    /// The native function `native`, called at `pc`, raised the structured exception `code` (an NTSTATUS, such as
+    /// 0xC0000005 for an access violation) at the host instruction `address`. Only a VM with
+    /// [`Catch::native_exceptions`](crate::Catch::native_exceptions) reports it.
+    #[cfg(feature = "seh")]
+    NativeException {
+        pc: u64,
+        native: String,
+        code: u32,
+        address: u64,
+    },
 }
 
 impl fmt::Display for ExecError {
@@ -283,6 +293,16 @@ impl fmt::Display for ExecError {
             Self::UnknownExtern { pc, slot } => {
                 write!(f, "instruction {pc} calls extern slot {slot}, which does not exist")
             }
+            #[cfg(feature = "seh")]
+            Self::NativeException {
+                pc,
+                native,
+                code,
+                address,
+            } => write!(
+                f,
+                "native function {native}, called at instruction {pc}, raised exception {code:#010x} at {address:#x}"
+            ),
         }
     }
 }

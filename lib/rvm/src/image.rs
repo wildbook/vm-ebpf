@@ -428,9 +428,22 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
         let checked = tagged && sig.has_pointers();
         // SAFETY: `bind_externs` checked that the native at `index` has the signature `sig`, which a native keeps in
         // every later table the program refreshes to. `Vm::register_native` vouches for the function.
-        if !unsafe { code.bind_native(at as usize, index, sig.args(), checked) } {
+        let bound = unsafe {
+            #[cfg(feature = "seh")]
+            match config.catch.native_exceptions {
+                true => code.bind_guarded_native(at as usize, index, checked),
+                false => code.bind_native(at as usize, index, sig.args(), checked),
+            }
+            #[cfg(not(feature = "seh"))]
+            code.bind_native(at as usize, index, sig.args(), checked)
+        };
+        if !bound {
             return Err(invalid(format!("native call at instruction {at} is not a valid call")));
         }
+    }
+    #[cfg(feature = "seh")]
+    if config.guards_raw() {
+        code.guard_accesses();
     }
     let program = Program::new(code, memory, stack_top, functions, helpers.clone(), snapshot, config);
     #[cfg(feature = "maps")]

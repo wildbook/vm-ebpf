@@ -30,6 +30,10 @@ fuel = ["rvm-core/fuel"]
 maps = ["dep:bytemuck"]
 # Guest hash maps use a fixed hash seed, so builds compared in benchmarks probe the same way.
 fixed-hash-seed = []
+# Windows x64 only. `VmConfig::catch`: a structured exception in a native function, or an access violation of a guest
+# access to an unmapped raw address, fails the guest's call instead of ending the process. `Catch` states what is
+# caught. A VM that leaves both off runs as without the feature.
+seh = ["rvm-core/seh"]
 
 [dev-dependencies]
 btf       = { workspace = true }
@@ -51,6 +55,10 @@ required-features = ["link", "maps"]
 name = "workloads"
 harness = false
 required-features = ["link", "maps"]
+
+[[example]]
+name = "catch"
+required-features = ["link", "seh"]
 
 [[example]]
 name = "core_reloc"

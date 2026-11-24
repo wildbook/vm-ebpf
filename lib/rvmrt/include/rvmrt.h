@@ -46,7 +46,8 @@ rvm_status rvm_load(const uint8_t *image, size_t len, rvm_program **program);
 // interpreter calls directly. It must:
 // - take its `args` arguments, each an integer or pointer of up to 64 bits, in the Windows x64 convention and return
 //   its result in rax;
-// - never unwind: no C++ exception, SEH unwind or longjmp may leave it;
+// - never unwind: no C++ exception, SEH unwind or longjmp may leave it, unless the program is loaded with
+//   RVM_CATCH_NATIVE (see rvm_load_with);
 // - stay loaded while any program loaded with it may call it, and be safe to run on several threads at once;
 // - stay sound for any argument values: the runtime checks only the pointers `kind` declares, so integer arguments
 //   and the bytes behind pointers are the guest's choice.
@@ -75,6 +76,42 @@ typedef struct rvm_native {
 // with the signature the image was linked against.
 rvm_status rvm_load_natives(const uint8_t *image, size_t len, const rvm_native *natives, size_t count,
                             rvm_program **program);
+
+// The next two functions exist in a library built with its `seh` feature, on x86-64 Windows.
+//
+// Flags of rvm_load_with:
+// - RVM_RAW_POINTERS: a guest address without a region tag, from 64 KiB up, is the host address, and the guest's
+//   loads, stores and atomics there go straight to host memory, unchecked. Give a guest such a pointer only if every
+//   access it may make through it is sound.
+// - RVM_CATCH_NATIVE: an exception that leaves a native function fails the guest's call with RVM_ERR_FAULT instead
+//   of ending the process: an access violation, a stack overflow or another hardware fault, a RaiseException
+//   failure, a C++ exception. The system unwinds the function's frames first, which runs their __finally blocks and
+//   C++ destructors as their compiler arranged them. rvm_last_exception tells which exception it was.
+// - RVM_CATCH_RAW: with RVM_RAW_POINTERS, a guest access to a raw address that isn't mapped fails the call with
+//   RVM_ERR_FAULT, as an access outside the guest's memory does.
+// After a caught exception the program is callable as after any failed call. Everything else ends the process as
+// before:
+// - an exception in a native function that lies in the same executable or DLL as the runtime, as every native of a
+//   host that links the static rvmrt.lib does unless it comes from another DLL, or in a native function that called
+//   back into the runtime first;
+// - an exception in a native function without unwind information;
+// - breakpoints, single steps and other exception codes below 0xC0000000, which pass on to the debugger and the
+//   host's handlers;
+// - a fail-fast (__fastfail, a stack cookie check, abort) and heap corruption, which Windows gives to no handler.
+// A caught exception leaves the native function's own state as it was at the exception: locks it held stay held,
+// and C++ built without /EHa runs no destructors for a hardware fault. A debugger sees each caught exception as a
+// first-chance exception. A native call costs about 25 instructions more with RVM_CATCH_NATIVE. With RVM_CATCH_RAW
+// each call into the guest costs about 105 more, and each atomic about 18 more.
+enum { RVM_RAW_POINTERS = 1, RVM_CATCH_NATIVE = 2, RVM_CATCH_RAW = 4 };
+
+// rvm_load_natives with `flags`; RVM_ERR_ARGUMENT for a flag it doesn't know.
+rvm_status rvm_load_with(const uint8_t *image, size_t len, const rvm_native *natives, size_t count, uint32_t flags,
+                         rvm_program **program);
+
+// Stores the code of the exception that failed the program's last call of a native function (an NTSTATUS, such as
+// 0xC0000005 for an access violation) in *code and the address of the instruction that raised it in *address;
+// RVM_ERR_NOT_FOUND if no call failed so.
+rvm_status rvm_last_exception(const rvm_program *program, uint32_t *code, uint64_t *address);
 
 // Frees a program from rvm_load; NULL is ignored.
 void rvm_free(rvm_program *program);
