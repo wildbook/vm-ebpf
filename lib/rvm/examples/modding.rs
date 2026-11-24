@@ -1,6 +1,6 @@
 //! A game that runs its mods as rvm plugins.
 //!
-//! - `bpf/examples/game_rules.c` spawns monster waves through the host function `spawn` and exports `record_kills`,
+//! - `bpf/examples/game_rules_v1.c` spawns monster waves through the host function `spawn` and exports `record_kills`,
 //!   which keeps each hero's score in a map.
 //! - `bpf/examples/game_combat.c` moves monsters, attacks through the host function `damage`, and passes each tick's
 //!   kills to `record_kills` in one buffer that the rules plugin borrows for the call.
@@ -24,7 +24,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use rvm::{MemoryError, Perms, Plugin, Pod, Scalar, SharedRegion, ValueSpacing, Vm};
 
-const RULES: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/prebuilt/examples/game_rules.o"));
+const RULES: &[u8] =
+    include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/prebuilt/examples/game_rules_v1.o"));
 const RULES_V2: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/prebuilt/examples/game_rules_v2.o"));
 const COMBAT: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/prebuilt/examples/game_combat.o"));
@@ -182,7 +183,7 @@ struct Stats {
     armor: i32,
 }
 
-/// `struct wave_state` in `bpf/examples/game_rules.c`, the value of the `waves` map.
+/// `struct wave_state` in `bpf/examples/game_rules_v1.c`, the value of the `waves` map.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct WaveState {

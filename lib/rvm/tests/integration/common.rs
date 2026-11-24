@@ -39,7 +39,7 @@ pub fn host_vm_with(config: VmConfig) -> Vm {
     vm.enable_print(|_| {});
     // SAFETY: programs from this VM run on the thread that calls them, one at a time.
     unsafe { vm.share_region(FIRST_FREE_REGION, 64, Perms::RW) }.unwrap();
-    let a = Plugin::new("a", vm.load_elf(&object("tests/plugin_a.o")).unwrap());
+    let a = Plugin::new("a", vm.load_elf(&object("tests/plugin_a_v1.o")).unwrap());
     vm.export(&a, "a_scale").unwrap();
     let callee = Plugin::new("callee", vm.load_elf(&object("tests/borrow_callee.o")).unwrap());
     for func in ["sum", "fill", "poke"] {

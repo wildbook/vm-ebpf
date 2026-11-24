@@ -43,7 +43,7 @@ fn images_run_like_elf() {
         (&["tests/std_helpers.o"], &[("draws_differ", &[])]),
         (&["tests/shared_counter.o"], &[("bump", &[]), ("bump", &[])]),
         (&["tests/shared_region.o"], &[("put", &[SLOT, 42]), ("get", &[SLOT])]),
-        (&["tests/plugin_a.o"], &[("a_scale", &[5])]),
+        (&["tests/plugin_a_v1.o"], &[("a_scale", &[5])]),
         (&["tests/plugin_b.o"], &[("b_run", &[5])]),
         (&["tests/borrow_caller.o"], &[("run", &[])]),
         (&["tests/link_main.o", "tests/link_lib.o"], &[("run", &[7]), ("lib_scale", &[5])]),
@@ -83,13 +83,13 @@ fn plugins_from_images() {
     vm.register_extern("host_reenter", |x: u64| x);
     let image = |name: &str| vm.prepare_elf(&object(name)).unwrap().to_bytes();
 
-    let a = Plugin::new("a", vm.load_image_bytes(&image("tests/plugin_a.o")).unwrap());
+    let a = Plugin::new("a", vm.load_image_bytes(&image("tests/plugin_a_v1.o")).unwrap());
     vm.export(&a, "a_scale").unwrap();
     let b_image = image("tests/plugin_b.o");
     let b = Plugin::new("b", vm.load_image_bytes(&b_image).unwrap());
     assert_eq!(b.call("b_run", &[5]).unwrap(), 11);
 
-    a.replace(vm.load_image_bytes(&image("tests/plugin_a3.o")).unwrap())
+    a.replace(vm.load_image_bytes(&image("tests/plugin_a_v2.o")).unwrap())
         .unwrap();
     assert_eq!(b.call("b_run", &[5]).unwrap(), 16);
 

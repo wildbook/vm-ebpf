@@ -30,7 +30,7 @@ fn entry(c: &mut Criterion) {
 fn cross_plugin(c: &mut Criterion) {
     let vm = Vm::new();
     vm.register_extern("host_reenter", |x: u64| x);
-    let a = Plugin::new("a", vm.load_elf(&object("tests/plugin_a.o")).unwrap());
+    let a = Plugin::new("a", vm.load_elf(&object("tests/plugin_a_v1.o")).unwrap());
     vm.export(&a, "a_scale").unwrap();
     let b = Plugin::new("b", vm.load_elf(&object("tests/plugin_b.o")).unwrap());
 

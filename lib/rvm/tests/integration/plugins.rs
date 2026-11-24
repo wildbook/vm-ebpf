@@ -107,7 +107,7 @@ fn plugin_calls_export_and_survives_reload() {
         VmError::Link(LinkError::UnresolvedSymbol(name)) if name == "a_scale"
     ));
 
-    let a = Plugin::new("a", vm.load_elf(&object("tests/plugin_a.o")).unwrap());
+    let a = Plugin::new("a", vm.load_elf(&object("tests/plugin_a_v1.o")).unwrap());
     vm.export(&a, "a_scale").unwrap();
     let b = Plugin::new("b", vm.load_elf(&object("tests/plugin_b.o")).unwrap());
     assert_eq!(b.call("b_run", &[5]).unwrap(), 11);
@@ -116,7 +116,7 @@ fn plugin_calls_export_and_survives_reload() {
     assert_eq!(direct, a.call("a_scale", &[5]).unwrap());
 
     // Replacing A's code is picked up by B's next call without relinking B.
-    a.replace(vm.load_elf(&object("tests/plugin_a3.o")).unwrap()).unwrap();
+    a.replace(vm.load_elf(&object("tests/plugin_a_v2.o")).unwrap()).unwrap();
     assert_eq!(b.call("b_run", &[5]).unwrap(), 16);
     // A handle into the replaced program fails instead of running the new one at its pc.
     assert!(matches!(a.lock().unwrap().call_func(scale, &[5]), Err(VmError::ForeignFunc)));
@@ -125,11 +125,11 @@ fn plugin_calls_export_and_survives_reload() {
 #[test]
 fn plugin_func_follows_replace() {
     let vm = Vm::new();
-    let a = Plugin::new("a", vm.load_elf(&object("tests/plugin_a.o")).unwrap());
+    let a = Plugin::new("a", vm.load_elf(&object("tests/plugin_a_v1.o")).unwrap());
     let scale = a.func("a_scale").unwrap();
     assert_eq!(scale.call(&[5]).unwrap(), 10);
 
-    a.replace(vm.load_elf(&object("tests/plugin_a3.o")).unwrap()).unwrap();
+    a.replace(vm.load_elf(&object("tests/plugin_a_v2.o")).unwrap()).unwrap();
     assert_eq!(scale.call(&[5]).unwrap(), 15);
 
     // A program without the function fails the call, and the handle recovers when a later program has it again.
@@ -139,14 +139,14 @@ fn plugin_func_follows_replace() {
         matches!(&err, VmError::FunctionNotFound { plugin: Some(p), func } if p == "a" && func == "a_scale"),
         "{err}"
     );
-    a.replace(vm.load_elf(&object("tests/plugin_a.o")).unwrap()).unwrap();
+    a.replace(vm.load_elf(&object("tests/plugin_a_v1.o")).unwrap()).unwrap();
     assert_eq!(scale.call(&[5]).unwrap(), 10);
 }
 
 #[test]
 fn reentrant_call_and_replace_fail_instead_of_deadlocking() {
     let vm = Vm::new();
-    let a = Plugin::new("a", vm.load_elf(&object("tests/plugin_a.o")).unwrap());
+    let a = Plugin::new("a", vm.load_elf(&object("tests/plugin_a_v1.o")).unwrap());
     vm.export(&a, "a_scale").unwrap();
 
     // host_reenter calls back into b, and tries to replace it, while b is running. It holds b weakly: a strong handle

@@ -1,7 +1,7 @@
 //! Hot reload: loads a plugin, runs it, replaces its program while the host keeps using it, and checks what the reload
 //! kept and what it replaced.
 //!
-//! `bpf/examples/counter.c` counts hits per id in the map `totals`. The VM shares that map, so it belongs to the VM
+//! `bpf/examples/counter_v1.c` counts hits per id in the map `totals`. The VM shares that map, so it belongs to the VM
 //! and not to a program. Version 2 of the plugin counts in steps of 10.
 //!
 //! - Function handles follow the reload: the handles looked up before it call version 2 afterwards.
@@ -16,7 +16,7 @@ use std::error::Error;
 
 use rvm::{Plugin, PluginFunc, ValueSpacing, Vm};
 
-const V1: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/prebuilt/examples/counter.o"));
+const V1: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/prebuilt/examples/counter_v1.o"));
 const V2: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/prebuilt/examples/counter_v2.o"));
 
 type Check = Result<(), Box<dyn Error>>;

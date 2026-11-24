@@ -1,5 +1,5 @@
 /*
- * Plugin importing a_scale from plugin_a and a host function that calls back into
+ * Plugin importing a_scale from plugin_a_v1 and a host function that calls back into
  * this plugin.
  */
 #include "rvm_bpf.h"
