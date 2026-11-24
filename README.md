@@ -94,7 +94,7 @@ The host decides what a plugin can reach. The only built-in helpers are the map 
 
 A native function is a plain function pointer that the interpreter calls directly, in the Windows x64 convention. A
 call from a plugin loop costs 18 host instructions without arguments and 31 with one, against 38 and 50 for a host
-function from `register_extern`; a pointer argument that rvm checks adds about 20. The plugin declares a native as an
+function from `register_extern`; a pointer argument that rvm checks adds about 30. The plugin declares a native as an
 `extern` like any host function, and the host registers it with its signature, which says which arguments are
 pointers to plugin memory and how many bytes each covers:
 
