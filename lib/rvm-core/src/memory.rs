@@ -5,10 +5,11 @@ use std::ptr;
 
 /// The guest memory that loads and stores go to. Values are little-endian, and an address needs no alignment.
 ///
-/// An implementation provides [`load_u8`](Self::load_u8) and [`store_u8`](Self::store_u8). The wider loads and stores,
-/// the atomics and the acquire and release accesses default to sequences of those, which is correct for memory that
-/// only one interpreter reaches; override them for speed, and for memory shared between threads. A memory that hands
-/// out [`Window`]s also provides [`window`](Self::window) and [`epoch`](Self::epoch).
+/// An implementation provides [`load_u8`](Self::load_u8), [`store_u8`](Self::store_u8) and
+/// [`native_ptr`](Self::native_ptr). The wider loads and stores, the atomics and the acquire and release accesses
+/// default to sequences of those, which is correct for memory that only one interpreter reaches; override them for
+/// speed, and for memory shared between threads. A memory that hands out [`Window`]s also provides
+/// [`window`](Self::window) and [`epoch`](Self::epoch).
 ///
 /// # Safety
 ///
@@ -140,6 +141,15 @@ pub unsafe trait Memory {
     fn epoch(&self) -> u64 {
         0
     }
+
+    /// The host address of the `len` bytes at guest address `addr`, which the native function of a checked native
+    /// call ([`Code::bind_native`](crate::Code::bind_native)) gets in place of `addr` and reads, or with `write` reads
+    /// and writes. Fails with the error of the first of those bytes the guest may not access so.
+    ///
+    /// The host bytes must stay valid for that access until the memory next changes its mapping, which no native
+    /// function can do. They may instead be host memory that the embedder lets the guest name directly, as a
+    /// [`Window`] may cover.
+    fn native_ptr(&self, addr: u64, len: u64, write: bool) -> Result<u64, Self::Error>;
 }
 
 /// A read-modify-write operation for [`Memory::atomic_u32`] and [`Memory::atomic_u64`].

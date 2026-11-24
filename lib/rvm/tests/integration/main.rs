@@ -9,6 +9,9 @@ mod linking;
 // thousands of loads per fixture, far too slow under Miri
 #[cfg(not(miri))]
 mod mutations;
+// Miri can't call the `extern "win64"` natives through their pointers
+#[cfg(not(miri))]
+mod natives;
 mod plugins;
 mod programs;
 mod regions;

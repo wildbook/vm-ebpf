@@ -1,12 +1,18 @@
 //! rvm as a C library: load a prepared image, map guest memory, copy bytes in and out, and call functions by name.
 //!
 //! `include/rvmrt.h` declares these functions for C. Images come from `rvm::Vm::prepare_elf` and
-//! `rvm::Image::to_bytes`; the runtime has no helpers and no maps, and it limits each call to
-//! `rvm::DEFAULT_INSTRUCTION_LIMIT` instructions.
+//! `rvm::Image::to_bytes`; the runtime has no helpers and no maps, only the native functions the host passes to
+//! [`rvm_load_natives`]. With the `fuel` feature it limits each call to `rvm::DEFAULT_INSTRUCTION_LIMIT` instructions.
 
 use std::slice;
 
-use rvm::{ExecError, Func, Perms, Program, Region, Vm, VmConfig, VmError, DEFAULT_INSTRUCTION_LIMIT};
+use rvm::{ExecError, Func, NativeArg, NativeSig, Perms, Program, Region, Vm, VmConfig, VmError, MAX_NATIVE_ARGS};
+
+/// The limit of each call; 0 is no limit.
+#[cfg(feature = "fuel")]
+const INSTRUCTION_LIMIT: u64 = rvm::DEFAULT_INSTRUCTION_LIMIT;
+#[cfg(not(feature = "fuel"))]
+const INSTRUCTION_LIMIT: u64 = 0;
 
 /// What an `rvm_program` pointer points to: a program, the handles of its functions in name order, so that a call by
 /// index looks nothing up, and the regions [`rvm_map`] mapped.
@@ -75,15 +81,71 @@ impl Status {
 /// `image` must point to `len` readable bytes, and `program` must be valid for writes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rvm_load(image: *const u8, len: usize, program: *mut *mut RvmProgram) -> Status {
+    unsafe { rvm_load_natives(image, len, std::ptr::null(), 0, program) }
+}
+
+/// A native function the image imports by name; `rvm_native` in the header.
+#[repr(C)]
+pub struct RvmNative {
+    pub name: *const u8,
+    pub name_len: usize,
+    pub func: *const (),
+    /// Arguments, 0 to 5.
+    pub args: u8,
+    /// Per argument: 0 for an integer, 1 for a pointer the function reads, 2 for one it reads and writes.
+    pub kind: [u8; MAX_NATIVE_ARGS],
+    /// Per pointer argument: 0 for one byte, or the number of the integer argument that holds its length.
+    pub len_arg: [u8; MAX_NATIVE_ARGS],
+}
+
+/// [`rvm_load`] with `natives` registered as `rvm::Vm::register_native` registers them.
+///
+/// # Safety
+///
+/// As [`rvm_load`]; `natives` must point to `count` entries, and each function must meet the contract of
+/// `rvm::Vm::register_native`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rvm_load_natives(
+    image: *const u8,
+    len: usize,
+    natives: *const RvmNative,
+    count: usize,
+    program: *mut *mut RvmProgram,
+) -> Status {
     let bytes = unsafe { slice_or_empty(image, len) };
+    let mut list = Vec::with_capacity(count);
+    for native in unsafe { slice_or_empty(natives, count) } {
+        let name = unsafe { str_or_none(native.name, native.name_len) };
+        let (Some(name), Some(sig)) = (name, native_sig(native)) else {
+            return Status::Argument;
+        };
+        list.push((name, native.func, sig));
+    }
     let config = VmConfig {
-        instruction_limit: DEFAULT_INSTRUCTION_LIMIT,
+        instruction_limit: INSTRUCTION_LIMIT,
         ..VmConfig::default()
     };
-    let loaded = Vm::with_config(config)
+    // SAFETY: the caller's
+    let loaded = unsafe { Vm::with_natives(config, &list) }
         .and_then(|vm| vm.load_image_bytes(bytes))
         .map(|p| Box::into_raw(Box::new(RvmProgram::new(p))));
     unsafe { finish(loaded, program) }
+}
+
+/// The signature `native` describes, or `None` for an invalid one.
+fn native_sig(native: &RvmNative) -> Option<NativeSig> {
+    let args = native.kind.get(..usize::from(native.args))?;
+    let mut list = [NativeArg::Int; MAX_NATIVE_ARGS];
+    for (i, &kind) in args.iter().enumerate() {
+        let len = (native.len_arg[i] != 0).then_some(native.len_arg[i]);
+        list[i] = match kind {
+            0 => NativeArg::Int,
+            1 => NativeArg::Read(len),
+            2 => NativeArg::Write(len),
+            _ => return None,
+        };
+    }
+    NativeSig::try_new(&list[..args.len()])
 }
 
 /// Frees a program from [`rvm_load`]; null is ignored.

@@ -72,5 +72,9 @@ required-features = ["link", "maps"]
 test = true
 
 [[example]]
+name = "natives"
+required-features = ["link"]
+
+[[example]]
 name = "passthrough"
 required-features = ["link"]

@@ -402,6 +402,18 @@ impl VmMemory {
         (at < fits[idx]).then(|| self.host_at(idx, at))
     }
 
+    /// The first byte from guest address `addr` on that the guest can't access with `need`, where a range from `addr`
+    /// failed to resolve: `addr` itself or the end of its region.
+    #[cold]
+    #[inline(never)]
+    fn unreachable_byte(&self, addr: u64, need: Perms) -> u64 {
+        if self.resolve(addr, 1, need).is_none() {
+            return addr;
+        }
+        let idx = region_of(addr);
+        self.bases[idx] + self.lens[idx] as u64
+    }
+
     /// Host pointer to `len` bytes at guest address `addr` whose region allows `need`. No reference is created, so the
     /// bytes may be shared or aliased.
     pub fn host_ptr(&self, addr: u64, len: usize, need: Perms) -> Result<NonNull<u8>, MemoryError> {
@@ -913,6 +925,25 @@ unsafe impl Memory for VmMemory {
 
     fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    // The native function reaches the bytes in place, so they need the guest's permissions for its access, which the
+    // fits of 1-byte accesses give: the region's length where its perms allow the access, else 0. Every guest address
+    // is its host address under the region's tag. An empty buffer may be null, as C passes it, so it only loses its
+    // tag.
+    #[inline(always)]
+    fn native_ptr(&self, addr: u64, len: u64, write: bool) -> Result<u64, u64> {
+        let idx = region_of(addr);
+        let mut fits = self.read_fits[0][idx];
+        if write {
+            fits = fits.min(self.write_fits[0][idx]);
+        }
+        let at = addr.wrapping_sub(self.bases[idx]);
+        let host = addr & (region_tag(1) - 1);
+        match (at < fits && len <= fits - at) || len == 0 {
+            true => Ok(host),
+            false => Err(self.unreachable_byte(addr, if write { Perms::RW } else { Perms::R })),
+        }
     }
 }
 

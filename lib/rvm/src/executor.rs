@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use rvm_core::{Callee, Code, Context, Host, Interpreter, Reason, METERED};
+use rvm_core::{Callee, Code, Context, Host, Interpreter, Native, Reason, METERED};
 
 use crate::error::{ExecError, MemoryError, Result, VmError};
 use crate::helper::{CallerFuel, HelperRegistry, HostState, Stop};
@@ -233,10 +233,11 @@ fn resume_at(reason: Reason<u64>, pc: u64, code: &Code, interp: &mut Interpreter
         Reason::StackOverflow => Err(ExecError::StackOverflow { pc }.into()),
         // a call the linker planted for an unresolved CO-RE relocation
         Reason::CallHelper(CORE_POISON_HELPER) => Err(ExecError::UnresolvedCoreRelo { pc }.into()),
-        Reason::CallHelper(_) | Reason::CallKfunc(_) => {
-            let stop = interp.host.stop.take().expect("stopped host call left no reason");
-            Err(failure(stop, pc))
-        }
+        Reason::CallHelper(id) | Reason::CallKfunc(id) => match interp.host.stop.take() {
+            Some(stop) => Err(failure(stop, pc)),
+            // a native call past the table, which binding never writes
+            None => Err(ExecError::UnknownExtern { pc, slot: id }.into()),
+        },
         Reason::OutOfFuel => {
             let limit = interp.limit().expect("only a metered call runs out of fuel");
             Err(ExecError::InstructionLimit { limit }.into())
@@ -329,12 +330,17 @@ impl Host<VmMemory> for HostCalls {
         };
         self.call_kfunc(ctx, slot).map(Callee::Host)
     }
+
+    #[inline(always)]
+    fn natives(&self) -> &[Native] {
+        self.registry.natives()
+    }
 }
 
-/// The fault of the load or store at `pc` that failed at `addr`.
+/// The fault at `pc` of the load or store, or of the native call's pointer argument, that failed at `addr`.
 fn memory_fault(pc: u64, addr: u64, code: &Code) -> VmError {
-    // only loads and stores fail with `Reason::MemoryFault`
-    let size = code.access_size(pc).expect("memory fault outside a load or store");
+    // `VmMemory::native_ptr` fails with the first byte out of reach
+    let size = code.access_size(pc).unwrap_or(1);
     ExecError::MemoryFault {
         pc,
         error: MemoryError { addr, size },

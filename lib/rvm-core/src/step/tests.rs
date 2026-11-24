@@ -28,6 +28,10 @@ unsafe impl Memory for TestMem {
         *self.data.get_mut(addr as usize).ok_or(())? = value;
         Ok(())
     }
+
+    fn native_ptr(&self, _: u64, _: u64, _: bool) -> Result<u64, ()> {
+        Err(())
+    }
 }
 
 impl Machine {

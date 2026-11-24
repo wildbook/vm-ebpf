@@ -13,7 +13,8 @@ use std::ops::Range;
 
 use btf::{apply_core_relocations, Btf, BtfBuilder, BtfType, BTF_FUNC_EXTERN};
 use constelf::raw::reloc;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
+use rvm_core::{NativeArg, NativeSig};
 
 use crate::error::{LinkError, Result, VmError};
 use crate::executor::{CORE_POISON_HELPER, MAX_ARGS};
@@ -122,6 +123,10 @@ pub fn link<'m>(
     let (mut image, layouts) = lay_out(modules, &mut MemoryBudget::new(memory_limit))?;
     let global_symbols = build_symbol_table(modules, &layouts)?;
     check_extern_signatures(helpers, &btfs)?;
+    let natives = btfs
+        .iter()
+        .map(|btf| check_native_externs(helpers, btf.as_ref()))
+        .collect::<Result<Vec<_>>>()?;
 
     for (module, btf) in modules.iter().zip(&btfs) {
         for def in map_defs(module, btf.as_ref())? {
@@ -133,9 +138,9 @@ pub fn link<'m>(
     }
 
     // Relocations bind maps and named externs; then numeric helper calls.
-    for (module, layout) in modules.iter().zip(&layouts) {
+    for ((module, layout), natives) in modules.iter().zip(&layouts).zip(&natives) {
         for reloc in &module.relocations {
-            apply_relocation(helpers, module, layout, &global_symbols, reloc, &mut image)?;
+            apply_relocation(helpers, natives, module, layout, &global_symbols, reloc, &mut image)?;
         }
     }
     mark_helper_calls(helpers, &mut image)?;
@@ -259,7 +264,8 @@ fn check_extern_signatures(helpers: &HelperRegistry, btfs: &[Option<Btf<'_>>]) -
             else {
                 continue;
             };
-            let Some(slot) = helpers.slot_of_name(name) else {
+            // a native has a check of its own
+            let Some(slot) = helpers.slot_of_name(name).filter(|_| helpers.native(name).is_none()) else {
                 continue;
             };
             // a trailing unnamed void parameter marks a variadic prototype
@@ -286,6 +292,81 @@ fn check_extern_signatures(helpers: &HelperRegistry, btfs: &[Option<Btf<'_>>]) -
         }
     }
     Ok(())
+}
+
+/// Compare each extern in `btf` that names a native function with the native's signature: the same number of argument
+/// registers, an integer or enum where it takes an integer and a pointer where it takes a pointer, and a `borrow` or
+/// `borrow_ro` tag only on a pointer with the same length argument and access. Returns the names it checked, which are
+/// the only natives the module may call.
+fn check_native_externs(helpers: &HelperRegistry, btf: Option<&Btf<'_>>) -> Result<HashSet<String>> {
+    let mut checked = HashSet::new();
+    let Some(btf) = btf else {
+        return Ok(checked);
+    };
+    let borrows = function_borrows(Some(btf))?;
+    for (_, ty) in btf.types() {
+        let BtfType::Func {
+            name,
+            proto_type,
+            linkage: BTF_FUNC_EXTERN,
+        } = ty
+        else {
+            continue;
+        };
+        let Some((_, sig)) = helpers.native(name) else {
+            continue;
+        };
+        let mismatch = |reason: String| LinkError::NativeMismatch {
+            name: name.to_string(),
+            reason,
+        };
+
+        let Some(BtfType::FuncProto { return_type, params }) = btf.type_by_id(*proto_type) else {
+            return Err(mismatch("the extern has no prototype".into()).into());
+        };
+        if params.last().is_some_and(|p| p.type_id == 0) {
+            return Err(mismatch("the extern is variadic".into()).into());
+        }
+        if params.len() != usize::from(sig.args()) {
+            let (name, declared, host) = (name.to_string(), params.len(), sig.args());
+            return Err(LinkError::SignatureMismatch { name, declared, host }.into());
+        }
+        let returns = btf.resolve_type(*return_type).map(|(_, ty)| ty);
+        if !matches!(returns, Some(BtfType::Void | BtfType::Int { .. } | BtfType::Enum { .. } | BtfType::Ptr { .. })) {
+            return Err(mismatch("the extern returns something other than an integer or pointer".into()).into());
+        }
+        for (n, param) in (1..).zip(params) {
+            let pointer = match btf.resolve_type(param.type_id).map(|(_, ty)| ty) {
+                Some(BtfType::Int { .. } | BtfType::Enum { .. }) => false,
+                Some(BtfType::Ptr { .. }) => true,
+                _ => return Err(mismatch(format!("parameter {n} is neither an integer nor a pointer")).into()),
+            };
+            if pointer != !matches!(sig.arg(n), Some(NativeArg::Int)) {
+                let host = if pointer { "an integer" } else { "a pointer" };
+                return Err(mismatch(format!("parameter {n} is {host} in the host's signature")).into());
+            }
+        }
+        for borrow in borrows.get(*name).into_iter().flatten() {
+            if !borrow_matches(borrow, sig) {
+                let n = borrow.arg + 1;
+                return Err(
+                    mismatch(format!("parameter {n} has a borrow tag the host's signature doesn't match")).into()
+                );
+            }
+        }
+        checked.insert(name.to_string());
+    }
+    Ok(checked)
+}
+
+/// Whether the native signature `sig` declares the pointer that `borrow` tags, with its length argument and access.
+fn borrow_matches(borrow: &Borrow, sig: NativeSig) -> bool {
+    let len = Some(borrow.len_arg + 1);
+    match sig.arg(borrow.arg + 1) {
+        Some(NativeArg::Read(l)) => !borrow.writable && l == len,
+        Some(NativeArg::Write(l)) => borrow.writable && l == len,
+        _ => false,
+    }
 }
 
 /// The argument registers clang uses for each parameter of the function prototype `proto_type`, numbered from 0 for
@@ -341,6 +422,7 @@ fn build_symbol_table(modules: &[&Module], layouts: &[ModuleLayout]) -> Result<H
 /// Patch the instruction or data that `reloc` points at.
 fn apply_relocation(
     helpers: &HelperRegistry,
+    natives: &HashSet<String>,
     module: &Module,
     layout: &ModuleLayout,
     global_symbols: &HashMap<String, Addr>,
@@ -391,11 +473,18 @@ fn apply_relocation(
     } else if let Some(&addr) = global_symbols.get(&symbol.name) {
         addr
     } else if let (reloc::bpf::BPF_64_32, Addr::Code(at)) = (reloc.rel_type, patch) {
-        // Call to an extern function, bound to its slot in the extern table on load.
-        if helpers.slot_of_name(&symbol.name).is_none() {
-            return Err(LinkError::UnresolvedSymbol(symbol.name.clone()).into());
-        }
-        mark_extern(image, at, Import::Name(symbol.name.clone()))?;
+        // Call to an extern function, bound to its slot in the extern table on load, or to a native function.
+        let name = symbol.name.clone();
+        let import = match helpers.native(&name) {
+            Some((_, sig)) if natives.contains(&name) => Import::Native { name, sig },
+            Some(_) => {
+                let reason = "the module has no BTF for the extern to check its signature against".into();
+                return Err(LinkError::NativeMismatch { name, reason }.into());
+            }
+            None if helpers.slot_of_name(&name).is_some() => Import::Name(name),
+            None => return Err(LinkError::UnresolvedSymbol(name).into()),
+        };
+        mark_extern(image, at, import)?;
         return Ok(());
     } else {
         return Err(LinkError::UnresolvedSymbol(symbol.name.clone()).into());

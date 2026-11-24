@@ -2,8 +2,9 @@
 //!
 //! An [`Image`] is everything linking produces except runtime binding and allocation: the final code with every
 //! relocation, CO-RE adjustment and jump table applied, the initial data, map declarations, exported functions, and the
-//! call sites that bind to host functions. [`crate::Vm::load_image`] binds those call sites in the loading VM,
-//! allocates memory and maps, maps the VM's shared maps and regions, and returns a [`Program`].
+//! call sites that bind to host and native functions, natives with the signature they were linked against.
+//! [`crate::Vm::load_image`] binds those call sites in the loading VM, allocates memory and maps, maps the VM's shared
+//! maps and regions, and returns a [`Program`].
 //!
 //! # Format
 //!
@@ -16,7 +17,7 @@
 use std::sync::Arc;
 
 use rvm_core::opcode::{call, CALL, LD_IMM64};
-use rvm_core::{Code, Instruction, MAX_CALL_DEPTH};
+use rvm_core::{Code, Instruction, NativeArg, NativeSig, MAX_CALL_DEPTH, MAX_NATIVE_ARGS};
 
 use crate::error::{LinkError, Result, VmError};
 use crate::helper::{HelperRegistry, SharedHelpers};
@@ -31,7 +32,7 @@ use crate::program::{Borrow, FunctionInfo, Functions, Program};
 use crate::vm::{Shared, VmConfig};
 
 const MAGIC: &[u8; 4] = b"RVMI";
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 const RVM_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // tag bytes of the `MapKind`, `Import` and `Site` variants
@@ -39,6 +40,10 @@ const MAP_ARRAY: u8 = 0;
 const MAP_HASH: u8 = 1;
 const IMPORT_NAME: u8 = 0;
 const IMPORT_HELPER: u8 = 1;
+const IMPORT_NATIVE: u8 = 2;
+const ARG_INT: u8 = 0;
+const ARG_READ: u8 = 1;
+const ARG_WRITE: u8 = 2;
 const SITE_CODE: u8 = 0;
 const SITE_RODATA: u8 = 1;
 const SITE_DATA: u8 = 2;
@@ -77,6 +82,8 @@ pub enum Import {
     Name(String),
     /// A helper registered by ID.
     Helper(u32),
+    /// A native function registered by name, with the signature it had where the image was linked.
+    Native { name: String, sig: NativeSig },
 }
 
 /// A link address in an image: `region_tag(region)` plus an offset that an addend may take past the region's ends.
@@ -173,6 +180,19 @@ impl Image {
                     Import::Helper(id) => {
                         w.0.push(IMPORT_HELPER);
                         w.u32(*id);
+                    }
+                    Import::Native { name, sig } => {
+                        w.0.push(IMPORT_NATIVE);
+                        w.str(name);
+                        w.0.push(sig.args());
+                        for n in 1..=sig.args() {
+                            let (kind, len) = match sig.arg(n) {
+                                Some(NativeArg::Read(len)) => (ARG_READ, len),
+                                Some(NativeArg::Write(len)) => (ARG_WRITE, len),
+                                _ => (ARG_INT, None),
+                            };
+                            w.0.extend_from_slice(&[kind, len.unwrap_or(0)]);
+                        }
                     }
                 }
             }
@@ -283,6 +303,11 @@ impl<'a> Sections<'a> {
             let import = match s.u8()? {
                 IMPORT_NAME => Import::Name(s.str()?),
                 IMPORT_HELPER => Import::Helper(s.u32()?),
+                IMPORT_NATIVE => {
+                    let name = s.str()?;
+                    let sig = s.native_sig(&name)?;
+                    Import::Native { name, sig }
+                }
                 kind => return Err(invalid(format!("extern at instruction {at}: unknown kind {kind}"))),
             };
             externs.push((at, import));
@@ -373,7 +398,7 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
     // Bind against one version of the table; the program refreshes from there.
     let snapshot = helpers.snapshot();
     bind_helper_calls(&mut insns, s.code, &snapshot.table);
-    bind_externs(&mut insns, &s.externs, &snapshot.table)?;
+    let natives = bind_externs(&mut insns, &s.externs, &snapshot.table)?;
     let functions = check_functions(s.functions, insns.len() as u64)?;
 
     let mut memory = VmMemory::with_passthrough(config.passthrough);
@@ -396,7 +421,17 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
     maps.locate(&memory);
     relocate(&s.addresses, &mut insns, &mut memory)?;
 
-    let code = Code::new(insns);
+    let mut code = Code::new(insns);
+    // tagged pointers resolve to host addresses before the call; untagged ones are host addresses already
+    let tagged = !config.passthrough.is_untagged();
+    for (at, index, sig) in natives {
+        let checked = tagged && sig.has_pointers();
+        // SAFETY: `bind_externs` checked that the native at `index` has the signature `sig`, which a native keeps in
+        // every later table the program refreshes to. `Vm::register_native` vouches for the function.
+        if !unsafe { code.bind_native(at as usize, index, sig.args(), checked) } {
+            return Err(invalid(format!("native call at instruction {at} is not a valid call")));
+        }
+    }
     let program = Program::new(code, memory, stack_top, functions, helpers.clone(), snapshot, config);
     #[cfg(feature = "maps")]
     let program = program.with_maps(maps);
@@ -473,8 +508,14 @@ fn bind_helper_calls(insns: &mut [Instruction], code: &[u8], table: &HelperRegis
     }
 }
 
-/// Turn each extern call in `insns` into a call to the slot of its import in `table`.
-fn bind_externs(insns: &mut [Instruction], externs: &[(u32, Import)], table: &HelperRegistry) -> Result<()> {
+/// Turn each extern call in `insns` into a call to the slot of its import in `table`, but for native imports, which
+/// it checks against `table` and returns as their instruction index, native index and signature.
+fn bind_externs(
+    insns: &mut [Instruction],
+    externs: &[(u32, Import)],
+    table: &HelperRegistry,
+) -> Result<Vec<(u32, u32, NativeSig)>> {
+    let mut natives = Vec::new();
     for (at, import) in externs {
         let insn = insns
             .get_mut(*at as usize)
@@ -485,8 +526,33 @@ fn bind_externs(insns: &mut [Instruction], externs: &[(u32, Import)], table: &He
                 .slot_of_name(name)
                 .ok_or_else(|| LinkError::UnresolvedSymbol(name.clone()))?,
             Import::Helper(id) => table.slot_of_id(*id).ok_or(LinkError::UnknownHelper(*id))?,
+            Import::Native { name, sig } => {
+                let (index, host) = table
+                    .native(name)
+                    .ok_or_else(|| LinkError::UnresolvedSymbol(name.clone()))?;
+                check_native(name, *sig, host)?;
+                natives.push((*at, index, *sig));
+                continue;
+            }
         };
         bind_call(insn, slot);
+    }
+    Ok(natives)
+}
+
+/// Fails unless `linked`, the signature an image recorded for the native `name`, is `host`, the loading VM's.
+fn check_native(name: &str, linked: NativeSig, host: NativeSig) -> Result<()> {
+    if linked.args() != host.args() {
+        let (name, declared, host) = (name.to_string(), usize::from(linked.args()), host.args());
+        return Err(LinkError::SignatureMismatch { name, declared, host }.into());
+    }
+    if linked != host {
+        let reason = "the image was linked against other pointer arguments".to_string();
+        return Err(LinkError::NativeMismatch {
+            name: name.to_string(),
+            reason,
+        }
+        .into());
     }
     Ok(())
 }
@@ -644,5 +710,26 @@ impl<'a> Reader<'a> {
             return Err(invalid(format!("{} unexpected bytes", self.0.len())));
         }
         Ok(())
+    }
+
+    /// The [`NativeSig`] of the native `name`, as [`Image::to_bytes`] writes it.
+    fn native_sig(&mut self, name: &str) -> Result<NativeSig> {
+        let args = self.u8()?;
+        if usize::from(args) > MAX_NATIVE_ARGS {
+            return Err(invalid(format!("native {name}: {args} arguments")));
+        }
+        let mut list = [NativeArg::Int; MAX_NATIVE_ARGS];
+        for arg in &mut list[..usize::from(args)] {
+            let [kind, len] = self.array()?;
+            let len = (len != 0).then_some(len);
+            *arg = match kind {
+                ARG_INT => NativeArg::Int,
+                ARG_READ => NativeArg::Read(len),
+                ARG_WRITE => NativeArg::Write(len),
+                kind => return Err(invalid(format!("native {name}: argument of unknown kind {kind}"))),
+            };
+        }
+        let sig = NativeSig::try_new(&list[..usize::from(args)]);
+        sig.ok_or_else(|| invalid(format!("native {name}: a length that isn't an integer argument")))
     }
 }

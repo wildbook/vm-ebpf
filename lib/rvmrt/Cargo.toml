@@ -11,5 +11,10 @@ workspace = true
 [lib]
 crate-type = ["cdylib", "staticlib"]
 
+[features]
+default = ["fuel"]
+# Limits each call to `rvm::DEFAULT_INSTRUCTION_LIMIT` instructions. Without it calls have no limit.
+fuel = ["rvm/fuel"]
+
 [dependencies]
-rvm = { path = "../rvm", default-features = false, features = ["fuel"] }
+rvm = { path = "../rvm", default-features = false }

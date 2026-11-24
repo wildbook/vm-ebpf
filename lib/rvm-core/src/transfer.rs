@@ -311,6 +311,10 @@ mod tests {
         fn store_u8(&mut self, _: u64, _: u8) -> Result<(), ()> {
             Err(())
         }
+
+        fn native_ptr(&self, _: u64, _: u64, _: bool) -> Result<u64, ()> {
+            Err(())
+        }
     }
 
     struct NoHost;

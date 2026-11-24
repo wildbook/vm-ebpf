@@ -4,9 +4,9 @@ use std::fmt::{self, Debug, Formatter};
 
 #[cfg(feature = "fuel")]
 use crate::fuel::Rests;
-use crate::opcode::OpCode;
+use crate::opcode::{OpCode, CALL};
 use crate::slot::Slot;
-use crate::{bytes, fuse, rewrite, transfer, Instruction};
+use crate::{bytes, fuse, native, rewrite, transfer, Instruction, MAX_NATIVE_ARGS};
 
 /// Bytecode prepared for an [`Interpreter`](crate::Interpreter).
 pub struct Code {
@@ -69,6 +69,34 @@ impl Code {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Make the `call` in slot `pc` a call of the native function at `index` in
+    /// [`Host::natives`](crate::Host::natives), which takes the `args` argument registers r1 to rN in the Windows x64
+    /// convention and returns r0. With `checked`, the call first passes each pointer argument of the function's
+    /// [`NativeSig`](crate::NativeSig) through [`Memory::native_ptr`](crate::Memory::native_ptr) and stops with
+    /// [`Reason::MemoryFault`](crate::Reason::MemoryFault) where that fails. A call counts as one instruction, and its
+    /// native function runs unmetered.
+    ///
+    /// Returns false and leaves the code as it is if slot `pc` holds no `call` or `args` exceeds
+    /// [`MAX_NATIVE_ARGS`].
+    ///
+    /// # Safety
+    ///
+    /// For every run of this code, an entry at `index` in the host's `natives` must be a function callable as
+    /// `unsafe extern "win64" fn(u64, ...) -> u64` with `args` arguments, with a signature of `args` arguments, and
+    /// sound to call with any argument values but the pointers that `checked` resolves. It must not unwind.
+    pub unsafe fn bind_native(&mut self, pc: usize, index: u32, args: u8, checked: bool) -> bool {
+        let args = usize::from(args);
+        let Some(slot) = self.slots[..self.len].get_mut(pc) else {
+            return false;
+        };
+        if slot.byte() != CALL || args > MAX_NATIVE_ARGS {
+            return false;
+        }
+        let byte = native::byte(args, checked && args != 0);
+        *slot = Slot::new(Instruction::new(OpCode(byte), 0, 0, 0, index as i32));
+        true
     }
 
     /// Bytes the load or store in slot `pc` accesses, or `None` if the slot holds none, for reporting a

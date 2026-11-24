@@ -21,6 +21,10 @@
 //!     fn store_u8(&mut self, _addr: u64, _value: u8) -> Result<(), ()> {
 //!         Err(())
 //!     }
+//!
+//!     fn native_ptr(&self, _addr: u64, _len: u64, _write: bool) -> Result<u64, ()> {
+//!         Err(())
+//!     }
 //! }
 //!
 //! /// Declines every call, so a run stops at it.
@@ -68,6 +72,7 @@
 //! What an embedder implements:
 //! - `memory`: [`Memory`], with [`Window`] and [`AtomicOp`]
 //! - `host`: [`Host`]
+//! - `native`: the native functions a host may give the guest, [`Native`] and [`NativeSig`]
 //!
 //! What one instruction does:
 //! - `step`: `step`, which runs an instruction on registers and memory, by class in `step::{alu, jump, mem}`
@@ -85,8 +90,8 @@
 //! - `context`: [`Context`]
 //! - `dispatch`: how one handler continues with the next, and the tables of handlers
 //! - `handler`: the handlers of the eBPF opcodes
-//! - `fuse::handler`, `windows`, `transfer`: the handlers of superinstructions, of loads and stores in a memory
-//!   window, and of jumps out of the code
+//! - `fuse::handler`, `windows`, `transfer`, `native`: the handlers of superinstructions, of loads and stores in a
+//!   memory window, of jumps out of the code, and of native calls
 //! - `fuel`: metered runs
 //!
 //! # Words
@@ -121,6 +126,7 @@ mod host;
 mod instruction;
 mod interp;
 mod memory;
+mod native;
 mod rewrite;
 mod slot;
 mod step;
@@ -135,3 +141,4 @@ pub use host::{Callee, Host};
 pub use instruction::Instruction;
 pub use interp::{Interpreter, Reason, Stop, MAX_CALL_DEPTH, METERED};
 pub use memory::{AtomicOp, Memory, Window};
+pub use native::{Native, NativeArg, NativeFn, NativeSig, MAX_ARGS as MAX_NATIVE_ARGS};

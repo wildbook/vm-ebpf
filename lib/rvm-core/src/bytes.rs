@@ -4,11 +4,13 @@
 //! makes. It gives every instruction that runs the same whatever its fields hold one byte ([`canonical`]), which
 //! frees the other bytes of such instructions. And it gives some slots one of the freed bytes, which then has a
 //! handler of its own: the first slot of a superinstruction ([`fuse`](crate::fuse)), a load or store through r10
-//! ([`windows`](crate::windows)), a `mov` with an offset ([`MOVSX32`], [`MOVSX64`]), and the slots that
-//! [`transfer`](crate::transfer) makes. [`usual`] gives the opcode that a slot with such a byte runs as.
+//! ([`windows`](crate::windows)), a `mov` with an offset ([`MOVSX32`], [`MOVSX64`]), the slots that
+//! [`transfer`](crate::transfer) makes, and native calls ([`native`](crate::native)). [`usual`] gives the opcode that
+//! a slot with such a byte runs as.
 
 use crate::fuse::{Super, SUPERS};
-use crate::opcode::{AluEnd, AluOpc, Class, JmpOpc, MemMode, MemSize, OpCode, Source, LD_IMM64};
+use crate::native;
+use crate::opcode::{AluEnd, AluOpc, Class, JmpOpc, MemMode, MemSize, OpCode, Source, CALL, LD_IMM64};
 use crate::transfer::{FAR, GUARD};
 use crate::windows::STACK_ACCESSES;
 
@@ -71,12 +73,22 @@ const fn always_fails(opc: OpCode) -> bool {
 }
 
 /// The opcode that the instruction in a slot with opcode byte `byte` runs as: for the first slot of a superinstruction
-/// or r10 access, which holds a free byte in its place, the first instruction of the sequence or the load or store, and
-/// for a `mov` from a register with an offset, the `mov`.
+/// or r10 access, which holds a free byte in its place, the first instruction of the sequence or the load or store, for
+/// a `mov` from a register with an offset, the `mov`, and for a native call, `call`.
 pub const fn usual(byte: u8) -> u8 {
     const_for!((stack, opcode) in STACK_ACCESSES => {
         if stack == byte {
             return opcode;
+        }
+    });
+    const_for!(native in native::PLAIN => {
+        if native == byte {
+            return CALL;
+        }
+    });
+    const_for!(native in native::CHECKED => {
+        if native == byte {
+            return CALL;
         }
     });
     match (byte, Super::with_byte(byte)) {
@@ -102,4 +114,6 @@ const _: () = {
     claim(&mut used, FAR);
     claim(&mut used, MOVSX32);
     claim(&mut used, MOVSX64);
+    const_for!(byte in native::PLAIN => claim(&mut used, byte));
+    const_for!(byte in native::CHECKED => claim(&mut used, byte));
 };

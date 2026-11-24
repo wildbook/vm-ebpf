@@ -7,9 +7,11 @@ use std::ptr::NonNull;
 use std::sync::ReentrantLock;
 use std::sync::{Arc, Mutex};
 
+use rvm_core::{Native, NativeFn, NativeSig};
+
 use crate::error::{Result, VmError};
 use crate::executor::DEFAULT_FRAME_SIZE;
-use crate::helper::{FromArgs, HostFn, IntoReturn, SharedHelpers};
+use crate::helper::{FromArgs, HelperRegistry, HostFn, IntoReturn, SharedHelpers};
 #[cfg(feature = "link")]
 use crate::host_type::HostTypes;
 use crate::image::{self, Image};
@@ -124,6 +126,11 @@ impl Passthrough {
         !matches!(self.0, Mode::Off)
     }
 
+    /// Whether guest pointers carry no tags.
+    pub(crate) const fn is_untagged(self) -> bool {
+        matches!(self.0, Mode::Untagged)
+    }
+
     /// The guest address of the host byte at `ptr` in region `idx`.
     pub(crate) fn address(self, idx: usize, ptr: NonNull<u8>) -> u64 {
         let tag = match self.0 {
@@ -164,18 +171,44 @@ impl Vm {
     /// the VM. Without the `fuel` feature, a non-zero [`VmConfig::instruction_limit`] fails with
     /// [`VmError::FuelNotEnabled`].
     pub fn with_config(config: VmConfig) -> Result<Self> {
-        if !rvm_core::METERED && config.instruction_limit != 0 {
-            return Err(VmError::FuelNotEnabled);
-        }
+        Self::check(&config)?;
         Ok(Self::build(config))
     }
 
+    /// [`with_config`](Self::with_config) with `natives` registered as [`register_native`](Self::register_native)
+    /// registers each, without the lock that later registrations take.
+    ///
+    /// # Safety
+    ///
+    /// As [`register_native`](Self::register_native), for each function.
+    pub unsafe fn with_natives(config: VmConfig, natives: &[(&str, *const (), NativeSig)]) -> Result<Self> {
+        Self::check(&config)?;
+        let mut registry = HelperRegistry::default();
+        for &(name, func, sig) in natives {
+            registry.put_native(name.to_string(), native(name, func, sig)?)?;
+        }
+        Ok(Self::with_registry(config, registry))
+    }
+
+    fn check(config: &VmConfig) -> Result<()> {
+        match !rvm_core::METERED && config.instruction_limit != 0 {
+            true => Err(VmError::FuelNotEnabled),
+            false => Ok(()),
+        }
+    }
+
     fn build(config: VmConfig) -> Self {
-        let helpers = Arc::new(SharedHelpers::default());
+        Self::with_registry(config, HelperRegistry::default())
+    }
+
+    fn with_registry(
+        config: VmConfig,
+        #[cfg_attr(not(feature = "maps"), expect(unused_mut))] mut registry: HelperRegistry,
+    ) -> Self {
         #[cfg(feature = "maps")]
-        helpers.update(maps::register_helpers);
+        maps::register_helpers(&mut registry);
         Self {
-            helpers,
+            helpers: Arc::new(SharedHelpers::new(registry)),
             shared: Shared::default(),
             #[cfg(feature = "link")]
             types: ReentrantLock::default(),
@@ -264,6 +297,73 @@ impl Vm {
     {
         self.helpers
             .update(|h| h.put_name(name.into(), HostFn::with_memory(func)));
+    }
+
+    /// Register `func`, a native function that programs import by name as they import a host function
+    /// (`extern u64 name(...);` in C), and that the interpreter calls directly with r1 to r5 in the Windows x64
+    /// convention, its result in r0. `sig` says which arguments are pointers to guest bytes, and how many bytes.
+    ///
+    /// Linking checks the extern's BTF against `sig`: the same number of argument registers, integers or enums where
+    /// `sig` has integers and pointers where it has pointers, nothing else, and on a pointer that a `BORROW` or
+    /// `BORROW_RO` tag marks, the same length argument and access. An image records `sig`, and loading it checks
+    /// `sig` against the loading VM's. Registering a name again replaces the function, which programs linked earlier
+    /// call from their next call on; it fails with [`VmError::InvalidArgument`] if `sig` differs, as it does for a null
+    /// `func`. A name with both a native and a host function binds to the native.
+    ///
+    /// Pointer arguments: unless the VM's [`Passthrough`] is `untagged`, a call checks each pointer that `sig`
+    /// declares before it calls `func`. The guest must be allowed to read the bytes, and for [`NativeArg::Write`] to
+    /// write them too: one byte at the pointer, or as many as its length argument holds. `func` then gets the host
+    /// address of the bytes, and a failed check stops the guest's call with
+    /// [`ExecError::MemoryFault`](crate::ExecError::MemoryFault) at the call. Untagged, every argument reaches `func`
+    /// as the register holds it. Pointers inside guest memory, such as the fields of a struct the guest fills, keep
+    /// their region tags, so a function that follows them needs `untagged`. A returned pointer reaches the guest as the
+    /// host address, which guest loads and stores resolve only with [`Passthrough::on`] or `untagged`.
+    ///
+    /// `func` runs unmetered: its call counts as one instruction against the instruction limit, and nothing
+    /// interrupts it. It has no way to fail the guest's call, and one that calls back into the plugin that called it
+    /// gets [`VmError::PluginBusy`].
+    ///
+    /// # Safety
+    ///
+    /// `func` must:
+    /// - be callable as `unsafe extern "win64" fn(u64, ...) -> u64` with the `sig.args()` integer or pointer arguments,
+    ///   returning in rax;
+    /// - never unwind: no Rust panic with an unwinding ABI, C++ exception, SEH unwind or `longjmp` may leave it;
+    /// - stay loaded while any call of it may run, one that started before it was replaced included;
+    /// - be safe to run on any thread, on several at once;
+    /// - stay sound for any argument values the guest passes. The checks cover only the pointers `sig` declares, and
+    ///   none in `untagged` mode, so integer arguments and the contents of guest memory are the guest's choice.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rvm::{NativeArg, NativeSig, Vm};
+    ///
+    /// extern "win64" fn add(a: u64, b: u64) -> u64 {
+    ///     a.wrapping_add(b)
+    /// }
+    ///
+    /// // Fills `len` bytes at `buf` with `byte`.
+    /// unsafe extern "win64" fn fill(buf: *mut u8, len: u64, byte: u64) -> u64 {
+    ///     unsafe { buf.write_bytes(byte as u8, len as usize) };
+    ///     0
+    /// }
+    ///
+    /// const FILL: NativeSig = NativeSig::new(&[NativeArg::Write(Some(2)), NativeArg::Int, NativeArg::Int]);
+    ///
+    /// let vm = Vm::new();
+    /// // SAFETY: both take their arguments in the Windows x64 convention and never unwind, and `fill` writes only
+    /// // the bytes the call checks, which it does with passthrough off.
+    /// unsafe {
+    ///     vm.register_native("add", add as *const (), NativeSig::ints(2))?;
+    ///     vm.register_native("fill", fill as *const (), FILL)?;
+    /// }
+    /// # Ok::<_, rvm::VmError>(())
+    /// ```
+    pub unsafe fn register_native(&self, name: impl Into<String>, func: *const (), sig: NativeSig) -> Result<()> {
+        let name = name.into();
+        let native = native(&name, func, sig)?;
+        self.helpers.update(|h| h.put_native(name, native))
     }
 
     /// Enable `ktime_get_ns` (helper 5).
@@ -430,6 +530,16 @@ impl Vm {
     pub fn load_elf(&self, elf_bytes: &[u8]) -> Result<Program> {
         self.load_image(self.prepare_elf(elf_bytes)?)
     }
+}
+
+/// `func` with `sig`, as the extern table keeps a native function; fails on a null `func`.
+fn native(name: &str, func: *const (), sig: NativeSig) -> Result<Native> {
+    if func.is_null() {
+        return Err(VmError::InvalidArgument(format!("native {name}: null function")));
+    }
+    // SAFETY: a non-null code pointer, which calls cast to the signature the registration's contract promises
+    let func = unsafe { std::mem::transmute::<*const (), NativeFn>(func) };
+    Ok(Native { func, sig })
 }
 
 impl std::fmt::Debug for Vm {

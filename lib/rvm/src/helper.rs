@@ -5,9 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use hashbrown::HashMap;
-use rvm_core::Context;
+use rvm_core::{Context, Native, NativeSig};
 
-use crate::error::HostError;
+use crate::error::{HostError, VmError};
 #[cfg(feature = "maps")]
 use crate::maps::Maps;
 use crate::memory::{GuestMemory, VmMemory};
@@ -316,11 +316,17 @@ fn finish<E: Into<Stop>>(result: Result<u64, E>, stop: &mut Option<Stop>) -> Opt
 /// declared in the program). The linker rewrites every call into a slot call, so linked programs dispatch by index.
 /// Putting a function under an ID or name that has one replaces it in its slot, which keeps linked call sites valid
 /// (hot reload).
+///
+/// Native functions have a table of their own, which the interpreter calls straight from the call's handler. A name
+/// with both a native and a host function binds to the native.
 #[derive(Default, Clone)]
 pub struct HelperRegistry {
     slots: Vec<HostFn>,
     by_id: Vec<(u32, u32)>, // (helper ID, slot)
     by_name: HashMap<String, u32>,
+    natives: Vec<Native>,
+    // by index; few enough to search
+    native_names: Vec<String>,
 }
 
 impl HelperRegistry {
@@ -338,6 +344,35 @@ impl HelperRegistry {
         let slot = self.by_name.get(&name).copied();
         let slot = self.put(slot, func);
         self.by_name.insert(name, slot);
+    }
+
+    /// Put `native` under `name`: in the index of the native the name had, which must have the same signature, or at a
+    /// new index. The caller of [`Vm::register_native`](crate::Vm::register_native) vouches for the function.
+    pub fn put_native(&mut self, name: String, native: Native) -> Result<(), VmError> {
+        let Some(index) = self.native_names.iter().position(|n| *n == name) else {
+            self.natives.push(native);
+            self.native_names.push(name);
+            return Ok(());
+        };
+        let old = &mut self.natives[index];
+        if old.sig != native.sig {
+            let msg = format!("native {name} is registered with another signature");
+            return Err(VmError::InvalidArgument(msg));
+        }
+        *old = native;
+        Ok(())
+    }
+
+    /// The index and signature of the native function `name`.
+    pub fn native(&self, name: &str) -> Option<(u32, NativeSig)> {
+        let index = self.native_names.iter().position(|n| n == name)?;
+        Some((index as u32, self.natives[index].sig))
+    }
+
+    /// The native functions, by index.
+    #[inline(always)]
+    pub fn natives(&self) -> &[Native] {
+        &self.natives
     }
 
     /// Replace the function in `slot`, or append a new slot.
@@ -395,6 +430,7 @@ impl std::fmt::Debug for HelperRegistry {
             .field("slots", &self.slots.len())
             .field("ids", &self.by_id)
             .field("names", &self.by_name)
+            .field("natives", &self.native_names)
             .finish()
     }
 }
@@ -413,6 +449,15 @@ pub struct SharedHelpers {
 }
 
 impl SharedHelpers {
+    /// A table that starts as `registry`.
+    pub fn new(registry: HelperRegistry) -> Self {
+        Self {
+            current: Published::new(Arc::new(registry)),
+            writer: Mutex::new(()),
+            version: AtomicU64::new(0),
+        }
+    }
+
     /// Apply `f` to a copy of the table and publish the result.
     pub fn update<R>(&self, f: impl FnOnce(&mut HelperRegistry) -> R) -> R {
         let _writer = lock(&self.writer);

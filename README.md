@@ -90,6 +90,50 @@ middle of a call. Registering a function again replaces it, also for plugins loa
 The host decides what a plugin can reach. The only built-in helpers are the map helpers. `Vm::enable_time`,
 `Vm::enable_random` and `Vm::enable_print` add `bpf_ktime_get_ns`, `bpf_get_prandom_u32` and `bpf_trace_printk`.
 
+### Native functions
+
+A native function is a plain function pointer that the interpreter calls directly, in the Windows x64 convention. A
+call from a plugin loop costs 18 host instructions without arguments and 31 with one, against 38 and 50 for a host
+function from `register_extern`; a pointer argument that rvm checks adds about 20. The plugin declares a native as an
+`extern` like any host function, and the host registers it with its signature, which says which arguments are
+pointers to plugin memory and how many bytes each covers:
+
+```c
+extern u64 checksum(const u8 *buf BORROW_RO(1), u64 len);
+```
+
+```rust
+use rvm::{NativeArg, NativeSig};
+
+unsafe extern "win64" fn checksum(buf: *const u8, len: u64) -> u64 {
+    // ...
+}
+
+const CHECKSUM: NativeSig = NativeSig::new(&[NativeArg::Read(Some(2)), NativeArg::Int]);
+// SAFETY: checksum reads only the `len` bytes at `buf`, never unwinds, and runs on any thread
+unsafe { vm.register_native("checksum", checksum as *const (), CHECKSUM)? };
+// all integers: NativeSig::ints(3)
+```
+
+Loading checks the plugin's declaration against the signature: the same number of arguments, pointers in the same
+places, and a `BORROW` tag, where there is one, on the same length argument. A prepared image records the signature
+and loads only where the native has the same one. Before each call, rvm checks every pointer the signature declares
+against the plugin's memory, one byte or as many as its length argument says, with the plugin's read or write
+permission, and the native gets the host address of the bytes. A bad pointer stops the plugin call with
+`ExecError::MemoryFault`. With `Passthrough::untagged()` arguments arrive unchanged and unchecked.
+
+Pointers stored inside plugin memory, such as the fields of a struct the plugin fills, keep the plugin's region tag,
+and native code can't follow them; such APIs need `Passthrough::untagged()`. A pointer that a native returns is a
+host address, which the plugin can follow only with passthrough on or untagged.
+
+Registration is unsafe: the native must take exactly the signature's arguments, never unwind (no panic, C++ exception
+or `longjmp`), stay loaded while plugins may call it, be safe on any thread, and treat its integer arguments and the
+bytes behind its pointers as untrusted. Native time doesn't count against the instruction limit, a native can't fail
+the plugin call, and one that calls back into the same plugin gets `VmError::PluginBusy`. Use `register_extern` where
+you need any of those. `rvm_load_natives` does the same for the C library.
+[`lib/rvm/examples/natives.rs`](lib/rvm/examples/natives.rs) calls natives on integers and buffers and follows a
+returned pointer.
+
 ### Passing data
 
 Arguments and return values are up to five `u64` values. For more data, the host maps memory into the plugin and
@@ -300,16 +344,18 @@ rvm_free(program);
 ```
 
 `rvm_func` looks a function up once and `rvm_call_func` calls it by index; `rvm_function_count` and
-`rvm_function_name` list the functions. The C library is smaller in scope than the Rust API. It has no host functions
-and no maps, so images that import a host function or declare a map fail to load. Each call is limited to 1,000,000
-instructions, unless the library is built without `fuel`. A panic inside the library ends the process.
+`rvm_function_name` list the functions. The C library is smaller in scope than the Rust API. Its only host functions
+are the native functions passed to `rvm_load_natives`, and it has no maps, so images that import any other host
+function or declare a map fail to load. Each call is limited to 1,000,000
+instructions, unless the library is built with `--no-default-features`, which drops its `fuel` feature and the limit.
+A panic inside the library ends the process.
 
 Built with `cargo build --profile embedded` in `lib/rvmrt`, on x86-64 Windows:
 
 | build | `rvmrt.dll` | added to a C host by `rvmrt.lib` |
 |---|---|---|
-| default | 103,424 bytes, 31 imports from 3 DLLs | 96,256 bytes, 8 imports |
-| without `fuel` | 84,480 bytes, 31 imports from 3 DLLs | 76,800 bytes, 8 imports |
+| default | 119,296 bytes, 31 imports from 3 DLLs | 107,008 bytes, 8 imports |
+| without `fuel` | 97,280 bytes, 31 imports from 3 DLLs | 84,992 bytes, 8 imports |
 
 The 8 imports of the static library are the process heap functions, `memcmp`, `memmove`, `GetCurrentProcess` and
 `TerminateProcess`. The build rebuilds the standard library for size, which needs the `rust-src` component.
@@ -449,8 +495,10 @@ that declares maps fails to load. `fixed-hash-seed` makes hash maps use a fixed 
   nested calls.
 - A plugin runs one call at a time. Calls from several threads into the same plugin fail with
   `VmError::PluginBusy`; load one program per thread to run them in parallel.
+- Native functions use the Windows x64 convention only and take integers and pointers only: no structs by value, no
+  floats and no variadic functions. They run unmetered.
 - Images are tied to the rvm version that wrote them. Relink them when you update rvm.
-- The C library runs prepared images only, without host functions, maps or raw host pointers.
+- The C library runs prepared images only, without host functions other than natives, maps or raw host pointers.
 - rvm is not published on crates.io.
 
 ## Building and development
@@ -466,6 +514,7 @@ cargo run -p rvm --example msgpack_logs # a MessagePack parser plugin that fills
 cargo run -p rvm --example core_reloc   # one plugin against two layouts of a host struct
 cargo run -p rvm --example hello        # hand-assembled bytecode loaded as an Image, without ELF
 cargo run -p rvm --example passthrough  # a plugin that follows pointers in host structs, and the faults around them
+cargo run -p rvm --example natives      # native functions on integers and buffers, and a returned host pointer
 ```
 
 The plugins under [`bpf/`](bpf) are checked in compiled, under `bpf/prebuilt/`, so cargo doesn't need clang. After you

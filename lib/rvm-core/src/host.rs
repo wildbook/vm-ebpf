@@ -1,6 +1,6 @@
 //! What an embedder implements to run the guest's calls of host functions: [`Host`].
 
-use crate::{Context, Memory};
+use crate::{Context, Memory, Native};
 
 /// The host functions that the guest calls. The interpreter runs them from inside a run, so a call that the host
 /// runs costs no stop.
@@ -25,6 +25,14 @@ pub trait Host<M: Memory> {
     /// Call through `target`, the address in the `dst_reg` of a `callx`: name the guest function it addresses, or run
     /// the host function it addresses.
     fn call_indirect(&mut self, ctx: &mut Context<M>, target: u64) -> Option<Callee>;
+
+    /// The native functions that calls bound with [`Code::bind_native`](crate::Code::bind_native) name by index. A
+    /// call of an index past the end stops the run with [`Reason::CallKfunc`] and that index. The default has none.
+    ///
+    /// The entries must meet the contract of `bind_native` for every call in the code of a run that names them.
+    fn natives(&self) -> &[Native] {
+        &[]
+    }
 }
 
 /// What a `callx` calls, as [`Host::call_indirect`] resolves its target.

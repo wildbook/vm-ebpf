@@ -32,7 +32,8 @@ pub enum Reason<E> {
 
     /// A call of the helper with this ID, which [`Host::call_helper`] declined.
     CallHelper(u32),
-    /// A call of the external function with this ID, which [`Host::call_kfunc`] declined.
+    /// A call of the external function with this ID, which [`Host::call_kfunc`] declined, or a native call of this
+    /// index past the end of [`Host::natives`].
     CallKfunc(u32),
     /// `callx`: a call through this address, which [`Host::call_indirect`] declined or resolved to a pc outside the
     /// code.
@@ -44,7 +45,7 @@ pub enum Reason<E> {
     InvalidInstruction,
     /// A valid instruction that the interpreter doesn't implement.
     Unsupported,
-    /// A load or store that the memory failed with this error.
+    /// A load or store, or a pointer argument of a checked native call, that the memory failed with this error.
     MemoryFault(E),
     /// The fuel ran out before the instruction at `pc`. Only a metered run stops with it.
     OutOfFuel,

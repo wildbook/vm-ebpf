@@ -188,6 +188,9 @@ pub enum LinkError {
     /// An extern declares a different number of argument registers than the host function takes. `declared` counts
     /// registers, not parameters: a struct of 9 to 16 bytes takes two, and a struct return adds a result pointer.
     SignatureMismatch { name: String, declared: usize, host: u8 },
+    /// An extern or image disagrees with the native function's signature in what isn't the register count, or the
+    /// extern has no BTF to check it against.
+    NativeMismatch { name: String, reason: String },
     /// A host-bound extern needs more argument registers than the five eBPF has.
     TooManyRegisters { name: String, registers: usize },
     /// A program declares a shared map with a different layout than the existing one.
@@ -216,6 +219,7 @@ impl fmt::Display for LinkError {
             Self::SignatureMismatch { name, declared, host } => {
                 write!(f, "extern {name} takes {declared} argument registers but the host function takes {host}")
             }
+            Self::NativeMismatch { name, reason } => write!(f, "native {name}: {reason}"),
             Self::TooManyRegisters { name, registers } => {
                 write!(f, "extern {name} takes {registers} argument registers, but eBPF passes at most {MAX_ARGS}")
             }
