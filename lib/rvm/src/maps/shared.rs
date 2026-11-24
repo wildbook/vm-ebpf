@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use super::hash::HashIndex;
 use super::{MapDef, MapKind, CACHE_LINE, VALUE_ALIGN};
 use crate::error::{LinkError, Result};
-use crate::memory::{MemoryBudget, SharedBuffer, MAX_REGIONS};
+use crate::memory::{MemoryBudget, SharedBuffer};
 use crate::sync::lock;
 
 /// Maps that every program linked by one VM shares by name.
@@ -47,7 +47,7 @@ impl SharedMaps {
     /// The shared instance for `def`, created by the first program that declares it, which pays for it from `budget`.
     /// `None` if maps with this name aren't shared.
     pub fn bind(&self, def: &MapDef, budget: &mut MemoryBudget) -> Result<Option<Arc<SharedMap>>> {
-        use crate::layout::SHARED_MAPS_FIRST_REGION;
+        use crate::layout::{CODE_REGION, SHARED_MAPS_FIRST_REGION};
 
         let mut state = lock(&self.state);
         if let Some(map) = state.bound.iter().find(|m| m.def.name == def.name) {
@@ -61,7 +61,7 @@ impl SharedMaps {
         };
 
         let region = SHARED_MAPS_FIRST_REGION + state.next_region;
-        if region >= MAX_REGIONS {
+        if region >= CODE_REGION {
             return Err(LinkError::InvalidMap(format!("too many shared maps for {}", def.name)).into());
         }
         let align = match spacing {

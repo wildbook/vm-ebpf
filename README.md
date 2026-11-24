@@ -234,6 +234,35 @@ Here `heal` reads `hp` at offset 16, where the host has it. A plugin can test wh
 that the host does not describe fails when it runs. `HostTypes` (from `Vm::with_types`) also builds BTF by hand, for
 layouts without a Rust struct.
 
+### Raw host pointers
+
+By default a plugin reaches only memory the host maps for it, and any other address faults. A host whose plugins
+should follow its own pointers, for example the pointer fields of a struct the plugin reads through CO-RE, opts in
+when it creates the `Vm`:
+
+```rust
+let vm = Vm::with_config(VmConfig {
+    // SAFETY: the plugins may read and write any memory of this process
+    passthrough: unsafe { Passthrough::on() },
+    ..VmConfig::default()
+})?;
+plugin.call("walk", &[&raw const scene as u64])?;
+```
+
+`VmConfig::passthrough` has three modes:
+
+| mode | plugin pointers into its own memory | other addresses |
+|---|---|---|
+| `Passthrough::OFF` (default) | checked against their region | fault |
+| `Passthrough::on()` | checked against their region | from 64 KiB up, read and written directly |
+| `Passthrough::untagged()` | plain host addresses, unchecked | from 64 KiB up, read and written directly |
+
+With either of the unsafe modes, a plugin can read and write any memory of the process it can name, as native code
+can; addresses below 64 KiB still fault, so a null pointer stops the call. Pass pointers as integers with `as`, which
+keeps Rust's provenance rules satisfied. Host functions that take `GuestMemory` and the map helpers accept the same
+pointers the plugin can use. [`lib/rvm/examples/passthrough.rs`](lib/rvm/examples/passthrough.rs) walks a host list
+through pointer fields and shows the faults of each mode.
+
 ### Prepared images
 
 A host does not need the ELF parser and linker at run time. `Vm::prepare_elf` links a plugin ahead of time, for
@@ -310,13 +339,13 @@ in a build without the `fuel` feature. Without that feature, a non-zero limit fa
 
 ## Isolation and threat model
 
-Each program has its own guest memory: a 64-bit address names a region and an offset in it. The stack, the read-only
-data, the writable data, the maps and every buffer the host maps are separate regions, each with a length and read and
-write permissions. The interpreter checks every load and store against them and stops the call with
-`ExecError::MemoryFault` when an access falls outside. The first 4 GiB of addresses are never mapped, so null pointers
-fault. The code itself is outside guest memory: a plugin can't read or change it, and a jump, indirect call or jump
-table entry that leads outside the program's instructions stops the call. Calls nest at most 8 deep, with a 512-byte
-stack frame each by default (`VmConfig::frame_size`).
+Each program has its own guest memory: a 64-bit address is a host address with a region tag in its top bits. The
+stack, the read-only data, the writable data, the maps and every buffer the host maps are separate regions, each with a
+length and read and write permissions. The interpreter checks every load and store against the region its tag names
+and stops the call with `ExecError::MemoryFault` when an access falls outside. Addresses without a tag are never mapped
+unless the host turns on raw host pointers, so null pointers fault. The code itself is outside guest memory: a plugin
+can't read or change it, and a jump, indirect call or jump table entry that leads outside the program's instructions
+stops the call. Calls nest at most 8 deep, with a 512-byte stack frame each by default (`VmConfig::frame_size`).
 
 A plugin can reach only what the host gives it: the host functions it registers, the memory it maps, and the maps and
 regions it shares. Another plugin's memory is visible only through a borrowed buffer, for the duration of one call.
@@ -338,7 +367,9 @@ Limits of the model:
 - Host functions run with the host's full privileges. Their checks are your responsibility; `GuestMemory` only checks
   that a pointer is valid for the plugin.
 - rvm has no mitigations for side channels such as Spectre.
-- `VmMemory::map_host`, `Vm::share_map` and `Vm::share_region` are unsafe and depend on their documented contracts.
+- `VmMemory::map_host`, `Vm::share_map`, `Vm::share_region` and the raw host pointer modes are unsafe and depend on
+  their documented contracts.
+- A plugin's pointers hold host addresses, so a plugin learns the layout that address randomization hides.
 
 ## What plugins can use
 
@@ -419,7 +450,7 @@ that declares maps fails to load. `fixed-hash-seed` makes hash maps use a fixed 
 - A plugin runs one call at a time. Calls from several threads into the same plugin fail with
   `VmError::PluginBusy`; load one program per thread to run them in parallel.
 - Images are tied to the rvm version that wrote them. Relink them when you update rvm.
-- The C library runs prepared images only, without host functions or maps.
+- The C library runs prepared images only, without host functions, maps or raw host pointers.
 - rvm is not published on crates.io.
 
 ## Building and development
@@ -434,6 +465,7 @@ cargo run -p rvm --example modding      # a game with two mod plugins: CO-RE, ex
 cargo run -p rvm --example msgpack_logs # a MessagePack parser plugin that fills maps
 cargo run -p rvm --example core_reloc   # one plugin against two layouts of a host struct
 cargo run -p rvm --example hello        # hand-assembled bytecode loaded as an Image, without ELF
+cargo run -p rvm --example passthrough  # a plugin that follows pointers in host structs, and the faults around them
 ```
 
 The plugins under [`bpf/`](bpf) are checked in compiled, under `bpf/prebuilt/`, so cargo doesn't need clang. After you

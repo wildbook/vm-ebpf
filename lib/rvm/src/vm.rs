@@ -2,6 +2,7 @@
 
 #[cfg(feature = "link")]
 use std::cell::RefCell;
+use std::ptr::NonNull;
 #[cfg(feature = "link")]
 use std::sync::ReentrantLock;
 use std::sync::{Arc, Mutex};
@@ -17,7 +18,7 @@ use crate::layout::free_host_region;
 use crate::linker;
 #[cfg(feature = "maps")]
 use crate::maps::{self, SharedMaps, ValueSpacing};
-use crate::memory::{GuestMemory, Perms, SharedBuffer, SharedRegion, VmMemory, MAX_REGION_LEN};
+use crate::memory::{region_tag, GuestMemory, Perms, SharedBuffer, SharedRegion, VmMemory, MAX_REGION_LEN};
 #[cfg(feature = "link")]
 use crate::module::Module;
 use crate::plugin::Plugin;
@@ -47,6 +48,8 @@ pub struct VmConfig {
     /// Most bytes one program may allocate: its code, stack, data, map values and hash map keys, the shared maps it
     /// creates included. Linking and loading check it before they allocate and fail with [`VmError::MemoryLimit`].
     pub memory_limit: usize,
+    /// Whether guests reach host memory through raw pointers; off by default. See [`Passthrough::on`].
+    pub passthrough: Passthrough,
 }
 
 impl Default for VmConfig {
@@ -55,7 +58,79 @@ impl Default for VmConfig {
             instruction_limit: 0,
             frame_size: DEFAULT_FRAME_SIZE,
             memory_limit: DEFAULT_MEMORY_LIMIT,
+            passthrough: Passthrough::OFF,
         }
+    }
+}
+
+/// Whether the programs a VM links and loads reach host memory through raw pointers, for [`VmConfig::passthrough`].
+///
+/// A guest address is the host address of its byte with the region's index as a tag in the top bits (see
+/// [`region_tag`](crate::region_tag)), and the untagged addresses form region 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Passthrough(Mode);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Off,
+    On,
+    Untagged,
+}
+
+impl Passthrough {
+    /// A guest address without a region tag faults, as any unmapped address does.
+    pub const OFF: Self = Self(Mode::Off);
+
+    /// A guest address without a region tag, from [`RAW_START`](crate::RAW_START) (64 KiB) up to
+    /// [`RAW_END`](crate::RAW_END) (2^47), is the host address: the guest's loads, stores and atomics there go straight
+    /// to host memory, unchecked. A host hands a guest such a pointer as a plain integer, in a helper's return value or
+    /// a field of a host struct the guest reads. Addresses below 64 KiB still fault, so null pointers and small
+    /// offsets from them stay guest faults.
+    ///
+    /// Everything else keeps its region: the stack, data, maps, borrows and shared regions have their bounds,
+    /// permissions and faults as before. Host functions see the guest's view: [`GuestMemory`] and the map helpers
+    /// accept raw pointers, for keys and values too, and [`VmMemory::bytes`](crate::VmMemory::bytes) refuses those
+    /// outside the program's regions.
+    ///
+    /// # Safety
+    ///
+    /// Every program the VM links or loads can read and write any memory of the process it can name, as native code
+    /// could, with nothing checking what it does. The host must make sure that every access a guest makes through a
+    /// raw address is sound: that the memory is mapped, that the guest's writes keep the host's values valid, and that
+    /// they don't race other threads or conflict with references the host holds. A guest that strips the tag of one of
+    /// its pointers, truncates it to 32 bits or computes a pointer from an integer reaches whatever host memory lies
+    /// there.
+    ///
+    /// The interpreter reaches a raw address through a pointer of exposed provenance
+    /// ([`std::ptr::with_exposed_provenance_mut`]), so the host must expose the provenance of each pointer it hands a
+    /// guest, which casting it to an integer with `as` does.
+    pub const unsafe fn on() -> Self {
+        Self(Mode::On)
+    }
+
+    /// [`on`](Self::on), and every region's tag is 0: guest pointers into the stack, data, maps and shared regions
+    /// are plain host addresses too, and every guest access goes through region 0. No bounds or permissions hold for
+    /// guest accesses then, the program's own memory included; the regions only tell the host functions apart.
+    ///
+    /// # Safety
+    ///
+    /// As [`on`](Self::on), for every guest access.
+    pub const unsafe fn untagged() -> Self {
+        Self(Mode::Untagged)
+    }
+
+    /// Whether guests reach host memory through raw pointers.
+    pub const fn is_on(self) -> bool {
+        !matches!(self.0, Mode::Off)
+    }
+
+    /// The guest address of the host byte at `ptr` in region `idx`.
+    pub(crate) fn address(self, idx: usize, ptr: NonNull<u8>) -> u64 {
+        let tag = match self.0 {
+            Mode::Untagged => 0,
+            _ => region_tag(idx),
+        };
+        tag | ptr.addr().get() as u64
     }
 }
 
@@ -250,7 +325,7 @@ impl Vm {
     /// # Ok::<_, Box<dyn std::error::Error>>(())
     /// ```
     pub unsafe fn share_region(&self, len: usize, perms: Perms) -> Result<SharedRegion> {
-        self.shared.regions.add(len, perms)
+        self.shared.regions.add(len, perms, self.config.passthrough)
     }
 
     /// Load an image as a program: from `Vm::prepare_elf` (with the `link` feature), [`Image::from_bytes`], or built by
@@ -393,8 +468,9 @@ struct Mapping {
 }
 
 impl SharedRegions {
-    /// [`Vm::share_region`]; its contract binds the programs that map the buffer, not this call.
-    fn add(&self, len: usize, perms: Perms) -> Result<SharedRegion> {
+    /// [`Vm::share_region`]; its contract binds the programs that map the buffer, not this call. Every program maps it
+    /// at the guest address `passthrough` gives it.
+    fn add(&self, len: usize, perms: Perms, passthrough: Passthrough) -> Result<SharedRegion> {
         let _writer = lock(&self.writer);
         let list = self.list.get();
 
@@ -411,8 +487,9 @@ impl SharedRegions {
             buffer: buffer.clone(),
         };
         drop(self.list.replace(list.iter().cloned().chain([mapping]).collect()));
+        let base = passthrough.address(region, buffer.as_ptr());
         // SAFETY: the host's handle is the only `SharedRegion` over `buffer`.
-        Ok(unsafe { SharedRegion::new(region, perms, buffer) })
+        Ok(unsafe { SharedRegion::new(base, perms, buffer) })
     }
 
     /// Map every shared region into `memory`.

@@ -10,7 +10,7 @@ use crate::image::INSN_SIZE;
 use crate::layout::CODE_REGION;
 #[cfg(feature = "maps")]
 use crate::maps::Maps;
-use crate::memory::{region_base, VmMemory};
+use crate::memory::{region_tag, VmMemory};
 use crate::vm::VmConfig;
 
 /// Default stack bytes reserved per call frame (eBPF's `MAX_BPF_STACK`).
@@ -351,7 +351,7 @@ fn jump_indirect(target: u64, pc: u64, code: &Code) -> Result<u64> {
 /// Instruction index of the guest code address `addr`, if it is an instruction boundary in the code region. The index
 /// may lie past the end of the code.
 fn code_index(addr: u64) -> Option<u64> {
-    let offset = addr.checked_sub(region_base(CODE_REGION))?;
+    let offset = addr.checked_sub(region_tag(CODE_REGION))?;
     (offset % INSN_SIZE == 0).then_some(offset / INSN_SIZE)
 }
 
@@ -479,7 +479,7 @@ mod tests {
         let mut helpers = HelperRegistry::default();
         helpers.put_id(1, HostFn::typed(|x: u64| x * 2));
         let run = |asm: &Assembler| run_with(&asm.assemble().unwrap(), &helpers, VmMemory::new(), &VmConfig::default());
-        let addr = |pc: u64| (region_base(CODE_REGION) + pc * INSN_SIZE) as i64;
+        let addr = |pc: u64| (region_tag(CODE_REGION) + pc * INSN_SIZE) as i64;
 
         // the function at pc 8 returns r1 + 1, then helper 1 doubles it
         let mut asm = Assembler::new();
@@ -508,7 +508,7 @@ mod tests {
             Ok::<_, MemoryError>(old)
         };
         helpers.put_name("bump".into(), HostFn::with_memory(bump));
-        let run = |addr: Option<u64>| {
+        let run = |addr: Option<u64>, memory: VmMemory| {
             let mut asm = Assembler::new();
             asm.stdw(R10, -8, 41);
             match addr {
@@ -527,16 +527,16 @@ mod tests {
             let call = insns.iter_mut().find(|insn| insn[0] == rvm_core::opcode::CALL).unwrap();
             crate::image::set_slot_call(call, helpers.slot_of_name("bump").unwrap());
 
-            let mut memory = VmMemory::new();
-            memory.map_bytes_any(2, &[7; 8], 8, Perms::R).unwrap();
             run_with(&code, &helpers, memory, &VmConfig::default())
         };
 
         // r0 in the low half, the stack slot in the high half
-        assert_eq!(run(None).unwrap(), 42 << 32 | 41);
+        assert_eq!(run(None, VmMemory::new()).unwrap(), 42 << 32 | 41);
         // an unmapped address, and a read-only region that can be read but not written
-        for addr in [0, region_base(2)] {
-            let err = run(Some(addr)).unwrap_err();
+        let mut read_only = VmMemory::new();
+        let base = read_only.map_bytes_any(2, &[7; 8], 8, Perms::R).unwrap();
+        for (addr, memory) in [(0, VmMemory::new()), (base, read_only)] {
+            let err = run(Some(addr), memory).unwrap_err();
             let VmError::Host(HostError::Failed(e)) = &err else {
                 panic!("{err:?}")
             };

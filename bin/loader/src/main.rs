@@ -27,7 +27,6 @@ fn main() -> Result<()> {
     println!("\n=== Linking ===");
     let mut program = vm.load_modules(&[&module])?;
     println!("  Stack region: {} bytes", program.memory().region_len(rvm::STACK_REGION));
-    println!("  Stack top: 0x{:x}", stack_top(&program));
     print_function_table(&program);
 
     println!("\n=== simple_add(100, 200) ===");
@@ -69,11 +68,6 @@ fn print_function_table(program: &Program) {
     }
 }
 
-/// The initial r10: the end of the stack region.
-fn stack_top(program: &Program) -> u64 {
-    rvm::region_base(rvm::STACK_REGION) + program.memory().region_len(rvm::STACK_REGION) as u64
-}
-
 /// Call `name` with `args`, printing the entry point, arguments and result.
 fn run_and_report(program: &mut Program, name: &str, args: &[u64]) -> Result<u64> {
     if let Some(info) = program.function_info(name) {
@@ -81,7 +75,6 @@ fn run_and_report(program: &mut Program, name: &str, args: &[u64]) -> Result<u64
         let byte_offset = pc * rvm::INSN_SIZE;
         println!("Entry PC: {pc} (byte offset: 0x{byte_offset:x})");
     }
-    println!("Stack pointer (r10): 0x{:x}", stack_top(program));
     for (i, &arg) in args.iter().enumerate() {
         let reg = i + 1;
         println!("Argument r{reg}: 0x{arg:x} ({arg})");

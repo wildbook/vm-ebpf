@@ -113,7 +113,8 @@ pub use map_def::{MapDef, MapKind};
 #[cfg(feature = "maps")]
 pub use maps::{Entries, MapError, MapIter, MapKey, MapRef, ValueSpacing, BPF_ANY, BPF_EXIST, BPF_NOEXIST};
 pub use memory::{
-    region_base, GuestMemory, Perms, Region, Scalar, SharedRegion, VmMemory, MAX_REGIONS, MAX_REGION_LEN, REGION_SHIFT,
+    region_tag, GuestMemory, Perms, Region, Scalar, SharedRegion, VmMemory, MAX_REGIONS, MAX_REGION_LEN, RAW_END,
+    RAW_START, REGION_SHIFT,
 };
 #[cfg(feature = "link")]
 pub use module::Module;
@@ -125,4 +126,4 @@ pub use std_helpers::{
     BPF_FUNC_MAP_UPDATE_ELEM, BPF_FUNC_TRACE_PRINTK,
 };
 pub use sync::TryLockGuard;
-pub use vm::{Vm, VmConfig, DEFAULT_INSTRUCTION_LIMIT, DEFAULT_MEMORY_LIMIT};
+pub use vm::{Passthrough, Vm, VmConfig, DEFAULT_INSTRUCTION_LIMIT, DEFAULT_MEMORY_LIMIT};

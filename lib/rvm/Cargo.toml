@@ -70,3 +70,7 @@ test = true
 name = "msgpack_logs"
 required-features = ["link", "maps"]
 test = true
+
+[[example]]
+name = "passthrough"
+required-features = ["link"]

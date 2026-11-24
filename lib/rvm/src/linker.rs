@@ -18,10 +18,10 @@ use hashbrown::HashMap;
 use crate::error::{LinkError, Result, VmError};
 use crate::executor::{CORE_POISON_HELPER, MAX_ARGS};
 use crate::helper::HelperRegistry;
-use crate::image::{set_imm, set_slot_call, Image, Import, INSN_SIZE};
+use crate::image::{set_imm, set_slot_call, Address, Image, Import, Site, INSN_SIZE};
 use crate::layout::{CODE_REGION, DATA_REGION, RODATA_REGION};
 use crate::map_def::map_defs;
-use crate::memory::{region_base, split_addr, MemoryBudget, MAX_REGION_LEN};
+use crate::memory::{region_tag, split_addr, MemoryBudget, MAX_REGION_LEN};
 use crate::module::{Module, Relocation};
 use crate::program::{Borrow, FunctionInfo};
 use crate::section::SectionKind;
@@ -33,7 +33,7 @@ const _: () = assert!(CORE_POISON_HELPER == btf::CORE_POISON_HELPER);
 enum Addr {
     /// Byte offset into the program's code.
     Code(u64),
-    /// Guest data address.
+    /// Link address of guest data (see [`crate::memory`]).
     Data(u64),
 }
 
@@ -50,7 +50,7 @@ impl Addr {
     /// The address the guest sees.
     fn guest(self) -> u64 {
         match self {
-            Self::Code(a) => region_base(CODE_REGION).wrapping_add(a),
+            Self::Code(a) => region_tag(CODE_REGION).wrapping_add(a),
             Self::Data(a) => a,
         }
     }
@@ -177,8 +177,8 @@ fn lay_out(modules: &[&Module], budget: &mut MemoryBudget) -> Result<(Image, Vec
                 }
                 let addr = match section.kind {
                     SectionKind::Code => Addr::Code(at as u64),
-                    SectionKind::RoData => Addr::Data(region_base(RODATA_REGION) + at as u64),
-                    _ => Addr::Data(region_base(DATA_REGION) + at as u64),
+                    SectionKind::RoData => Addr::Data(region_tag(RODATA_REGION) + at as u64),
+                    _ => Addr::Data(region_tag(DATA_REGION) + at as u64),
                 };
                 layout.sections.insert(idx, addr);
             }
@@ -240,7 +240,7 @@ fn lay_out_jump_tables(
         }
         layout
             .jump_tables
-            .insert(key, Addr::Data(region_base(RODATA_REGION) + at as u64));
+            .insert(key, Addr::Data(region_tag(RODATA_REGION) + at as u64));
     }
     Ok(())
 }
@@ -406,6 +406,13 @@ fn apply_relocation(
     match (reloc.rel_type, patch, sym_addr) {
         (reloc::bpf::BPF_64_64, Addr::Code(at), target) => {
             image.set_ld_imm64(at, target.guest().wrapping_add_signed(reloc.addend))?;
+            if let Addr::Data(target) = target {
+                let at = Site::Code((at / INSN_SIZE) as u32);
+                image.addresses.push(Address {
+                    at,
+                    region: split_addr(target).0,
+                });
+            }
         }
         (reloc::bpf::BPF_64_32, Addr::Code(at), Addr::Code(target)) => {
             // BPF-to-BPF call: imm becomes the instruction offset from the next instruction.
@@ -417,6 +424,16 @@ fn apply_relocation(
             // a data or function pointer stored in global data
             let addr = target.guest().wrapping_add_signed(reloc.addend);
             image.data_mut(at, 8)?.copy_from_slice(&addr.to_le_bytes());
+            if let Addr::Data(target) = target {
+                let at = match split_addr(at) {
+                    (RODATA_REGION, offset) => Site::RoData(offset as u32),
+                    (_, offset) => Site::Data(offset as u32),
+                };
+                image.addresses.push(Address {
+                    at,
+                    region: split_addr(target).0,
+                });
+            }
         }
         // calls into data, and relocation types a loaded section shouldn't carry
         _ => return Err(bad_target().into()),

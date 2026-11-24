@@ -1,7 +1,7 @@
 //! Clang-compiled programs exercising atomics, maps, data relocations, function pointers, CO-RE and the standard
 //! helpers.
 
-use rvm::{region_base, ExecError, Perms, Vm, VmError, CODE_REGION, DATA_REGION, REGION_SHIFT};
+use rvm::{region_tag, ExecError, Perms, Vm, VmError, CODE_REGION, DATA_REGION, REGION_SHIFT};
 
 use crate::common::{describe_bits, object};
 
@@ -13,7 +13,7 @@ fn clang_atomics() {
 
     assert_eq!(program.call("run", &[5]).unwrap(), 1058);
 
-    let bss = region_base(DATA_REGION);
+    let bss = program.memory().region_base(DATA_REGION);
     assert_eq!(program.memory().read::<u64>(bss).unwrap(), 9);
     assert_eq!(program.memory().read::<u32>(bss + 8).unwrap(), 0xFFFF_FFFF);
 }
@@ -66,8 +66,8 @@ fn function_pointers_and_jump_tables() {
     assert_eq!(add >> REGION_SHIFT, CODE_REGION as u64);
     assert_eq!(program.call("call_ptr", &[add, 2, 3]).unwrap(), 5);
     let misaligned = add + 4;
-    let past_end = region_base(CODE_REGION) + (1 << 20);
-    let data = region_base(DATA_REGION);
+    let past_end = region_tag(CODE_REGION) + (1 << 20);
+    let data = program.memory().region_base(DATA_REGION);
     for bad in [misaligned, past_end, data] {
         let err = program.call("call_ptr", &[bad, 2, 3]).unwrap_err();
         assert!(matches!(err, VmError::Exec(ExecError::BadCodeAddress { target, .. }) if target == bad), "{err}");

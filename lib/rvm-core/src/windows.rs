@@ -167,10 +167,11 @@ impl Cache {
             return None;
         }
 
+        // from the address, not `self.ptr`: a window over raw host addresses has no allocation `self.ptr` points into
+        // (see `Window::new`)
+        let host = ptr::with_exposed_provenance_mut::<u8>(self.ptr.expose_provenance() + at as usize);
         // SAFETY: the access fits in the window at `at`, and the memory is at the window's epoch (see `Windows`), so
         // the host bytes there are the guest bytes and valid for the access
-        let host = unsafe { self.ptr.add(at as usize) };
-        // SAFETY: as above
         unsafe {
             match (opc.class(), opc.mem_size()) {
                 (Class::Ldx, MemSize::Byte) => return Some(host.read().into()),

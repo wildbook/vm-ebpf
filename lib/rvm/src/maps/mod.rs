@@ -23,7 +23,7 @@ use hashbrown::{hash_table, HashMap};
 use crate::error::{LinkError, Result};
 use crate::layout::MAPS_REGION;
 use crate::map_def::{check_def, MapDef, MapKind, CACHE_LINE};
-use crate::memory::{region_base, MemoryBudget, Perms, VmMemory, MAX_REGION_LEN};
+use crate::memory::{region_tag, split_addr, MemoryBudget, Perms, VmMemory, MAX_REGION_LEN};
 use crate::std_helpers::EINVAL;
 use crate::sync::{read, write};
 
@@ -103,7 +103,7 @@ pub struct MapRef<'a> {
 #[derive(Debug, Clone)]
 struct Map {
     def: MapDef,
-    // guest address of value 0
+    // guest address of value 0; its link address until `Maps::locate`
     base: u64,
     // distance between values
     stride: u64,
@@ -136,10 +136,10 @@ impl Maps {
                 return Err(LinkError::InvalidMap(format!("map {}: declared twice", def.name)).into());
             }
             let (base, stride, index) = match shared.bind(&def, budget)? {
-                Some(map) => (region_base(map.region), map.stride, Index::Shared(map)),
+                Some(map) => (region_tag(map.region), map.stride, Index::Shared(map)),
                 None => {
                     let stride = u64::from(def.value_size).next_multiple_of(VALUE_ALIGN);
-                    let base = region_base(MAPS_REGION) + len;
+                    let base = region_tag(MAPS_REGION) + len;
                     let end = (len + stride * u64::from(def.max_entries)).next_multiple_of(CACHE_LINE);
                     if end > MAX_REGION_LEN as u64 {
                         let msg = format!("map {}: maps exceed {MAX_REGION_LEN} bytes", def.name);
@@ -162,6 +162,14 @@ impl Maps {
             });
         }
         Ok((maps, len as usize))
+    }
+
+    /// Move each map's base from its link address to its guest address in `memory`, where the map regions are mapped.
+    pub fn locate(&mut self, memory: &VmMemory) {
+        for map in &mut self.maps {
+            let (region, offset) = split_addr(map.base);
+            map.base = memory.region_base(region) + offset as u64;
+        }
     }
 
     /// Shared maps this program binds, for mapping their storage into its memory.
@@ -514,6 +522,7 @@ mod tests {
         let (mut maps, len) = Maps::new(defs, &SharedMaps::default(), &mut MemoryBudget::new(1 << 20)).unwrap();
         let mut memory = VmMemory::new();
         memory.map_any(MAPS_REGION, len, Perms::RW).unwrap();
+        maps.locate(&memory);
 
         let mut hash = MapRef::new(&mut maps, &mut memory, 0);
         assert_eq!(hash.entries().iter().len(), 0);

@@ -1,15 +1,15 @@
-//! Guest memory region layout.
+//! Guest memory regions. A region's index is the tag of its guest addresses, [`region_tag`](crate::region_tag).
 //!
 //! | Region | Contents | Guest perms |
 //! |---|---|---|
-//! | 0 | unmapped (null) | - |
+//! | 0 | addresses without a region tag: unmapped, or host memory with [`Passthrough`](crate::Passthrough) | - or RW |
 //! | [`STACK_REGION`] | stack, one frame per call level | RW |
 //! | [`RODATA_REGION`] | `.rodata*` | R |
 //! | [`DATA_REGION`] | `.data*`, `.bss*` | RW |
 //! | [`MAPS_REGION`] | map values | RW |
 //! | [`FIRST_HOST_REGION`]..[`BORROW_FIRST_REGION`] | host regions: `VmMemory::map`, `Vm::share_region` | per mapping |
 //! | [`BORROW_FIRST_REGION`]..[`SHARED_MAPS_FIRST_REGION`] | buffers borrowed during a plugin call | per tag |
-//! | [`SHARED_MAPS_FIRST_REGION`]..[`MAX_REGIONS`] | shared maps, one region each | RW |
+//! | [`SHARED_MAPS_FIRST_REGION`]..[`CODE_REGION`] | shared maps, one region each | RW |
 //! | [`CODE_REGION`] | code addresses for `callx` and `gotox`, never mapped | - |
 
 use crate::error::{Result, VmError};
@@ -32,13 +32,12 @@ pub const BORROW_FIRST_REGION: usize = SHARED_MAPS_FIRST_REGION - BORROW_REGIONS
 pub const BORROW_REGIONS: usize = MAX_ARGS;
 /// First guest region used for shared maps; each shared map has its own region at the same address in every program.
 pub const SHARED_MAPS_FIRST_REGION: usize = MAX_REGIONS / 2;
-/// Region index of guest code addresses: `region_base(CODE_REGION)` plus a byte offset into the program's code. It lies
-/// past the last mappable region, so loads and stores through a code address fault and no data pointer is a valid call
-/// target.
-pub const CODE_REGION: usize = MAX_REGIONS;
+/// Region index of guest code addresses: `region_tag(CODE_REGION)` plus a byte offset into the program's code. It is
+/// never mapped, so loads and stores through a code address fault and no data pointer is a valid call target.
+pub const CODE_REGION: usize = MAX_REGIONS - 1;
 
 // Each region range in the table above holds at least one region.
-const _: () = assert!(FIRST_HOST_REGION < BORROW_FIRST_REGION && SHARED_MAPS_FIRST_REGION < MAX_REGIONS);
+const _: () = assert!(FIRST_HOST_REGION < BORROW_FIRST_REGION && SHARED_MAPS_FIRST_REGION < CODE_REGION);
 
 /// The host regions, one bit per region.
 const HOST_REGIONS: u64 = (1 << BORROW_FIRST_REGION) - (1 << FIRST_HOST_REGION);

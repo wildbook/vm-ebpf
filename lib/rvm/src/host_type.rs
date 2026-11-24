@@ -119,6 +119,25 @@ impl<T: HostType + 'static, const N: usize> HostType for [T; N] {
     }
 }
 
+// A pointer is `void *` whatever it points to: CO-RE relocates a pointer field onto any local pointer type, so the
+// pointee needs no description and a struct that points to itself doesn't recurse. Only `bpf_core_type_matches`
+// compares pointees, so it rejects a struct whose C declaration has a pointer to anything but void.
+impl<T> HostType for *const T {
+    fn btf_type(types: &mut HostTypes) -> u32 {
+        void_ptr(types)
+    }
+}
+
+impl<T> HostType for *mut T {
+    fn btf_type(types: &mut HostTypes) -> u32 {
+        void_ptr(types)
+    }
+}
+
+fn void_ptr(types: &mut HostTypes) -> u32 {
+    types.__memo::<*const ()>(|types| types.add_ptr(0))
+}
+
 /// Describe a `#[repr(C)]` host struct to CO-RE, as `struct name` in C.
 ///
 /// Adds the struct to [`HostTypes`] with its size and the listed fields at their offsets, each typed by its

@@ -8,8 +8,10 @@
 //! # Format
 //!
 //! Little endian. A header: `RVMI`, the format version as `u32`, and the version of rvm that wrote the image as a
-//! string. Then six sections, each a `u64` byte length and its contents: code, rodata, data, maps, functions, externs.
-//! A string is a `u32` length and UTF-8 bytes. An image loads only into the rvm version that wrote it.
+//! string. Then seven sections, each a `u64` byte length and its contents: code, rodata, data, maps, functions,
+//! externs, addresses.
+//! A string is a `u32` length and UTF-8 bytes. An image loads only into the rvm version that wrote it. The code and
+//! data hold link addresses (see [`crate::memory`]), which loading moves to guest addresses.
 
 use std::sync::Arc;
 
@@ -24,19 +26,22 @@ use crate::layout::{DATA_REGION, RODATA_REGION, STACK_REGION};
 use crate::map_def::{MapDef, MapKind};
 #[cfg(feature = "maps")]
 use crate::maps::Maps;
-use crate::memory::{MemoryBudget, Perms, VmMemory, MAX_REGION_LEN};
+use crate::memory::{region_tag, MemoryBudget, Perms, VmMemory, MAX_REGION_LEN};
 use crate::program::{Borrow, FunctionInfo, Functions, Program};
 use crate::vm::{Shared, VmConfig};
 
 const MAGIC: &[u8; 4] = b"RVMI";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 const RVM_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// tag bytes of the `MapKind` and `Import` variants
+// tag bytes of the `MapKind`, `Import` and `Site` variants
 const MAP_ARRAY: u8 = 0;
 const MAP_HASH: u8 = 1;
 const IMPORT_NAME: u8 = 0;
 const IMPORT_HELPER: u8 = 1;
+const SITE_CODE: u8 = 0;
+const SITE_RODATA: u8 = 1;
+const SITE_DATA: u8 = 2;
 
 /// Size of an instruction in bytes.
 pub const INSN_SIZE: u64 = size_of::<Instruction>() as u64;
@@ -60,6 +65,9 @@ pub struct Image {
     pub functions: Vec<(String, FunctionInfo)>,
     /// Call instructions, by index, that bind to a host function at load time.
     pub externs: Vec<(u32, Import)>,
+    /// The link addresses of `.rodata` and `.data` bytes in the code and data, which loading moves to the guest
+    /// addresses of those bytes.
+    pub addresses: Vec<Address>,
 }
 
 /// The host function an extern call binds to.
@@ -69,6 +77,26 @@ pub enum Import {
     Name(String),
     /// A helper registered by ID.
     Helper(u32),
+}
+
+/// A link address in an image: `region_tag(region)` plus an offset that an addend may take past the region's ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Address {
+    /// Where the address is.
+    pub at: Site,
+    /// The region it points into, [`RODATA_REGION`] or [`DATA_REGION`].
+    pub region: usize,
+}
+
+/// Where an image holds an [`Address`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Site {
+    /// The immediate of the `lddw` at this instruction index.
+    Code(u32),
+    /// The 8 bytes at this offset into `.rodata`.
+    RoData(u32),
+    /// The 8 bytes at this offset into `.data`.
+    Data(u32),
 }
 
 impl Image {
@@ -149,6 +177,19 @@ impl Image {
                 }
             }
         });
+        w.section(|w| {
+            w.u32(self.addresses.len() as u32);
+            for address in &self.addresses {
+                let (kind, at) = match address.at {
+                    Site::Code(at) => (SITE_CODE, at),
+                    Site::RoData(at) => (SITE_RODATA, at),
+                    Site::Data(at) => (SITE_DATA, at),
+                };
+                w.0.push(kind);
+                w.u32(at);
+                w.0.push(address.region as u8);
+            }
+        });
         w.0
     }
 
@@ -164,6 +205,7 @@ impl Image {
             maps: s.maps,
             functions: s.functions,
             externs: s.externs,
+            addresses: s.addresses,
         })
     }
 }
@@ -179,6 +221,7 @@ struct Sections<'a> {
     maps: Vec<MapDef>,
     functions: Vec<(String, FunctionInfo)>,
     externs: Vec<(u32, Import)>,
+    addresses: Vec<Address>,
 }
 
 impl<'a> Sections<'a> {
@@ -245,6 +288,23 @@ impl<'a> Sections<'a> {
             externs.push((at, import));
         }
         s.end()?;
+
+        let mut s = r.section()?;
+        let mut addresses = Vec::new();
+        for _ in 0..s.u32()? {
+            let (kind, at) = (s.u8()?, s.u32()?);
+            let at = match kind {
+                SITE_CODE => Site::Code(at),
+                SITE_RODATA => Site::RoData(at),
+                SITE_DATA => Site::Data(at),
+                kind => return Err(invalid(format!("address site of unknown kind {kind}"))),
+            };
+            addresses.push(Address {
+                at,
+                region: s.u8()?.into(),
+            });
+        }
+        s.end()?;
         r.end()?;
 
         Ok(Self {
@@ -256,6 +316,7 @@ impl<'a> Sections<'a> {
             maps,
             functions,
             externs,
+            addresses,
         })
     }
 }
@@ -271,6 +332,7 @@ pub fn load(image: Image, helpers: &Arc<SharedHelpers>, shared: &Shared, config:
         maps,
         functions,
         externs,
+        addresses,
     } = image;
     let sections = Sections {
         code: &code,
@@ -281,6 +343,7 @@ pub fn load(image: Image, helpers: &Arc<SharedHelpers>, shared: &Shared, config:
         maps,
         functions,
         externs,
+        addresses,
     };
     load_sections(sections, helpers, shared, config)
 }
@@ -304,7 +367,7 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
         budget.take(len)?;
     }
     #[cfg(feature = "maps")]
-    let (maps, maps_len) = Maps::new(s.maps, &shared.maps, &mut budget)?;
+    let (mut maps, maps_len) = Maps::new(s.maps, &shared.maps, &mut budget)?;
 
     let mut insns = Instruction::decode(s.code);
     // Bind against one version of the table; the program refreshes from there.
@@ -313,7 +376,7 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
     bind_externs(&mut insns, &s.externs, &snapshot.table)?;
     let functions = check_functions(s.functions, insns.len() as u64)?;
 
-    let mut memory = VmMemory::new();
+    let mut memory = VmMemory::with_passthrough(config.passthrough);
     let stack_top = memory.map_any(STACK_REGION, stack_len as usize, Perms::RW)? + stack_len;
     memory.map_bytes_any(RODATA_REGION, s.rodata, s.rodata_len, Perms::R)?;
     memory.map_bytes_any(DATA_REGION, s.data, s.data_len, Perms::RW)?;
@@ -329,12 +392,55 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
         }
         shared.regions.map_into(&mut memory);
     }
+    #[cfg(feature = "maps")]
+    maps.locate(&memory);
+    relocate(&s.addresses, &mut insns, &mut memory)?;
 
     let code = Code::new(insns);
     let program = Program::new(code, memory, stack_top, functions, helpers.clone(), snapshot, config);
     #[cfg(feature = "maps")]
     let program = program.with_maps(maps);
     Ok(program)
+}
+
+/// Move each of `addresses` from its link address to the guest address of the same byte in `memory`, where the
+/// regions they point into are mapped.
+fn relocate(addresses: &[Address], insns: &mut [Instruction], memory: &mut VmMemory) -> Result<()> {
+    // the immediate of an instruction
+    const IMM: u64 = 0xFFFF_FFFF << 32;
+
+    for &Address { at, region } in addresses {
+        let bad = || invalid(format!("address at {at:?} into region {region}"));
+        if region != RODATA_REGION && region != DATA_REGION {
+            return Err(bad());
+        }
+        let base = memory.region_base(region);
+        let guest = |link: u64| base.wrapping_add(link.wrapping_sub(region_tag(region)));
+        match at {
+            Site::Code(at) => {
+                let at = at as usize;
+                let [lo, hi] = insns.get_mut(at..at + 2).ok_or_else(bad)? else {
+                    unreachable!("two instructions")
+                };
+                if lo.byte() != LD_IMM64 {
+                    return Err(bad());
+                }
+                let addr = guest((lo.0 >> 32) | (hi.0 & IMM));
+                lo.0 = lo.0 & !IMM | addr << 32;
+                hi.0 = hi.0 & !IMM | addr & IMM;
+            }
+            Site::RoData(offset) | Site::Data(offset) => {
+                let in_region = match at {
+                    Site::RoData(_) => RODATA_REGION,
+                    _ => DATA_REGION,
+                };
+                let site = memory.region_base(in_region) + u64::from(offset);
+                let addr = guest(memory.read(site).map_err(|_| bad())?);
+                memory.write(site, addr).map_err(|_| bad())?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Fails unless the code is whole instructions and the code and the initial data fit their regions.

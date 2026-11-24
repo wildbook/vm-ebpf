@@ -304,8 +304,7 @@ fn borrowed_buffers() {
     // a read-only borrow faults on write, and the slot is unmapped afterwards
     let err = caller.call("write_ro", &[]).unwrap_err().to_string();
     assert!(err.contains("callee::poke") && err.contains("memory fault"), "{err}");
-    let slot = rvm::region_base(rvm::BORROW_FIRST_REGION);
-    assert!(callee.lock().unwrap().memory().bytes(slot, 1).is_err());
+    assert_eq!(callee.lock().unwrap().memory().region_len(rvm::BORROW_FIRST_REGION), 0);
 
     // an empty buffer may be null, as C passes it: sum(NULL, 0)
     #[rustfmt::skip]
@@ -336,8 +335,7 @@ fn panic_during_borrowed_call() {
     let caller = Plugin::new("caller", vm.load_elf(&object("tests/borrow_host_caller.o")).unwrap());
 
     assert!(catch_unwind(AssertUnwindSafe(|| caller.call("run", &[]))).is_err());
-    let slot = rvm::region_base(rvm::BORROW_FIRST_REGION);
-    assert!(callee.lock().unwrap().memory().bytes(slot, 1).is_err());
+    assert_eq!(callee.lock().unwrap().memory().region_len(rvm::BORROW_FIRST_REGION), 0);
 
     fail.store(false, Ordering::Relaxed);
     assert_eq!(caller.call("run", &[]).unwrap(), 42);

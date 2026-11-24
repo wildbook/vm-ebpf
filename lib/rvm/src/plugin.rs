@@ -19,7 +19,7 @@ use crate::error::{HostError, Result, VmError};
 use crate::executor::MAX_ARGS;
 use crate::helper::{CallerFuel, HelperContext, Stop};
 use crate::layout::{BORROW_FIRST_REGION, BORROW_REGIONS};
-use crate::memory::{region_base, Perms, VmMemory};
+use crate::memory::{Perms, VmMemory};
 use crate::program::{Borrow, Func, FuncSlot, FunctionInfo, LimitedCall, Program};
 use crate::sync::{TryLock, TryLockGuard};
 
@@ -172,10 +172,10 @@ fn call_with_borrows(
             _ => caller.host_ptr(addr, len, perms)?,
         };
         let region = borrow_region(arg);
+        // the callee sees the caller's bytes at their host address, under the borrow region's tag
         // SAFETY: the caller is blocked in this call, and `callee` unmaps the region before the call returns or
         // unwinds.
-        unsafe { callee.program.memory_any().map_host_any(region, ptr, len, perms) };
-        args[arg as usize] = region_base(region);
+        args[arg as usize] = unsafe { callee.program.memory_any().map_host_any(region, ptr, len, perms) };
     }
     callee.program.call_func_charged(entry, &args, fuel)
 }

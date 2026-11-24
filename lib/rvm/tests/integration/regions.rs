@@ -4,7 +4,7 @@ use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 
 use ebpf_asm::{Assembler, R0, R1, R2};
-use rvm::{region_base, ExecError, Image, Perms, Plugin, Program, Region, Vm, VmError, DATA_REGION, RODATA_REGION};
+use rvm::{ExecError, Image, Perms, Plugin, Program, Region, Vm, VmError, DATA_REGION, RODATA_REGION};
 
 use crate::common::object;
 
@@ -35,10 +35,11 @@ fn rodata_is_read_only_data_is_writable() {
     assert_eq!(program.call("return_magic", &[]).unwrap(), 0xDEAD_BEEF_CAFE_BABE);
 
     let mut program = store_load(&Vm::new());
-    let rodata = region_base(RODATA_REGION);
+    let rodata = program.memory().region_base(RODATA_REGION);
     assert!(is_mem_fault(program.call("main", &[rodata, 0])));
     assert_eq!(program.memory().read::<u64>(rodata).unwrap(), 0x0101_0101_0101_0101);
-    assert_eq!(program.call("main", &[region_base(DATA_REGION), 77]).unwrap(), 77);
+    let data = program.memory().region_base(DATA_REGION);
+    assert_eq!(program.call("main", &[data, 77]).unwrap(), 77);
 }
 
 /// `bpf_main` writes through host-mapped structs; the writes must not land on other code.

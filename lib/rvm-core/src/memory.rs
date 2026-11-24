@@ -199,7 +199,8 @@ impl Window {
     };
 
     /// The `read_len` readable and `write_len` writable bytes at guest address `base`, which are the host bytes at
-    /// `ptr`, valid while the memory's [`Memory::epoch`] is `epoch`.
+    /// `ptr`, valid while the memory's [`Memory::epoch`] is `epoch`. The interpreter exposes the provenance of `ptr`
+    /// and reaches the bytes through pointers made from their addresses with [`ptr::with_exposed_provenance_mut`].
     ///
     /// # Safety
     ///
@@ -208,6 +209,10 @@ impl Window {
     /// `i + n <= read_len` (`write_len`) on that memory must do nothing but read (write) the `n` bytes at `ptr + i`,
     /// unaligned and little-endian. `ptr` must not come from a reference to the memory, which a call of a [`Memory`]
     /// method would invalidate. [`Memory`] states the rules for epochs.
+    ///
+    /// A window may instead cover host addresses that the embedder lets the guest name directly, with a `ptr` of
+    /// exposed provenance ([`ptr::with_exposed_provenance_mut`]). The bytes there needn't be valid: the embedder
+    /// answers for every access the guest makes, as it would for native code.
     pub const unsafe fn new(base: u64, ptr: *mut u8, read_len: u64, write_len: u64, epoch: u64) -> Self {
         Self {
             base,
