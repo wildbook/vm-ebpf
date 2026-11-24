@@ -4,7 +4,8 @@
 use std::mem::offset_of;
 
 use anyhow::{ensure, Context, Result};
-use rvm::{Module, Perms, Pod, Program, Vm};
+use bytemuck::{Pod, Zeroable};
+use rvm::{Module, Perms, Program, Vm};
 
 const ELF_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/prebuilt/examples/example.o");
 
@@ -39,7 +40,7 @@ fn main() -> Result<()> {
 
     // `struct input_ctx` and `struct output_result` live in a host-mapped scratch region.
     println!("\n=== bpf_main (op=mul, 10 * 20) ===");
-    let ctx = program.memory_mut().map(rvm::FIRST_FREE_REGION, 4096, Perms::RW)?;
+    let ctx = program.memory_mut().map(4096, Perms::RW)?.base();
     let out = ctx + 64;
     let input = InputCtx {
         value_a: 10,
@@ -47,7 +48,7 @@ fn main() -> Result<()> {
         operation: OP_MUL,
         flags: 0,
     };
-    program.memory_mut().write_bytes(ctx, input.as_bytes())?;
+    program.memory_mut().write_bytes(ctx, bytemuck::bytes_of(&input))?;
     let status = program.call("bpf_main", &[ctx, out])?;
     let product: u64 = program.memory().read(out + offset_of!(OutputResult, result) as u64)?;
     println!("bpf_main returned {status}, out->result = {product}");
@@ -93,16 +94,13 @@ fn run_and_report(program: &mut Program, name: &str, args: &[u64]) -> Result<u64
 
 /// `struct input_ctx` in `bpf/examples/example.c`.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct InputCtx {
     value_a: u64,
     value_b: u64,
     operation: u32,
     flags: u32,
 }
-
-// SAFETY: integer fields only, and the `u32`s fill the struct's last 8 bytes, so there is no padding.
-unsafe impl Pod for InputCtx {}
 
 /// `struct output_result` in `bpf/examples/example.c`.
 #[repr(C)]

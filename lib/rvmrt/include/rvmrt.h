@@ -24,7 +24,8 @@ typedef enum rvm_status {
     RVM_ERR_LINK = 2,
     // no function with this name
     RVM_ERR_NOT_FOUND = 3,
-    // more than 5 call arguments, a region or length that can't be mapped, or a name that isn't UTF-8
+    // more than 5 call arguments, a length that can't be mapped, no free region to map, an address that rvm_map
+    // didn't return, or a name that isn't UTF-8
     RVM_ERR_ARGUMENT = 4,
     // the call ran more than the runtime's limit of 1,000,000 instructions (rvm's DEFAULT_INSTRUCTION_LIMIT)
     RVM_ERR_LIMIT = 5,
@@ -42,12 +43,11 @@ rvm_status rvm_load(const uint8_t *image, size_t len, rvm_program **program);
 // Frees a program from rvm_load; NULL is ignored.
 void rvm_free(rvm_program *program);
 
-// Maps len zeroed read-write bytes as host region `region`, counted from 0, and stores the region's guest address in
-// *addr. A region that is already mapped is replaced.
-rvm_status rvm_map(rvm_program *program, size_t region, size_t len, uint64_t *addr);
+// Maps len zeroed read-write bytes at an address the runtime picks and stores that address in *addr.
+rvm_status rvm_map(rvm_program *program, size_t len, uint64_t *addr);
 
-// Unmaps host region `region`, counted from 0 as rvm_map counts it. A region that isn't mapped stays unmapped.
-rvm_status rvm_unmap(rvm_program *program, size_t region);
+// Unmaps the region that rvm_map mapped at addr.
+rvm_status rvm_unmap(rvm_program *program, uint64_t addr);
 
 // Copies len bytes at guest address addr into buf. The guest must be allowed to read them. buf may be NULL when len
 // is 0.

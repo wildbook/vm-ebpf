@@ -8,7 +8,7 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use rvm::{Perms, Plugin, Vm, FIRST_FREE_REGION};
+use rvm::{Perms, Plugin, Vm};
 
 fn object(name: &str) -> Vec<u8> {
     std::fs::read(format!("{}/../../bpf/prebuilt/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
@@ -64,10 +64,7 @@ fn guest(c: &mut Criterion) {
         records.extend([(i % 4) as u8, n]);
         records.extend((0..n).map(|j| j.wrapping_mul(31)));
     }
-    let buf = program
-        .memory_mut()
-        .map_bytes(FIRST_FREE_REGION, &records, BUF, Perms::R)
-        .unwrap();
+    let buf = program.memory_mut().map_bytes(&records, BUF, Perms::R).unwrap().base();
 
     let mut group = c.benchmark_group("guest");
     group.throughput(Throughput::Bytes(records.len() as u64));

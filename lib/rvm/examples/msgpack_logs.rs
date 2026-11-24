@@ -15,7 +15,8 @@
 
 use std::error::Error;
 
-use rvm::{Perms, Pod, Program, Vm};
+use bytemuck::{Pod, Zeroable};
+use rvm::{Perms, Program, Vm};
 
 const PARSER: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/prebuilt/examples/msgpack_logs.o"));
@@ -34,7 +35,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let vm = Vm::new();
     let mut parser = vm.load_elf(PARSER)?;
-    let input = parser.memory_mut().map(rvm::FIRST_FREE_REGION, INPUT_LEN, Perms::R)?;
+    let input = parser.memory_mut().map(INPUT_LEN, Perms::R)?.base();
     let parse = parser.func("parse")?;
 
     let mut pending = Vec::new();
@@ -156,7 +157,7 @@ impl Stats {
 
 /// `struct svc_stats`, a value of the `services` map.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct SvcStats {
     name: [u8; NAME_LEN],
     events: u64,
@@ -166,21 +167,15 @@ struct SvcStats {
     bytes: u64,
 }
 
-// SAFETY: integer fields only, and the `u64`s start at an 8 byte offset, so there is no padding.
-unsafe impl Pod for SvcStats {}
-
 /// `struct totals`, the value of the `totals` map.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct Totals {
     events: u64,
     services: u64,
     skipped_fields: u64,
     other_records: u64,
 }
-
-// SAFETY: `u64` fields only, so there is no padding.
-unsafe impl Pod for Totals {}
 
 /// Encodes `records` log records and tallies what the parser should make of them. Every 40th record is a heartbeat and
 /// every 57th a map without a service name; the rest are events, some with fields the parser doesn't know.

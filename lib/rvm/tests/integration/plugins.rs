@@ -227,9 +227,8 @@ fn shared_map_atomics_across_threads() {
 fn shared_region_is_visible_to_every_plugin() {
     let vm = Vm::new();
     // SAFETY: the plugins run on this thread only.
-    let rw = unsafe { vm.share_region(rvm::FIRST_FREE_REGION, 64, rvm::Perms::RW) }.unwrap();
-    let ro = unsafe { vm.share_region(rvm::FIRST_FREE_REGION + 1, 64, rvm::Perms::R) }.unwrap();
-    assert!(unsafe { vm.share_region(rvm::FIRST_FREE_REGION, 64, rvm::Perms::RW) }.is_err());
+    let rw = unsafe { vm.share_region(64, rvm::Perms::RW) }.unwrap();
+    let ro = unsafe { vm.share_region(64, rvm::Perms::R) }.unwrap();
 
     let x = Plugin::new("x", vm.load_elf(&object("tests/shared_region.o")).unwrap());
     let y = Plugin::new("y", vm.load_elf(&object("tests/shared_region.o")).unwrap());
@@ -251,7 +250,7 @@ fn shared_region_acquire_release() {
     const WORDS: u64 = 6;
     let vm = Vm::new();
     // SAFETY: each plugin touches the payload only after a load-acquire shows the other one is done with it.
-    let region = unsafe { vm.share_region(rvm::FIRST_FREE_REGION, 128, rvm::Perms::RW) }.unwrap();
+    let region = unsafe { vm.share_region(128, rvm::Perms::RW) }.unwrap();
     let [producer, consumer] =
         ["x", "y"].map(|name| Plugin::new(name, vm.load_elf(&object("tests/acq_rel.o")).unwrap()));
     let mailbox = region.base();

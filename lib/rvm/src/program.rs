@@ -15,7 +15,7 @@ use crate::executor::{fuel_for, Executor, MAX_ARGS};
 use crate::helper::{SharedHelpers, Snapshot};
 #[cfg(feature = "maps")]
 use crate::maps::{MapRef, Maps};
-use crate::memory::{Perms, Scalar, VmMemory};
+use crate::memory::{Perms, Region, Scalar, VmMemory};
 use crate::plugin::not_found;
 use crate::vm::VmConfig;
 
@@ -288,19 +288,33 @@ impl Program {
     }
 }
 
-/// A program's guest memory from [`Program::memory_mut`]. It reads like a [`VmMemory`], and maps and writes as one
-/// except that it can't replace the memory or remap the regions the program reserves, which its maps and stack need.
+/// A program's guest memory from [`Program::memory_mut`]. It reads like a [`VmMemory`] and maps and writes as one, but
+/// can't replace the memory, which holds the program's stack, data and maps.
 pub struct ProgramMemory<'a>(&'a mut VmMemory);
 
 impl ProgramMemory<'_> {
     /// [`VmMemory::map`].
-    pub fn map(&mut self, idx: usize, len: usize, perms: Perms) -> Result<u64> {
-        self.0.map(idx, len, perms)
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rvm::{Image, Perms, Vm};
+    ///
+    /// // r0 = *(u64 *)r1
+    /// let code = [0x79, 0x10, 0, 0, 0, 0, 0, 0, 0x95, 0, 0, 0, 0, 0, 0, 0];
+    /// let mut program = Vm::new().load_image(Image::from_code(code.to_vec()))?;
+    /// let input = program.memory_mut().map_bytes(&42u64.to_le_bytes(), 8, Perms::R)?;
+    /// assert_eq!(program.call("main", &[input.base()])?, 42);
+    /// program.memory_mut().unmap(input)?;
+    /// # Ok::<_, rvm::VmError>(())
+    /// ```
+    pub fn map(&mut self, len: usize, perms: Perms) -> Result<Region> {
+        self.0.map(len, perms)
     }
 
     /// [`VmMemory::map_bytes`].
-    pub fn map_bytes(&mut self, idx: usize, init: &[u8], len: usize, perms: Perms) -> Result<u64> {
-        self.0.map_bytes(idx, init, len, perms)
+    pub fn map_bytes(&mut self, init: &[u8], len: usize, perms: Perms) -> Result<Region> {
+        self.0.map_bytes(init, len, perms)
     }
 
     /// [`VmMemory::map_host`].
@@ -308,14 +322,15 @@ impl ProgramMemory<'_> {
     /// # Safety
     ///
     /// As [`VmMemory::map_host`].
-    pub unsafe fn map_host(&mut self, idx: usize, ptr: NonNull<u8>, len: usize, perms: Perms) -> Result<u64> {
+    pub unsafe fn map_host(&mut self, ptr: NonNull<u8>, len: usize, perms: Perms) -> Result<Region> {
         // SAFETY: the caller's contract.
-        unsafe { self.0.map_host(idx, ptr, len, perms) }
+        unsafe { self.0.map_host(ptr, len, perms) }
     }
 
-    /// [`VmMemory::unmap`].
-    pub fn unmap(&mut self, idx: usize) -> Result<()> {
-        self.0.unmap(idx)
+    /// [`VmMemory::unmap`]. A handle from the program that [`Plugin::replace`](crate::Plugin::replace) swapped out
+    /// fails with [`VmError::ForeignRegion`].
+    pub fn unmap(&mut self, region: Region) -> Result<()> {
+        self.0.unmap(region)
     }
 
     /// [`VmMemory::bytes_mut`].

@@ -164,7 +164,8 @@ images declare none, as `bin/emu` does (see
 [`lib/rvmrt/Cargo.toml`](lib/rvmrt/Cargo.toml) selects, as `rvmrt.dll` and a
 static `rvmrt.lib`. `lib/rvmrt/include/rvmrt.h` declares its
 functions: `rvm_load` loads a prepared image, `rvm_map` maps zeroed guest
-memory and `rvm_unmap` unmaps it, `rvm_write` and `rvm_read` copy bytes into
+memory and returns its address, `rvm_unmap` unmaps the memory at such an
+address, `rvm_write` and `rvm_read` copy bytes into
 and out of guest memory where the guest itself may write or read them,
 `rvm_call` calls a function by name, and `rvm_free` frees the program.
 Functions also have indices, in name order: `rvm_function_count` and
@@ -193,8 +194,8 @@ rvmrt it is 9,216 bytes with 44 imports.
 
 | build | `rvmrt.dll` | added to the C host by `rvmrt.lib` |
 |---|---|---|
-| in `lib/rvmrt` | 102,912 B, 31 imports from 3 DLLs | 95,744 B, 8 imports |
-| at the root | 188,928 B, 58 imports from 6 DLLs | 181,760 B, 33 imports |
+| in `lib/rvmrt` | 103,424 B, 31 imports from 3 DLLs | 96,256 B, 8 imports |
+| at the root | 189,440 B, 58 imports from 6 DLLs | 182,272 B, 33 imports |
 | in `lib/rvmrt`, without `fuel` | 84,480 B, 31 imports from 3 DLLs | 76,800 B, 8 imports |
 | at the root, without `fuel` | 169,984 B, 58 imports from 6 DLLs | 162,816 B, 33 imports |
 
@@ -243,19 +244,25 @@ region slots, each with its own byte range and permissions:
 | `RODATA_REGION` (2) | `.rodata*` | R |
 | `DATA_REGION` (3) | `.data*`, `.bss*` | RW |
 | `MAPS_REGION` (4) | map values | RW |
-| `FIRST_FREE_REGION` (5) to 26 | free for the host, `Vm::share_region` | - |
+| 5 to 26 | host regions: `VmMemory::map`, `Vm::share_region` | per mapping |
 | `BORROW_FIRST_REGION` (27) to 31 | buffers borrowed during a plugin call | per tag |
 | `SHARED_MAPS_FIRST_REGION` (32) to 63 | shared maps, one region each | RW |
 | `CODE_REGION` (64) | code addresses, never mapped | - |
 
-The host maps its own regions, `FIRST_FREE_REGION` up to `BORROW_FIRST_REGION`,
-with `VmMemory::map` (zeroed) or `VmMemory::map_bytes` (initialized from a
-slice); the others belong to the program and the runtime, and mapping or
-unmapping them fails. The unsafe `VmMemory::map_host` maps existing host memory,
-which must outlive the mapping.
+The host maps memory into a program with `VmMemory::map` (zeroed) or
+`VmMemory::map_bytes` (initialized from a slice), through
+`Program::memory_mut`. The unsafe `VmMemory::map_host` maps existing host
+memory, which must outlive the mapping. Each returns a `Region` handle at a
+free host region; `Region::base` is its guest address, and `VmMemory::unmap`
+takes the handle back and frees the region. The other regions belong to the
+program and the runtime, and no call maps over them. A mapping fails with
+`VmError::NoFreeRegion` once every host region is taken, and an unmap with
+`VmError::ForeignRegion` when the handle comes from another program, such as
+the one a `Plugin::replace` swapped out.
 
-`Vm::share_region(region, len, perms)` maps one buffer at the same region in
-every program linked afterwards, so plugins can pass plain pointers into it.
+`Vm::share_region(len, perms)` maps one buffer at a free host region, at the
+same address in every program linked afterwards, so plugins can pass plain
+pointers into it. Programs linked afterwards map their own memory around it.
 The host accesses it through the returned `SharedRegion`: `read_bytes`,
 `write_bytes`, `read` and `write` copy, and `atomic_u32`/`atomic_u64` are real
 atomics. The call is unsafe: guests on different threads may only touch the
@@ -277,6 +284,10 @@ The host reaches a map through `Program::map(name)`, as bytes (`get`, `update`,
 and refuses shared maps; `get_as` copies. `MapRef::entries` iterates without
 allocating: every element of an array map, or the present keys of a hash map.
 For a shared hash map it holds the key index read-locked until dropped.
+`rvm::Pod` is bytemuck's trait; a host struct gets it from
+`#[derive(Clone, Copy, Pod, Zeroable)]` with bytemuck's `derive` feature, which
+checks at compile time that the struct is `#[repr(C)]` plain data without
+padding.
 
 `Vm::share_map(name, spacing)` makes maps of that name one instance across
 every program linked afterwards, at the same guest address in each. The first

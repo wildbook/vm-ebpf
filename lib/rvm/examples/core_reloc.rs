@@ -57,7 +57,7 @@ fn run_against(layout: &[Field]) -> Result<(), Box<dyn Error>> {
 
     let mut program = vm.load_elf(OBJECT)?;
     let mut mem = program.memory_mut();
-    let event_ptr = mem.map(rvm::FIRST_FREE_REGION, size as usize, Perms::RW)?;
+    let event_ptr = mem.map(size as usize, Perms::RW)?.base();
     for &(offset, size, value) in &fields {
         let addr = event_ptr + u64::from(offset);
         match size {

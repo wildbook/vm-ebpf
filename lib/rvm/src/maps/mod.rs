@@ -17,12 +17,13 @@
 use std::ops::Range;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use bytemuck::Pod;
 use hashbrown::{hash_table, HashMap};
 
 use crate::error::{LinkError, Result};
 use crate::layout::MAPS_REGION;
 use crate::map_def::{check_def, MapDef, MapKind, CACHE_LINE};
-use crate::memory::{region_base, MemoryBudget, Perms, Pod, VmMemory, MAX_REGION_LEN};
+use crate::memory::{region_base, MemoryBudget, Perms, VmMemory, MAX_REGION_LEN};
 use crate::std_helpers::EINVAL;
 use crate::sync::{read, write};
 
@@ -271,17 +272,20 @@ impl<'a> MapRef<'a> {
 
     /// The value for `key`, copied out as a `V`; `Ok(None)` if the key is absent. Fails with [`MapError::Invalid`] if
     /// `K` or `V` differs in size from the map's keys or values.
+    ///
+    /// `key` and the value are copied in host byte order. Guests are little endian, so fields wider than a byte only
+    /// read back right on a little-endian host.
     pub fn get_as<K: Pod, V: Pod>(&self, key: K) -> std::result::Result<Option<V>, MapError> {
         check_sizes::<K, V>(self.def())?;
-        let Some(addr) = self.maps.lookup(self.handle, key.as_bytes()) else {
+        let Some(addr) = self.maps.lookup(self.handle, bytemuck::bytes_of(&key)) else {
             return Ok(None);
         };
         Ok(Some(self.memory.read_pod(addr).expect("map slots are mapped")))
     }
 
-    /// [`MapRef::update`] with the bytes of `key` and `value`.
+    /// [`MapRef::update`] with the bytes of `key` and `value`, in host byte order as for [`MapRef::get_as`].
     pub fn update_as<K: Pod, V: Pod>(&mut self, key: K, value: V, flags: u64) -> std::result::Result<(), MapError> {
-        self.update(key.as_bytes(), value.as_bytes(), flags)
+        self.update(bytemuck::bytes_of(&key), bytemuck::bytes_of(&value), flags)
     }
 
     /// The map's entries, for [`Entries::iter`] or [`Entries::iter_as`].
@@ -332,16 +336,17 @@ impl Entries<'_> {
         }
     }
 
-    /// [`Entries::iter`] with keys and values copied out as `K` and `V`; an array index is a 4 byte key. Fails with
-    /// [`MapError::Invalid`] if `K` or `V` differs in size from the map's keys or values.
+    /// [`Entries::iter`] with keys and values copied out as `K` and `V`, in host byte order as for
+    /// [`MapRef::get_as`]; an array index is a 4 byte key. Fails with [`MapError::Invalid`] if `K` or `V` differs in
+    /// size from the map's keys or values.
     pub fn iter_as<K: Pod, V: Pod>(&self) -> std::result::Result<impl Iterator<Item = (K, V)> + '_, MapError> {
         check_sizes::<K, V>(&self.map.def)?;
         Ok(self.iter().map(|(key, value)| {
             let key = match key {
-                MapKey::Index(index) => K::from_bytes(&index.to_le_bytes()),
-                MapKey::Bytes(bytes) => K::from_bytes(bytes),
+                MapKey::Index(index) => bytemuck::try_pod_read_unaligned(&index.to_le_bytes()),
+                MapKey::Bytes(bytes) => bytemuck::try_pod_read_unaligned(bytes),
             };
-            let value = V::from_bytes(value);
+            let value = bytemuck::try_pod_read_unaligned(value);
             (key.expect("key size checked"), value.expect("value size checked"))
         }))
     }

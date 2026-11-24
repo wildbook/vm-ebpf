@@ -12,7 +12,7 @@ use crate::helper::{FromArgs, HostFn, IntoReturn, SharedHelpers};
 #[cfg(feature = "link")]
 use crate::host_type::HostTypes;
 use crate::image::{self, Image};
-use crate::layout::{BORROW_FIRST_REGION, FIRST_FREE_REGION};
+use crate::layout::free_host_region;
 #[cfg(feature = "link")]
 use crate::linker;
 #[cfg(feature = "maps")]
@@ -214,9 +214,11 @@ impl Vm {
         self.shared.maps.declare(name, spacing);
     }
 
-    /// Allocate `len` zeroed bytes and map them as region `region` into every program linked afterwards, so plugins can
-    /// exchange data through plain pointers. `region` must lie in `FIRST_FREE_REGION..BORROW_FIRST_REGION` and not be
-    /// shared already.
+    /// Allocate `len` zeroed bytes and map them at a free host region, at the same guest address in every program
+    /// linked afterwards, so plugins can exchange data through plain pointers. The region stays shared as long as the
+    /// VM lives, and programs linked afterwards can't map their own memory there. Fails with
+    /// [`VmError::NoFreeRegion`] if the VM shares every host region already, and with [`VmError::InvalidArgument`]
+    /// unless `len` is in `1..=`[`MAX_REGION_LEN`].
     ///
     /// # Safety
     ///
@@ -225,11 +227,28 @@ impl Vm {
     /// different threads may only touch bytes another thread writes concurrently with atomics, guest load-acquire and
     /// store-release among them; other guest stores, map helper writes and host writes all count as plain stores, and
     /// host reads, including [`GuestMemory`] and [`SharedRegion`] copies, as plain loads.
-    pub unsafe fn share_region(&self, region: usize, len: usize, perms: Perms) -> Result<SharedRegion> {
-        self.shared.regions.add(region, len, perms)
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use rvm::{Image, Perms, Vm};
+    ///
+    /// let vm = Vm::new();
+    /// // SAFETY: the program runs on this thread only.
+    /// let mut shared = unsafe { vm.share_region(64, Perms::R) }?;
+    /// shared.write(0, 42u64)?;
+    ///
+    /// // r0 = *(u64 *)r1
+    /// let code = [0x79, 0x10, 0, 0, 0, 0, 0, 0, 0x95, 0, 0, 0, 0, 0, 0, 0];
+    /// let mut program = vm.load_image(Image::from_code(code.to_vec()))?;
+    /// assert_eq!(program.call("main", &[shared.base()])?, 42);
+    /// # Ok::<_, Box<dyn std::error::Error>>(())
+    /// ```
+    pub unsafe fn share_region(&self, len: usize, perms: Perms) -> Result<SharedRegion> {
+        self.shared.regions.add(len, perms)
     }
 
-    /// Load an image as a program: from [`Vm::prepare_elf`](Self::prepare_elf), [`Image::from_bytes`], or built by
+    /// Load an image as a program: from `Vm::prepare_elf` (with the `link` feature), [`Image::from_bytes`], or built by
     /// hand around raw bytecode, whose `call <id>` instructions reach the helpers registered here by ID.
     ///
     /// Binds the image's extern calls by name or helper ID in this VM, allocates its memory and maps, and maps the maps
@@ -370,20 +389,15 @@ struct Mapping {
 
 impl SharedRegions {
     /// [`Vm::share_region`]; its contract binds the programs that map the buffer, not this call.
-    fn add(&self, region: usize, len: usize, perms: Perms) -> Result<SharedRegion> {
+    fn add(&self, len: usize, perms: Perms) -> Result<SharedRegion> {
         let _writer = lock(&self.writer);
         let list = self.list.get();
 
-        let invalid = |msg: String| Err(VmError::InvalidArgument(msg));
-        if !(FIRST_FREE_REGION..BORROW_FIRST_REGION).contains(&region) {
-            return invalid(format!("region {region} is outside {FIRST_FREE_REGION}..{BORROW_FIRST_REGION}"));
-        }
-        if list.iter().any(|m| m.region == region) {
-            return invalid(format!("region {region} is already shared"));
-        }
         if len == 0 || len > MAX_REGION_LEN {
-            return invalid(format!("region length {len} is not in 1..={MAX_REGION_LEN}"));
+            let msg = format!("region length {len} is not in 1..={MAX_REGION_LEN}");
+            return Err(VmError::InvalidArgument(msg));
         }
+        let region = free_host_region(list.iter().fold(0, |taken, m| taken | 1 << m.region))?;
 
         let buffer = Arc::new(SharedBuffer::new(len)?);
         let mapping = Mapping {

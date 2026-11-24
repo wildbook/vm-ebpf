@@ -9,7 +9,7 @@
 mod asm;
 mod data;
 
-use rvm::{Image, Perms, Vm, FIRST_FREE_REGION};
+use rvm::{Image, Perms, Vm};
 
 #[test]
 fn bpf_conformance_suite() {
@@ -46,11 +46,11 @@ fn run_one(text: &str) -> Result<(), String> {
     // calling it doesn't abort the program
     vm.register_helper(5, |_: ()| 0u64);
     let mut program = vm.load_image(Image::from_code(case.code)).map_err(|e| e.to_string())?;
-    let mem_ptr = program
+    let mem = program
         .memory_mut()
-        .map_bytes(FIRST_FREE_REGION, &case.mem, case.mem.len(), Perms::RW)
+        .map_bytes(&case.mem, case.mem.len(), Perms::RW)
         .map_err(|e| e.to_string())?;
-    let outcome = program.call("main", &[mem_ptr, case.mem.len() as u64]);
+    let outcome = program.call("main", &[mem.base(), case.mem.len() as u64]);
 
     match (outcome, case.result, case.error) {
         (Ok(r0), Some(expected), _) if r0 == expected => Ok(()),

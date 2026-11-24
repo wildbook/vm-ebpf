@@ -8,8 +8,9 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-rvm    = { path = "../../lib/rvm" }
-anyhow = "1.0"
+rvm      = { path = "../../lib/rvm" }
+anyhow   = "1.0"
+bytemuck = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
 btf.workspace = true

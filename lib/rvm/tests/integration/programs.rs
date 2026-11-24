@@ -1,7 +1,7 @@
 //! Clang-compiled programs exercising atomics, maps, data relocations, function pointers, CO-RE and the standard
 //! helpers.
 
-use rvm::{region_base, ExecError, Perms, Vm, VmError, CODE_REGION, DATA_REGION, FIRST_FREE_REGION, REGION_SHIFT};
+use rvm::{region_base, ExecError, Perms, Vm, VmError, CODE_REGION, DATA_REGION, REGION_SHIFT};
 
 use crate::common::{describe_bits, object};
 
@@ -96,7 +96,7 @@ fn core_relocations_follow_host_layout() {
     });
     let mut program = vm.load_elf(&object("tests/core_guard.o")).unwrap();
 
-    let event = program.memory_mut().map(FIRST_FREE_REGION, 16, Perms::R).unwrap();
+    let event = program.memory_mut().map(16, Perms::R).unwrap().base();
     program.memory_mut().write::<u32>(event + 12, 77).unwrap();
 
     assert_eq!(program.call("read_pid", &[event]).unwrap(), 77);
@@ -115,7 +115,7 @@ fn core_relocations_follow_appended_host_btf() {
     let mut program = vm.load_elf(&object("tests/core_guard.o")).unwrap();
 
     // Host layout: flags(0), pid(4), timestamp(8); every field present, reordered.
-    let event = program.memory_mut().map(FIRST_FREE_REGION, 16, Perms::R).unwrap();
+    let event = program.memory_mut().map(16, Perms::R).unwrap().base();
     program.memory_mut().write::<u32>(event, 0xABCD).unwrap(); // flags
     program.memory_mut().write::<u32>(event + 4, 77).unwrap(); // pid
 
@@ -135,7 +135,7 @@ fn core_relocations_read_signed_bitfield() {
 
     // b = -5 (12-bit two's complement) at bit 20, with arbitrary bits below it.
     let word: u32 = (0xABCDE) | (0xFFBu32 << 20);
-    let ptr = program.memory_mut().map(FIRST_FREE_REGION, 4, Perms::R).unwrap();
+    let ptr = program.memory_mut().map(4, Perms::R).unwrap().base();
     program.memory_mut().write::<u32>(ptr, word).unwrap();
 
     assert_eq!(program.call("read_b", &[ptr]).unwrap(), -5i64 as u64);

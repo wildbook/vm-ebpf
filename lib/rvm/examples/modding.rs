@@ -22,7 +22,8 @@ use std::error::Error;
 use std::mem::{offset_of, size_of};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use rvm::{MemoryError, Perms, Plugin, Pod, Scalar, SharedRegion, ValueSpacing, Vm};
+use bytemuck::{Pod, Zeroable};
+use rvm::{MemoryError, Perms, Plugin, Scalar, SharedRegion, ValueSpacing, Vm};
 
 const RULES: &[u8] =
     include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bpf/prebuilt/examples/game_rules_v1.o"));
@@ -185,25 +186,19 @@ struct Stats {
 
 /// `struct wave_state` in `bpf/examples/game_rules_v1.c`, the value of the `waves` map.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct WaveState {
     wave: u64,
     spawned: u64,
 }
 
-// SAFETY: `u64` fields only, so there is no padding.
-unsafe impl Pod for WaveState {}
-
 /// `struct score` in `bpf/examples/game_sdk.h`, the value of the `scores` map.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Pod, Zeroable)]
 struct Score {
     points: u64,
     kills: u64,
 }
-
-// SAFETY: `u64` fields only, so there is no padding.
-unsafe impl Pod for Score {}
 
 /// Entities in a region shared with every plugin, as an array the host appends to and compacts.
 struct World {
@@ -221,7 +216,7 @@ struct WorldState {
 impl World {
     fn new(vm: &Vm) -> rvm::Result<Self> {
         // SAFETY: plugins only run on this thread.
-        let region = unsafe { vm.share_region(rvm::FIRST_FREE_REGION, CAPACITY * size_of::<Entity>(), Perms::RW)? };
+        let region = unsafe { vm.share_region(CAPACITY * size_of::<Entity>(), Perms::RW)? };
         Ok(Self {
             base: region.base(),
             state: Mutex::new(WorldState {

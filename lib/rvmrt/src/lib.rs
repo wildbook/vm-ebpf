@@ -6,20 +6,25 @@
 
 use std::slice;
 
-use rvm::{ExecError, Func, Perms, Program, Vm, VmConfig, VmError, DEFAULT_INSTRUCTION_LIMIT, FIRST_FREE_REGION};
+use rvm::{ExecError, Func, Perms, Program, Region, Vm, VmConfig, VmError, DEFAULT_INSTRUCTION_LIMIT};
 
-/// What an `rvm_program` pointer points to: a program and the handles of its functions in name order, so that a call
-/// by index looks nothing up.
+/// What an `rvm_program` pointer points to: a program, the handles of its functions in name order, so that a call by
+/// index looks nothing up, and the regions [`rvm_map`] mapped.
 pub struct RvmProgram {
     program: Program,
     funcs: Vec<Func>,
+    regions: Vec<Region>,
 }
 
 impl RvmProgram {
     fn new(program: Program) -> Self {
         let handle = |(name, _): &(String, _)| program.func(name).expect("a listed function");
         let funcs = program.functions().iter().map(handle).collect();
-        Self { program, funcs }
+        Self {
+            program,
+            funcs,
+            regions: Vec::new(),
+        }
     }
 }
 
@@ -33,7 +38,8 @@ pub enum Status {
     Link = 2,
     /// No function with this name.
     NotFound = 3,
-    /// A bad argument: more than 5 call arguments, a region or length that can't be mapped, a name that isn't UTF-8.
+    /// A bad argument: more than 5 call arguments, a length that can't be mapped, no free region to map, an address
+    /// that [`rvm_map`] didn't return, a name that isn't UTF-8.
     Argument = 4,
     /// The call ran more instructions than the limit.
     Limit = 5,
@@ -52,7 +58,7 @@ impl Status {
             VmError::InvalidImage(_) | VmError::ProgramTooLarge(_) | VmError::MemoryLimit(_) => Self::Image,
             VmError::Link(_) => Self::Link,
             VmError::FunctionNotFound { .. } => Self::NotFound,
-            VmError::TooManyArgs(_) | VmError::InvalidArgument(_) => Self::Argument,
+            VmError::TooManyArgs(_) | VmError::InvalidArgument(_) | VmError::NoFreeRegion => Self::Argument,
             VmError::Exec(ExecError::InstructionLimit { .. }) => Self::Limit,
             VmError::Exec(ExecError::UnknownHelper { .. } | ExecError::UnknownExtern { .. }) => Self::Helper,
             VmError::Exec(_) | VmError::Memory(_) => Self::Fault,
@@ -92,30 +98,34 @@ pub unsafe extern "C" fn rvm_free(program: *mut RvmProgram) {
     }
 }
 
-/// Maps `len` zeroed read-write bytes as host region `region`, counted from 0, and stores the region's guest address
-/// in `*addr`. A region that is already mapped is replaced.
+/// Maps `len` zeroed read-write bytes at an address the runtime picks, and stores that address in `*addr`.
 ///
 /// # Safety
 ///
 /// `program` must be a live program from [`rvm_load`], and `addr` must be valid for writes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rvm_map(program: *mut RvmProgram, region: usize, len: usize, addr: *mut u64) -> Status {
-    let program = unsafe { &mut (*program).program };
-    let idx = FIRST_FREE_REGION.saturating_add(region);
-    unsafe { finish(program.memory_mut().map(idx, len, Perms::RW), addr) }
+pub unsafe extern "C" fn rvm_map(program: *mut RvmProgram, len: usize, addr: *mut u64) -> Status {
+    let RvmProgram { program, regions, .. } = unsafe { &mut *program };
+    let mapped = program.memory_mut().map(len, Perms::RW).map(|region| {
+        let base = region.base();
+        regions.push(region);
+        base
+    });
+    unsafe { finish(mapped, addr) }
 }
 
-/// Unmaps host region `region`, counted from 0, as [`rvm_map`] numbers it. Unmapping a region that isn't mapped does
-/// nothing.
+/// Unmaps the region that [`rvm_map`] mapped at `addr`.
 ///
 /// # Safety
 ///
 /// `program` must be a live program from [`rvm_load`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rvm_unmap(program: *mut RvmProgram, region: usize) -> Status {
-    let program = unsafe { &mut (*program).program };
-    let idx = FIRST_FREE_REGION.saturating_add(region);
-    unsafe { finish(program.memory_mut().unmap(idx), &mut ()) }
+pub unsafe extern "C" fn rvm_unmap(program: *mut RvmProgram, addr: u64) -> Status {
+    let RvmProgram { program, regions, .. } = unsafe { &mut *program };
+    let Some(found) = regions.iter().position(|region| region.base() == addr) else {
+        return Status::Argument;
+    };
+    unsafe { finish(program.memory_mut().unmap(regions.swap_remove(found)), &mut ()) }
 }
 
 /// Copies `len` bytes at guest address `addr` into `buf`. The guest must be allowed to read them, as for its own loads.
@@ -219,7 +229,7 @@ pub unsafe extern "C" fn rvm_call_func(
     nargs: usize,
     ret: *mut u64,
 ) -> Status {
-    let RvmProgram { program, funcs } = unsafe { &mut *program };
+    let RvmProgram { program, funcs, .. } = unsafe { &mut *program };
     let Some(&func) = funcs.get(index) else {
         return Status::NotFound;
     };

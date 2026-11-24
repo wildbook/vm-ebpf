@@ -1,8 +1,8 @@
 //! Prepared images: they run like programs linked from ELF, plugins load from them, and malformed ones fail to load.
 
 use rvm::{
-    region_base, Borrow, FunctionInfo, Image, Import, LinkError, MapDef, MapKind, Module, Plugin, Program, Vm,
-    VmConfig, VmError, DEFAULT_MEMORY_LIMIT, FIRST_FREE_REGION, MAX_REGION_LEN,
+    Borrow, FunctionInfo, Image, Import, LinkError, MapDef, MapKind, Module, Perms, Plugin, Program, Vm, VmConfig,
+    VmError, DEFAULT_MEMORY_LIMIT, MAX_REGION_LEN,
 };
 use rvm_core::opcode::CALL;
 
@@ -11,8 +11,11 @@ use crate::common::{host_vm, object};
 /// Every program from an image calls exactly like the same program linked from ELF.
 #[test]
 fn images_run_like_elf() {
-    type Case = (&'static [&'static str], &'static [(&'static str, &'static [u64])]);
-    const SLOT: u64 = region_base(FIRST_FREE_REGION) + 8;
+    type Case<'a> = (&'a [&'a str], &'a [(&'a str, &'a [u64])]);
+    let vm = host_vm();
+    // SAFETY: the programs run on this thread only.
+    let shared = unsafe { vm.share_region(64, Perms::RW) }.unwrap();
+    let slot = shared.base() + 8;
     let cases: &[Case] = &[
         (&["tests/atomics.o"], &[("run", &[5])]),
         (&["tests/data_ptrs.o"], &[("deref", &[])]),
@@ -42,14 +45,12 @@ fn images_run_like_elf() {
         (&["examples/example.o"], &[("simple_add", &[2, 3]), ("return_magic", &[])]),
         (&["tests/std_helpers.o"], &[("draws_differ", &[])]),
         (&["tests/shared_counter.o"], &[("bump", &[]), ("bump", &[])]),
-        (&["tests/shared_region.o"], &[("put", &[SLOT, 42]), ("get", &[SLOT])]),
+        (&["tests/shared_region.o"], &[("put", &[slot, 42]), ("get", &[slot])]),
         (&["tests/plugin_a_v1.o"], &[("a_scale", &[5])]),
         (&["tests/plugin_b.o"], &[("b_run", &[5])]),
         (&["tests/borrow_caller.o"], &[("run", &[])]),
         (&["tests/link_main.o", "tests/link_lib.o"], &[("run", &[7]), ("lib_scale", &[5])]),
     ];
-
-    let vm = host_vm();
 
     for &(objects, calls) in cases {
         let elfs: Vec<_> = objects.iter().map(|name| object(name)).collect();

@@ -14,6 +14,7 @@ constelf  = { workspace = true, optional = true }
 btf       = { workspace = true, optional = true }
 hashbrown = { workspace = true }
 foldhash  = { version = "0.2.0", default-features = false }
+bytemuck  = { workspace = true, optional = true }
 
 # These comments are the feature reference; the README and the crate docs link here.
 [features]
@@ -24,14 +25,15 @@ link = ["dep:constelf", "dep:btf"]
 # Enforces `VmConfig::instruction_limit`. Without it, the interpreter doesn't count instructions, and a non-zero limit
 # fails with `VmError::FuelNotEnabled`. A call without a limit costs the same with and without it.
 fuel = ["rvm-core/fuel"]
-# Guest maps: the map helpers, `Program::map` and `Vm::share_map`. Without it, an image that declares maps fails to
-# load with `LinkError::InvalidMap`.
-maps = []
+# Guest maps: the map helpers, `Program::map`, `Vm::share_map`, and `Pod` for typed keys and values. Without it, an
+# image that declares maps fails to load with `LinkError::InvalidMap`.
+maps = ["dep:bytemuck"]
 # Guest hash maps use a fixed hash seed, so builds compared in benchmarks probe the same way.
 fixed-hash-seed = []
 
 [dev-dependencies]
 btf       = { workspace = true }
+bytemuck  = { workspace = true, features = ["derive"] }
 constelf  = { workspace = true }
 criterion = "0.7"
 ebpf-asm  = { workspace = true }

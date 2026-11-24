@@ -94,6 +94,8 @@ mod vm;
 
 #[cfg(feature = "link")]
 pub use btf::{BtfBuilder, BtfError, CoreReloError};
+#[cfg(feature = "maps")]
+pub use bytemuck::{Pod, Zeroable};
 pub use error::{ExecError, HostError, LinkError, MemoryError, Result, VmError};
 pub use executor::DEFAULT_FRAME_SIZE;
 pub use helper::{FromArgs, IntoReturn};
@@ -104,14 +106,14 @@ pub use host_type::__host_field_type;
 pub use host_type::{HostType, HostTypes};
 pub use image::{Image, Import, INSN_SIZE};
 pub use layout::{
-    BORROW_FIRST_REGION, BORROW_REGIONS, CODE_REGION, DATA_REGION, FIRST_FREE_REGION, MAPS_REGION, RODATA_REGION,
+    BORROW_FIRST_REGION, BORROW_REGIONS, CODE_REGION, DATA_REGION, MAPS_REGION, RODATA_REGION,
     SHARED_MAPS_FIRST_REGION, STACK_REGION,
 };
 pub use map_def::{MapDef, MapKind};
 #[cfg(feature = "maps")]
 pub use maps::{Entries, MapError, MapIter, MapKey, MapRef, ValueSpacing, BPF_ANY, BPF_EXIST, BPF_NOEXIST};
 pub use memory::{
-    region_base, GuestMemory, Perms, Pod, Scalar, SharedRegion, VmMemory, MAX_REGIONS, MAX_REGION_LEN, REGION_SHIFT,
+    region_base, GuestMemory, Perms, Region, Scalar, SharedRegion, VmMemory, MAX_REGIONS, MAX_REGION_LEN, REGION_SHIFT,
 };
 #[cfg(feature = "link")]
 pub use module::Module;

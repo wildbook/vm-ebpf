@@ -49,6 +49,15 @@ pub enum VmError {
     /// A function handle looked up in another program.
     ForeignFunc,
 
+    /// A region handle from another memory, such as the memory of a program that
+    /// [`Plugin::replace`](crate::Plugin::replace) swapped out.
+    ForeignRegion,
+
+    /// Every host region is taken: in the program for [`VmMemory::map`](crate::VmMemory::map), in the VM for
+    /// [`Vm::share_region`](crate::Vm::share_region). A region the VM shares is taken in every program linked
+    /// afterwards.
+    NoFreeRegion,
+
     /// A call with more arguments than the 5 that eBPF functions take.
     TooManyArgs(usize),
 
@@ -100,6 +109,8 @@ impl fmt::Display for VmError {
             #[cfg(feature = "maps")]
             Self::MapNotFound(name) => write!(f, "map not found: {name}"),
             Self::ForeignFunc => write!(f, "function handle belongs to another program; look the function up again"),
+            Self::ForeignRegion => write!(f, "region handle belongs to another memory"),
+            Self::NoFreeRegion => write!(f, "every host region is taken"),
             Self::TooManyArgs(count) => write!(f, "{count} arguments, but eBPF functions take at most {MAX_ARGS}"),
             Self::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
             Self::MemoryLimit(limit) => {

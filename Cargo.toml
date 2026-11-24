@@ -15,6 +15,7 @@ constelf  = { path = "lib/constelf" }
 ebpf-asm  = { path = "lib/ebpf-asm" }
 rvm-core  = { path = "lib/rvm-core", default-features = false }
 hashbrown = { version = "0.17.1", default-features = false, features = ["default-hasher"] }
+bytemuck  = { version = "1.25", default-features = false }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
