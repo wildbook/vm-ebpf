@@ -375,12 +375,6 @@ impl HelperRegistry {
         &self.natives
     }
 
-    /// The name the native function at `index` is registered under.
-    #[cfg(feature = "seh")]
-    pub fn native_name(&self, index: u32) -> &str {
-        self.native_names.get(index as usize).map_or("", String::as_str)
-    }
-
     /// Replace the function in `slot`, or append a new slot.
     fn put(&mut self, slot: Option<u32>, func: HostFn) -> u32 {
         match slot {

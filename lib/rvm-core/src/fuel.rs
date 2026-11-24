@@ -216,9 +216,6 @@ mod metered {
         /// left, which isn't short.
         left: u64,
         metered: bool,
-        /// Whether the runs are guarded (`Interpreter::set_guard`): `start` is then the guard's table.
-        #[cfg(feature = "seh")]
-        guard: bool,
     }
 
     // SAFETY: `start` points to a constant table of functions
@@ -246,8 +243,6 @@ mod metered {
                 limit: fuel,
                 left: fuel,
                 metered: limit.is_some(),
-                #[cfg(feature = "seh")]
-                guard: false,
             }
         }
 
@@ -268,36 +263,10 @@ mod metered {
             // SAFETY: the code has a slot at `pc`
             let rest = unsafe { code.rests().of(code, Ip::at(code, pc)) };
             self.left = self.left.wrapping_sub(rest);
-            #[cfg(feature = "seh")]
-            if self.guard {
-                return match short(self.left) {
-                    true => &Tables::<M, H>::GUARDED_STEPS,
-                    false => &Tables::<M, H>::GUARDED_METERED,
-                };
-            }
             match short(self.left) {
                 true => &Tables::<M, H>::STEPS,
                 false => &Tables::<M, H>::METERED,
             }
-        }
-
-        /// Start and resume the runs through the tables of the guard from now on, or through their own. So the
-        /// choice costs a run nothing: it loads the table it starts through either way.
-        #[cfg(feature = "seh")]
-        pub fn set_guard(&mut self, guard: bool) {
-            let start: &Table<M, H> = match (self.metered, guard) {
-                (false, false) => &Tables::<M, H>::PLAIN,
-                (true, false) => &Tables::<M, H>::STEPS,
-                (false, true) => &Tables::<M, H>::GUARDED_PLAIN,
-                (true, true) => &Tables::<M, H>::GUARDED_STEPS,
-            };
-            self.start = NonNull::from(start);
-            self.guard = guard;
-        }
-
-        #[cfg(feature = "seh")]
-        pub fn guard(&self) -> bool {
-            self.guard
         }
 
         /// Why a call can't start, if `fresh`, or resume at a pc outside the code. A fresh call has the fuel of the
@@ -457,69 +426,25 @@ mod metered {
 
 #[cfg(not(feature = "fuel"))]
 mod unmetered {
-    #[cfg(not(feature = "seh"))]
     use std::marker::PhantomData;
-    #[cfg(feature = "seh")]
-    use std::ptr::NonNull;
 
     use super::*;
     use crate::dispatch::Tables;
     use crate::Reason;
 
     /// The meter of a build that can't meter: it holds nothing.
-    #[cfg(not(feature = "seh"))]
     pub struct Meter<M, H>(PhantomData<fn(M, H)>);
 
-    #[cfg(not(feature = "seh"))]
     impl<M, H> Default for Meter<M, H> {
         fn default() -> Self {
             Self(PhantomData)
         }
     }
 
-    /// The meter of a build that can't meter. It holds only the table the runs start through: the plain one, or the
-    /// guard's (`Interpreter::set_guard`), so that the choice costs a run nothing.
-    #[cfg(feature = "seh")]
-    pub struct Meter<M: Memory, H> {
-        start: NonNull<Table<M, H>>,
-    }
-
-    // SAFETY: `start` points to a constant table of functions
-    #[cfg(feature = "seh")]
-    unsafe impl<M: Memory, H> Send for Meter<M, H> {}
-    #[cfg(feature = "seh")]
-    unsafe impl<M: Memory, H> Sync for Meter<M, H> {}
-
-    #[cfg(feature = "seh")]
-    impl<M: Memory, H: Host<M>> Default for Meter<M, H> {
-        fn default() -> Self {
-            Self {
-                start: NonNull::from(&Tables::<M, H>::PLAIN),
-            }
-        }
-    }
-
     impl<M: Memory, H: Host<M>> Meter<M, H> {
-        #[cfg(not(feature = "seh"))]
         #[inline(always)]
         pub fn start<'a>(&self) -> &'a Table<M, H> {
             &Tables::<M, H>::PLAIN
-        }
-
-        #[cfg(feature = "seh")]
-        #[inline(always)]
-        pub fn start<'a>(&self) -> &'a Table<M, H> {
-            // SAFETY: the pointer comes from a table in static memory
-            unsafe { self.start.as_ref() }
-        }
-
-        #[cfg(feature = "seh")]
-        pub fn set_guard(&mut self, guard: bool) {
-            let start: &Table<M, H> = match guard {
-                true => &Tables::<M, H>::GUARDED_PLAIN,
-                false => &Tables::<M, H>::PLAIN,
-            };
-            self.start = NonNull::from(start);
         }
 
         #[inline(always)]

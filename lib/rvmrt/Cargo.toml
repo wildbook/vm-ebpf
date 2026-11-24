@@ -15,13 +15,6 @@ crate-type = ["cdylib", "staticlib"]
 default = ["fuel"]
 # Limits each call to `rvm::DEFAULT_INSTRUCTION_LIMIT` instructions. Without it calls have no limit.
 fuel = ["rvm/fuel"]
-# x86-64 Windows only. `rvm_load_with` and `rvm_last_exception`: a structured exception in a native function, or an
-# access violation of a guest access to a raw address, fails the call instead of ending the process.
-seh = ["rvm/seh"]
 
 [dependencies]
 rvm = { path = "../rvm", default-features = false }
-
-[dev-dependencies]
-# tests/seh.rs prepares its image with the linker
-rvm = { path = "../rvm", default-features = false, features = ["link"] }

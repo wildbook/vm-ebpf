@@ -209,13 +209,6 @@ impl Slot {
         self.byte
     }
 
-    /// The slot with the opcode byte `byte`, which must have the layout of the byte it replaces.
-    #[cfg(feature = "seh")]
-    pub fn with_byte(self, byte: u8) -> Self {
-        debug_assert!(LAYOUTS[usize::from(byte)] == LAYOUTS[usize::from(self.byte)]);
-        Self { byte, ..self }
-    }
-
     /// `imm`, which every layout but [`Layout::DstSrc`] keeps.
     #[inline(always)]
     pub fn imm(self) -> i32 {

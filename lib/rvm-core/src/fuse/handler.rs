@@ -82,7 +82,7 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
                 let at = ip.offset($k);
                 let decoded = sup.decode($k, slot_of($k), ROLE_INDEXES, Some(FREE));
                 let step = match const { windows::windowed(Super::of(S).opcode($k)) } {
-                    true if windows::data_step::<_, _, $k>(&interp.windows, &mut roles, decoded, ip) => Step::Next,
+                    true if windows::data_step(&interp.windows, &mut roles, decoded) => Step::Next,
                     // the access missed its window: the sequence continues unfused from it, as a jump into its middle
                     // would, but through the handler of the access alone, since its slot may hold a superinstruction
                     // (this one at slot 0); the slot has the access's layout either way (see `slot_of`)

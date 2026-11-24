@@ -62,11 +62,6 @@
 //!
 //! - `fuel` (default): an interpreter can limit the instructions of a run (`Interpreter::set_limit`). A run without
 //!   a limit costs the same with and without the feature.
-//! - `seh`, on Windows x64: a structured exception can stop a run instead of ending the process. A guarded native
-//!   call (`Code::bind_guarded_native`) catches an exception that leaves the native function, and a guarded run
-//!   (`Interpreter::set_guard`) catches an access violation of a load or store in a memory window. The `seh` module
-//!   states what each catches. Sign-extending loads and atomics run in memory windows only in code prepared with
-//!   `Code::guard_accesses`.
 //!
 //! # Modules
 //!
@@ -116,9 +111,6 @@
 #![feature(explicit_tail_calls, rust_preserve_none_cc)]
 #![allow(incomplete_features)]
 
-#[cfg(all(feature = "seh", not(all(windows, target_arch = "x86_64"))))]
-compile_error!("the `seh` feature needs Windows on x86-64");
-
 #[macro_use]
 mod macros;
 #[macro_use]
@@ -136,8 +128,6 @@ mod interp;
 mod memory;
 mod native;
 mod rewrite;
-#[cfg(feature = "seh")]
-mod seh;
 mod slot;
 mod step;
 mod transfer;
@@ -152,5 +142,3 @@ pub use instruction::Instruction;
 pub use interp::{Interpreter, Reason, Stop, MAX_CALL_DEPTH, METERED};
 pub use memory::{AtomicOp, Memory, Window};
 pub use native::{Native, NativeArg, NativeFn, NativeSig, MAX_ARGS as MAX_NATIVE_ARGS};
-#[cfg(feature = "seh")]
-pub use seh::Caught;

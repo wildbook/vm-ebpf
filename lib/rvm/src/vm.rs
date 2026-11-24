@@ -52,10 +52,6 @@ pub struct VmConfig {
     pub memory_limit: usize,
     /// Whether guests reach host memory through raw pointers; off by default. See [`Passthrough::on`].
     pub passthrough: Passthrough,
-    /// Which structured exceptions fail the guest's call instead of ending the process; none by default. See
-    /// [`Catch`].
-    #[cfg(feature = "seh")]
-    pub catch: Catch,
 }
 
 impl Default for VmConfig {
@@ -65,94 +61,8 @@ impl Default for VmConfig {
             frame_size: DEFAULT_FRAME_SIZE,
             memory_limit: DEFAULT_MEMORY_LIMIT,
             passthrough: Passthrough::OFF,
-            #[cfg(feature = "seh")]
-            catch: Catch::NONE,
         }
     }
-}
-
-#[cfg(feature = "seh")]
-impl VmConfig {
-    /// Whether the programs of the VM run with the guard of [`Catch::raw_faults`]: only a guest with raw host
-    /// pointers can name unmapped memory.
-    pub(crate) fn guards_raw(&self) -> bool {
-        self.catch.raw_faults && self.passthrough.is_on()
-    }
-}
-
-/// Which Windows structured exceptions fail the guest call that raised them with an error instead of ending the
-/// process, for [`VmConfig::catch`]. The type exists with the `seh` feature, on Windows x64.
-///
-/// # What is caught
-///
-/// - With `native_exceptions`, an exception that leaves a native function ([`Vm::register_native`]): an access
-///   violation, a stack overflow or another hardware fault, a failure raised with `RaiseException`, a C++
-///   exception. The system unwinds the frames of the function and of what it called, which runs their `__finally`
-///   blocks and C++ destructors as their compiler arranged them, and the guest's call fails with
-///   [`ExecError::NativeException`](crate::ExecError::NativeException).
-/// - With `raw_faults`, an access violation of a guest load, store or atomic at an address that isn't mapped, which
-///   only a guest of a VM with [`Passthrough`] can name. The call fails with the
-///   [`ExecError::MemoryFault`](crate::ExecError::MemoryFault) that an access outside the guest's regions gives:
-///   the same instruction, address and size.
-///
-/// After either, the program, its plugin and the plugins that called it are in the state any failed call leaves.
-///
-/// # What is not
-///
-/// Every other exception passes on, to the host's own handlers or the end of the process, as without this:
-///
-/// - One raised in a host function ([`Vm::register_extern`]) or in code it calls, in a raw access a host function
-///   makes ([`GuestMemory`], the map helpers), or in rvm itself.
-/// - One raised in a native function that lies in the same executable or DLL as rvm, or that called back into that
-///   image first, for example into a plugin. A catch discards the frames below it without running them, so it must
-///   not discard frames of Rust code, and it tells them by their image.
-/// - One raised in a native function without unwind information, as generated code has unless it registers some.
-/// - A breakpoint, a single step, a guard page hit, and the informational codes that debuggers and runtimes
-///   exchange (every code whose two top bits are not both set).
-/// - A fail-fast (`__fastfail`, a stack cookie check, `abort`) and heap corruption, which Windows gives to no
-///   handler.
-///
-/// # What a caught exception leaves behind
-///
-/// The native function's own state is as it was at the exception: a lock it held stays held and memory it owned
-/// stays allocated, unless its own unwinding releases them. C++ built without `/EHa` runs no destructors for a
-/// hardware fault. Catching limits the damage to one guest call; it doesn't repair the function. After a stack
-/// overflow rvm restores the stack's guard page, and aborts the process if it can't. A native function written in
-/// Rust must not panic, as before.
-///
-/// A debugger sees each caught exception as a first-chance exception and no second chance. Vectored exception
-/// handlers of other libraries run before the catch; one that ends the process on an access violation, as
-/// AddressSanitizer's does, defeats it.
-///
-/// # Cost
-///
-/// In host instructions, measured on Zen 3: `native_exceptions` adds about 25 to each native call of the VM's
-/// programs. `raw_faults` adds about 105 to each call into a program, about 18 to each atomic and each acquire or
-/// release access, and 3 to each sign-extending load; plain loads and stores and every other instruction cost the
-/// same. A VM without them pays for neither.
-#[cfg(feature = "seh")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Catch {
-    /// Catch exceptions that leave native functions.
-    pub native_exceptions: bool,
-    /// Catch access violations of guest accesses to raw host addresses. It has an effect only with
-    /// [`Passthrough`].
-    pub raw_faults: bool,
-}
-
-#[cfg(feature = "seh")]
-impl Catch {
-    /// Catch nothing.
-    pub const NONE: Self = Self {
-        native_exceptions: false,
-        raw_faults: false,
-    };
-
-    /// Catch both.
-    pub const ALL: Self = Self {
-        native_exceptions: true,
-        raw_faults: true,
-    };
 }
 
 /// Whether the programs a VM links and loads reach host memory through raw pointers, for [`VmConfig::passthrough`].
@@ -418,9 +328,7 @@ impl Vm {
     /// `func` must:
     /// - be callable as `unsafe extern "win64" fn(u64, ...) -> u64` with the `sig.args()` integer or pointer arguments,
     ///   returning in rax;
-    /// - never unwind: no Rust panic with an unwinding ABI, C++ exception, SEH unwind or `longjmp` may leave it. With
-    ///   the `seh` feature, a VM with `Catch::native_exceptions` lifts this for structured and C++ exceptions, under
-    ///   the conditions `Catch` states;
+    /// - never unwind: no Rust panic with an unwinding ABI, C++ exception, SEH unwind or `longjmp` may leave it;
     /// - stay loaded while any call of it may run, one that started before it was replaced included;
     /// - be safe to run on any thread, on several at once;
     /// - stay sound for any argument values the guest passes. The checks cover only the pointers `sig` declares, and

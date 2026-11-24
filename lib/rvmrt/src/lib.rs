@@ -3,8 +3,6 @@
 //! `include/rvmrt.h` declares these functions for C. Images come from `rvm::Vm::prepare_elf` and
 //! `rvm::Image::to_bytes`; the runtime has no helpers and no maps, only the native functions the host passes to
 //! [`rvm_load_natives`]. With the `fuel` feature it limits each call to `rvm::DEFAULT_INSTRUCTION_LIMIT` instructions.
-//! With the `seh` feature, on Windows x64, `rvm_load_with` loads a program that fails a call on a structured
-//! exception instead of ending the process (`rvm::Catch`), and `rvm_last_exception` describes the exception.
 
 use std::slice;
 
@@ -22,10 +20,6 @@ pub struct RvmProgram {
     program: Program,
     funcs: Vec<Func>,
     regions: Vec<Region>,
-    /// The code and address of the exception that failed the last call of a native function, for
-    /// [`rvm_last_exception`].
-    #[cfg(feature = "seh")]
-    exception: Option<(u32, u64)>,
 }
 
 impl RvmProgram {
@@ -36,17 +30,7 @@ impl RvmProgram {
             program,
             funcs,
             regions: Vec::new(),
-            #[cfg(feature = "seh")]
-            exception: None,
         }
-    }
-}
-
-/// Keeps the exception of `result`, the result of a call, in `exception` if a native function raised one.
-#[cfg(feature = "seh")]
-fn note(exception: &mut Option<(u32, u64)>, result: &rvm::Result<u64>) {
-    if let Err(VmError::Exec(ExecError::NativeException { code, address, .. })) = result {
-        *exception = Some((*code, *address));
     }
 }
 
@@ -114,29 +98,6 @@ pub struct RvmNative {
     pub len_arg: [u8; MAX_NATIVE_ARGS],
 }
 
-/// The body of [`rvm_load_natives`] and of `rvm_load_with`: loads the image for a VM with the configuration `$config`
-/// and with `$natives`, and stores the program in `*$program`. It is a macro so that `rvm_load_natives` holds the
-/// statements themselves, and compiles to the same code with and without the `seh` feature.
-macro_rules! load {
-    ($image:ident, $len:ident, $natives:ident, $count:ident, $program:ident, $config:expr) => {{
-        let bytes = unsafe { slice_or_empty($image, $len) };
-        let mut list = Vec::with_capacity($count);
-        for native in unsafe { slice_or_empty($natives, $count) } {
-            let name = unsafe { str_or_none(native.name, native.name_len) };
-            let (Some(name), Some(sig)) = (name, native_sig(native)) else {
-                return Status::Argument;
-            };
-            list.push((name, native.func, sig));
-        }
-        let config = $config;
-        // SAFETY: the caller's
-        let loaded = unsafe { Vm::with_natives(config, &list) }
-            .and_then(|vm| vm.load_image_bytes(bytes))
-            .map(|p| Box::into_raw(Box::new(RvmProgram::new(p))));
-        unsafe { finish(loaded, $program) }
-    }};
-}
-
 /// [`rvm_load`] with `natives` registered as `rvm::Vm::register_native` registers them.
 ///
 /// # Safety
@@ -151,90 +112,24 @@ pub unsafe extern "C" fn rvm_load_natives(
     count: usize,
     program: *mut *mut RvmProgram,
 ) -> Status {
-    load!(
-        image,
-        len,
-        natives,
-        count,
-        program,
-        VmConfig {
-            instruction_limit: INSTRUCTION_LIMIT,
-            ..VmConfig::default()
-        }
-    )
-}
-
-/// Flags of [`rvm_load_with`]; `RVM_RAW_POINTERS`, `RVM_CATCH_NATIVE` and `RVM_CATCH_RAW` in the header.
-#[cfg(feature = "seh")]
-const RAW_POINTERS: u32 = 1;
-#[cfg(feature = "seh")]
-const CATCH_NATIVE: u32 = 2;
-#[cfg(feature = "seh")]
-const CATCH_RAW: u32 = 4;
-
-/// [`rvm_load_natives`] with `flags`: with `RVM_RAW_POINTERS` the guest reaches host memory through raw pointers
-/// (`rvm::Passthrough::on`), with `RVM_CATCH_NATIVE` an exception in a native function fails the guest's call, and
-/// with `RVM_CATCH_RAW` an access violation of a guest access to a raw address does (`rvm::Catch`). Any other flag
-/// fails with [`Status::Argument`].
-///
-/// # Safety
-///
-/// As [`rvm_load_natives`], but that with `RVM_CATCH_NATIVE` an exception may leave a native function. With
-/// `RVM_RAW_POINTERS`, the contract of `rvm::Passthrough::on` holds for every access the guest makes.
-#[cfg(feature = "seh")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rvm_load_with(
-    image: *const u8,
-    len: usize,
-    natives: *const RvmNative,
-    count: usize,
-    flags: u32,
-    program: *mut *mut RvmProgram,
-) -> Status {
-    if flags & !(RAW_POINTERS | CATCH_NATIVE | CATCH_RAW) != 0 {
-        return Status::Argument;
+    let bytes = unsafe { slice_or_empty(image, len) };
+    let mut list = Vec::with_capacity(count);
+    for native in unsafe { slice_or_empty(natives, count) } {
+        let name = unsafe { str_or_none(native.name, native.name_len) };
+        let (Some(name), Some(sig)) = (name, native_sig(native)) else {
+            return Status::Argument;
+        };
+        list.push((name, native.func, sig));
     }
-    let passthrough = match flags & RAW_POINTERS != 0 {
-        // SAFETY: the caller's
-        true => unsafe { rvm::Passthrough::on() },
-        false => rvm::Passthrough::OFF,
+    let config = VmConfig {
+        instruction_limit: INSTRUCTION_LIMIT,
+        ..VmConfig::default()
     };
-    let catch = rvm::Catch {
-        native_exceptions: flags & CATCH_NATIVE != 0,
-        raw_faults: flags & CATCH_RAW != 0,
-    };
-    load!(
-        image,
-        len,
-        natives,
-        count,
-        program,
-        VmConfig {
-            instruction_limit: INSTRUCTION_LIMIT,
-            passthrough,
-            catch,
-            ..VmConfig::default()
-        }
-    )
-}
-
-/// Stores the code and the instruction address of the exception that failed the last call of a native function in
-/// `*code` and `*address`; [`Status::NotFound`] if no call of the program failed so.
-///
-/// # Safety
-///
-/// `program` must be a live program from [`rvm_load`], and `code` and `address` must be valid for writes.
-#[cfg(feature = "seh")]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rvm_last_exception(program: *const RvmProgram, code: *mut u32, address: *mut u64) -> Status {
-    let Some((raised, at)) = unsafe { &*program }.exception else {
-        return Status::NotFound;
-    };
-    unsafe {
-        code.write(raised);
-        address.write(at);
-    }
-    Status::Ok
+    // SAFETY: the caller's
+    let loaded = unsafe { Vm::with_natives(config, &list) }
+        .and_then(|vm| vm.load_image_bytes(bytes))
+        .map(|p| Box::into_raw(Box::new(RvmProgram::new(p))));
+    unsafe { finish(loaded, program) }
 }
 
 /// The signature `native` describes, or `None` for an invalid one.
@@ -350,17 +245,12 @@ pub unsafe extern "C" fn rvm_call(
     nargs: usize,
     ret: *mut u64,
 ) -> Status {
-    #[cfg(feature = "seh")]
-    let exception = unsafe { &mut (*program).exception };
     let program = unsafe { &mut (*program).program };
     let Some(name) = (unsafe { str_or_none(name, name_len) }) else {
         return Status::Argument;
     };
     let args = unsafe { slice_or_empty(args, nargs) };
-    let result = program.call(name, args);
-    #[cfg(feature = "seh")]
-    note(exception, &result);
-    unsafe { finish(result, ret) }
+    unsafe { finish(program.call(name, args), ret) }
 }
 
 /// Stores the index of the function `name` in `*index`, for [`rvm_call_func`].
@@ -401,21 +291,12 @@ pub unsafe extern "C" fn rvm_call_func(
     nargs: usize,
     ret: *mut u64,
 ) -> Status {
-    let RvmProgram {
-        program,
-        funcs,
-        #[cfg(feature = "seh")]
-        exception,
-        ..
-    } = unsafe { &mut *program };
+    let RvmProgram { program, funcs, .. } = unsafe { &mut *program };
     let Some(&func) = funcs.get(index) else {
         return Status::NotFound;
     };
     let args = unsafe { slice_or_empty(args, nargs) };
-    let result = program.call_func(func, args);
-    #[cfg(feature = "seh")]
-    note(exception, &result);
-    unsafe { finish(result, ret) }
+    unsafe { finish(program.call_func(func, args), ret) }
 }
 
 /// The number of functions. Indices go from 0 to this count minus 1, in name order.

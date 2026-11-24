@@ -126,6 +126,4 @@ pub use std_helpers::{
     BPF_FUNC_MAP_UPDATE_ELEM, BPF_FUNC_TRACE_PRINTK,
 };
 pub use sync::TryLockGuard;
-#[cfg(feature = "seh")]
-pub use vm::Catch;
 pub use vm::{Passthrough, Vm, VmConfig, DEFAULT_INSTRUCTION_LIMIT, DEFAULT_MEMORY_LIMIT};

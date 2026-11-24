@@ -99,38 +99,6 @@ impl Code {
         true
     }
 
-    /// [`bind_native`](Self::bind_native) for a guarded call: an exception that leaves the native function ends the
-    /// run with [`Reason::NativeException`](crate::Reason::NativeException) instead of the process, under the
-    /// conditions of [`seh::native`](crate::seh::native). The call passes all five argument registers, of which the
-    /// function reads its own.
-    ///
-    /// # Safety
-    ///
-    /// As [`bind_native`](Self::bind_native), but that an exception may leave the function. What the function
-    /// leaves behind in its own state when one does is its own concern.
-    #[cfg(feature = "seh")]
-    pub unsafe fn bind_guarded_native(&mut self, pc: usize, index: u32, checked: bool) -> bool {
-        let Some(slot) = self.slots[..self.len].get_mut(pc).filter(|slot| slot.byte() == CALL) else {
-            return false;
-        };
-        let byte = native::GUARDED[usize::from(checked)];
-        *slot = Slot::new(Instruction::new(OpCode(byte), 0, 0, 0, index as i32));
-        true
-    }
-
-    /// Give every sign-extending load and every atomic the handler that runs it in a memory window, where a guarded
-    /// run ([`Interpreter::set_guard`](crate::Interpreter::set_guard)) catches its access violation. The plain loads
-    /// and stores need no such step. Code that runs unguarded has no use for it: the handler costs more than the one
-    /// it replaces.
-    #[cfg(feature = "seh")]
-    pub fn guard_accesses(&mut self) {
-        for slot in &mut self.slots[..self.len] {
-            if let Some(byte) = crate::windows::guarded_byte(slot.byte()) {
-                *slot = slot.with_byte(byte);
-            }
-        }
-    }
-
     /// Bytes the load or store in slot `pc` accesses, or `None` if the slot holds none, for reporting a
     /// [`Reason::MemoryFault`](crate::Reason::MemoryFault) at `pc`.
     #[cold]

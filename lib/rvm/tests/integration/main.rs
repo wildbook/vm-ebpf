@@ -15,6 +15,3 @@ mod natives;
 mod plugins;
 mod programs;
 mod regions;
-// Miri can't raise or unwind Windows exceptions
-#[cfg(all(feature = "seh", not(miri)))]
-mod seh;

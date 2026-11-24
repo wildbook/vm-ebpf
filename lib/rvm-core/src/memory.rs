@@ -132,11 +132,6 @@ pub unsafe trait Memory {
     /// window around r10, and for the window around the address of a load or store that falls outside the windows it
     /// holds. It runs the plain loads and stores that fall inside its windows without calling the methods above, and
     /// uses a window only while the memory is at the window's epoch. The default is [`Window::NONE`].
-    ///
-    /// With the `seh` feature, code prepared with `Code::guard_accesses` also runs its sign-extending loads, its
-    /// atomics and its acquire and release accesses in a window that covers them, as the host's instructions for
-    /// them. An atomic or ordered access at an address that isn't aligned for its size still goes to the methods
-    /// above.
     fn window(&self, addr: u64) -> Window {
         let _ = addr;
         Window::NONE
