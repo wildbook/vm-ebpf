@@ -16,7 +16,7 @@ hashbrown = { workspace = true }
 foldhash  = { version = "0.2.0", default-features = false }
 bytemuck  = { workspace = true, optional = true }
 
-# These comments are the feature reference; the README and the crate docs link here.
+# These comments are the feature reference; the crate docs link here.
 [features]
 default = ["link", "fuel", "maps"]
 # ELF parsing, BTF, CO-RE and the linker: `Module`, `HostTypes`, `Vm::with_types`, `Vm::prepare_elf`,
