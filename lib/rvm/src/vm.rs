@@ -50,8 +50,12 @@ pub struct VmConfig {
     /// Most bytes one program may allocate: its code, stack, data, map values and hash map keys, the shared maps it
     /// creates included. Linking and loading check it before they allocate and fail with [`VmError::MemoryLimit`].
     pub memory_limit: usize,
-    /// Whether guests reach host memory through raw pointers; off by default. See [`Passthrough::on`].
+    /// Whether guests reach host memory through raw pointers; off by default. See [`Passthrough::on`]. A
+    /// [`Loader`] sets it for one program.
     pub passthrough: Passthrough,
+    /// Whether a `callx` through a raw address calls native code; off by default. See [`RawCalls::on`]. A
+    /// [`Loader`] sets it for one program.
+    pub raw_calls: RawCalls,
 }
 
 impl Default for VmConfig {
@@ -61,11 +65,13 @@ impl Default for VmConfig {
             frame_size: DEFAULT_FRAME_SIZE,
             memory_limit: DEFAULT_MEMORY_LIMIT,
             passthrough: Passthrough::OFF,
+            raw_calls: RawCalls::OFF,
         }
     }
 }
 
-/// Whether the programs a VM links and loads reach host memory through raw pointers, for [`VmConfig::passthrough`].
+/// Whether a program reaches host memory through raw pointers, for [`VmConfig::passthrough`] and
+/// [`Loader::passthrough`].
 ///
 /// A guest address is the host address of its byte with the region's index as a tag in the top bits (see
 /// [`region_tag`](crate::region_tag)), and the untagged addresses form region 0.
@@ -96,7 +102,7 @@ impl Passthrough {
     ///
     /// # Safety
     ///
-    /// Every program the VM links or loads can read and write any memory of the process it can name, as native code
+    /// Every program loaded with it can read and write any memory of the process it can name, as native code
     /// could, with nothing checking what it does. The host must make sure that every access a guest makes through a
     /// raw address is sound: that the memory is mapped, that the guest's writes keep the host's values valid, and that
     /// they don't race other threads or conflict with references the host holds. A guest that strips the tag of one of
@@ -138,6 +144,54 @@ impl Passthrough {
             _ => region_tag(idx),
         };
         tag | ptr.addr().get() as u64
+    }
+}
+
+/// Whether a `callx` of a program calls native code through a raw address, for [`VmConfig::raw_calls`] and
+/// [`Loader::raw_calls`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawCalls(bool);
+
+impl RawCalls {
+    /// A `callx` through an address without a region tag calls the helper with that ID, and fails with
+    /// [`ExecError::UnknownHelper`](crate::ExecError::UnknownHelper) or
+    /// [`ExecError::BadCodeAddress`](crate::ExecError::BadCodeAddress) if there is none.
+    pub const OFF: Self = Self(false);
+
+    /// A `callx` through an address without a region tag, from [`RAW_START`](crate::RAW_START) (64 KiB) up to
+    /// [`RAW_END`](crate::RAW_END) (2^47), calls the native function at that address: a function pointer that the
+    /// host put in a struct, passed as an argument or returned from a host function. The call passes r1 to r5 in the
+    /// Windows x64 convention, the first four also in xmm0 to xmm3, and puts rax in r0. It works with every
+    /// [`Passthrough`] mode.
+    ///
+    /// The addresses of the program's own functions keep their meaning, and so do helper IDs below 64 KiB. A helper
+    /// ID from 64 KiB up is reachable through `call <id>` only.
+    ///
+    /// - Arguments reach the function as the registers hold them. Nothing declares what a `callx` passes, so no
+    ///   pointer is checked or converted: a pointer into the program's memory keeps its region tag, unless the
+    ///   program is [untagged](Passthrough::untagged) or strips the tag itself (`UNTAG` in `bpf/rvm_bpf.h`).
+    /// - The function runs unmetered: its call counts as one instruction against the instruction limit, and nothing
+    ///   interrupts it.
+    /// - A function that calls back into the plugin that called it gets [`VmError::PluginBusy`].
+    /// - Control Flow Guard doesn't check the call.
+    ///
+    /// # Safety
+    ///
+    /// The program is as trusted as native code, whatever its [`Passthrough`] mode: it can call any address in the
+    /// process with any arguments, and nothing validates the target. A `callx` through an address that isn't a
+    /// function, such as a data pointer of an untagged program, runs the bytes there. The host must make sure that
+    /// every call the program makes is sound: that the target is a function of the Windows x64 convention, that it is
+    /// sound for the arguments it gets, on the thread that runs the program, and that it stays loaded during the call.
+    ///
+    /// The functions the program calls must never unwind: no Rust panic with an unwinding ABI, C++ exception, SEH
+    /// unwind or `longjmp` may leave them.
+    pub const unsafe fn on() -> Self {
+        Self(true)
+    }
+
+    /// Whether a `callx` calls native code through a raw address.
+    pub const fn is_on(self) -> bool {
+        self.0
     }
 }
 
@@ -310,8 +364,8 @@ impl Vm {
     /// call from their next call on; it fails with [`VmError::InvalidArgument`] if `sig` differs, as it does for a null
     /// `func`. A name with both a native and a host function binds to the native.
     ///
-    /// Pointer arguments: unless the VM's [`Passthrough`] is `untagged`, a call checks each pointer that `sig`
-    /// declares before it calls `func`. The guest must be allowed to read the bytes, and for [`NativeArg::Write`] to
+    /// Pointer arguments: unless the program's [`Passthrough`] is `untagged`, a call checks each pointer that `sig`
+    /// declares before it calls `func`. The guest must be allowed to read the bytes, and for [`NativeArg::Write`](crate::NativeArg::Write) to
     /// write them too: one byte at the pointer, or as many as its length argument holds. `func` then gets the host
     /// address of the bytes, and a failed check stops the guest's call with
     /// [`ExecError::MemoryFault`](crate::ExecError::MemoryFault) at the call. Untagged, every argument reaches `func`
@@ -384,7 +438,8 @@ impl Vm {
     /// Share maps called `name` between every program linked afterwards: they bind to one instance, created by the
     /// first program that declares it, and later declarations must match its layout.
     ///
-    /// Values live at the same guest address in every program, from region [`crate::SHARED_MAPS_FIRST_REGION`] up.
+    /// Values live at the same guest address in every program of one [`Passthrough`] mode, from region
+    /// [`crate::SHARED_MAPS_FIRST_REGION`] up.
     ///
     /// # Safety
     ///
@@ -395,10 +450,10 @@ impl Vm {
     }
 
     /// Allocate `len` zeroed bytes and map them at a free host region, at the same guest address in every program
-    /// linked afterwards, so plugins can exchange data through plain pointers. The region stays shared as long as the
-    /// VM lives, and programs linked afterwards can't map their own memory there. Fails with
-    /// [`VmError::NoFreeRegion`] if the VM shares every host region already, and with [`VmError::InvalidArgument`]
-    /// unless `len` is in `1..=`[`MAX_REGION_LEN`].
+    /// of one [`Passthrough`] mode that is linked afterwards, so plugins can exchange data through plain pointers.
+    /// The region stays shared as long as the VM lives, and programs linked afterwards can't map their own memory
+    /// there. Fails with [`VmError::NoFreeRegion`] if the VM shares every host region already, and with
+    /// [`VmError::InvalidArgument`] unless `len` is in `1..=`[`MAX_REGION_LEN`].
     ///
     /// # Safety
     ///
@@ -453,6 +508,14 @@ impl Vm {
     /// [`Image::from_bytes`] makes.
     pub fn load_image_bytes(&self, bytes: &[u8]) -> Result<Program> {
         image::load_bytes(bytes, &self.helpers, &self.shared, &self.config)
+    }
+
+    /// A [`Loader`], which loads programs with a [`Passthrough`] mode or a [`RawCalls`] switch other than this VM's.
+    pub fn loader(&self) -> Loader<'_> {
+        Loader {
+            vm: self,
+            config: self.config.clone(),
+        }
     }
 
     /// Publish `func` from `plugin` as an extern of the same name.
@@ -532,6 +595,80 @@ impl Vm {
     }
 }
 
+/// Loads programs into a [`Vm`] with a [`Passthrough`] mode and a [`RawCalls`] switch of their own; from
+/// [`Vm::loader`]. Both start as the VM's.
+///
+/// # Example
+///
+/// ```
+/// use rvm::{Image, Passthrough, Vm};
+///
+/// // r0 = *(u64 *)r1
+/// let code = [0x79, 0x10, 0, 0, 0, 0, 0, 0, 0x95, 0, 0, 0, 0, 0, 0, 0];
+/// let value = 42u64;
+/// let addr = &raw const value as u64;
+///
+/// let vm = Vm::new();
+/// // SAFETY: the program reads only `value` through a raw pointer
+/// let passthrough = unsafe { Passthrough::on() };
+/// let mut trusted = vm.loader().passthrough(passthrough).load_image(Image::from_code(code.to_vec()))?;
+/// assert_eq!(trusted.call("main", &[addr])?, 42);
+///
+/// // the VM's own mode checks every address
+/// let mut checked = vm.load_image(Image::from_code(code.to_vec()))?;
+/// assert!(checked.call("main", &[addr]).is_err());
+/// # Ok::<_, rvm::VmError>(())
+/// ```
+pub struct Loader<'a> {
+    vm: &'a Vm,
+    /// The VM's, but for the passthrough mode and the raw calls switch.
+    config: VmConfig,
+}
+
+impl Loader<'_> {
+    /// Load with `passthrough` instead of [`VmConfig::passthrough`].
+    ///
+    /// Programs of different modes work in one VM. Each program gets the addresses of its own memory, of its maps,
+    /// of the shared regions and of the buffers it borrows in its own mode, so calls between plugins, borrows and
+    /// shared maps work across modes. A pointer that a program stores in shared memory or passes to another plugin
+    /// as a plain argument is an address in its own mode, which only programs of the same mode can follow. Another
+    /// program faults on it, and one with [`Passthrough::on`] follows the host address that an untagged program
+    /// stored, unchecked. [`SharedRegion::base`] is a shared region's address in the VM's mode, and
+    /// [`SharedRegion::base_for`] its address in another.
+    pub fn passthrough(mut self, passthrough: Passthrough) -> Self {
+        self.config.passthrough = passthrough;
+        self
+    }
+
+    /// Load with `raw_calls` instead of [`VmConfig::raw_calls`].
+    pub fn raw_calls(mut self, raw_calls: RawCalls) -> Self {
+        self.config.raw_calls = raw_calls;
+        self
+    }
+
+    /// [`Vm::load_image`].
+    pub fn load_image(&self, image: Image) -> Result<Program> {
+        image::load(image, &self.vm.helpers, &self.vm.shared, &self.config)
+    }
+
+    /// [`Vm::load_image_bytes`].
+    pub fn load_image_bytes(&self, bytes: &[u8]) -> Result<Program> {
+        image::load_bytes(bytes, &self.vm.helpers, &self.vm.shared, &self.config)
+    }
+
+    /// [`Vm::load_modules`].
+    #[cfg(feature = "link")]
+    pub fn load_modules(&self, modules: &[&Module]) -> Result<Program> {
+        self.load_image(self.vm.prepare_modules(modules)?)
+    }
+
+    /// [`Vm::load_elf`].
+    #[cfg(feature = "link")]
+    pub fn load_elf(&self, elf_bytes: &[u8]) -> Result<Program> {
+        self.load_image(self.vm.prepare_elf(elf_bytes)?)
+    }
+}
+
 /// `func` with `sig`, as the extern table keeps a native function; fails on a null `func`.
 fn native(name: &str, func: *const (), sig: NativeSig) -> Result<Native> {
     if func.is_null() {
@@ -578,8 +715,8 @@ struct Mapping {
 }
 
 impl SharedRegions {
-    /// [`Vm::share_region`]; its contract binds the programs that map the buffer, not this call. Every program maps it
-    /// at the guest address `passthrough` gives it.
+    /// [`Vm::share_region`]; its contract binds the programs that map the buffer, not this call. The handle's base
+    /// is the buffer's guest address in a program of `passthrough`.
     fn add(&self, len: usize, perms: Perms, passthrough: Passthrough) -> Result<SharedRegion> {
         let _writer = lock(&self.writer);
         let list = self.list.get();
@@ -597,9 +734,8 @@ impl SharedRegions {
             buffer: buffer.clone(),
         };
         drop(self.list.replace(list.iter().cloned().chain([mapping]).collect()));
-        let base = passthrough.address(region, buffer.as_ptr());
         // SAFETY: the host's handle is the only `SharedRegion` over `buffer`.
-        Ok(unsafe { SharedRegion::new(base, perms, buffer) })
+        Ok(unsafe { SharedRegion::new(region, passthrough, perms, buffer) })
     }
 
     /// Map every shared region into `memory`.

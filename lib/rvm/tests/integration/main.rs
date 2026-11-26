@@ -14,4 +14,7 @@ mod mutations;
 mod natives;
 mod plugins;
 mod programs;
+// nor the natives a raw call reaches
+#[cfg(not(miri))]
+mod raw_calls;
 mod regions;

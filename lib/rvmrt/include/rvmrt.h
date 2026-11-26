@@ -26,7 +26,7 @@ typedef enum rvm_status {
     // no function with this name
     RVM_ERR_NOT_FOUND = 3,
     // more than 5 call arguments, a length that can't be mapped, no free region to map, an address that rvm_map
-    // didn't return, a name that isn't UTF-8, or an invalid rvm_native
+    // didn't return, a name that isn't UTF-8, or an invalid rvm_native or rvm_options
     RVM_ERR_ARGUMENT = 4,
     // the call ran more than the runtime's limit of 1,000,000 instructions (rvm's DEFAULT_INSTRUCTION_LIMIT); a
     // library built without its `fuel` feature has no limit
@@ -48,14 +48,15 @@ rvm_status rvm_load(const uint8_t *image, size_t len, rvm_program **program);
 //   its result in rax;
 // - never unwind: no C++ exception, SEH unwind or longjmp may leave it;
 // - stay loaded while any program loaded with it may call it, and be safe to run on several threads at once;
+// - leave the program that calls it alone: no rvmrt function may take that program during the call;
 // - stay sound for any argument values: the runtime checks only the pointers `kind` declares, so integer arguments
 //   and the bytes behind pointers are the guest's choice.
 // Before the call, each pointer argument is checked: the guest must be allowed to read the bytes (RVM_ARG_READ) or
 // read and write them (RVM_ARG_WRITE), one byte at the pointer or as many as its length argument holds. The function
 // then gets the host address of the bytes, and a failed check stops the guest's call with RVM_ERR_FAULT. Pointers
 // inside guest memory keep the guest's region tags and don't resolve in native code; pointers the function returns
-// don't resolve in the guest. Native time doesn't count against the instruction limit, and a native function can't
-// fail the guest's call.
+// don't resolve in the guest. RVM_UNTAGGED and RVM_RAW_POINTERS change both. Native time doesn't count against the
+// instruction limit, and a native function can't fail the guest's call.
 enum { RVM_ARG_INT = 0, RVM_ARG_READ = 1, RVM_ARG_WRITE = 2 };
 
 typedef struct rvm_native {
@@ -71,10 +72,37 @@ typedef struct rvm_native {
     uint8_t len_arg[5];
 } rvm_native;
 
-// rvm_load with the image's native imports bound to `natives`, `count` entries. Each import must name one of them
-// with the signature the image was linked against.
-rvm_status rvm_load_natives(const uint8_t *image, size_t len, const rvm_native *natives, size_t count,
-                            rvm_program **program);
+// What the guest of a program may do beyond the default, in which every memory access is checked against the memory
+// the runtime maps for the program and a call through a pointer reaches only the program's own functions. Each flag
+// makes the guest as trusted as native code for what it allows, and nothing checks what the guest then does:
+// - RVM_RAW_POINTERS: an address without a region tag, from 64 KiB up, is a host address, which the guest reads and
+//   writes directly. The guest's own memory stays checked. The host hands the guest such pointers as integers.
+// - RVM_UNTAGGED: every guest pointer is a plain host address, also into the guest's own memory, and no access is
+//   checked. Native functions get each argument as the register holds it, without the checks of rvm_native. rvm_map
+//   returns a host address. Includes RVM_RAW_POINTERS.
+// - RVM_RAW_CALLS: a call through a function pointer that holds an address without a region tag, from 64 KiB up,
+//   calls the native function there, with up to 5 arguments in the Windows x64 convention, the first four also in
+//   xmm0 to xmm3. Nothing validates the address, so the guest can call any code in the process with any arguments.
+//   The arguments pass as the registers hold them: a pointer into guest memory keeps its region tag unless the
+//   program is loaded with RVM_UNTAGGED or the guest strips the tag (UNTAG in rvm's bpf/rvm_bpf.h). The function
+//   must never unwind and must leave the calling program alone, as a native function of rvm_native must, and its
+//   time doesn't count against the instruction limit.
+enum { RVM_UNTAGGED = 1, RVM_RAW_POINTERS = 2, RVM_RAW_CALLS = 4 };
+
+typedef struct rvm_options {
+    // sizeof(rvm_options)
+    size_t size;
+    // the native functions the image imports, `native_count` entries; may be NULL when the count is 0. Each native
+    // import of the image must name one of them with the signature the image was linked against.
+    const rvm_native *natives;
+    size_t native_count;
+    // RVM_UNTAGGED, RVM_RAW_POINTERS and RVM_RAW_CALLS, or 0
+    uint32_t flags;
+} rvm_options;
+
+// rvm_load with `options`. RVM_ERR_ARGUMENT if `size` isn't the library's sizeof(rvm_options) or `flags` has a bit
+// the library doesn't know.
+rvm_status rvm_load_with(const uint8_t *image, size_t len, const rvm_options *options, rvm_program **program);
 
 // Frees a program from rvm_load; NULL is ignored.
 void rvm_free(rvm_program *program);

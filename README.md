@@ -130,7 +130,7 @@ Registration is unsafe: the native must take exactly the signature's arguments, 
 or `longjmp`), stay loaded while plugins may call it, be safe on any thread, and treat its integer arguments and the
 bytes behind its pointers as untrusted. Native time doesn't count against the instruction limit, a native can't fail
 the plugin call, and one that calls back into the same plugin gets `VmError::PluginBusy`. Use `register_extern` where
-you need any of those. `rvm_load_natives` does the same for the C library.
+you need any of those. `rvm_load_with` does the same for the C library.
 [`lib/rvm/examples/natives.rs`](lib/rvm/examples/natives.rs) calls natives on integers and buffers and follows a
 returned pointer.
 
@@ -307,6 +307,66 @@ keeps Rust's provenance rules satisfied. Host functions that take `GuestMemory` 
 pointers the plugin can use. [`lib/rvm/examples/passthrough.rs`](lib/rvm/examples/passthrough.rs) walks a host list
 through pointer fields and shows the faults of each mode.
 
+A `Loader` picks the mode for one plugin, and the VM's mode stays the default:
+
+```rust
+// SAFETY: this plugin may read and write any memory of this process
+let untagged = unsafe { Passthrough::untagged() };
+let trusted = vm.loader().passthrough(untagged).load_elf(&object)?;
+let checked = vm.load_elf(&other)?;
+```
+
+Plugins of different modes work in one VM. Calls between them, borrowed buffers and shared maps give each side
+addresses of its own mode. A pointer that a plugin stores in shared memory is an address of its own mode, so only
+plugins of the same mode can follow it, and `SharedRegion::base_for(mode)` is a shared region's address for a mode
+other than the VM's.
+
+### Function pointers to native code
+
+A plugin can call native code that it only holds a pointer to: a table of functions in a host struct, a callback it
+got as an argument, the result of a lookup. The host allows it with `RawCalls::on()`, for the VM in
+`VmConfig::raw_calls` or for one plugin:
+
+```c
+struct host_api {
+    u64 (*version)(void);
+    void (*log)(const char *text, u64 len);
+};
+
+u64 run(const struct host_api *api) {
+    api->log("hello", 5);
+    return api->version();
+}
+```
+
+```rust
+// SAFETY: the plugin is as trusted as native code; it reads `API` and calls the functions in it
+let (untagged, raw_calls) = unsafe { (Passthrough::untagged(), RawCalls::on()) };
+let mut plugin = vm.loader().passthrough(untagged).raw_calls(raw_calls).load_elf(&object)?;
+plugin.call("run", &[&raw const API as u64])?;
+```
+
+A call through a pointer that holds an address without a region tag, from 64 KiB up, then calls the function at that
+address in the Windows x64 convention, with up to five arguments, and the plugin gets what the function leaves in
+rax. The first four arguments also go to xmm0 to xmm3, where a function reads `float` and `double` parameters and a
+variadic function its copies. Pointers to the plugin's own functions and helper IDs below 64 KiB work as before.
+Without the switch, such a call fails with `ExecError::BadCodeAddress`, or with `ExecError::UnknownHelper` if the
+address fits 32 bits.
+
+Nothing declares what such a call passes, so each argument arrives as the register holds it, without a check or a
+conversion. A pointer into plugin memory keeps its region tag, which native code can't follow: load the plugin with
+`Passthrough::untagged()`, or strip the tag with `UNTAG(p)` from `rvm_bpf.h`. For an address that the plugin holds as
+a constant, use `NATIVE_AT(type, addr)` from the same header, because clang compiles a call through a constant
+address as a helper call and keeps only the low 32 bits of the address.
+
+The switch makes the plugin as trusted as native code, whatever its memory mode. It can call any address in the
+process with any arguments, nothing validates the target, and a call through a pointer that is no function runs
+whatever bytes are there. The function must not unwind, its time doesn't count against the instruction limit, and
+one that calls back into the plugin that called it gets `VmError::PluginBusy`. A call through a pointer costs about
+45 host instructions more than a call of a native function that the plugin declares as an `extern`, so declare the
+functions it calls often. [`lib/rvm/examples/vtable.rs`](lib/rvm/examples/vtable.rs) runs a plugin against a table
+of host functions.
+
 ### Prepared images
 
 A host does not need the ELF parser and linker at run time. `Vm::prepare_elf` links a plugin ahead of time, for
@@ -345,17 +405,32 @@ rvm_free(program);
 
 `rvm_func` looks a function up once and `rvm_call_func` calls it by index; `rvm_function_count` and
 `rvm_function_name` list the functions. The C library is smaller in scope than the Rust API. Its only host functions
-are the native functions passed to `rvm_load_natives`, and it has no maps, so images that import any other host
+are the native functions passed to `rvm_load_with`, and it has no maps, so images that import any other host
 function or declare a map fail to load. Each call is limited to 1,000,000
 instructions, unless the library is built with `--no-default-features`, which drops its `fuel` feature and the limit.
 A panic inside the library ends the process.
+
+`rvm_load_with` takes an `rvm_options`: the native functions, and the flags `RVM_RAW_POINTERS`, `RVM_UNTAGGED` and
+`RVM_RAW_CALLS` for `Passthrough::on()`, `Passthrough::untagged()` and `RawCalls::on()`, under the same contracts. A
+plugin loaded untagged and with raw calls takes a host struct as it is and calls the function pointers in it:
+
+```c
+static const struct host_api api = {version, log_line};
+
+rvm_options options = {.size = sizeof options, .flags = RVM_UNTAGGED | RVM_RAW_CALLS};
+if (rvm_load_with(image, image_len, &options, &program) != RVM_OK)
+    return 1;
+
+uint64_t args[1] = {(uint64_t)&api}, result;
+rvm_status status = rvm_call(program, "run", 3, args, 1, &result);
+```
 
 Built with `cargo build --profile embedded` in `lib/rvmrt`, on x86-64 Windows:
 
 | build | `rvmrt.dll` | added to a C host by `rvmrt.lib` |
 |---|---|---|
-| default | 119,296 bytes, 31 imports from 3 DLLs | 107,008 bytes, 8 imports |
-| without `fuel` | 97,280 bytes, 31 imports from 3 DLLs | 84,992 bytes, 8 imports |
+| default | 119,808 bytes, 31 imports from 3 DLLs | 107,520 bytes, 8 imports |
+| without `fuel` | 97,792 bytes, 31 imports from 3 DLLs | 85,504 bytes, 8 imports |
 
 The 8 imports of the static library are the process heap functions, `memcmp`, `memmove`, `GetCurrentProcess` and
 `TerminateProcess`. The build rebuilds the standard library for size, which needs the `rust-src` component.
@@ -391,7 +466,8 @@ length and read and write permissions. The interpreter checks every load and sto
 and stops the call with `ExecError::MemoryFault` when an access falls outside. Addresses without a tag are never mapped
 unless the host turns on raw host pointers, so null pointers fault. The code itself is outside guest memory: a plugin
 can't read or change it, and a jump, indirect call or jump table entry that leads outside the program's instructions
-stops the call. Calls nest at most 8 deep, with a 512-byte stack frame each by default (`VmConfig::frame_size`).
+stops the call, unless the host turns on raw calls, which let an indirect call reach native code. Calls nest at most
+8 deep, with a 512-byte stack frame each by default (`VmConfig::frame_size`).
 
 A plugin can reach only what the host gives it: the host functions it registers, the memory it maps, and the maps and
 regions it shares. Another plugin's memory is visible only through a borrowed buffer, for the duration of one call.
@@ -413,8 +489,8 @@ Limits of the model:
 - Host functions run with the host's full privileges. Their checks are your responsibility; `GuestMemory` only checks
   that a pointer is valid for the plugin.
 - rvm has no mitigations for side channels such as Spectre.
-- `VmMemory::map_host`, `Vm::share_map`, `Vm::share_region` and the raw host pointer modes are unsafe and depend on
-  their documented contracts.
+- `VmMemory::map_host`, `Vm::share_map`, `Vm::share_region`, the raw host pointer modes and raw calls are unsafe and
+  depend on their documented contracts. With raw host pointers or raw calls, a plugin is as trusted as native code.
 - A plugin's pointers hold host addresses, so a plugin learns the layout that address randomization hides.
 
 ## What plugins can use
@@ -497,8 +573,12 @@ that declares maps fails to load. `fixed-hash-seed` makes hash maps use a fixed 
   `VmError::PluginBusy`; load one program per thread to run them in parallel.
 - Native functions use the Windows x64 convention only and take integers and pointers only: no structs by value, no
   floats and no variadic functions. They run unmetered.
+- A call through a function pointer to native code has no signature. It passes five registers as they are: pointers
+  keep their region tags, a struct by value passes only if it is 1, 2, 4 or 8 bytes long, there is no sixth argument,
+  and a `float` or `double` result is lost. Nothing validates the target, and Control Flow Guard doesn't check the
+  call.
 - Images are tied to the rvm version that wrote them. Relink them when you update rvm.
-- The C library runs prepared images only, without host functions other than natives, maps or raw host pointers.
+- The C library runs prepared images only, without maps and without host functions other than natives.
 - rvm is not published on crates.io.
 
 ## Building and development
@@ -515,6 +595,7 @@ cargo run -p rvm --example core_reloc   # one plugin against two layouts of a ho
 cargo run -p rvm --example hello        # hand-assembled bytecode loaded as an Image, without ELF
 cargo run -p rvm --example passthrough  # a plugin that follows pointers in host structs, and the faults around them
 cargo run -p rvm --example natives      # native functions on integers and buffers, and a returned host pointer
+cargo run -p rvm --example vtable       # a plugin that calls the host through a table of function pointers
 ```
 
 The plugins under [`bpf/`](bpf) are checked in compiled, under `bpf/prebuilt/`, so cargo doesn't need clang. After you

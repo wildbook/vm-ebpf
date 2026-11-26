@@ -8,12 +8,18 @@
 //! dispatch needs afterwards are in registers the Windows x64 convention preserves (see
 //! [`Handler`](crate::dispatch::Handler)). It skips the windows check of other host calls, as a native function has
 //! no way to the memory of the run.
+//!
+//! A `callx` has no signature. Where its target is the address of a native function,
+//! [`Host::call_indirect`](crate::Host::call_indirect) calls it through a [`NativeCall`], which passes r1 to r5 in
+//! assembly: no Rust function pointer type fits a function whose argument count the caller doesn't know.
 
+use std::arch::global_asm;
 use std::mem::transmute;
 
 use crate::code::Slots;
 use crate::dispatch::{Handler, Spare, Table};
 use crate::fuel::Fuel;
+use crate::interp::StopRecord;
 use crate::slot::{Fields, Shape, Slot};
 use crate::transfer::Ip;
 use crate::{Context, Host, Interpreter, Memory, Reason};
@@ -256,3 +262,69 @@ unsafe fn call(func: NativeFn, n: usize, a: [u64; MAX_ARGS]) -> u64 {
         }
     }
 }
+
+/// What [`Host::call_indirect`](crate::Host::call_indirect) calls a native function with, where the target of a
+/// `callx` is the address of one.
+pub struct NativeCall<'a, E> {
+    stop: &'a mut StopRecord<E>,
+    /// The `callx`.
+    ip: Ip,
+}
+
+impl<'a, E> NativeCall<'a, E> {
+    pub(crate) fn new(stop: &'a mut StopRecord<E>, ip: Ip) -> Self {
+        Self { stop, ip }
+    }
+
+    /// Call the function at `func` with r1 to r5 of `regs` in the Windows x64 convention, the first four also in
+    /// xmm0 to xmm3, and return its rax. No signature says what the function takes, so nothing is checked or
+    /// converted.
+    ///
+    /// It first records the `callx` and `func` as the stop of the run. Nothing reads that record but a debugger,
+    /// which finds the guest instruction behind a call that crashed there: the stop that ends the run replaces it.
+    ///
+    /// # Safety
+    ///
+    /// `func` must be the address of a function of the Windows x64 convention that is sound to call with whatever
+    /// `regs` hold, and that never unwinds.
+    #[inline(always)]
+    pub unsafe fn call(self, func: u64, regs: &[u64; 16]) -> u64 {
+        self.stop.calling(self.ip, func);
+        // SAFETY: the caller's
+        unsafe { rvm_call_regs(func, regs) }
+    }
+}
+
+unsafe extern "win64" {
+    fn rvm_call_regs(func: u64, regs: &[u64; 16]) -> u64;
+}
+
+// rvm_call_regs(func, regs): func(regs[1], ..., regs[5]). The first four arguments go to xmm0 to xmm3 as well, where a
+// callee reads its float and double parameters, and where a variadic callee expects a copy of each register argument.
+// A callee ignores the arguments it doesn't take. The unwind directives let a debugger, a profiler and exception
+// dispatch walk from the callee through this frame.
+global_asm!(
+    ".globl rvm_call_regs",
+    ".def rvm_call_regs; .scl 2; .type 32; .endef",
+    ".seh_proc rvm_call_regs",
+    "rvm_call_regs:",
+    // the callee's home area and its fifth argument, on an aligned stack
+    "    sub rsp, 40",
+    "    .seh_stackalloc 40",
+    "    .seh_endprologue",
+    "    mov rax, rcx",
+    "    mov r10, [rdx + 40]",
+    "    mov rcx, [rdx + 8]",
+    "    mov r8, [rdx + 24]",
+    "    mov r9, [rdx + 32]",
+    "    mov rdx, [rdx + 16]",
+    "    mov [rsp + 32], r10",
+    "    movq xmm0, rcx",
+    "    movq xmm1, rdx",
+    "    movq xmm2, r8",
+    "    movq xmm3, r9",
+    "    call rax",
+    "    add rsp, 40",
+    "    ret",
+    "    .seh_endproc",
+);

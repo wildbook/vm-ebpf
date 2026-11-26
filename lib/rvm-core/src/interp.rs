@@ -240,12 +240,13 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
 }
 
 /// Where and why the chain of handlers stopped. The handler that ends the chain writes it, and the interpreter makes
-/// the [`Stop`] of the run from it.
+/// the [`Stop`] of the run from it. A `callx` of a native function writes it too, before the call.
 pub struct StopRecord<E> {
     /// The address of the slot it stopped at, or 0 if it stopped at `pc`.
     slot: usize,
     pc: u64,
-    /// [`Reason::Exit`] where no chain has stopped since the interpreter took the last one.
+    /// [`Reason::Exit`] where no chain has stopped since the interpreter took the last one, unless a `callx` called a
+    /// native function since.
     reason: Reason<E>,
 }
 
@@ -261,6 +262,13 @@ impl<E> StopRecord<E> {
     pub fn at(&mut self, ip: Ip, reason: Reason<E>) {
         core::hint::cold_path();
         (self.slot, self.reason) = (ip.addr(), reason);
+    }
+
+    /// Record the `callx` at `ip` that is about to call the native function at `target`. Only a debugger reads the
+    /// record, to find the guest instruction behind a call that crashed: the handler that ends the chain replaces it.
+    #[inline(always)]
+    pub fn calling(&mut self, ip: Ip, target: u64) {
+        (self.slot, self.reason) = (ip.addr(), Reason::CallIndirect(target));
     }
 
     /// Stop at `pc`, which may lie outside the code.

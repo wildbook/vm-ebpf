@@ -5,6 +5,7 @@ use crate::code::Slots;
 use crate::dispatch::{self, Spare, Table, SPARE};
 use crate::fuel::Fuel;
 use crate::host::Callee;
+use crate::native::NativeCall;
 use crate::opcode::{CALL, CALLX};
 use crate::slot::{Fields, Shape, Slot};
 use crate::step::{self, Regs, Step};
@@ -127,7 +128,8 @@ extern "rust-preserve-none" fn indirect_call<M: Memory, H: Host<M>, F: Fuel>(
     let target = ctx
         .regs
         .get(unsafe { ip.view(slot, const { Shape::of(CALLX) }) }.dst_reg());
-    let callee = interp.host.call_indirect(ctx, target);
+    let native = NativeCall::new(&mut interp.stop, ip);
+    let callee = interp.host.call_indirect(ctx, target, native);
     interp.windows.revalidate(ctx.memory);
     match callee {
         Some(Callee::Local(pc)) => {

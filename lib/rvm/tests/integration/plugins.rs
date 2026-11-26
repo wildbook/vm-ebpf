@@ -4,7 +4,10 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rvm::{HostError, Image, Import, LimitedCall, LinkError, Plugin, Program, ValueSpacing, Vm, VmError, WeakPlugin};
+use rvm::{
+    HostError, Image, Import, LimitedCall, LinkError, Passthrough, Plugin, Program, ValueSpacing, Vm, VmError,
+    WeakPlugin,
+};
 
 use crate::common::object;
 
@@ -317,6 +320,41 @@ fn borrowed_buffers() {
     let mut image = Image::from_code(code.to_vec());
     image.externs.push((2, Import::Name("sum".into())));
     assert_eq!(vm.load_image(image).unwrap().call("main", &[]).unwrap(), 0);
+}
+
+/// Plugins of different passthrough modes in one VM: each reaches a shared region at its own address and faults on
+/// the other's, and a borrowed buffer arrives at an address of the callee's mode.
+#[test]
+fn plugins_of_different_modes() {
+    // SAFETY: the untagged plugins read and write only the shared region, their own memory and the borrowed buffers
+    let untagged = unsafe { Passthrough::untagged() };
+
+    let vm = Vm::new();
+    // SAFETY: one thread
+    let shared = unsafe { vm.share_region(64, rvm::Perms::RW) }.unwrap();
+    let elf = object("tests/shared_region.o");
+    let mut checked = vm.load_elf(&elf).unwrap();
+    let mut raw = vm.loader().passthrough(untagged).load_elf(&elf).unwrap();
+    let (checked_addr, raw_addr) = (shared.base(), shared.base_for(untagged));
+
+    checked.call("put", &[checked_addr, 5]).unwrap();
+    assert_eq!(raw.call("get", &[raw_addr]).unwrap(), 5);
+    for (program, addr) in [(&mut checked, raw_addr), (&mut raw, checked_addr)] {
+        let err = program.call("get", &[addr]).unwrap_err();
+        assert!(matches!(err, VmError::Exec(rvm::ExecError::MemoryFault { .. })), "{err}");
+    }
+
+    for (callee_mode, caller_mode) in [(untagged, Passthrough::OFF), (Passthrough::OFF, untagged)] {
+        let vm = Vm::new();
+        let callee = vm.loader().passthrough(callee_mode);
+        let callee = Plugin::new("callee", callee.load_elf(&object("tests/borrow_callee.o")).unwrap());
+        for func in ["sum", "fill", "poke", "sum_keyed"] {
+            vm.export(&callee, func).unwrap();
+        }
+        let caller = vm.loader().passthrough(caller_mode);
+        let mut caller = caller.load_elf(&object("tests/borrow_caller.o")).unwrap();
+        assert_eq!(caller.call("run", &[]).unwrap(), 10_014);
+    }
 }
 
 /// A host function that panics during a call with a borrowed buffer leaves the buffer unmapped and both plugins

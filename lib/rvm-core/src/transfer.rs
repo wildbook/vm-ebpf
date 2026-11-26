@@ -296,7 +296,7 @@ fn run_moved<M: Memory, H: Host<M>>(
 mod tests {
     use super::*;
     use crate::opcode::{AluOpc, LD_IMM64};
-    use crate::{Callee, Code};
+    use crate::{Callee, Code, NativeCall};
 
     struct NoMem;
 
@@ -328,7 +328,7 @@ mod tests {
             None
         }
 
-        fn call_indirect(&mut self, _: &mut Context<NoMem>, _: u64) -> Option<Callee> {
+        fn call_indirect(&mut self, _: &mut Context<NoMem>, _: u64, _: NativeCall<'_, ()>) -> Option<Callee> {
             None
         }
     }

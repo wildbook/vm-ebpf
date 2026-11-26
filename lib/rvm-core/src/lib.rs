@@ -6,7 +6,7 @@
 //!
 //! ```
 //! use rvm_core::opcode::{AluOpc, JmpOpc, OpCode, Source};
-//! use rvm_core::{Callee, Code, Context, Host, Instruction, Interpreter, Memory, Reason};
+//! use rvm_core::{Callee, Code, Context, Host, Instruction, Interpreter, Memory, NativeCall, Reason};
 //!
 //! struct NoMemory;
 //!
@@ -39,7 +39,12 @@
 //!         None
 //!     }
 //!
-//!     fn call_indirect(&mut self, _ctx: &mut Context<NoMemory>, _target: u64) -> Option<Callee> {
+//!     fn call_indirect(
+//!         &mut self,
+//!         _ctx: &mut Context<NoMemory>,
+//!         _target: u64,
+//!         _native: NativeCall<'_, ()>,
+//!     ) -> Option<Callee> {
 //!         None
 //!     }
 //! }
@@ -141,4 +146,4 @@ pub use host::{Callee, Host};
 pub use instruction::Instruction;
 pub use interp::{Interpreter, Reason, Stop, MAX_CALL_DEPTH, METERED};
 pub use memory::{AtomicOp, Memory, Window};
-pub use native::{Native, NativeArg, NativeFn, NativeSig, MAX_ARGS as MAX_NATIVE_ARGS};
+pub use native::{Native, NativeArg, NativeCall, NativeFn, NativeSig, MAX_ARGS as MAX_NATIVE_ARGS};

@@ -58,4 +58,25 @@ static u64 (*bpf_ktime_get_ns)(void) = (void *)5;
 static long (*bpf_trace_printk)(const char *fmt, u32 fmt_size, ...) = (void *)6;
 static u32 (*bpf_get_prandom_u32)(void) = (void *)7;
 
+/*
+ * Calls through a function pointer to native code, which the host allows with RawCalls::on().
+ *
+ * NATIVE_AT(type, addr) is a function pointer of type `type` to the native code at `addr`, for an address the plugin
+ * holds as a constant. Clang compiles a call through a constant address as a helper call and keeps only the low 32
+ * bits of the address, so the macro moves the address through a register.
+ */
+#define NATIVE_AT(type, addr)             \
+    ({                                    \
+        u64 rvm_at_ = (u64)(addr);        \
+        asm volatile("" : "+r"(rvm_at_)); \
+        (type) rvm_at_;                   \
+    })
+
+/*
+ * The pointer `p` without its region tag: the host address of its byte, which native code can follow. A call through
+ * a function pointer passes each argument as the register holds it, so a plugin whose pointers carry tags strips
+ * the tag of a pointer argument. An untagged plugin needs no UNTAG: its pointers are host addresses.
+ */
+#define UNTAG(p) ((__typeof__(0 ? (p) : (p)))((u64)(p) & 0x03ffffffffffffffULL))
+
 #endif

@@ -2,11 +2,14 @@
 //!
 //! `include/rvmrt.h` declares these functions for C. Images come from `rvm::Vm::prepare_elf` and
 //! `rvm::Image::to_bytes`; the runtime has no helpers and no maps, only the native functions the host passes to
-//! [`rvm_load_natives`]. With the `fuel` feature it limits each call to `rvm::DEFAULT_INSTRUCTION_LIMIT` instructions.
+//! [`rvm_load_with`]. With the `fuel` feature it limits each call to `rvm::DEFAULT_INSTRUCTION_LIMIT` instructions.
 
 use std::slice;
 
-use rvm::{ExecError, Func, NativeArg, NativeSig, Perms, Program, Region, Vm, VmConfig, VmError, MAX_NATIVE_ARGS};
+use rvm::{
+    ExecError, Func, NativeArg, NativeSig, Passthrough, Perms, Program, RawCalls, Region, Vm, VmConfig, VmError,
+    MAX_NATIVE_ARGS,
+};
 
 /// The limit of each call; 0 is no limit.
 #[cfg(feature = "fuel")]
@@ -81,7 +84,13 @@ impl Status {
 /// `image` must point to `len` readable bytes, and `program` must be valid for writes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rvm_load(image: *const u8, len: usize, program: *mut *mut RvmProgram) -> Status {
-    unsafe { rvm_load_natives(image, len, std::ptr::null(), 0, program) }
+    let options = RvmOptions {
+        size: size_of::<RvmOptions>(),
+        natives: std::ptr::null(),
+        native_count: 0,
+        flags: 0,
+    };
+    unsafe { rvm_load_with(image, len, &options, program) }
 }
 
 /// A native function the image imports by name; `rvm_native` in the header.
@@ -98,31 +107,75 @@ pub struct RvmNative {
     pub len_arg: [u8; MAX_NATIVE_ARGS],
 }
 
-/// [`rvm_load`] with `natives` registered as `rvm::Vm::register_native` registers them.
+/// How [`rvm_load_with`] loads an image; `rvm_options` in the header.
+#[repr(C)]
+pub struct RvmOptions {
+    /// The caller's `sizeof(rvm_options)`, which tells the layouts of different library versions apart.
+    pub size: usize,
+    pub natives: *const RvmNative,
+    pub native_count: usize,
+    /// `RVM_UNTAGGED`, `RVM_RAW_POINTERS` and `RVM_RAW_CALLS`.
+    pub flags: u32,
+}
+
+/// `RVM_UNTAGGED`: `rvm::Passthrough::untagged`.
+const UNTAGGED: u32 = 1;
+/// `RVM_RAW_POINTERS`: `rvm::Passthrough::on`.
+const RAW_POINTERS: u32 = 2;
+/// `RVM_RAW_CALLS`: `rvm::RawCalls::on`.
+const RAW_CALLS: u32 = 4;
+
+/// [`rvm_load`] with `options`: its natives registered as `rvm::Vm::register_native` registers them, and the memory
+/// mode and raw calls its flags name.
 ///
 /// # Safety
 ///
-/// As [`rvm_load`]; `natives` must point to `count` entries, and each function must meet the contract of
-/// `rvm::Vm::register_native`.
+/// As [`rvm_load`]; `options` must point to an `rvm_options` whose `natives` point to `native_count` entries. Each
+/// function must meet the contract of `rvm::Vm::register_native`, and the host those of `rvm::Passthrough::on`,
+/// `rvm::Passthrough::untagged` and `rvm::RawCalls::on` for the flags it sets.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rvm_load_natives(
+pub unsafe extern "C" fn rvm_load_with(
     image: *const u8,
     len: usize,
-    natives: *const RvmNative,
-    count: usize,
+    options: *const RvmOptions,
     program: *mut *mut RvmProgram,
 ) -> Status {
+    // the size comes first in every layout, and says whether the rest is this one
+    if unsafe { options.cast::<usize>().read() } != size_of::<RvmOptions>() {
+        return Status::Argument;
+    }
+    let options = unsafe { &*options };
+    if options.flags & !(UNTAGGED | RAW_POINTERS | RAW_CALLS) != 0 {
+        return Status::Argument;
+    }
+
     let bytes = unsafe { slice_or_empty(image, len) };
-    let mut list = Vec::with_capacity(count);
-    for native in unsafe { slice_or_empty(natives, count) } {
+    let mut list = Vec::with_capacity(options.native_count);
+    for native in unsafe { slice_or_empty(options.natives, options.native_count) } {
         let name = unsafe { str_or_none(native.name, native.name_len) };
         let (Some(name), Some(sig)) = (name, native_sig(native)) else {
             return Status::Argument;
         };
         list.push((name, native.func, sig));
     }
+
+    // SAFETY: the caller's, for each flag
+    let (passthrough, raw_calls) = unsafe {
+        let passthrough = match options.flags {
+            flags if flags & UNTAGGED != 0 => Passthrough::untagged(),
+            flags if flags & RAW_POINTERS != 0 => Passthrough::on(),
+            _ => Passthrough::OFF,
+        };
+        let raw_calls = match options.flags & RAW_CALLS {
+            0 => RawCalls::OFF,
+            _ => RawCalls::on(),
+        };
+        (passthrough, raw_calls)
+    };
     let config = VmConfig {
         instruction_limit: INSTRUCTION_LIMIT,
+        passthrough,
+        raw_calls,
         ..VmConfig::default()
     };
     // SAFETY: the caller's

@@ -44,7 +44,8 @@
 //! | an [`Image`] | | [`Vm::load_image`] |
 //! | bytes from [`Image::to_bytes`] | [`Image::from_bytes`] | [`Vm::load_image_bytes`] |
 //!
-//! The ELF and module rows need the `link` feature.
+//! The ELF and module rows need the `link` feature. [`Vm::loader`] has the same four functions for a program that
+//! gets its own [`Passthrough`] mode or [`RawCalls`] switch.
 //!
 //! ## Components
 //!
@@ -126,4 +127,4 @@ pub use std_helpers::{
     BPF_FUNC_MAP_UPDATE_ELEM, BPF_FUNC_TRACE_PRINTK,
 };
 pub use sync::TryLockGuard;
-pub use vm::{Passthrough, Vm, VmConfig, DEFAULT_INSTRUCTION_LIMIT, DEFAULT_MEMORY_LIMIT};
+pub use vm::{Loader, Passthrough, RawCalls, Vm, VmConfig, DEFAULT_INSTRUCTION_LIMIT, DEFAULT_MEMORY_LIMIT};

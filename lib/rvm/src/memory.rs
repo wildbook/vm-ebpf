@@ -746,8 +746,8 @@ macro_rules! region_atomic {
     };
 }
 
-/// A buffer that [`Vm::share_region`](crate::Vm::share_region) maps at the same guest address into every program the
-/// VM links afterwards.
+/// A buffer that [`Vm::share_region`](crate::Vm::share_region) maps into every program the VM links afterwards, at
+/// the same guest address in each program of one [`Passthrough`] mode.
 ///
 /// The host reads and writes the buffer through this handle, at offsets from the region's start and regardless of the
 /// guest permissions. Accessors copy and never hand out references, so a host function may use them while guest code
@@ -761,24 +761,35 @@ macro_rules! region_atomic {
 /// reads such a value.
 #[derive(Debug)]
 pub struct SharedRegion {
+    region: usize,
     base: u64,
     perms: Perms,
     buffer: Arc<SharedBuffer>,
 }
 
 impl SharedRegion {
-    /// The host's handle on `buffer`, which every program maps at guest address `base`.
+    /// The host's handle on `buffer`, which every program maps as region `region`; `passthrough` is the VM's.
     ///
     /// # Safety
     ///
     /// While this handle is in use on one thread, no other `SharedRegion` over `buffer` may be used on another.
-    pub(crate) unsafe fn new(base: u64, perms: Perms, buffer: Arc<SharedBuffer>) -> Self {
-        Self { base, perms, buffer }
+    pub(crate) unsafe fn new(region: usize, passthrough: Passthrough, perms: Perms, buffer: Arc<SharedBuffer>) -> Self {
+        Self {
+            region,
+            base: passthrough.address(region, buffer.as_ptr()),
+            perms,
+            buffer,
+        }
     }
 
-    /// Guest address of the first byte.
+    /// Guest address of the first byte in a program of the VM's [`Passthrough`] mode.
     pub fn base(&self) -> u64 {
         self.base
+    }
+
+    /// Guest address of the first byte in a program loaded with `passthrough`.
+    pub fn base_for(&self, passthrough: Passthrough) -> u64 {
+        passthrough.address(self.region, self.buffer.as_ptr())
     }
 
     /// Guest permissions.
@@ -1143,9 +1154,8 @@ mod tests {
     #[test]
     fn shared_region_bounds_and_alignment() {
         let buffer = Arc::new(SharedBuffer::new(16).unwrap());
-        let base = Passthrough::OFF.address(5, buffer.as_ptr());
         // SAFETY: the only handle over the buffer.
-        let mut region = unsafe { SharedRegion::new(base, Perms::R, buffer) };
+        let mut region = unsafe { SharedRegion::new(5, Passthrough::OFF, Perms::R, buffer) };
         let base = region.base();
         let fault = |offset: u64, size| MemoryError {
             addr: base.wrapping_add(offset),

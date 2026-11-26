@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use rvm_core::{Callee, Code, Context, Host, Interpreter, Native, Reason, METERED};
+use rvm_core::{Callee, Code, Context, Host, Interpreter, Native, NativeCall, Reason, METERED};
 
 use crate::error::{ExecError, MemoryError, Result, VmError};
 use crate::helper::{CallerFuel, HelperRegistry, HostState, Stop};
@@ -10,7 +10,7 @@ use crate::image::INSN_SIZE;
 use crate::layout::CODE_REGION;
 #[cfg(feature = "maps")]
 use crate::maps::Maps;
-use crate::memory::{region_tag, VmMemory};
+use crate::memory::{region_tag, VmMemory, RAW_END, RAW_START};
 use crate::vm::VmConfig;
 
 /// Default stack bytes reserved per call frame (eBPF's `MAX_BPF_STACK`).
@@ -35,12 +35,14 @@ pub struct Executor {
 }
 
 impl Executor {
-    /// An executor whose calls start with r10 at `stack_top`, with the frame size and instruction limit of `config`.
+    /// An executor whose calls start with r10 at `stack_top`, with the frame size, instruction limit and raw calls of
+    /// `config`.
     pub fn new(helpers: HelperRegistry, stack_top: u64, config: &VmConfig) -> Self {
         let host = HostCalls {
             registry: helpers,
             state: HostState::default(),
             stop: None,
+            raw_calls: config.raw_calls.is_on(),
         };
         #[cfg_attr(not(feature = "fuel"), expect(unused_mut))]
         let mut executor = Self {
@@ -272,6 +274,8 @@ struct HostCalls {
     state: HostState,
     /// Why the host call that stopped the run did, until the executor takes it.
     stop: Option<Stop>,
+    /// Whether a `callx` through a raw address calls it: [`RawCalls::on`](crate::RawCalls::on).
+    raw_calls: bool,
 }
 
 impl HostCalls {
@@ -313,17 +317,35 @@ impl Host<VmMemory> for HostCalls {
         self.registry.call_slot(slot, ctx, &mut self.state, &mut self.stop)
     }
 
-    // A code address names a guest function, which the interpreter checks against the code. A helper's address is its
-    // ID, as in libbpf's `(void *)BPF_FUNC_*` helper declarations.
+    // A code address names a guest function, which the interpreter checks against the code. With raw calls, an
+    // address without a tag from 64 KiB up is a native function. A helper's address is its ID, as in libbpf's
+    // `(void *)BPF_FUNC_*` helper declarations.
     //
     // Always inline: the interpreter has one `callx` handler for metered runs and one for the others, and LLVM leaves
     // a function with two callers out of line, which costs every `callx` a call.
     #[inline(always)]
-    fn call_indirect(&mut self, ctx: &mut Context<VmMemory>, target: u64) -> Option<Callee> {
+    fn call_indirect(
+        &mut self,
+        ctx: &mut Context<VmMemory>,
+        target: u64,
+        native: NativeCall<'_, u64>,
+    ) -> Option<Callee> {
         if let Some(pc) = code_index(target) {
             return Some(Callee::Local(pc));
         }
-        let id = u32::try_from(target).ok()?;
+        // The helper IDs in use lie below 64 KiB, so this one test decides for them. Its other side is cold, so that
+        // the register allocator serves the helper call first.
+        if target >= RAW_START {
+            core::hint::cold_path();
+            if self.raw_calls && target < RAW_END {
+                // SAFETY: `RawCalls::on` leaves every target and its arguments to the host
+                return Some(Callee::Host(unsafe { native.call(target, &ctx.regs) }));
+            }
+            if target > u64::from(u32::MAX) {
+                return None;
+            }
+        }
+        let id = target as u32;
         let Some(slot) = self.registry.slot_of_id(id) else {
             self.stop = Some(Stop::UnknownHelper(id));
             return None;
