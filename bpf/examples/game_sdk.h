@@ -33,11 +33,14 @@ static inline s32 armor_of(struct entity *e) {
     return e->armor;
 }
 
-/* A char table, not a switch: clang can't emit a lookup table of string pointers for BPF. */
-static const char kind_names[][8] = {"hero", "goblin", "orc", "troll"};
-
 static inline const char *kind_name(u32 kind) {
-    return kind < sizeof(kind_names) / sizeof(kind_names[0]) ? kind_names[kind] : "?";
+    switch (kind) {
+    case HERO: return "hero";
+    case GOBLIN: return "goblin";
+    case ORC: return "orc";
+    case TROLL: return "troll";
+    }
+    return "?";
 }
 
 /* Host functions. */

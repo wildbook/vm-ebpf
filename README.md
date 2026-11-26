@@ -22,7 +22,7 @@ u64 run(u64 x) {
 ```
 
 ```bash
-clang -target bpf -mcpu=v4 -O2 -g -c plugin.c -o plugin.o
+clang -target bpf -mcpu=v4 -O2 -g -fno-slp-vectorize -c plugin.c -o plugin.o
 ```
 
 A host that loads it:
@@ -49,13 +49,25 @@ rvm needs nightly Rust; [`rust-toolchain.toml`](rust-toolchain.toml) pins the ch
 
 ### Plugins are C compiled by clang
 
-Plugins are relocatable eBPF ELF objects as `clang -target bpf -mcpu=v4 -O2 -g` writes them; the objects in this
-repository are built with clang 22. No custom toolchain, SDK build or post-processing step is needed. A plugin can
-have globals (`.data`, `.bss`, `.rodata`), static functions, function pointers, `switch` statements that clang turns
-into jump tables, and libbpf style maps. Its non-static functions are the ones the host can call, by name. `-g` emits
-the BTF that maps, CO-RE and borrowed buffers need, and lets the linker check the argument count of each host
-function. [`bpf/rvm_bpf.h`](bpf/rvm_bpf.h) has the integer types, the map declaration macros, the borrow tags and the
-built-in helpers; the plugins under [`bpf/examples/`](bpf/examples) use it.
+Plugins are relocatable eBPF ELF objects as `clang -target bpf -mcpu=v4 -O2 -g -fno-slp-vectorize` writes them. rvm
+needs clang 23.1.6 or newer and follows its calling convention; the objects in this repository are built with clang
+23.1.6. No custom toolchain, SDK build or post-processing step is needed. A plugin can have globals (`.data`, `.bss`,
+`.rodata`), static functions, function pointers, `switch` statements that clang turns into jump tables, and libbpf
+style maps. Its non-static functions are the ones the host can call, by name. `-g` emits the BTF that maps, CO-RE
+and borrowed buffers need, and lets the linker check the registers of each host function.
+[`bpf/rvm_bpf.h`](bpf/rvm_bpf.h) has the integer types, the map declaration macros, the borrow tags and the built-in
+helpers; the plugins under [`bpf/examples/`](bpf/examples) use it.
+
+About the compiler:
+
+- Clang 22 and older return small structs by another convention, so rvm fails the load of their objects with
+  `LinkError::UnsupportedCompiler`. It reads the compiler from the debug strings that `-g` writes. An object stripped
+  of them says nothing of its compiler and loads. `rvm_bpf.h` stops the compilation under an older clang.
+- `-fno-slp-vectorize` avoids a crash of clang 23.1 in BPF instruction selection (`BPF DAG->DAG Pattern Instruction
+  Selection`), on a signed vector division that its SLP vectorizer forms from scalar divisions. The BPF target has
+  no vector instructions, so the flag loses nothing.
+- Clang 23 compiles calls with more than five arguments, which rvm does not run yet; see
+  [What plugins can use](#what-plugins-can-use).
 
 ### Host functions
 
@@ -76,16 +88,31 @@ vm.register_extern_with_memory("print", |mem, (msg, len): (u64, u64)| {
 });
 ```
 
-A host function takes `()`, one integer, or a tuple of up to five `u64`, and returns `()`, an integer, `bool` or a
-`Result` of one. The `_with_memory` variants also get the calling plugin's memory. Every read and write through it
-copies, needs the same permissions as the plugin's own loads and stores, and returns a `MemoryError` for a pointer the
-plugin could not use itself. An `Err` from a host function fails the plugin call with `HostError::Failed`. To give the
-plugin an error code instead, return it as an integer.
+A host function takes `()`, one integer, or a tuple of up to five `u64`, and returns `()`, an integer, `bool`, a
+`(u64, u64)` or a `Result` of one of these. The `_with_memory` variants also get the calling plugin's memory. Every
+read and write through it copies, needs the same permissions as the plugin's own loads and stores, and returns a
+`MemoryError` for a pointer the plugin could not use itself. An `Err` from a host function fails the plugin call with
+`HostError::Failed`. To give the plugin an error code instead, return it as an integer.
 
-Loading fails when a plugin uses a name or helper ID that the host has not registered, or when the C declaration of
-an extern passes a different number of registers than the host function takes: a struct of 9 to 16 bytes passes two,
-and a struct return passes the result's address first. A missing host function is a load error, not a crash in the
-middle of a call. Registering a function again replaces it, also for plugins loaded earlier, from their next call.
+A struct or union that the C declaration passes or returns by value travels in registers, as clang 23 lays it out,
+and the host function takes and returns those registers:
+
+| C type | as a parameter | as the result |
+|---|---|---|
+| integer, enum, pointer, struct of up to 8 bytes | one argument, the first byte in the lowest bits | r0: the function returns an integer |
+| struct of 9 to 16 bytes, `__int128` | two arguments, bytes 0 to 7 first | r0 and r2: the function returns `(u64, u64)`, bytes 0 to 7 first |
+| struct of more than 16 bytes | clang rejects the call | memory: the plugin passes the address for the result as the first argument, ahead of the parameters |
+| empty struct | no argument | nothing |
+
+```rust
+// C: struct size { u64 width, height; };  extern struct size window_size(u64 window);
+vm.register_extern("window_size", |window: u64| (800u64, 600u64));
+```
+
+Loading fails when a plugin uses a name or helper ID that the host has not registered, when the C declaration of an
+extern passes a different number of registers than the host function takes, and when one of the two returns in r0
+and r2 and the other in r0 alone. A missing host function is a load error, not a crash in the middle of a call.
+Registering a function again replaces it, also for plugins loaded earlier, from their next call.
 
 The host decides what a plugin can reach. The only built-in helpers are the map helpers. `Vm::enable_time`,
 `Vm::enable_random` and `Vm::enable_print` add `bpf_ktime_get_ns`, `bpf_get_prandom_u32` and `bpf_trace_printk`.
@@ -116,11 +143,13 @@ unsafe { vm.register_native("checksum", checksum as *const (), CHECKSUM)? };
 ```
 
 Loading checks the plugin's declaration against the signature: the same number of arguments, pointers in the same
-places, and a `BORROW` tag, where there is one, on the same length argument. A prepared image records the signature
-and loads only where the native has the same one. Before each call, rvm checks every pointer the signature declares
-against the plugin's memory, one byte or as many as its length argument says, with the plugin's read or write
-permission, and the native gets the host address of the bytes. A bad pointer stops the plugin call with
-`ExecError::MemoryFault`. With `Passthrough::untagged()` arguments arrive unchanged and unchecked.
+places, and a `BORROW` tag, where there is one, on the same length argument. The declaration may return nothing, an
+integer, a pointer, or a struct of 1, 2, 4 or 8 bytes, which the Windows x64 convention returns in rax; loading fails
+for a struct of another size, which that convention returns through a pointer. A prepared image records the
+signature and loads only where the native has the same one. Before each call, rvm checks every pointer the
+signature declares against the plugin's memory, one byte or as many as its length argument says, with the plugin's
+read or write permission, and the native gets the host address of the bytes. A bad pointer stops the plugin call
+with `ExecError::MemoryFault`. With `Passthrough::untagged()` arguments arrive unchanged and unchecked.
 
 Pointers stored inside plugin memory, such as the fields of a struct the plugin fills, keep the plugin's region tag,
 and native code can't follow them; such APIs need `Passthrough::untagged()`. A pointer that a native returns is a
@@ -191,6 +220,11 @@ assert_eq!(score.call(&[])?, 6);
 A plugin runs one call at a time. A call into a plugin that is already running, from another thread or from a chain of
 calls that comes back to it, fails with `VmError::PluginBusy` instead of blocking. When the call came through another
 plugin's import, the error reaches the host as `HostError::Plugin`, which names the export.
+
+The caller of an exported function gets r0, which holds a result of up to 8 bytes, and so does the host from
+`call`. A plugin that declares an import with a struct of 9 to 16 bytes as the result fails to load. A struct of
+more than 16 bytes comes back through a pointer into the caller's memory, which the callee can follow only if both
+plugins are loaded untagged.
 
 ### Maps and shared memory
 
@@ -429,8 +463,8 @@ Built with `cargo build --profile embedded` in `lib/rvmrt`, on x86-64 Windows:
 
 | build | `rvmrt.dll` | added to a C host by `rvmrt.lib` |
 |---|---|---|
-| default | 119,808 bytes, 31 imports from 3 DLLs | 107,520 bytes, 8 imports |
-| without `fuel` | 97,792 bytes, 31 imports from 3 DLLs | 85,504 bytes, 8 imports |
+| default | 120,320 bytes, 31 imports from 3 DLLs | 108,032 bytes, 8 imports |
+| without `fuel` | 98,304 bytes, 31 imports from 3 DLLs | 86,016 bytes, 8 imports |
 
 The 8 imports of the static library are the process heap functions, `memcmp`, `memmove`, `GetCurrentProcess` and
 `TerminateProcess`. The build rebuilds the standard library for size, which needs the `rust-src` component.
@@ -501,14 +535,23 @@ rvm implements the eBPF instruction set of [RFC 9669](https://www.rfc-editor.org
 
 - Load-acquire and store-release (Linux 6.15).
 - Function pointers (`callx`). A pointer can also be a helper ID, as in libbpf's `(void *)BPF_FUNC_*` declarations.
-- Jump tables (`gotox`), which clang 22 emits for dense `switch` statements.
+- Jump tables (`gotox`), which clang emits for dense `switch` statements.
 - `may_goto` (libbpf's `can_loop`). It never jumps; use the instruction limit to bound loops.
 
 Not supported: the legacy packet loads (`BPF_ABS`, `BPF_IND`), kfunc calls by BTF ID, and map types other than array
 and hash.
 
-The eBPF calling convention applies to plugins too: functions take at most five arguments, all integers or pointers,
-and return one. eBPF has no floating point instructions. clang rejects code that breaks either rule.
+The eBPF calling convention applies to plugins too: a call passes at most five argument registers, each an integer, a
+pointer or half of a small struct, and returns up to 16 bytes. eBPF has no floating point instructions, and clang
+rejects code that needs them.
+
+Clang 23 compiles a call that needs more than five registers and passes the rest on the stack, through r11, also
+between the functions of one plugin. rvm does not support stack arguments yet: such an object fails to load with
+`LinkError::StackArguments`, or with `LinkError::TooManyRegisters` where the callee is a host function. Pass a pointer
+to a struct instead. Clang 23.1 also miscompiles these calls between BPF functions: with `-mcpu=v3` or `v4`, it
+stores a `char`, `short` or `int` argument past the fifth register without extending it, and the callee reads all
+64 bits. The fix, [llvm/llvm-project#238315](https://github.com/llvm/llvm-project/commit/0fdfbb6f05), is on LLVM's
+main branch and in no 23.x release.
 
 ## Performance
 
@@ -567,16 +610,19 @@ that declares maps fails to load. `fixed-hash-seed` makes hash maps use a fixed 
 - rvm is an interpreter. Compute-bound plugins run about 15 to 30 times slower than native code; there is no JIT.
 - rvm is developed and measured on x86-64 Windows only.
 - It needs nightly Rust.
-- Plugins are limited by eBPF: five integer arguments per function, no floating point, a 512-byte stack frame and 8
+- Plugins are limited by eBPF: five argument registers per call, no floating point, a 512-byte stack frame and 8
   nested calls.
 - A plugin runs one call at a time. Calls from several threads into the same plugin fail with
   `VmError::PluginBusy`; load one program per thread to run them in parallel.
-- Native functions use the Windows x64 convention only and take integers and pointers only: no structs by value, no
-  floats and no variadic functions. They run unmetered.
+- A struct of 9 to 16 bytes comes back in two registers, which only a host function from `register_extern` returns.
+  Native functions, the functions that plugins export and calls from the host carry r0.
+- Native functions use the Windows x64 convention only. They take integers and pointers and return integers,
+  pointers and structs of 1, 2, 4 or 8 bytes: no struct parameters, no floats and no variadic functions. They run
+  unmetered.
 - A call through a function pointer to native code has no signature. It passes five registers as they are: pointers
-  keep their region tags, a struct by value passes only if it is 1, 2, 4 or 8 bytes long, there is no sixth argument,
-  and a `float` or `double` result is lost. Nothing validates the target, and Control Flow Guard doesn't check the
-  call.
+  keep their region tags, a struct by value passes and comes back only if it is 1, 2, 4 or 8 bytes long, there is no
+  sixth argument, and a `float` or `double` result is lost. Nothing validates the target, and Control Flow Guard
+  doesn't check the call.
 - Images are tied to the rvm version that wrote them. Relink them when you update rvm.
 - The C library runs prepared images only, without maps and without host functions other than natives.
 - rvm is not published on crates.io.
@@ -599,14 +645,18 @@ cargo run -p rvm --example vtable       # a plugin that calls the host through a
 ```
 
 The plugins under [`bpf/`](bpf) are checked in compiled, under `bpf/prebuilt/`, so cargo doesn't need clang. After you
-change a C source or header, rebuild them with clang, Ninja and CMake 3.21 or later:
+change a C source or header, rebuild them with clang 23.1.6 or newer, Ninja and CMake 3.21 or later. `BPF_CLANG`
+names a clang other than the one on `PATH`:
 
 ```bash
-cmake --preset bpf && cmake --build --preset bpf
+cmake --preset bpf -DBPF_CLANG="C:/Program Files/LLVM/bin/clang.exe"
+cmake --build --preset bpf
 cmake --build --preset update-prebuilt   # copies the objects into bpf/prebuilt/
 ```
 
-`cargo test` fails when the sources changed and the objects were not rebuilt.
+The configuration fails for an older clang. A build directory keeps the compiler of its first configuration, so
+after you install or name another one, configure with `cmake --fresh --preset bpf`. `cargo test` fails when the
+sources or the CMake files changed and the objects were not rebuilt.
 
 The crates:
 

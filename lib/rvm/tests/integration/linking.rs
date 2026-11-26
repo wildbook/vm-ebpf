@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use constelf::raw::{shf, sht, Elf64Ehdr, Elf64Rel, Elf64Shdr, Elf64Sym};
 use constelf::{ElfFile, ElfRelocs};
-use rvm::{LinkError, Module, Vm, VmConfig, VmError, DEFAULT_MEMORY_LIMIT};
+use rvm::{LinkError, Module, NativeSig, Vm, VmConfig, VmError, DEFAULT_MEMORY_LIMIT};
 
 use crate::common::object;
 
@@ -78,58 +78,73 @@ struct Shape {
     name: &'static str,
     params: u8,
     registers: u8,
-    /// Values from r1 on, or from r2 on when r1 is the hidden pointer to the struct a call returns.
+    /// Values from r1 on, or from r2 on where r1 is the result pointer of [`Returns::Pointer`].
     args: &'static [u64],
-    returns_struct: bool,
+    returns: Returns,
 }
+
+/// Where the result of an extern comes back.
+#[derive(Clone, Copy, PartialEq)]
+enum Returns {
+    /// In r0, or nowhere.
+    R0,
+    /// A struct or union of 9 to 16 bytes, in r0 and r2.
+    R0R2,
+    /// A larger struct, in the caller's memory, through a pointer in r1 ahead of the arguments.
+    Pointer,
+}
+
+const fn shape(name: &'static str, params: u8, registers: u8, args: &'static [u64]) -> Shape {
+    Shape {
+        object: "tests/struct_args.o",
+        name,
+        params,
+        registers,
+        args,
+        returns: Returns::R0,
+    }
+}
+
+const fn returning(returns: Returns, name: &'static str, params: u8, registers: u8) -> Shape {
+    Shape {
+        returns,
+        ..shape(name, params, registers, &[1])
+    }
+}
+
+const SHAPES: [Shape; 12] = [
+    shape("scalars", 3, 3, &[1, 2, 0]),
+    // a 3-byte struct packed into r1
+    shape("s3_arg", 2, 2, &[0x03_0201, 4]),
+    shape("s8_arg", 2, 2, &[0x2_0000_0001, 3]),
+    // bytes 0 to 7 in r1, 8 to 11 in r2
+    shape("s12_arg", 2, 3, &[0x2_0000_0001, 3, 4]),
+    shape("s16_arg", 2, 3, &[1, 2, 3]),
+    shape("pair_arg", 2, 3, &[1, 2, 3]),
+    shape("two_s16", 3, 5, &[1, 2, 3, 4, 5]),
+    returning(Returns::R0, "s8_ret", 1, 1),
+    returning(Returns::R0R2, "s12_ret", 1, 1),
+    returning(Returns::R0R2, "pair_ret", 1, 1),
+    returning(Returns::Pointer, "s24_ret", 1, 2),
+    Shape {
+        object: "tests/struct_args_six.o",
+        ..shape("six", 4, 6, &[])
+    },
+];
 
 /// Linking compares the argument registers an extern takes with the host function's arguments, not its BTF
 /// parameters, and the host function gets those registers.
 #[test]
 fn struct_shapes_count_registers() {
-    const fn shape(name: &'static str, params: u8, registers: u8, args: &'static [u64]) -> Shape {
-        Shape {
-            object: "tests/struct_args.o",
-            name,
-            params,
-            registers,
-            args,
-            returns_struct: false,
-        }
-    }
-    const fn returning(name: &'static str, params: u8, registers: u8, args: &'static [u64]) -> Shape {
-        Shape {
-            returns_struct: true,
-            ..shape(name, params, registers, args)
-        }
-    }
-    let shapes = [
-        shape("scalars", 3, 3, &[1, 2, 0]),
-        // a 3-byte struct packed into r1
-        shape("s3_arg", 2, 2, &[0x03_0201, 4]),
-        shape("s8_arg", 2, 2, &[0x2_0000_0001, 3]),
-        // bytes 0 to 7 in r1, 8 to 11 in r2
-        shape("s12_arg", 2, 3, &[0x2_0000_0001, 3, 4]),
-        shape("s16_arg", 2, 3, &[1, 2, 3]),
-        shape("pair_arg", 2, 3, &[1, 2, 3]),
-        shape("two_s16", 3, 5, &[1, 2, 3, 4, 5]),
-        returning("s8_ret", 1, 2, &[1]),
-        returning("s24_ret", 1, 2, &[1]),
-        Shape {
-            object: "tests/struct_args_six.o",
-            ..shape("six", 4, 6, &[])
-        },
-    ];
-
-    for shape in &shapes {
+    for shape in &SHAPES {
         let module = Module::from_elf(&object(shape.object)).unwrap();
         for arity in [shape.params, shape.registers.min(5)] {
             let vm = Vm::new();
             let seen = Arc::new(Mutex::new(Vec::new()));
-            for other in shapes.iter().filter(|s| s.object == shape.object) {
-                register_recording(&vm, other.name, other.registers.min(5), &seen);
+            for other in SHAPES.iter().filter(|s| s.object == shape.object) {
+                register_recording(&vm, other, other.registers.min(5), &seen);
             }
-            register_recording(&vm, shape.name, arity, &seen);
+            register_recording(&vm, shape, arity, &seen);
             let linked = vm.load_modules(&[&module]);
             let context = format!("{} with {arity} host arguments", shape.name);
 
@@ -152,25 +167,112 @@ fn struct_shapes_count_registers() {
                 let mut program = linked.unwrap_or_else(|e| panic!("{context}: {e}"));
                 program.call(&format!("call_{}", shape.name), &[]).unwrap();
                 let seen = seen.lock().unwrap();
-                let args = &seen[usize::from(shape.returns_struct)..];
+                let args = &seen[usize::from(shape.returns == Returns::Pointer)..];
                 assert_eq!(args, shape.args, "{context}");
             }
         }
     }
 }
 
-/// Register `name` as an extern of `arity` arguments that stores them in `seen`.
-fn register_recording(vm: &Vm, name: &str, arity: u8, seen: &Arc<Mutex<Vec<u64>>>) {
+/// Register the extern of `shape` with `arity` arguments, which it stores in `seen`. It returns zeros in the
+/// registers the shape's result takes.
+fn register_recording(vm: &Vm, shape: &Shape, arity: u8, seen: &Arc<Mutex<Vec<u64>>>) {
     let seen = seen.clone();
     let record = move |args: &[u64]| *seen.lock().unwrap() = args.to_vec();
-    match arity {
-        1 => vm.register_extern(name, move |a: u64| record(&[a])),
-        2 => vm.register_extern(name, move |(a, b): (u64, u64)| record(&[a, b])),
-        3 => vm.register_extern(name, move |(a, b, c): (u64, u64, u64)| record(&[a, b, c])),
-        4 => vm.register_extern(name, move |(a, b, c, d): (u64, u64, u64, u64)| record(&[a, b, c, d])),
-        5 => vm.register_extern(name, move |(a, b, c, d, e): (u64, u64, u64, u64, u64)| record(&[a, b, c, d, e])),
+    let name = shape.name;
+    match (arity, shape.returns) {
+        (1, Returns::R0R2) => vm.register_extern(name, move |a: u64| {
+            record(&[a]);
+            (0, 0)
+        }),
+        (1, _) => vm.register_extern(name, move |a: u64| record(&[a])),
+        (2, _) => vm.register_extern(name, move |(a, b): (u64, u64)| record(&[a, b])),
+        (3, _) => vm.register_extern(name, move |(a, b, c): (u64, u64, u64)| record(&[a, b, c])),
+        (4, _) => vm.register_extern(name, move |(a, b, c, d): (u64, u64, u64, u64)| record(&[a, b, c, d])),
+        (5, _) => vm.register_extern(name, move |(a, b, c, d, e): (u64, u64, u64, u64, u64)| record(&[a, b, c, d, e])),
         _ => unreachable!("arity {arity}"),
     }
+}
+
+/// A VM with every extern of `tests/struct_args.o`. Those that return a struct take 1 and return it with 1, 2 and
+/// 3 in its fields.
+fn struct_args_vm() -> Vm {
+    let vm = Vm::new();
+    let seen = Arc::default();
+    for shape in SHAPES.iter().filter(|s| s.object == "tests/struct_args.o") {
+        register_recording(&vm, shape, shape.registers, &seen);
+    }
+    // struct s8 { u32 a, b; }
+    vm.register_extern("s8_ret", |x: u64| x | 2 << 32);
+    // struct s12 { u32 a, b, c; }
+    vm.register_extern("s12_ret", |x: u64| (x | 2 << 32, 3));
+    // union pair { u64 a[2]; u32 b; }
+    vm.register_extern("pair_ret", |x: u64| (x, 2));
+    // struct s24 { u64 a, b, c; }
+    vm.register_extern_with_memory("s24_ret", |memory, (result, x): (u64, u64)| {
+        memory.write(result, x)?;
+        memory.write(result + 8, 2u64)?;
+        memory.write(result + 16, 3u64)
+    });
+    vm
+}
+
+/// A host function returns a struct of up to 8 bytes as an integer, one of 9 to 16 bytes as a pair for r0 and r2,
+/// and a larger one through the result pointer. A host function for one register where the extern takes two, or
+/// the reverse, fails the link.
+#[test]
+fn struct_results_come_back_by_size() {
+    let module = Module::from_elf(&object("tests/struct_args.o")).unwrap();
+    let mut program = struct_args_vm().load_modules(&[&module]).unwrap();
+    // one decimal digit per field, the first field lowest
+    for (func, fields) in [
+        ("call_s8_ret", 21),
+        ("call_s12_ret", 321),
+        ("call_pair_ret", 21),
+        ("call_s24_ret", 321),
+    ] {
+        assert_eq!(program.call(func, &[]).unwrap(), fields, "{func}");
+    }
+
+    let mismatch = |vm: Vm, name: &str, wide| {
+        let err = vm.load_modules(&[&module]).err().unwrap();
+        let name = name.into();
+        let expected = LinkError::ReturnMismatch { name, wide };
+        assert!(matches!(&err, VmError::Link(e) if *e == expected), "{err}");
+    };
+    let vm = struct_args_vm();
+    vm.register_extern("s12_ret", |x: u64| x);
+    mismatch(vm, "s12_ret", true);
+    let vm = struct_args_vm();
+    vm.register_extern("s8_ret", |x: u64| (x, 0));
+    mismatch(vm, "s8_ret", false);
+}
+
+/// A native function returns a struct of 8 bytes in rax, where the guest takes it from r0. The Windows x64 convention
+/// returns one of 12 bytes through a pointer, so that extern fails the link.
+#[test]
+fn native_struct_results() {
+    #[repr(C)]
+    struct S8 {
+        a: u32,
+        b: u32,
+    }
+    extern "win64" fn s8_ret(x: u64) -> S8 {
+        S8 { a: x as u32, b: 2 }
+    }
+    let module = Module::from_elf(&object("tests/struct_args.o")).unwrap();
+    let native = |name: &str| {
+        let vm = struct_args_vm();
+        // SAFETY: `s8_ret` takes one integer. The link fails for the other name, so nothing calls it by that name.
+        unsafe { vm.register_native(name, s8_ret as *const (), NativeSig::ints(1)) }.unwrap();
+        vm.load_modules(&[&module])
+    };
+
+    let mut program = native("s8_ret").unwrap();
+    assert_eq!(program.call("call_s8_ret", &[]).unwrap(), 21);
+
+    let err = native("s12_ret").err().unwrap();
+    assert!(matches!(&err, VmError::Link(LinkError::NativeMismatch { name, .. }) if name == "s12_ret"), "{err}");
 }
 
 /// Linking inside `with_types` fails instead of deadlocking on the types the closure holds.

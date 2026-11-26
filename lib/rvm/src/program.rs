@@ -34,8 +34,8 @@ pub struct FunctionInfo {
 /// length in bytes. The callee sees the buffer at offset 0 of its own region, and a callee atomic at offset `o` counts
 /// as aligned when the caller's address plus `o` is, since both name the same bytes.
 ///
-/// Both fields are argument registers, not parameter indices: after a struct return or a struct parameter of 9 to 16
-/// bytes, a parameter sits in a later register than its index.
+/// Both fields are argument registers, not parameter indices: after the result pointer of a returned struct of more
+/// than 16 bytes or a struct parameter of 9 to 16 bytes, a parameter sits in a later register than its index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Borrow {
     /// Register of the pointer parameter, 0 for r1.
@@ -178,7 +178,7 @@ impl Program {
         Some(&self.functions.list.get(index)?.1)
     }
 
-    /// Call a function by name; arguments go in r1-r5.
+    /// Call a function by name; arguments go in r1-r5. Returns r0, which holds a result of up to 8 bytes.
     #[inline]
     pub fn call(&mut self, name: &str, args: &[u64]) -> Result<u64> {
         let pc = self.func(name)?.pc;

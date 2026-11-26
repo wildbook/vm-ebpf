@@ -309,8 +309,12 @@ impl Vm {
     /// link.
     ///
     /// Each argument is one register, and linking checks their number against the extern's BTF. A struct of up to 8
-    /// bytes arrives in one register and one of 9 to 16 bytes in two, little endian; a function that returns a
-    /// struct gets the guest address to write it to first, which needs
+    /// bytes arrives in one register and one of 9 to 16 bytes in two, little endian.
+    ///
+    /// The result follows clang 23. Up to 8 bytes come back in r0, so `func` returns a struct of that size as an
+    /// integer. A struct of 9 to 16 bytes comes back in r0 and r2, so `func` returns `(u64, u64)`, bytes 0 to 7
+    /// first, and linking fails for a function that returns one register where the extern takes two, or the reverse.
+    /// For a larger struct the guest passes the address to write it to as the first argument, which needs
     /// [`register_extern_with_memory`](Self::register_extern_with_memory).
     ///
     /// # Example
@@ -359,10 +363,12 @@ impl Vm {
     ///
     /// Linking checks the extern's BTF against `sig`: the same number of argument registers, integers or enums where
     /// `sig` has integers and pointers where it has pointers, nothing else, and on a pointer that a `BORROW` or
-    /// `BORROW_RO` tag marks, the same length argument and access. An image records `sig`, and loading it checks
-    /// `sig` against the loading VM's. Registering a name again replaces the function, which programs linked earlier
-    /// call from their next call on; it fails with [`VmError::InvalidArgument`] if `sig` differs, as it does for a null
-    /// `func`. A name with both a native and a host function binds to the native.
+    /// `BORROW_RO` tag marks, the same length argument and access. The extern may return nothing, an integer, a
+    /// pointer, or a struct of 1, 2, 4 or 8 bytes, which the convention returns in rax; every other struct fails to
+    /// link. An image records `sig`, and loading it checks `sig` against the loading VM's. Registering a name again
+    /// replaces the function, which programs linked earlier call from their next call on; it fails with
+    /// [`VmError::InvalidArgument`] if `sig` differs, as it does for a null `func`. A name with both a native and a
+    /// host function binds to the native.
     ///
     /// Pointer arguments: unless the program's [`Passthrough`] is `untagged`, a call checks each pointer that `sig`
     /// declares before it calls `func`. The guest must be allowed to read the bytes, and for [`NativeArg::Write`](crate::NativeArg::Write) to
@@ -521,7 +527,8 @@ impl Vm {
     /// Publish `func` from `plugin` as an extern of the same name.
     ///
     /// Programs linked afterwards can import it; programs that already import it pick up the new target at their next
-    /// call.
+    /// call. The caller gets r0, so a result of up to 8 bytes: an import that declares a struct of 9 to 16 bytes as
+    /// the result fails to link with [`LinkError::ReturnMismatch`](crate::LinkError::ReturnMismatch).
     pub fn export(&self, plugin: &Plugin, func: &str) -> Result<()> {
         let export = HostFn::raw(plugin.export_fn(func)?);
         self.helpers.update(|h| h.put_name(func.to_string(), export));

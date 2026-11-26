@@ -6,8 +6,11 @@
 //!
 //! Arguments and the result are plain values: a pointer from one plugin means nothing in another's memory, unless the
 //! exported function tags the parameter as a borrow (see [`Borrow`]). Then the caller's buffer is mapped into the
-//! callee at a [`BORROW_FIRST_REGION`] slot for the duration of the call, and the callee gets that address instead. A
-//! call into a plugin that is already running, from the host or through a chain of plugin calls, fails with
+//! callee at a [`BORROW_FIRST_REGION`] slot for the duration of the call, and the callee gets that address instead.
+//! The result is the callee's r0, which holds up to 8 bytes. A struct of more than 16 bytes comes back through a
+//! pointer into the caller's memory, which the callee can follow only where both plugins are untagged.
+//!
+//! A call into a plugin that is already running, from the host or through a chain of plugin calls, fails with
 //! [`VmError::PluginBusy`] instead of deadlocking. So does [`Plugin::replace`] while the plugin runs.
 
 use std::ptr::NonNull;

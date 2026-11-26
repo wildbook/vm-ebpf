@@ -186,13 +186,24 @@ pub enum LinkError {
     /// A call to a helper ID that isn't registered.
     UnknownHelper(u32),
     /// An extern declares a different number of argument registers than the host function takes. `declared` counts
-    /// registers, not parameters: a struct of 9 to 16 bytes takes two, and a struct return adds a result pointer.
+    /// registers, not parameters: a struct of 9 to 16 bytes takes two, and a returned struct of more than 16 bytes
+    /// adds a result pointer.
     SignatureMismatch { name: String, declared: usize, host: u8 },
+    /// An extern declares a result of 9 to 16 bytes, which comes back in r0 and r2, and the host function sets only
+    /// r0 (`wide`), or the reverse. A function another plugin exports sets only r0.
+    ReturnMismatch { name: String, wide: bool },
     /// An extern or image disagrees with the native function's signature in what isn't the register count, or the
     /// extern has no BTF to check it against.
     NativeMismatch { name: String, reason: String },
     /// A host-bound extern needs more argument registers than the five eBPF has.
     TooManyRegisters { name: String, registers: usize },
+    /// The instruction at `pc` passes or takes an argument on the stack, through r11, as clang does from the sixth
+    /// argument register on. `function` is the exported function it lies in, if any.
+    StackArguments { pc: u64, function: Option<String> },
+    /// The object's debug info names a clang older than 23 as its compiler, here by version. Such a clang returns
+    /// small structs by another convention.
+    #[cfg(feature = "link")]
+    UnsupportedCompiler(String),
     /// A program declares a shared map with a different layout than the existing one.
     #[cfg(feature = "maps")]
     MapMismatch(String),
@@ -219,9 +230,30 @@ impl fmt::Display for LinkError {
             Self::SignatureMismatch { name, declared, host } => {
                 write!(f, "extern {name} takes {declared} argument registers but the host function takes {host}")
             }
+            Self::ReturnMismatch { name, wide: true } => {
+                write!(f, "extern {name} returns 9 to 16 bytes in r0 and r2, but the host function sets only r0")
+            }
+            Self::ReturnMismatch { name, wide: false } => {
+                write!(
+                    f,
+                    "the host function {name} sets r0 and r2, which only an extern that returns 9 to 16 bytes reads"
+                )
+            }
             Self::NativeMismatch { name, reason } => write!(f, "native {name}: {reason}"),
             Self::TooManyRegisters { name, registers } => {
                 write!(f, "extern {name} takes {registers} argument registers, but eBPF passes at most {MAX_ARGS}")
+            }
+            Self::StackArguments { pc, function } => {
+                let place = function.as_ref().map(|name| format!(" in {name}")).unwrap_or_default();
+                write!(
+                    f,
+                    "instruction {pc}{place} passes or takes an argument on the stack, through r11, which rvm doesn't \
+                     support: a call has at most {MAX_ARGS} argument registers"
+                )
+            }
+            #[cfg(feature = "link")]
+            Self::UnsupportedCompiler(version) => {
+                write!(f, "the object comes from clang {version}, and rvm takes objects from clang 23 or newer")
             }
             #[cfg(feature = "maps")]
             Self::MapMismatch(name) => write!(f, "shared map {name} is declared with a different layout"),

@@ -250,9 +250,10 @@ fn lay_out_jump_tables(
     Ok(())
 }
 
-/// Compare each host-bound extern's BTF prototype with the registered function, counting argument registers as clang
-/// passes them (see [`arg_registers`]). Fails for an extern that needs more than [`MAX_ARGS`] registers, and for a
-/// host function with a known arity that differs. Modules without BTF and variadic prototypes are not checked.
+/// Compare each host-bound extern's BTF prototype with the registered function, counting registers as clang uses them
+/// (see [`registers`]). Fails for an extern that needs more than [`MAX_ARGS`] argument registers, for a host function
+/// with a known arity that differs, and for a result in r0 and r2 where the host function sets only r0 or the
+/// reverse. Modules without BTF and variadic prototypes are not checked.
 fn check_extern_signatures(helpers: &HelperRegistry, btfs: &[Option<Btf<'_>>]) -> Result<()> {
     for btf in btfs.iter().flatten() {
         for (_, ty) in btf.types() {
@@ -278,16 +279,20 @@ fn check_extern_signatures(helpers: &HelperRegistry, btfs: &[Option<Btf<'_>>]) -
             }
 
             let name = name.to_string();
-            let Some((_, registers)) = arg_registers(btf, *proto_type) else {
+            let Some(Registers { args, returns, .. }) = registers(btf, *proto_type) else {
                 let msg = format!("extern {name}: a parameter or return type no register holds");
                 return Err(LinkError::InvalidReference(msg).into());
             };
-            if registers > MAX_ARGS {
-                return Err(LinkError::TooManyRegisters { name, registers }.into());
+            if args > MAX_ARGS {
+                return Err(LinkError::TooManyRegisters { name, registers: args }.into());
             }
-            if let Some(host) = helpers.arity(slot).filter(|&host| usize::from(host) != registers) {
-                let declared = registers;
+            if let Some(host) = helpers.arity(slot).filter(|&host| usize::from(host) != args) {
+                let declared = args;
                 return Err(LinkError::SignatureMismatch { name, declared, host }.into());
+            }
+            let wide = returns == Returns::R0R2;
+            if wide != helpers.wide(slot) {
+                return Err(LinkError::ReturnMismatch { name, wide }.into());
             }
         }
     }
@@ -295,9 +300,9 @@ fn check_extern_signatures(helpers: &HelperRegistry, btfs: &[Option<Btf<'_>>]) -
 }
 
 /// Compare each extern in `btf` that names a native function with the native's signature: the same number of argument
-/// registers, an integer or enum where it takes an integer and a pointer where it takes a pointer, and a `borrow` or
-/// `borrow_ro` tag only on a pointer with the same length argument and access. Returns the names it checked, which are
-/// the only natives the module may call.
+/// registers, an integer or enum where it takes an integer and a pointer where it takes a pointer, a result that the
+/// Windows x64 convention returns in rax, and a `borrow` or `borrow_ro` tag only on a pointer with the same length
+/// argument and access. Returns the names it checked, which are the only natives the module may call.
 fn check_native_externs(helpers: &HelperRegistry, btf: Option<&Btf<'_>>) -> Result<HashSet<String>> {
     let mut checked = HashSet::new();
     let Some(btf) = btf else {
@@ -331,13 +336,24 @@ fn check_native_externs(helpers: &HelperRegistry, btf: Option<&Btf<'_>>) -> Resu
             let (name, declared, host) = (name.to_string(), params.len(), sig.args());
             return Err(LinkError::SignatureMismatch { name, declared, host }.into());
         }
-        let returns = btf.resolve_type(*return_type).map(|(_, ty)| ty);
-        if !matches!(returns, Some(BtfType::Void | BtfType::Int { .. } | BtfType::Enum { .. } | BtfType::Ptr { .. })) {
-            return Err(mismatch("the extern returns something other than an integer or pointer".into()).into());
+        // rax returns an integer, a pointer, or a struct of 1, 2, 4 or 8 bytes. The convention returns every other
+        // struct through a pointer in rcx.
+        match btf.resolve_type(*return_type).map(|(_, ty)| ty) {
+            Some(BtfType::Void | BtfType::Int { size: ..=8, .. } | BtfType::Enum { .. } | BtfType::Ptr { .. }) => {}
+            Some(BtfType::Struct { size, .. } | BtfType::Union { size, .. }) => {
+                if !matches!(size, 0 | 1 | 2 | 4 | 8) {
+                    let reason = format!("the extern returns a struct of {size} bytes, not of 1, 2, 4 or 8");
+                    return Err(mismatch(reason).into());
+                }
+            }
+            _ => {
+                let reason = "the extern returns something other than an integer, a pointer or a struct";
+                return Err(mismatch(reason.into()).into());
+            }
         }
         for (n, param) in (1..).zip(params) {
             let pointer = match btf.resolve_type(param.type_id).map(|(_, ty)| ty) {
-                Some(BtfType::Int { .. } | BtfType::Enum { .. }) => false,
+                Some(BtfType::Int { size: ..=8, .. } | BtfType::Enum { .. }) => false,
                 Some(BtfType::Ptr { .. }) => true,
                 _ => return Err(mismatch(format!("parameter {n} is neither an integer nor a pointer")).into()),
             };
@@ -369,24 +385,29 @@ fn borrow_matches(borrow: &Borrow, sig: NativeSig) -> bool {
     }
 }
 
-/// The argument registers clang uses for each parameter of the function prototype `proto_type`, numbered from 0 for
-/// r1, and their total. A struct or union return passes a hidden result pointer in r1 ahead of the parameters. `None`
-/// for a missing prototype or a parameter or return type no register holds.
-fn arg_registers(btf: &Btf<'_>, proto_type: u32) -> Option<(Vec<Range<usize>>, usize)> {
+/// The registers clang 23 uses for the function prototype `proto_type`. `None` for a missing prototype or a parameter
+/// or return type no register holds.
+fn registers(btf: &Btf<'_>, proto_type: u32) -> Option<Registers> {
     let Some(BtfType::FuncProto { return_type, params }) = btf.type_by_id(proto_type) else {
         return None;
     };
-    let mut next = match btf.resolve_type(*return_type)?.1 {
-        BtfType::Struct { .. } | BtfType::Union { .. } => 1,
-        _ => 0,
+    let returns = match btf.resolve_type(*return_type)?.1 {
+        BtfType::Int { size, .. } | BtfType::Struct { size, .. } | BtfType::Union { size, .. } => match size {
+            0..=8 => Returns::R0,
+            9..=16 => Returns::R0R2,
+            _ => Returns::Pointer,
+        },
+        _ => Returns::R0,
     };
+
+    let mut next = usize::from(returns == Returns::Pointer);
     let mut ranges = Vec::with_capacity(params.len());
     for param in params {
         let width = match btf.resolve_type(param.type_id)?.1 {
-            BtfType::Int { .. } | BtfType::Enum { .. } | BtfType::Ptr { .. } | BtfType::Float { .. } => 1,
+            BtfType::Enum { .. } | BtfType::Ptr { .. } | BtfType::Float { .. } => 1,
             // Clang packs a struct of up to 16 bytes into registers and passes nothing for an empty one. A function
-            // gets a larger one by pointer, though calls to it fail to compile.
-            BtfType::Struct { size, .. } | BtfType::Union { size, .. } => match size {
+            // gets a larger one by pointer, though calls to it fail to compile. `__int128` takes two registers.
+            BtfType::Int { size, .. } | BtfType::Struct { size, .. } | BtfType::Union { size, .. } => match size {
                 0 => 0,
                 9..=16 => 2,
                 _ => 1,
@@ -396,7 +417,31 @@ fn arg_registers(btf: &Btf<'_>, proto_type: u32) -> Option<(Vec<Range<usize>>, u
         ranges.push(next..next + width);
         next += width;
     }
-    Some((ranges, next))
+    Some(Registers {
+        params: ranges,
+        args: next,
+        returns,
+    })
+}
+
+/// How a call passes the parameters of a function prototype and where its result comes back.
+struct Registers {
+    /// The argument registers of each parameter, numbered from 0 for r1.
+    params: Vec<Range<usize>>,
+    /// The argument registers in all, the result pointer of [`Returns::Pointer`] included.
+    args: usize,
+    returns: Returns,
+}
+
+/// Where the result of a function comes back.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Returns {
+    /// In r0: a value of up to 8 bytes, or nothing.
+    R0,
+    /// In r0 and r2: a struct, union or integer of 9 to 16 bytes, with bytes 0 to 7 in r0.
+    R0R2,
+    /// In the caller's memory: a larger struct or union, through a pointer in r1 ahead of the parameters.
+    Pointer,
 }
 
 /// Every module's exported symbols by name; two different definitions of one name fail.
@@ -631,7 +676,7 @@ fn build_function_table(
 }
 
 /// `borrow:N` / `borrow_ro:N` decl tags on function parameters, by function name, with each parameter mapped to its
-/// argument register (see [`arg_registers`]). Both parameters must take one register each.
+/// argument register (see [`registers`]). Both parameters must take one register each.
 fn function_borrows(btf: Option<&Btf<'_>>) -> Result<HashMap<String, Vec<Borrow>>> {
     let mut borrows: HashMap<String, Vec<Borrow>> = HashMap::new();
     let Some(btf) = btf else {
@@ -654,7 +699,7 @@ fn function_borrows(btf: Option<&Btf<'_>>) -> Result<HashMap<String, Vec<Borrow>
         let Some(BtfType::Func { name, proto_type, .. }) = btf.type_by_id(*type_id) else {
             continue;
         };
-        let params = arg_registers(btf, *proto_type).map(|(params, _)| params);
+        let params = registers(btf, *proto_type).map(|registers| registers.params);
         let register = |param: usize| {
             let range = params.as_ref()?.get(param)?;
             u8::try_from(range.start).ok().filter(|_| range.len() == 1)

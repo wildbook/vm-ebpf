@@ -1,9 +1,21 @@
 /*
  * Declarations shared by the BPF programs under bpf/: integer types, libbpf-style map definitions, borrow tags and
  * the standard helpers rvm provides.
+ *
+ * Compile with clang 23.1.6 or newer:
+ *
+ *     clang -target bpf -mcpu=v4 -O2 -g -fno-slp-vectorize -c plugin.c -o plugin.o
+ *
+ * -fno-slp-vectorize avoids a crash of clang 23.1 in BPF instruction selection, on vector divisions that the SLP
+ * vectorizer forms.
  */
 #ifndef RVM_BPF_H
 #define RVM_BPF_H
+
+/* rvm follows the calling convention of clang 23. Older versions return a struct of up to 16 bytes another way. */
+#if defined(__bpf__) && defined(__clang__) && __clang_major__ < 23
+#error "rvm needs clang 23 or newer"
+#endif
 
 typedef unsigned char      u8;
 typedef unsigned short     u16;
@@ -20,6 +32,19 @@ typedef signed long long   s64;
 #define __uint(name, val) int (*name)[val]
 #define __type(name, val) typeof(val) *name
 #define noinline __attribute__((noinline))
+
+/*
+ * A plugin declares the functions it calls outside itself as externs: host functions, native functions and the
+ * functions other plugins export.
+ *
+ *     extern u64 host_add(u64 a, u64 b);
+ *
+ * A call passes at most five registers: one per integer, pointer and struct of up to 8 bytes, two per struct of 9 to
+ * 16 bytes. rvm does not run calls that need more, which clang passes on the stack, also between a plugin's own
+ * functions. A result of up to 8 bytes comes back from every kind of function, where a native function returns a
+ * struct only if it is 1, 2, 4 or 8 bytes long. A larger struct comes back from a host function only. rvm fails the
+ * load of a plugin with a declaration that its function can't serve.
+ */
 
 /* The callee uses the caller's buffer in place for one call; parameter `len_arg` holds its size in bytes. */
 #define BORROW(len_arg)    __attribute__((btf_decl_tag("borrow:" #len_arg)))

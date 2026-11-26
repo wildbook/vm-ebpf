@@ -73,6 +73,9 @@ impl Module {
                 let msg = format!("legacy `{LEGACY_MAPS_SECTION}` section; declare maps in `{MAPS_SECTION}` with BTF");
                 return Err(LinkError::InvalidMap(msg).into());
             }
+            if name == ".debug_str" {
+                check_compiler(sect.bytes()?)?;
+            }
 
             let kind = if (sect.sh_flags & shf::EXECINSTR as u64) != 0 {
                 SectionKind::Code
@@ -280,4 +283,26 @@ fn rel_implicit_addend(data: &[u8], offset: u64, typ: u32) -> Option<i64> {
         reloc::bpf::BPF_64_ABS64 => i64::from_le_bytes(*data.get(at..)?.first_chunk::<8>()?),
         _ => 0,
     })
+}
+
+/// The oldest clang whose calling convention rvm follows: it returns a struct of up to 16 bytes in r0 and r2, where
+/// older versions return it through a pointer in r1.
+const MIN_CLANG: u32 = 23;
+
+/// Fails if `debug_str`, the strings of the object's debug info, name a clang older than [`MIN_CLANG`] as a compiler:
+/// `clang version 22.1.8 (...)`. An object without that string passes: nothing else in it tells the compiler.
+fn check_compiler(debug_str: &[u8]) -> Result<()> {
+    const MARK: &[u8] = b"clang version ";
+
+    let mut rest = debug_str;
+    while let Some(at) = rest.windows(MARK.len()).position(|window| window == MARK) {
+        rest = &rest[at + MARK.len()..];
+        let len = rest.iter().take_while(|b| b.is_ascii_digit() || **b == b'.').count();
+        let version = String::from_utf8_lossy(&rest[..len]);
+        let major = version.split('.').next().and_then(|major| major.parse::<u32>().ok());
+        if major.is_some_and(|major| major < MIN_CLANG) {
+            return Err(LinkError::UnsupportedCompiler(version.into_owned()).into());
+        }
+    }
+    Ok(())
 }

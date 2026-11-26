@@ -47,6 +47,13 @@
 //! The ELF and module rows need the `link` feature. [`Vm::loader`] has the same four functions for a program that
 //! gets its own [`Passthrough`] mode or [`RawCalls`] switch.
 //!
+//! ## Compiler
+//!
+//! Programs come from clang 23.1.6 or newer, as `clang -target bpf -mcpu=v4 -O2 -g -fno-slp-vectorize` writes them,
+//! and rvm follows the calling convention of that clang: five argument registers, a result of up to 8 bytes in r0,
+//! and a result of 9 to 16 bytes in r0 and r2. Loading fails for an object whose debug info names an older clang,
+//! which returns structs another way, and for code that passes arguments on the stack, which rvm does not support.
+//!
 //! ## Components
 //!
 //! - [`Vm`]: the entry point. Holds the host functions, the host types, and the maps and regions shared across the

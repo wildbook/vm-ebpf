@@ -114,17 +114,25 @@ macro_rules! single_arg {
 
 single_arg!(u64, u32, i64, i32);
 
-/// The value a host function puts in r0, or the error that fails the guest call.
+/// The value a host function returns to the guest, or the error that fails the guest call.
 ///
 /// `Err` fails the call into the guest with [`HostError::Failed`], which holds the error. A host function that wants
 /// the guest to see an error code returns it as an `i64`.
+///
+/// The guest declares the function in C. Clang takes a result of up to 8 bytes from r0, a struct or union included,
+/// with the first byte in the lowest bits. It takes one of 9 to 16 bytes from r0 and r2, which a `(u64, u64)` fills:
+/// bytes 0 to 7, then the rest.
 pub trait IntoReturn {
-    fn into_return(self) -> Result<u64, HostError>;
+    /// Whether the value fills r0 and r2.
+    const WIDE: bool = false;
+
+    /// The new r0. A [`WIDE`](Self::WIDE) value puts its second half in `r2`.
+    fn into_return(self, r2: &mut u64) -> Result<u64, HostError>;
 }
 
 impl IntoReturn for () {
     #[inline]
-    fn into_return(self) -> Result<u64, HostError> {
+    fn into_return(self, _r2: &mut u64) -> Result<u64, HostError> {
         Ok(0)
     }
 }
@@ -133,7 +141,7 @@ macro_rules! into_return {
     ($($ty:ty),*) => {$(
         impl IntoReturn for $ty {
             #[inline]
-            fn into_return(self) -> Result<u64, HostError> {
+            fn into_return(self, _r2: &mut u64) -> Result<u64, HostError> {
                 Ok(self as u64)
             }
         }
@@ -142,11 +150,23 @@ macro_rules! into_return {
 
 into_return!(u64, u32, i64, i32, bool);
 
-impl<T: IntoReturn, E: Into<Box<dyn Error + Send + Sync>>> IntoReturn for Result<T, E> {
+impl IntoReturn for (u64, u64) {
+    const WIDE: bool = true;
+
     #[inline]
-    fn into_return(self) -> Result<u64, HostError> {
+    fn into_return(self, r2: &mut u64) -> Result<u64, HostError> {
+        *r2 = self.1;
+        Ok(self.0)
+    }
+}
+
+impl<T: IntoReturn, E: Into<Box<dyn Error + Send + Sync>>> IntoReturn for Result<T, E> {
+    const WIDE: bool = T::WIDE;
+
+    #[inline]
+    fn into_return(self, r2: &mut u64) -> Result<u64, HostError> {
         match self {
-            Ok(value) => value.into_return(),
+            Ok(value) => value.into_return(r2),
             Err(error) => Err(failed(error)),
         }
     }
@@ -191,9 +211,12 @@ pub struct HostFn {
     // keeps `data` alive; the call path never touches it
     _owner: Arc<dyn Send + Sync>,
     // argument count, if registered with typed arguments; `None` for raw helpers, which read registers themselves. Only
-    // the linker reads it.
+    // the linker reads it and `wide`.
     #[cfg_attr(not(feature = "link"), allow(dead_code))]
     arity: Option<u8>,
+    // whether the function sets r2 as well as r0: `IntoReturn::WIDE`
+    #[cfg_attr(not(feature = "link"), allow(dead_code))]
+    wide: bool,
 }
 
 // SAFETY: `data` points into `_owner`, which is `Send + Sync` and lives as long as the `HostFn`.
@@ -202,17 +225,19 @@ unsafe impl Sync for HostFn {}
 
 impl HostFn {
     /// `func` called through `call`, which must take `data` as a pointer to an `F`.
-    fn with_trampoline<F: Send + Sync + 'static>(func: F, call: Trampoline, arity: Option<u8>) -> Self {
+    fn with_trampoline<F: Send + Sync + 'static>(func: F, call: Trampoline, arity: Option<u8>, wide: bool) -> Self {
         let owner = Arc::new(func);
         Self {
             call,
             data: Arc::as_ptr(&owner).cast(),
             _owner: owner,
             arity,
+            wide,
         }
     }
 
     /// A function that reads its arguments from the registers itself and reaches the caller's memory, maps and fuel.
+    /// Its result is r0.
     pub fn raw<F>(func: F) -> Self
     where
         F: Fn(&mut HelperContext) -> Result<u64, Stop> + Send + Sync + 'static,
@@ -237,7 +262,7 @@ impl HostFn {
             finish(unsafe { (*data.cast::<F>())(&mut helper_ctx) }, stop)
         }
 
-        Self::with_trampoline(func, trampoline::<F>, None)
+        Self::with_trampoline(func, trampoline::<F>, None, false)
     }
 
     /// A function of the typed arguments.
@@ -262,10 +287,11 @@ impl HostFn {
             R: IntoReturn,
         {
             let args = A::from_args(&HelperArgs::from_regs(&ctx.regs));
-            finish(unsafe { (*data.cast::<F>())(args) }.into_return(), stop)
+            let result = unsafe { (*data.cast::<F>())(args) };
+            finish(result.into_return(&mut ctx.regs[2]), stop)
         }
 
-        Self::with_trampoline(func, trampoline::<F, A, R>, Some(A::ARITY))
+        Self::with_trampoline(func, trampoline::<F, A, R>, Some(A::ARITY), R::WIDE)
     }
 
     /// A function of the caller's memory and the typed arguments.
@@ -291,10 +317,10 @@ impl HostFn {
         {
             let args = A::from_args(&HelperArgs::from_regs(&ctx.regs));
             let result = unsafe { (*data.cast::<F>())(&mut GuestMemory::new(ctx.memory), args) };
-            finish(result.into_return(), stop)
+            finish(result.into_return(&mut ctx.regs[2]), stop)
         }
 
-        Self::with_trampoline(func, trampoline::<F, A, R>, Some(A::ARITY))
+        Self::with_trampoline(func, trampoline::<F, A, R>, Some(A::ARITY), R::WIDE)
     }
 }
 
@@ -393,6 +419,12 @@ impl HelperRegistry {
     #[cfg(feature = "link")]
     pub fn arity(&self, slot: u32) -> Option<u8> {
         self.slots.get(slot as usize)?.arity
+    }
+
+    /// Whether the function in `slot` sets r2 as well as r0.
+    #[cfg(feature = "link")]
+    pub fn wide(&self, slot: u32) -> bool {
+        self.slots.get(slot as usize).is_some_and(|func| func.wide)
     }
 
     /// Slot of a helper ID.

@@ -16,7 +16,12 @@ op_fn rw_ops[2] = {mul, add};                    /* .data */
 /* Global, so clang can't specialize it for each callback. */
 noinline u64 apply(op_fn f, u64 a, u64 b) { return f(a, b); }
 
-u64 call_ro(u64 i, u64 a, u64 b) { return ro_ops[i](a, b); }
+/* Clang turns a call through a constant table into direct calls, unless it loses sight of the table's address. */
+u64 call_ro(u64 i, u64 a, u64 b) {
+    const op_fn *ops = ro_ops;
+    asm volatile("" : "+r"(ops));
+    return ops[i](a, b);
+}
 
 u64 call_rw(u64 i, u64 a, u64 b) { return rw_ops[i](a, b); }
 

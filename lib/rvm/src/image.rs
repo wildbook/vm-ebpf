@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use rvm_core::opcode::{call, CALL, LD_IMM64};
+use rvm_core::opcode::{call, MemMode, MemSize, OpCode, CALL, LD_IMM64};
 use rvm_core::{Code, Instruction, NativeArg, NativeSig, MAX_CALL_DEPTH, MAX_NATIVE_ARGS};
 
 use crate::error::{LinkError, Result, VmError};
@@ -395,6 +395,7 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
     let (mut maps, maps_len) = Maps::new(s.maps, &shared.maps, &mut budget)?;
 
     let mut insns = Instruction::decode(s.code);
+    check_stack_arguments(&insns, &s.functions)?;
     // Bind against one version of the table; the program refreshes from there.
     let snapshot = helpers.snapshot();
     bind_helper_calls(&mut insns, s.code, &snapshot.table);
@@ -496,6 +497,33 @@ fn check_lengths(s: &Sections<'_>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Fails if `insns` pass or take an argument on the stack as clang does from the sixth argument register on: with an
+/// 8-byte store to `r11 - 8k` or an 8-byte load from `r11 + 8k`. rvm has no stack arguments. To the interpreter r11
+/// is a register like r12 to r15, 0 unless the program sets it, and such an access would fault only when it runs.
+fn check_stack_arguments(insns: &[Instruction], functions: &[(String, FunctionInfo)]) -> Result<()> {
+    const R11: u8 = 11;
+    const LDX_DW: u8 = OpCode::ldx(MemSize::DWord, MemMode::Mem).0;
+    const ST_DW: u8 = OpCode::st(MemSize::DWord, MemMode::Mem).0;
+    const STX_DW: u8 = OpCode::stx(MemSize::DWord, MemMode::Mem).0;
+
+    let slot = |offset: i16| offset % 8 == 0;
+    let stack_argument = |insn: &Instruction| match insn.byte() {
+        LDX_DW => insn.src_reg() == R11 && insn.offset() > 0 && slot(insn.offset()),
+        ST_DW | STX_DW => insn.dst_reg() == R11 && insn.offset() < 0 && slot(insn.offset()),
+        _ => false,
+    };
+    let Some(pc) = insns.iter().position(stack_argument) else {
+        return Ok(());
+    };
+
+    let pc = pc as u64;
+    let function = functions
+        .iter()
+        .find(|(_, info)| pc >= info.pc && pc - info.pc < info.size / INSN_SIZE)
+        .map(|(name, _)| name.clone());
+    Err(LinkError::StackArguments { pc, function }.into())
 }
 
 /// Turn each `call <helper id>` in `code` whose helper `table` has into a call to its slot, as linking does, so the
