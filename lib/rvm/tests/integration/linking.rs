@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use constelf::raw::{shf, sht, Elf64Ehdr, Elf64Rel, Elf64Shdr, Elf64Sym};
 use constelf::{ElfFile, ElfRelocs};
-use rvm::{LinkError, Module, NativeSig, Vm, VmConfig, VmError, DEFAULT_MEMORY_LIMIT};
+use rvm::{LinkError, Module, Vm, VmConfig, VmError, DEFAULT_MEMORY_LIMIT};
 
 use crate::common::object;
 
@@ -264,10 +264,14 @@ fn struct_results_come_back_by_size() {
     mismatch(vm, "s8_ret", false);
 }
 
-/// A native function returns a struct of 8 bytes in rax, where the guest takes it from r0. The Windows x64 convention
-/// returns one of 12 bytes through a pointer, so that extern fails the link.
+/// A native function returns an 8-byte struct in rax, where the guest takes it from r0. A 12-byte struct does not fit
+/// in rax, so that extern fails the link.
+// Miri rejects transmuting `extern "C" fn(u64) -> S8` to `fn(u64) -> u64`
+#[cfg(not(miri))]
 #[test]
 fn native_struct_results() {
+    use rvm::NativeSig;
+
     #[repr(C)]
     struct S8 {
         a: u32,
@@ -385,17 +389,18 @@ fn layout_stays_within_memory_limit() {
     let err = Vm::new().prepare_elf(&elf).unwrap_err();
     assert!(matches!(err, VmError::MemoryLimit(DEFAULT_MEMORY_LIMIT)), "{err}");
 
-    // 64 code sections that each load 64 tables: 4096 copies from 128 sections
+    // n code sections that each load n tables: n^2 copies from 2n sections
+    let n = if cfg!(miri) { 8 } else { 64 };
     let elf = object("tests/func_ptr.o");
     let size = |elf: &[u8]| {
         let image = Vm::new().prepare_elf(elf).unwrap();
         image.code.len() + image.rodata_len + image.data_len
     };
     let base = size(&elf);
-    let (elf, code_size, table_size) = repeat_jump_tables(&elf, 64);
-    let copies = 64 * 64 * table_size;
-    assert!(size(&elf) >= base + 64 * code_size + copies);
-    let limit = base + 64 * code_size + copies / 2;
+    let (elf, code_size, table_size) = repeat_jump_tables(&elf, n);
+    let copies = n * n * table_size;
+    assert!(size(&elf) >= base + n * code_size + copies);
+    let limit = base + n * code_size + copies / 2;
     let err = limited(limit).prepare_elf(&elf).unwrap_err();
     assert!(matches!(err, VmError::MemoryLimit(_)), "{err}");
 }

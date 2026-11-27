@@ -77,8 +77,9 @@ fn function_pointers_and_jump_tables() {
 /// A loop bounded with `can_loop` (bpf/tests/may_goto.c) runs to completion: `may_goto` never jumps.
 #[test]
 fn may_goto_never_jumps() {
+    let n = if cfg!(miri) { 100 } else { 10_000 };
     let mut program = Vm::new().load_elf(&object("tests/may_goto.o")).unwrap();
-    assert_eq!(program.call("sum", &[10_000]).unwrap(), 10_000 * 9_999 / 2);
+    assert_eq!(program.call("sum", &[n]).unwrap(), n * (n - 1) / 2);
 }
 
 /// CO-RE against a host whose `struct event` moved `pid` and lacks `flags` (bpf/tests/core_guard.c): field accesses

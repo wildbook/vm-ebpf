@@ -18,8 +18,9 @@ fn instruction_limit_covers_plugin_calls() {
     use ebpf_asm::{Assembler, R0, R1, R6};
     use rvm::{ExecError, VmConfig, DEFAULT_INSTRUCTION_LIMIT};
 
-    const SPINS: i32 = 200_000;
-    const CALLS: i32 = 50;
+    const SPINS: i32 = if cfg!(miri) { 200 } else { 200_000 };
+    const CALLS: i32 = if cfg!(miri) { 5 } else { 50 };
+    const LIMIT: u64 = if cfg!(miri) { 1_000 } else { DEFAULT_INSTRUCTION_LIMIT };
 
     // spin(n): count n down to 0, 2 n + 2 instructions
     let mut asm = Assembler::new();
@@ -28,7 +29,7 @@ fn instruction_limit_covers_plugin_calls() {
     asm.sub64_imm(R1, 1).jne_imm(R1, 0, spin);
     asm.mov64_imm(R0, 1).exit();
     let vm = Vm::with_config(VmConfig {
-        instruction_limit: DEFAULT_INSTRUCTION_LIMIT,
+        instruction_limit: LIMIT,
         ..VmConfig::default()
     })
     .unwrap();
@@ -61,11 +62,13 @@ fn instruction_limit_covers_plugin_calls() {
     let LimitedCall { result, instructions } = caller.call_func_with_limit(main, &[], 0);
     let total = (4 * CALLS + 3 + CALLS * (2 * SPINS + 2)) as u64;
     assert_eq!((result.unwrap(), instructions), (0, total));
-    let LimitedCall { result, instructions } = caller.call_func_with_limit(main, &[], DEFAULT_INSTRUCTION_LIMIT);
+    let LimitedCall { result, instructions } = caller.call_func_with_limit(main, &[], LIMIT);
     assert!(result.is_err());
-    assert_eq!(instructions, DEFAULT_INSTRUCTION_LIMIT);
+    assert_eq!(instructions, LIMIT);
 }
 
+// spins past DEFAULT_INSTRUCTION_LIMIT (2M+ guest instructions), far too slow under Miri
+#[cfg(not(miri))]
 #[test]
 fn default_has_no_instruction_limit() {
     use ebpf_asm::{Assembler, R0, R1};
@@ -215,7 +218,7 @@ fn shared_map_is_one_instance_across_plugins() {
 /// Two plugins on two threads bump one shared counter with guest atomics.
 #[test]
 fn shared_map_atomics_across_threads() {
-    const N: u64 = 10_000;
+    const N: u64 = if cfg!(miri) { 100 } else { 10_000 };
     let vm = Vm::new();
     // SAFETY: `bump` only touches the value with an atomic add.
     unsafe { vm.share_map("hits", ValueSpacing::CacheLine) };
@@ -253,7 +256,7 @@ fn shared_region_is_visible_to_every_plugin() {
 /// way. Acquire and release accesses that aren't aligned fault.
 #[test]
 fn shared_region_acquire_release() {
-    const N: u64 = 2_000;
+    const N: u64 = if cfg!(miri) { 50 } else { 2_000 };
     const WORDS: u64 = 6;
     let vm = Vm::new();
     // SAFETY: each plugin touches the payload only after a load-acquire shows the other one is done with it.

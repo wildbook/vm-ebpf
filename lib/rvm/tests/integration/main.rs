@@ -3,6 +3,8 @@
 #![cfg_attr(not(miri), feature(alloc_error_hook))]
 
 mod common;
+// 33 compute-heavy programs across three seeds, far too slow under Miri
+#[cfg(not(miri))]
 mod corpus;
 mod images;
 mod linking;
