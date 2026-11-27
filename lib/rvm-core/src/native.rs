@@ -1,18 +1,18 @@
 //! Calls of native functions: a `call` that [`Code::bind_native`](crate::Code::bind_native) gave the byte of its
 //! argument count ([`PLAIN`], or [`CHECKED`] where pointer arguments go through
 //! [`Memory::native_ptr`](crate::Memory::native_ptr)), with the index of the function in
-//! [`Host::natives`](crate::Host::natives) in `imm`. Its handler passes r1 to rN in the Windows x64 convention and
-//! puts the result in r0.
+//! [`Host::natives`](crate::Host::natives) in `imm`. Its handler passes r1 to rN in the host C ABI (Windows x64 on
+//! Windows, System V AMD64 on Unix) and puts the result in r0.
 //!
-//! The handler saves nothing around the call: the guest registers live in memory, and the handler arguments the
-//! dispatch needs afterwards are in registers the Windows x64 convention preserves (see
-//! [`Handler`](crate::dispatch::Handler)). It skips the windows check of other host calls, as a native function has
-//! no way to the memory of the run.
+//! On Windows x64, the handler saves nothing around the call: the guest registers live in memory, and the handler
+//! arguments the dispatch needs afterwards are in registers the Windows x64 convention preserves (see
+//! [`Handler`](crate::dispatch::Handler)). On SysV x64, LLVM spills and reloads `RDI` and `RSI` around the call.
+//! Either way, it skips the windows check of other host calls, as a native function has no way to reach the memory of
+//! the run.
 //!
 //! A function with more than five arguments takes the rest from the stack arguments of the frame
 //! ([`args`](crate::args)). One handler runs every such call ([`STACK`]): it passes all twelve arguments through
-//! `rvm_call_args`, in assembly, and the function ignores those it doesn't take. The Windows x64 convention passes
-//! arguments 5 to 12 on the stack, so a handler per count would differ only in what it copies there.
+//! `rvm_call_args`, in assembly, and the function ignores those it doesn't take.
 //!
 //! A `callx` has no signature. Where its target is the address of a native function,
 //! [`Host::call_indirect`](crate::Host::call_indirect) calls it through a [`NativeCall`], which passes r1 to r5 in
@@ -37,9 +37,9 @@ const REG_ARGS: usize = 5;
 /// Most arguments a native function takes: the argument registers r1 to r5 and the stack arguments.
 pub const MAX_ARGS: usize = REG_ARGS + MAX_STACK_ARGS;
 
-/// A native function as [`Native`] keeps it. A call casts it to `unsafe extern "win64" fn(u64, ...) -> u64` with the
+/// A native function as [`Native`] keeps it. A call casts it to `unsafe extern "C" fn(u64, ...) -> u64` with the
 /// argument count of its [`NativeSig`].
-pub type NativeFn = unsafe extern "win64" fn() -> u64;
+pub type NativeFn = unsafe extern "C" fn() -> u64;
 
 /// A native function and what it takes, an entry of [`Host::natives`](crate::Host::natives).
 #[derive(Clone, Copy, Debug)]
@@ -327,14 +327,14 @@ fn resolve<M: Memory>(memory: &M, addr: u64, len: u64, write: bool) -> Result<u6
 ///
 /// # Safety
 ///
-/// `func` must take `n` integer or pointer arguments in the Windows x64 convention, and never unwind.
+/// `func` must take `n` integer or pointer arguments in the host C convention, and never unwind.
 #[inline(always)]
 unsafe fn call(func: NativeFn, n: usize, a: [u64; REG_ARGS]) -> u64 {
-    type F1 = unsafe extern "win64" fn(u64) -> u64;
-    type F2 = unsafe extern "win64" fn(u64, u64) -> u64;
-    type F3 = unsafe extern "win64" fn(u64, u64, u64) -> u64;
-    type F4 = unsafe extern "win64" fn(u64, u64, u64, u64) -> u64;
-    type F5 = unsafe extern "win64" fn(u64, u64, u64, u64, u64) -> u64;
+    type F1 = unsafe extern "C" fn(u64) -> u64;
+    type F2 = unsafe extern "C" fn(u64, u64) -> u64;
+    type F3 = unsafe extern "C" fn(u64, u64, u64) -> u64;
+    type F4 = unsafe extern "C" fn(u64, u64, u64, u64) -> u64;
+    type F5 = unsafe extern "C" fn(u64, u64, u64, u64, u64) -> u64;
     // SAFETY: the caller's
     unsafe {
         match n {
@@ -363,8 +363,8 @@ impl<'a, E> NativeCall<'a, E> {
         Self { stop, ip, stack }
     }
 
-    /// Call the function at `func` with r1 to r5 of `regs` in the Windows x64 convention, the first four also in
-    /// xmm0 to xmm3, and return its rax. No signature says what the function takes, so nothing is checked or
+    /// Call the function at `func` with r1 to r5 of `regs` in the host C convention, the first register arguments also
+    /// in xmm registers, and return its rax. No signature says what the function takes, so nothing is checked or
     /// converted.
     ///
     /// In a program that stores a stack argument anywhere, the call also passes the seven stack arguments of the
@@ -376,8 +376,8 @@ impl<'a, E> NativeCall<'a, E> {
     ///
     /// # Safety
     ///
-    /// `func` must be the address of a function of the Windows x64 convention that is sound to call with whatever
-    /// `regs` and the stack arguments hold, and that never unwinds.
+    /// `func` must be the address of a function of the host C convention that is sound to call with whatever `regs`
+    /// and the stack arguments hold, and that never unwinds.
     #[inline(always)]
     pub unsafe fn call(self, func: u64, regs: &[u64; 16]) -> u64 {
         self.stop.calling(self.ip, func);
@@ -389,15 +389,16 @@ impl<'a, E> NativeCall<'a, E> {
     }
 }
 
-unsafe extern "win64" {
+unsafe extern "C" {
     fn rvm_call_regs(func: u64, regs: &[u64; 16]) -> u64;
     fn rvm_call_args(func: u64, regs: &[u64; REG_ARGS], stack: &StackArgs) -> u64;
 }
 
-// rvm_call_regs(func, regs): func(regs[1], ..., regs[5]). The first four arguments go to xmm0 to xmm3 as well, where a
+// rvm_call_regs(func, regs): func(regs[1], ..., regs[5]). The register arguments go to xmm registers as well, where a
 // callee reads its float and double parameters, and where a variadic callee expects a copy of each register argument.
 // A callee ignores the arguments it doesn't take. The unwind directives let a debugger, a profiler and exception
 // dispatch walk from the callee through this frame.
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 global_asm!(
     ".globl rvm_call_regs",
     ".def rvm_call_regs; .scl 2; .type 32; .endef",
@@ -427,6 +428,7 @@ global_asm!(
 // rvm_call_args(func, regs, stack): func(regs[0], ..., regs[4], stack[0], ..., stack[6]), as rvm_call_regs passes
 // its five. It always copies all seven stack arguments, which costs less than a loop over a count and leaves the
 // frame one size for the unwind directives.
+#[cfg(all(target_arch = "x86_64", target_os = "windows"))]
 global_asm!(
     ".globl rvm_call_args",
     ".def rvm_call_args; .scl 2; .type 32; .endef",
@@ -460,3 +462,86 @@ global_asm!(
     "    ret",
     "    .seh_endproc",
 );
+
+#[cfg(all(target_arch = "x86_64", unix))]
+macro_rules! sysv_call_asm {
+    ($prefix:literal, $elf_type_regs:literal, $elf_size_regs:literal, $elf_type_args:literal, $elf_size_args:literal) => {
+        global_asm!(
+            concat!(".globl ", $prefix, "rvm_call_regs"),
+            $elf_type_regs,
+            concat!($prefix, "rvm_call_regs:"),
+            "    .cfi_startproc",
+            // align rsp to 16 bytes before call
+            "    sub rsp, 8",
+            "    .cfi_def_cfa_offset 16",
+            "    mov r11, rdi",
+            "    mov r10, rsi",
+            "    mov rdi, [r10 + 8]",
+            "    mov rsi, [r10 + 16]",
+            "    mov rdx, [r10 + 24]",
+            "    mov rcx, [r10 + 32]",
+            "    mov r8, [r10 + 40]",
+            "    movq xmm0, rdi",
+            "    movq xmm1, rsi",
+            "    movq xmm2, rdx",
+            "    movq xmm3, rcx",
+            "    movq xmm4, r8",
+            "    mov eax, 5",
+            "    call r11",
+            "    add rsp, 8",
+            "    .cfi_def_cfa_offset 8",
+            "    ret",
+            "    .cfi_endproc",
+            $elf_size_regs,
+        );
+
+        global_asm!(
+            concat!(".globl ", $prefix, "rvm_call_args"),
+            $elf_type_args,
+            concat!($prefix, "rvm_call_args:"),
+            "    .cfi_startproc",
+            // 48 bytes for stack args 7..12 plus 8 bytes for 16-byte alignment before call
+            "    sub rsp, 56",
+            "    .cfi_def_cfa_offset 64",
+            "    mov r11, rdi",
+            "    mov r10, rsi",
+            "    mov r9, [rdx]",
+            "    movups xmm0, [rdx + 8]",
+            "    movups xmm1, [rdx + 24]",
+            "    movups xmm2, [rdx + 40]",
+            "    movups [rsp], xmm0",
+            "    movups [rsp + 16], xmm1",
+            "    movups [rsp + 32], xmm2",
+            "    mov rdi, [r10]",
+            "    mov rsi, [r10 + 8]",
+            "    mov rdx, [r10 + 16]",
+            "    mov rcx, [r10 + 24]",
+            "    mov r8, [r10 + 32]",
+            "    movq xmm0, rdi",
+            "    movq xmm1, rsi",
+            "    movq xmm2, rdx",
+            "    movq xmm3, rcx",
+            "    movq xmm4, r8",
+            "    movq xmm5, r9",
+            "    mov eax, 6",
+            "    call r11",
+            "    add rsp, 56",
+            "    .cfi_def_cfa_offset 8",
+            "    ret",
+            "    .cfi_endproc",
+            $elf_size_args,
+        );
+    };
+}
+
+#[cfg(all(target_arch = "x86_64", unix, not(target_vendor = "apple")))]
+sysv_call_asm!(
+    "",
+    ".type rvm_call_regs, @function",
+    ".size rvm_call_regs, .-rvm_call_regs",
+    ".type rvm_call_args, @function",
+    ".size rvm_call_args, .-rvm_call_args"
+);
+
+#[cfg(all(target_arch = "x86_64", target_vendor = "apple"))]
+sysv_call_asm!("_", "", "", "", "");

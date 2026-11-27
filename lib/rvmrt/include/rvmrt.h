@@ -44,9 +44,9 @@ rvm_status rvm_load(const uint8_t *image, size_t len, rvm_program **program);
 
 // A native function that images import by name, as an extern (`extern u64 name(...);` in C), and that the
 // interpreter calls directly. It must:
-// - take its `args` arguments, each an integer or pointer of up to 64 bits, in the Windows x64 convention and return
-//   its result in rax. The guest passes the sixth argument and those after it on its stack, as clang 23 compiles a
-//   call with more than five, and they reach the function like the first five;
+// - take its `args` arguments, each an integer or pointer of up to 64 bits, in the host C convention (Windows x64 on
+//   Windows, System V AMD64 on Unix) and return its result in rax. The guest passes the sixth argument and those after
+//   it on its stack, as clang 23 compiles a call with more than five, and they reach the function like the first five;
 // - never unwind: no C++ exception, SEH unwind or longjmp may leave it;
 // - stay loaded while any program loaded with it may call it, and be safe to run on several threads at once;
 // - leave the program that calls it alone: no rvmrt function may take that program during the call;

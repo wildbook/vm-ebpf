@@ -20,7 +20,7 @@ use rvm::{NativeArg, NativeSig, Vm, VmConfig};
 
 /// The image of `bpf/tests/rvmrt_stack_args.c`, linked against natives with the signatures the C host registers.
 fn image() -> Vec<u8> {
-    extern "win64" fn unused() -> u64 {
+    extern "C" fn unused() -> u64 {
         0
     }
     let int = NativeArg::Int;

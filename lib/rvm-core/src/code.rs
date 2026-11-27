@@ -72,7 +72,7 @@ impl Code {
     }
 
     /// Make the `call` in slot `pc` a call of the native function at `index` in
-    /// [`Host::natives`](crate::Host::natives), which takes `args` arguments in the Windows x64 convention and
+    /// [`Host::natives`](crate::Host::natives), which takes `args` arguments in the host C convention and
     /// returns r0: r1 to r5, and from the sixth argument on the stack arguments of the frame. With `checked`, the
     /// call first passes each pointer argument of the function's [`NativeSig`](crate::NativeSig) through
     /// [`Memory::native_ptr`](crate::Memory::native_ptr) and stops with
@@ -85,7 +85,7 @@ impl Code {
     /// # Safety
     ///
     /// For every run of this code, an entry at `index` in the host's `natives` must be a function callable as
-    /// `unsafe extern "win64" fn(u64, ...) -> u64` with `args` arguments, with a signature of `args` arguments, and
+    /// `unsafe extern "C" fn(u64, ...) -> u64` with `args` arguments, with a signature of `args` arguments, and
     /// sound to call with any argument values but the pointers that `checked` resolves. It must not unwind.
     pub unsafe fn bind_native(&mut self, pc: usize, index: u32, args: u8, checked: bool) -> bool {
         let args = usize::from(args);

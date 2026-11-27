@@ -20,16 +20,16 @@ fn from(x: u64, n: u64) -> Vec<u64> {
     (x..x + n).collect()
 }
 
-extern "win64" fn n6(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) -> u64 {
+extern "C" fn n6(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) -> u64 {
     weigh(&[a, b, c, d, e, f])
 }
 
-extern "win64" fn n8(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, h: u64) -> u64 {
+extern "C" fn n8(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, h: u64) -> u64 {
     weigh(&[a, b, c, d, e, f, g, h])
 }
 
 #[rustfmt::skip]
-extern "win64" fn n12(
+extern "C" fn n12(
     a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, h: u64, i: u64, j: u64, k: u64, l: u64,
 ) -> u64 {
     weigh(&[a, b, c, d, e, f, g, h, i, j, k, l])
@@ -38,7 +38,7 @@ extern "win64" fn n12(
 /// # Safety
 ///
 /// `buf` must point to `len` readable bytes.
-unsafe extern "win64" fn n_buf(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, buf: *const u8, len: u64) -> u64 {
+unsafe extern "C" fn n_buf(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, buf: *const u8, len: u64) -> u64 {
     let bytes = unsafe { std::slice::from_raw_parts(buf, len as usize) };
     weigh(&[a, b, c, d, e, f]) + bytes.iter().map(|&b| u64::from(b)).sum::<u64>()
 }
@@ -371,14 +371,14 @@ fn narrow_stack_arguments() {
     }
 
     #[rustfmt::skip]
-    extern "win64" fn n_narrow(
+    extern "C" fn n_narrow(
         a: u64, b: u64, c: u64, d: u64, e: u64, f: i8, g: u8, h: i16, i: u16, j: i32, k: u32,
     ) -> i64 {
         (a + b + c + d + e) as i64 + sum_narrow(f, g, h, i, j, k)
     }
 
     let natives = [("n_narrow", n_narrow as *const (), NativeSig::ints(11))];
-    // SAFETY: `n_narrow` takes 11 integer arguments in the Windows x64 convention and never unwinds.
+    // SAFETY: `n_narrow` takes 11 integer arguments in the host C convention and never unwinds.
     let vm = unsafe { Vm::with_natives(VmConfig::default(), &natives) }.unwrap();
     type Eleven = (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
     vm.register_extern("h_narrow", |(a, b, c, d, e, f, g, h, i, j, k): Eleven| {

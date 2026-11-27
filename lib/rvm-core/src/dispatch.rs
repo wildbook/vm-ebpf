@@ -115,8 +115,8 @@ macro_rules! become_at_pc {
 /// `preserve_none` passes all arguments in registers (the Windows x64 C convention has four) and saves no registers, so
 /// a tail call between handlers is a jump. It passes them in R12, R13, R14, R15, RDI, RSI, RDX, RCX ... in order, and
 /// `code` takes two:
-/// - `interp` and `table` are in RDI and RSI, which a host function preserves, so a handler that calls one needn't
-///   save them;
+/// - `interp` and `table` are in RDI and RSI, which a Windows x64 host function preserves so a handler calling one
+///   needn't save them (on SysV x64 they are caller-saved, so LLVM spills and reloads them around calls);
 /// - the [`Spare`] is in RDX, which `div` and `mul` write: nothing is there to save around them;
 /// - `slot` comes eighth and lands in RCX: a single `movzx` reads its second byte from CH, and a shift by its `imm`
 ///   takes the count from CL.

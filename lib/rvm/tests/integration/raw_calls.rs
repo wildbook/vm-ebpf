@@ -5,22 +5,22 @@ use rvm::{ExecError, Passthrough, Program, RawCalls, Vm, VmConfig, VmError};
 
 use crate::common::object;
 
-extern "win64" fn zero() -> u64 {
+extern "C" fn zero() -> u64 {
     7
 }
 
-extern "win64" fn one(a: u64) -> u64 {
+extern "C" fn one(a: u64) -> u64 {
     a + 1
 }
 
-extern "win64" fn five(a: u64, b: u64, c: u64, d: u64, e: u64) -> u64 {
+extern "C" fn five(a: u64, b: u64, c: u64, d: u64, e: u64) -> u64 {
     a + 10 * b + 100 * c + 1000 * d + 10_000 * e
 }
 
 /// # Safety
 ///
 /// `buf` must point to `len` readable bytes.
-unsafe extern "win64" fn sum(buf: *const u8, len: u64) -> u64 {
+unsafe extern "C" fn sum(buf: *const u8, len: u64) -> u64 {
     let bytes = unsafe { std::slice::from_raw_parts(buf, len as usize) };
     bytes.iter().map(|&b| u64::from(b)).sum()
 }
@@ -28,10 +28,10 @@ unsafe extern "win64" fn sum(buf: *const u8, len: u64) -> u64 {
 /// `struct host_api` in the guest.
 #[repr(C)]
 struct HostApi {
-    zero: extern "win64" fn() -> u64,
-    one: extern "win64" fn(u64) -> u64,
-    five: extern "win64" fn(u64, u64, u64, u64, u64) -> u64,
-    sum: unsafe extern "win64" fn(*const u8, u64) -> u64,
+    zero: extern "C" fn() -> u64,
+    one: extern "C" fn(u64) -> u64,
+    five: extern "C" fn(u64, u64, u64, u64, u64) -> u64,
+    sum: unsafe extern "C" fn(*const u8, u64) -> u64,
 }
 
 static API: HostApi = HostApi { zero, one, five, sum };

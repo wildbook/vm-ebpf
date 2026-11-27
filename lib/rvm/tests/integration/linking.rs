@@ -273,7 +273,7 @@ fn native_struct_results() {
         a: u32,
         b: u32,
     }
-    extern "win64" fn s8_ret(x: u64) -> S8 {
+    extern "C" fn s8_ret(x: u64) -> S8 {
         S8 { a: x as u32, b: 2 }
     }
     let module = Module::from_elf(&object("tests/struct_args.o")).unwrap();

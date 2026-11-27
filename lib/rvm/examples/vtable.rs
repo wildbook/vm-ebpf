@@ -16,10 +16,10 @@ const OBJECT: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../..
 /// `struct host_api` in `bpf/examples/vtable.c`.
 #[repr(C)]
 struct HostApi {
-    version: extern "win64" fn() -> u64,
-    log: unsafe extern "win64" fn(*const u8, u64),
-    window_size: unsafe extern "win64" fn(*mut Size),
-    scale: extern "win64" fn(u64, u64, u64) -> u64,
+    version: extern "C" fn() -> u64,
+    log: unsafe extern "C" fn(*const u8, u64),
+    window_size: unsafe extern "C" fn(*mut Size),
+    scale: extern "C" fn(u64, u64, u64) -> u64,
 }
 
 /// `struct size` in the plugin.
@@ -39,14 +39,14 @@ static API: HostApi = HostApi {
 /// The lines the plugin logged.
 static LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-extern "win64" fn version() -> u64 {
+extern "C" fn version() -> u64 {
     2
 }
 
 /// # Safety
 ///
 /// `text` must point to `len` readable bytes.
-unsafe extern "win64" fn log(text: *const u8, len: u64) {
+unsafe extern "C" fn log(text: *const u8, len: u64) {
     let text = unsafe { std::slice::from_raw_parts(text, len as usize) };
     LOG.lock().unwrap().push(String::from_utf8_lossy(text).into_owned());
 }
@@ -54,7 +54,7 @@ unsafe extern "win64" fn log(text: *const u8, len: u64) {
 /// # Safety
 ///
 /// `out` must be valid for a write.
-unsafe extern "win64" fn window_size(out: *mut Size) {
+unsafe extern "C" fn window_size(out: *mut Size) {
     let size = Size {
         width: 640,
         height: 480,
@@ -62,7 +62,7 @@ unsafe extern "win64" fn window_size(out: *mut Size) {
     unsafe { out.write(size) };
 }
 
-extern "win64" fn scale(value: u64, numerator: u64, denominator: u64) -> u64 {
+extern "C" fn scale(value: u64, numerator: u64, denominator: u64) -> u64 {
     value * numerator / denominator.max(1)
 }
 

@@ -22,14 +22,14 @@ struct Config {
 
 static CONFIG: Config = Config { version: 1, scale: 7 };
 
-extern "win64" fn mix(a: u64, b: u64, c: u64) -> u64 {
+extern "C" fn mix(a: u64, b: u64, c: u64) -> u64 {
     a.wrapping_mul(b) ^ c
 }
 
 /// # Safety
 ///
 /// `buf` must point to `len` readable bytes, or `len` be 0.
-unsafe extern "win64" fn checksum(buf: *const u8, len: u64) -> u64 {
+unsafe extern "C" fn checksum(buf: *const u8, len: u64) -> u64 {
     if len == 0 {
         return 0;
     }
@@ -42,7 +42,7 @@ unsafe extern "win64" fn checksum(buf: *const u8, len: u64) -> u64 {
 /// # Safety
 ///
 /// `buf` must point to `len` writable bytes, or `len` be 0.
-unsafe extern "win64" fn upper(buf: *mut u8, len: u64) -> u64 {
+unsafe extern "C" fn upper(buf: *mut u8, len: u64) -> u64 {
     if len == 0 {
         return 0;
     }
@@ -53,12 +53,12 @@ unsafe extern "win64" fn upper(buf: *mut u8, len: u64) -> u64 {
 /// # Safety
 ///
 /// `buf` must point to `len` readable bytes, or `len` be 0.
-unsafe extern "win64" fn tagged_checksum(a: u64, b: u64, c: u64, d: u64, e: u64, buf: *const u8, len: u64) -> u64 {
+unsafe extern "C" fn tagged_checksum(a: u64, b: u64, c: u64, d: u64, e: u64, buf: *const u8, len: u64) -> u64 {
     let head = a.wrapping_add(b).wrapping_add(c).wrapping_add(d).wrapping_add(e);
     head.wrapping_add(unsafe { checksum(buf, len) })
 }
 
-extern "win64" fn host_config() -> u64 {
+extern "C" fn host_config() -> u64 {
     // `as` exposes the provenance of the pointer the guest reads through
     (&raw const CONFIG) as u64
 }

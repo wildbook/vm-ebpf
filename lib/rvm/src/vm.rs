@@ -139,6 +139,7 @@ impl Passthrough {
 
     /// The guest address of the host byte at `ptr` in region `idx`.
     pub(crate) fn address(self, idx: usize, ptr: NonNull<u8>) -> u64 {
+        debug_assert!((ptr.addr().get() as u64) < region_tag(1), "host address overlaps region tag bits");
         let tag = match self.0 {
             Mode::Untagged => 0,
             _ => region_tag(idx),
@@ -362,9 +363,10 @@ impl Vm {
     }
 
     /// Register `func`, a native function that programs import by name as they import a host function
-    /// (`extern u64 name(...);` in C), and that the interpreter calls directly in the Windows x64 convention, its
-    /// result in r0: with r1 to r5, and for a function of 6 to 12 arguments also with the stack arguments of the
-    /// caller. `sig` says which arguments are pointers to guest bytes, and how many bytes.
+    /// (`extern u64 name(...);` in C), and that the interpreter calls directly in the host C convention (Windows x64
+    /// on Windows, System V AMD64 on Unix), its result in r0: with r1 to r5, and for a function of 6 to 12 arguments
+    /// also with the stack arguments of the caller. `sig` says which arguments are pointers to guest bytes, and how
+    /// many bytes.
     ///
     /// Linking checks the extern's BTF against `sig`: the same number of argument registers, integers or enums where
     /// `sig` has integers and pointers where it has pointers, nothing else, and on a pointer that a `BORROW` or
@@ -393,7 +395,7 @@ impl Vm {
     /// # Safety
     ///
     /// `func` must:
-    /// - be callable as `unsafe extern "win64" fn(u64, ...) -> u64` with the `sig.args()` integer or pointer arguments,
+    /// - be callable as `unsafe extern "C" fn(u64, ...) -> u64` with the `sig.args()` integer or pointer arguments,
     ///   returning in rax;
     /// - never unwind: no Rust panic with an unwinding ABI, C++ exception, SEH unwind or `longjmp` may leave it;
     /// - stay loaded while any call of it may run, one that started before it was replaced included;
@@ -406,12 +408,12 @@ impl Vm {
     /// ```
     /// use rvm::{NativeArg, NativeSig, Vm};
     ///
-    /// extern "win64" fn add(a: u64, b: u64) -> u64 {
+    /// extern "C" fn add(a: u64, b: u64) -> u64 {
     ///     a.wrapping_add(b)
     /// }
     ///
     /// // Fills `len` bytes at `buf` with `byte`.
-    /// unsafe extern "win64" fn fill(buf: *mut u8, len: u64, byte: u64) -> u64 {
+    /// unsafe extern "C" fn fill(buf: *mut u8, len: u64, byte: u64) -> u64 {
     ///     unsafe { buf.write_bytes(byte as u8, len as usize) };
     ///     0
     /// }
@@ -419,8 +421,8 @@ impl Vm {
     /// const FILL: NativeSig = NativeSig::new(&[NativeArg::Write(Some(2)), NativeArg::Int, NativeArg::Int]);
     ///
     /// let vm = Vm::new();
-    /// // SAFETY: both take their arguments in the Windows x64 convention and never unwind, and `fill` writes only
-    /// // the bytes the call checks, which it does with passthrough off.
+    /// // SAFETY: both take their arguments in the host C convention and never unwind, and `fill` writes only the
+    /// // bytes the call checks, which it does with passthrough off.
     /// unsafe {
     ///     vm.register_native("add", add as *const (), NativeSig::ints(2))?;
     ///     vm.register_native("fill", fill as *const (), FILL)?;

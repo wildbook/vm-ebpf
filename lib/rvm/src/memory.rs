@@ -56,7 +56,11 @@ pub const MAX_REGION_LEN: usize = 1 << 32;
 /// small offsets from it stay guest faults. Windows never maps them.
 pub const RAW_START: u64 = 1 << 16;
 
-/// The end of the host addresses a guest reaches with [`Passthrough`]: user-mode addresses on x64 lie below 2^47.
+/// The end of the host addresses a guest reaches with [`Passthrough`]: user-mode addresses on x64 lie below 2^47
+/// (or 2^56 on Linux with 5-level paging, still below [`region_tag(1)`](region_tag)).
+#[cfg(target_os = "linux")]
+pub const RAW_END: u64 = 1 << 56;
+#[cfg(not(target_os = "linux"))]
 pub const RAW_END: u64 = 1 << 47;
 
 /// The tag of region `idx`: the bits its guest addresses have above the host address, and the link address of its

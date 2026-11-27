@@ -10,18 +10,18 @@ use rvm::{
 
 use crate::common::object;
 
-extern "win64" fn add(a: u64, b: u64) -> u64 {
+extern "C" fn add(a: u64, b: u64) -> u64 {
     a.wrapping_add(b)
 }
 
-extern "win64" fn five(a: u64, b: u64, c: u64, d: u64, e: u64) -> u64 {
+extern "C" fn five(a: u64, b: u64, c: u64, d: u64, e: u64) -> u64 {
     a + 10 * b + 100 * c + 1000 * d + 10_000 * e
 }
 
 /// # Safety
 ///
 /// `buf` must point to `len` readable bytes, or `len` be 0.
-unsafe extern "win64" fn sum(buf: *const u8, len: u64) -> u64 {
+unsafe extern "C" fn sum(buf: *const u8, len: u64) -> u64 {
     if len == 0 {
         return 0;
     }
@@ -32,7 +32,7 @@ unsafe extern "win64" fn sum(buf: *const u8, len: u64) -> u64 {
 /// # Safety
 ///
 /// `buf` must point to `len` writable bytes.
-unsafe extern "win64" fn fill(buf: *mut u8, len: u64, byte: u64) -> u64 {
+unsafe extern "C" fn fill(buf: *mut u8, len: u64, byte: u64) -> u64 {
     unsafe { buf.write_bytes(byte as u8, len as usize) };
     0
 }
@@ -40,7 +40,7 @@ unsafe extern "win64" fn fill(buf: *mut u8, len: u64, byte: u64) -> u64 {
 /// # Safety
 ///
 /// `p` must point to a readable byte.
-unsafe extern "win64" fn first(p: *const u8) -> u64 {
+unsafe extern "C" fn first(p: *const u8) -> u64 {
     unsafe { p.read() }.into()
 }
 
@@ -50,7 +50,7 @@ thread_local! {
 }
 
 /// 1 if a call back into the plugin that called it finds the plugin busy, else 0.
-extern "win64" fn reenter(x: u64) -> u64 {
+extern "C" fn reenter(x: u64) -> u64 {
     let plugin = REENTERED.with_borrow(|p| p.as_ref().and_then(WeakPlugin::upgrade));
     let busy = plugin.map(|p| p.call("add", &[x, 1]));
     matches!(busy, Some(Err(VmError::PluginBusy(_)))).into()
