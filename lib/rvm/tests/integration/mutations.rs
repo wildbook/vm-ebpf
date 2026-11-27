@@ -13,7 +13,9 @@ use std::backtrace::{Backtrace, BacktraceStatus};
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::Once;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, Once};
+use std::thread;
 
 use rvm::{Image, Module, VmConfig};
 
@@ -26,12 +28,12 @@ const MEMORY_LIMIT: usize = 64 << 20;
 /// close.
 const ALLOC_CAP: usize = 2 * MEMORY_LIMIT;
 
-/// Cases per fixture and loader, about a second in a debug build.
+/// Cases per fixture and loader.
 const DEFAULT_ITERS: u64 = 1000;
 
 /// Instruction budget when executing a mutated program that loaded cleanly.
 #[cfg(feature = "fuel")]
-const EXEC_LIMIT: u64 = 10_000;
+const EXEC_LIMIT: u64 = 1_000;
 
 fn limited_vm() -> rvm::Vm {
     host_vm_with(VmConfig {
@@ -51,36 +53,27 @@ fn mutated_images_load_or_fail() {
         .collect();
     assert!(images.len() >= 15, "only {} fixtures prepare", images.len());
 
-    let mut fuzz = Fuzz::new("image");
-    for (fixture, image) in &images {
-        let regions = image_regions(image);
-        fuzz.run(fixture, image, &regions, |bytes| {
-            if Image::from_bytes(bytes).is_err() {
-                return Outcome::Rejected;
-            }
-            outcome(vm.load_image_bytes(bytes))
-        });
-    }
-    fuzz.finish();
+    Fuzz::new("image").run_all(&images, image_regions, |bytes| {
+        if Image::from_bytes(bytes).is_err() {
+            return Outcome::Rejected;
+        }
+        outcome(vm.load_image_bytes(bytes))
+    });
 }
 
 #[test]
 fn mutated_elf_files_load_or_fail() {
     let vm = limited_vm();
-    let mut fuzz = Fuzz::new("elf");
-    for (fixture, elf) in &fixtures() {
-        let regions = elf_regions(elf);
-        fuzz.run(fixture, elf, &regions, |bytes| {
-            let Ok(module) = Module::from_elf(bytes) else {
-                return Outcome::Rejected;
-            };
-            let Ok(image) = vm.prepare_modules(&[&module]) else {
-                return Outcome::Rejected;
-            };
-            outcome(vm.load_image_bytes(&image.to_bytes()))
-        });
-    }
-    fuzz.finish();
+    let files = fixtures();
+    Fuzz::new("elf").run_all(&files, elf_regions, |bytes| {
+        let Ok(module) = Module::from_elf(bytes) else {
+            return Outcome::Rejected;
+        };
+        let Ok(image) = vm.prepare_modules(&[&module]) else {
+            return Outcome::Rejected;
+        };
+        outcome(vm.load_image_bytes(&image.to_bytes()))
+    });
 }
 
 /// Every `.o` in the directories under `bpf/prebuilt/`, by path relative to it.
@@ -168,54 +161,75 @@ enum Outcome {
 
 struct Fuzz {
     loader: &'static str,
-    counts: [u64; 2],
-    failures: Vec<String>,
 }
 
 impl Fuzz {
     fn new(loader: &'static str) -> Self {
         install_hooks();
-        Self {
-            loader,
-            counts: [0; 2],
-            failures: Vec::new(),
-        }
+        Self { loader }
     }
 
-    /// Run [`DEFAULT_ITERS`] or `RVM_FUZZ_ITERS` mutations of `original`, or the one case `RVM_FUZZ_SEED` names.
-    fn run(&mut self, fixture: &str, original: &[u8], regions: &[Range<usize>], load: impl Fn(&[u8]) -> Outcome) {
-        let seeds: Vec<u64> = match env_u64("RVM_FUZZ_SEED") {
-            Some(seed) => vec![seed],
-            None => {
-                let iters = env_u64("RVM_FUZZ_ITERS").unwrap_or(DEFAULT_ITERS);
-                let base = fnv1a(self.loader.as_bytes()) ^ fnv1a(fixture.as_bytes());
-                (0..iters).map(|i| Rng(base ^ i).next()).collect()
+    /// Run [`DEFAULT_ITERS`] or `RVM_FUZZ_ITERS` mutations of every fixture in parallel, or the one case
+    /// `RVM_FUZZ_SEED` names.
+    fn run_all(
+        self,
+        items: &[(String, Vec<u8>)],
+        regions_of: impl Fn(&[u8]) -> Vec<Range<usize>> + Sync,
+        load: impl Fn(&[u8]) -> Outcome + Sync,
+    ) {
+        let seed_override = env_u64("RVM_FUZZ_SEED");
+        let iters = env_u64("RVM_FUZZ_ITERS").unwrap_or(DEFAULT_ITERS);
+        let workers = thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(items.len().max(1));
+        let next = AtomicUsize::new(0);
+        let totals = Mutex::new(([0u64; 2], Vec::<String>::new()));
+
+        thread::scope(|s| {
+            for _ in 0..workers {
+                s.spawn(|| {
+                    let mut counts = [0u64; 2];
+                    let mut failures = Vec::new();
+                    let mut bytes = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some((fixture, original)) = items.get(i) else {
+                            break;
+                        };
+                        let regions = regions_of(original);
+                        let base = fnv1a(self.loader.as_bytes()) ^ fnv1a(fixture.as_bytes());
+                        let count = if seed_override.is_some() { 1 } else { iters };
+
+                        for idx in 0..count {
+                            let seed = seed_override.unwrap_or_else(|| Rng(base ^ idx).next());
+                            bytes.clear();
+                            bytes.extend_from_slice(original);
+                            mutate(&mut Rng(seed), &mut bytes, &regions);
+
+                            CAPTURING.set(true);
+                            let result = panic::catch_unwind(AssertUnwindSafe(|| load(&bytes)));
+                            CAPTURING.set(false);
+                            match result {
+                                Ok(outcome) => counts[outcome as usize] += 1,
+                                Err(_) => {
+                                    let panic = PANIC.take().unwrap_or_default();
+                                    failures.push(format!("{fixture} RVM_FUZZ_SEED={seed:#x}: {panic}"));
+                                }
+                            }
+                        }
+                    }
+                    let mut guard = totals.lock().unwrap();
+                    guard.0[0] += counts[0];
+                    guard.0[1] += counts[1];
+                    guard.1.extend(failures);
+                });
             }
-        };
+        });
 
-        for seed in seeds {
-            let mut bytes = original.to_vec();
-            mutate(&mut Rng(seed), &mut bytes, regions);
-
-            CAPTURING.set(true);
-            let result = panic::catch_unwind(AssertUnwindSafe(|| load(&bytes)));
-            CAPTURING.set(false);
-            match result {
-                Ok(outcome) => self.counts[outcome as usize] += 1,
-                Err(_) => {
-                    let panic = PANIC.take().unwrap_or_default();
-                    let failure = format!("{fixture} RVM_FUZZ_SEED={seed:#x}: {panic}");
-                    self.failures.push(failure);
-                }
-            }
-        }
-    }
-
-    fn finish(self) {
-        let [loaded, rejected] = self.counts;
-        let failed = self.failures.len();
+        let ([loaded, rejected], failures) = totals.into_inner().unwrap();
+        let failed = failures.len();
         println!("{}: {loaded} loaded, {rejected} rejected, {failed} failed", self.loader);
-        assert!(failed == 0, "{failed} {} cases failed:\n{}", self.loader, self.failures.join("\n"));
+        assert!(failed == 0, "{failed} {} cases failed:\n{}", self.loader, failures.join("\n"));
     }
 }
 

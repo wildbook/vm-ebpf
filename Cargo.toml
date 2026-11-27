@@ -20,6 +20,10 @@ bytemuck  = { version = "1.25", default-features = false }
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
+# Keep dev/test compiles fast: rvm-core monomorphizes ~256 handlers into rvm and every test binary.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 codegen-units = 1
 opt-level = "s"
