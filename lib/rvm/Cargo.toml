@@ -28,6 +28,8 @@ fuel = ["rvm-core/fuel"]
 # Guest maps: the map helpers, `Program::map`, `Vm::share_map`, and `Pod` for typed keys and values. Without it, an
 # image that declares maps fails to load with `LinkError::InvalidMap`.
 maps = ["dep:bytemuck"]
+# General native FFI marshalling: structs by value/return, float/double returns, variadics.
+ffi = ["rvm-core/ffi"]
 # Guest hash maps use a fixed hash seed, so builds compared in benchmarks probe the same way.
 fixed-hash-seed = []
 

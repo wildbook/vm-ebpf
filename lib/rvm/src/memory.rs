@@ -1192,7 +1192,12 @@ mod tests {
             asm.stxw(R6, 4, R7);
             asm.call(1).ldxw(R0, if old { R6 } else { R0 }, 0).add64(R0, R7).exit();
             let code = rvm_core::Code::new(rvm_core::Instruction::decode(&asm.assemble().unwrap()));
-            let result = Executor::new(Arc::new(helpers.clone()), stack_top, &config).call(&code, &mut mem, 0, &[]);
+            let result = Executor::new(Arc::new(helpers.clone()), Box::default(), stack_top, &config).call(
+                &code,
+                &mut mem,
+                0,
+                &[],
+            );
             (result, base)
         };
         assert_eq!(run(false).0.unwrap(), 21);
@@ -1359,7 +1364,7 @@ mod tests {
             let len = config.frame_size as usize;
             let stack_top = mem.map_any(STACK_REGION, len, Perms::RW).unwrap() + config.frame_size;
 
-            let mut executor = Executor::new(Arc::new(HelperRegistry::default()), stack_top, &config);
+            let mut executor = Executor::new(Arc::new(HelperRegistry::default()), Box::default(), stack_top, &config);
             assert_eq!(executor.call(&code, &mut mem, 0, &[next]).unwrap(), 2 + 2 + 3);
             // the first 64 KiB fault
             assert!(executor.call(&code, &mut mem, 0, &[RAW_START - 8]).is_err());

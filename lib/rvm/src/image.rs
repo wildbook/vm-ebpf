@@ -22,11 +22,11 @@ use rvm_core::{
 };
 
 use crate::error::{LinkError, Result, VmError};
-use crate::executor::{MAX_ARGS, REG_ARGS};
+use crate::executor::{Token, MAX_ARGS, REG_ARGS};
 use crate::helper::{HelperRegistry, NativeKind, SharedHelpers};
 #[cfg(feature = "maps")]
 use crate::layout::MAPS_REGION;
-use crate::layout::{BORROW_REGIONS, DATA_REGION, RODATA_REGION, STACK_REGION};
+use crate::layout::{BORROW_REGIONS, CODE_REGION, DATA_REGION, RODATA_REGION, STACK_REGION};
 use crate::map_def::{MapDef, MapKind};
 #[cfg(feature = "maps")]
 use crate::maps::Maps;
@@ -89,6 +89,8 @@ pub struct Image {
     /// The link addresses of `.rodata` and `.data` bytes in the code and data, which loading moves to the guest
     /// addresses of those bytes.
     pub addresses: Vec<Address>,
+    /// `&extern` references in code and data, as `(site, import index into imports)`.
+    pub tokens: Vec<(Site, u32)>,
 }
 
 /// A host, native, or plugin function that an [`Image`] imports.
@@ -163,16 +165,21 @@ impl Image {
         &self.imports
     }
 
-    /// Record a call at instruction index `at` to `import`, deduplicating `import` in [`Image::imports`].
-    pub fn add_call(&mut self, at: u32, import: Import) {
-        let idx = match self.imports.iter().position(|existing| existing == &import) {
+    /// Add `import` to [`Image::imports`], returning its deduplicated index.
+    pub fn add_import(&mut self, import: Import) -> u32 {
+        match self.imports.iter().position(|existing| existing == &import) {
             Some(idx) => idx as u32,
             None => {
                 let idx = self.imports.len() as u32;
                 self.imports.push(import);
                 idx
             }
-        };
+        }
+    }
+
+    /// Record a call at instruction index `at` to `import`, deduplicating `import` in [`Image::imports`].
+    pub fn add_call(&mut self, at: u32, import: Import) {
+        let idx = self.add_import(import);
         self.calls.push((at, idx));
     }
 
@@ -258,14 +265,19 @@ impl Image {
         w.section(|w| {
             w.u32(self.addresses.len() as u32);
             for address in &self.addresses {
-                let (kind, at) = match address.at {
-                    Site::Code(at) => (SITE_CODE, at),
-                    Site::RoData(at) => (SITE_RODATA, at),
-                    Site::Data(at) => (SITE_DATA, at),
-                };
+                let (kind, at) = site_bytes(address.at);
                 w.0.push(kind);
                 w.u32(at);
                 w.0.push(address.region as u8);
+            }
+        });
+        w.section(|w| {
+            w.u32(self.tokens.len() as u32);
+            for &(site, idx) in &self.tokens {
+                let (kind, at) = site_bytes(site);
+                w.0.push(kind);
+                w.u32(at);
+                w.u32(idx);
             }
         });
         w.0
@@ -285,7 +297,16 @@ impl Image {
             imports: s.imports,
             calls: s.calls,
             addresses: s.addresses,
+            tokens: s.tokens,
         })
+    }
+}
+
+fn site_bytes(site: Site) -> (u8, u32) {
+    match site {
+        Site::Code(at) => (SITE_CODE, at),
+        Site::RoData(at) => (SITE_RODATA, at),
+        Site::Data(at) => (SITE_DATA, at),
     }
 }
 
@@ -302,6 +323,7 @@ struct Sections<'a> {
     imports: Vec<Import>,
     calls: Vec<(u32, u32)>,
     addresses: Vec<Address>,
+    tokens: Vec<(Site, u32)>,
 }
 
 impl<'a> Sections<'a> {
@@ -392,17 +414,19 @@ impl<'a> Sections<'a> {
         let mut s = r.section()?;
         let mut addresses = Vec::new();
         for _ in 0..s.u32()? {
-            let (kind, at) = (s.u8()?, s.u32()?);
-            let at = match kind {
-                SITE_CODE => Site::Code(at),
-                SITE_RODATA => Site::RoData(at),
-                SITE_DATA => Site::Data(at),
-                kind => return Err(invalid(format!("address site of unknown kind {kind}"))),
-            };
+            let at = parse_site(s.u8()?, s.u32()?)?;
             addresses.push(Address {
                 at,
                 region: s.u8()?.into(),
             });
+        }
+        s.end()?;
+
+        let mut s = r.section()?;
+        let mut tokens = Vec::new();
+        for _ in 0..s.u32()? {
+            let site = parse_site(s.u8()?, s.u32()?)?;
+            tokens.push((site, s.u32()?));
         }
         s.end()?;
         r.end()?;
@@ -418,7 +442,17 @@ impl<'a> Sections<'a> {
             imports,
             calls,
             addresses,
+            tokens,
         })
+    }
+}
+
+fn parse_site(kind: u8, at: u32) -> Result<Site> {
+    match kind {
+        SITE_CODE => Ok(Site::Code(at)),
+        SITE_RODATA => Ok(Site::RoData(at)),
+        SITE_DATA => Ok(Site::Data(at)),
+        kind => Err(invalid(format!("site of unknown kind {kind}"))),
     }
 }
 
@@ -441,6 +475,7 @@ pub fn load(
         imports,
         calls,
         addresses,
+        tokens,
     } = image;
     let sections = Sections {
         code: &code,
@@ -453,6 +488,7 @@ pub fn load(
         imports,
         calls,
         addresses,
+        tokens,
     };
     load_with_shared_resolver(sections, helpers, resolver, shared, config)
 }
@@ -553,6 +589,21 @@ fn resolve_imports(
                 }
                 .into());
             }
+            (None, Some(p)) if p.needs_general() => {
+                #[cfg(feature = "ffi")]
+                {
+                    p.general_proto(name, None, true)?;
+                    (NativeSig::ints(0), NativeKind::General)
+                }
+                #[cfg(not(feature = "ffi"))]
+                {
+                    return Err(LinkError::NativeMismatch {
+                        name: name.clone(),
+                        reason: "this extern needs the `ffi` feature".into(),
+                    }
+                    .into());
+                }
+            }
             (None, Some(p)) => (p.native_sig(name)?, NativeKind::Strip),
             (None, None) => (NativeSig::ints(0), NativeKind::Raw),
         };
@@ -582,7 +633,11 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
     let snapshot = helpers.snapshot();
     bind_helper_calls(&mut insns, s.code, &snapshot.table);
     let tagged = !config.passthrough.is_untagged();
-    let Bound { natives, stack_calls } = bind_externs(&mut insns, &s.imports, &s.calls, &snapshot.table, tagged)?;
+    let Bound {
+        natives,
+        stack_calls,
+        resolved,
+    } = bind_externs(&mut insns, &s.imports, &s.calls, &snapshot.table, tagged)?;
     let functions = check_functions(s.functions, insns.len() as u64)?;
 
     let mut memory = VmMemory::with_passthrough(config.passthrough);
@@ -590,6 +645,7 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
     memory.map_bytes_any(RODATA_REGION, s.rodata, s.rodata_len, Perms::R)?;
     memory.map_bytes_any(DATA_REGION, s.data, s.data_len, Perms::RW)?;
     relocate(&s.addresses, &mut insns, &mut memory)?;
+    let tokens = patch_tokens(&s.tokens, &resolved, &mut insns, &mut memory)?;
 
     // SAFETY: `bind_externs` checked each native's prototype against `snapshot.table`'s signature, which a native
     // keeps in every later table the program refreshes to. `register_native` and `set_native_resolver` vouch for the
@@ -621,7 +677,8 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
     #[cfg(feature = "maps")]
     maps.locate(&memory);
 
-    let program = Program::new(code, memory, stack_top, functions, helpers.clone(), snapshot, config);
+    let program =
+        Program::new(code, memory, stack_top, functions, helpers.clone(), snapshot, config).with_tokens(tokens);
     #[cfg(feature = "maps")]
     let program = program.with_maps(maps);
     Ok(program)
@@ -665,6 +722,58 @@ fn relocate(addresses: &[Address], insns: &mut [Instruction], memory: &mut VmMem
         }
     }
     Ok(())
+}
+
+/// Patch each `&extern` token site in `code`, `.rodata` or `.data` with its token address in `CODE_REGION`
+/// (`region_tag(CODE_REGION) | (token_idx * 8 + 1)`).
+fn patch_tokens(
+    token_sites: &[(Site, u32)],
+    resolved: &[BoundImport],
+    insns: &mut [Instruction],
+    memory: &mut VmMemory,
+) -> Result<Box<[Token]>> {
+    const IMM: u64 = 0xFFFF_FFFF << 32;
+
+    let mut table: Vec<Token> = Vec::new();
+    for &(site, import_idx) in token_sites {
+        let bad = || invalid(format!("token at {site:?} for import {import_idx}"));
+        let bound = resolved.get(import_idx as usize).ok_or_else(bad)?;
+        let token = match *bound {
+            BoundImport::Slot { slot, stack } => Token::Slot { slot, stack },
+            BoundImport::Native { index, mode, .. } => Token::Native { index, mode },
+        };
+        let token_idx = match table.iter().position(|existing| existing == &token) {
+            Some(idx) => idx as u64,
+            None => {
+                let idx = table.len() as u64;
+                table.push(token);
+                idx
+            }
+        };
+        let addr = region_tag(CODE_REGION) | (token_idx * INSN_SIZE + 1);
+        match site {
+            Site::Code(at) => {
+                let at = at as usize;
+                let [lo, hi] = insns.get_mut(at..at + 2).ok_or_else(bad)? else {
+                    unreachable!("two instructions")
+                };
+                if lo.byte() != LD_IMM64 {
+                    return Err(bad());
+                }
+                lo.0 = lo.0 & !IMM | addr << 32;
+                hi.0 = hi.0 & !IMM | addr & IMM;
+            }
+            Site::RoData(offset) | Site::Data(offset) => {
+                let in_region = match site {
+                    Site::RoData(_) => RODATA_REGION,
+                    _ => DATA_REGION,
+                };
+                let at = memory.region_base(in_region) + u64::from(offset);
+                memory.write(at, addr).map_err(|_| bad())?;
+            }
+        }
+    }
+    Ok(table.into_boxed_slice())
 }
 
 /// Fails unless the code is whole instructions and the code and the initial data fit their regions.
@@ -729,6 +838,7 @@ fn bind_helper_calls(insns: &mut [Instruction], code: &[u8], table: &HelperRegis
 struct Bound {
     natives: Vec<NativeBind>,
     stack_calls: Vec<u32>,
+    resolved: Vec<BoundImport>,
 }
 
 enum BoundImport {
@@ -752,9 +862,11 @@ fn bind_externs(
     let mut bound = Bound {
         natives: Vec::new(),
         stack_calls: Vec::new(),
+        resolved,
     };
     for &(at, import_idx) in calls {
-        let target = resolved
+        let target = bound
+            .resolved
             .get(import_idx as usize)
             .ok_or_else(|| invalid(format!("call at instruction {at}: import index {import_idx} out of range")))?;
         let insn = insns
@@ -800,9 +912,24 @@ fn bind_import(import: &Import, table: &HelperRegistry, tagged: bool) -> Result<
                             .into());
                         };
                         p.check_native_sig(name, host_sig)?;
-                        match tagged && host_sig.has_pointers() {
-                            true => NativeMode::Checked,
-                            false => NativeMode::Plain,
+                        if p.needs_general() {
+                            #[cfg(feature = "ffi")]
+                            {
+                                NativeMode::General(p.general_proto(name, Some(host_sig), tagged)?)
+                            }
+                            #[cfg(not(feature = "ffi"))]
+                            {
+                                return Err(LinkError::NativeMismatch {
+                                    name: name.clone(),
+                                    reason: "this extern needs the `ffi` feature".into(),
+                                }
+                                .into());
+                            }
+                        } else {
+                            match tagged && host_sig.has_pointers() {
+                                true => NativeMode::Checked,
+                                false => NativeMode::Plain,
+                            }
                         }
                     }
                     NativeKind::Strip => {
@@ -814,6 +941,18 @@ fn bind_import(import: &Import, table: &HelperRegistry, tagged: bool) -> Result<
                             true => NativeMode::Strip,
                             false => NativeMode::Plain,
                         }
+                    }
+                    #[cfg(feature = "ffi")]
+                    NativeKind::General => {
+                        let Some(p) = proto else {
+                            let reason = "the module has no BTF for this extern".into();
+                            return Err(LinkError::NativeMismatch {
+                                name: name.clone(),
+                                reason,
+                            }
+                            .into());
+                        };
+                        NativeMode::General(p.general_proto(name, None, tagged)?)
                     }
                     NativeKind::Raw => NativeMode::Raw,
                 };

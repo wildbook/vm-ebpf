@@ -13,3 +13,5 @@ default = ["fuel"]
 # with and without the feature; it adds the metered handlers, their tables, and a `u64` per slot of each `Code` that
 # a metered run runs.
 fuel = []
+# General native call marshalling (structs of 3/5/6/7 and 9..16 bytes, struct returns, float/double returns, variadics).
+ffi = []

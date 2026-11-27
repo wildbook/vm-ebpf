@@ -209,6 +209,8 @@ pub enum Stop {
     UnknownHelper(u32),
     /// A call to an extern table slot that doesn't exist.
     UnknownSlot(u32),
+    /// A checked native token call faulted on guest address `addr`.
+    MemoryFault(u64),
 }
 
 impl From<HostError> for Stop {
@@ -269,6 +271,9 @@ pub enum NativeKind {
     Strip,
     /// Resolved without BTF (`Resolved::sig` and `Proto` were both `None`): passes r1 to r5 via `rvm_call_regs`.
     Raw,
+    /// Resolved from a plugin's BTF prototype that requires `GENERAL` marshalling (structs, floats, variadics).
+    #[cfg(feature = "ffi")]
+    General,
 }
 
 impl HostFn {

@@ -160,6 +160,12 @@ checks pointer bounds as for `register_native`. When it returns `sig: None`, the
 arguments are pointers, and rvm strips their region tags in tagged programs without bounds checks. Without BTF,
 arguments pass unchanged through the native trampoline.
 
+Taking the address of a declared extern (`&host_fn`, in code or in `.rodata`/`.data` tables) produces a callable token
+that dispatches through the import's bound target without requiring `RawCalls::on()`. With the `ffi` Cargo feature
+enabled, resolver-bound natives (and variadic natives registered with `NativeSig::variadic`) also support structs of 3,
+5, 6, 7 and 9 to 16 bytes by value, struct returns of any size, `float` and `double` arguments and returns, and
+variadic calls.
+
 Pointers stored inside plugin memory, such as the fields of a struct the plugin fills, keep the plugin's region tag,
 and native code can't follow them. Either load the plugin with `Passthrough::untagged()`, where every pointer is a
 plain host address and nothing is checked, or declare those pointers `__host` and convert with `HOST()` from

@@ -4,7 +4,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use rvm_core::{
-    Callee, Code, Context, Host, Interpreter, Native, NativeCall, Reason, StackArgs, MAX_STACK_ARGS, METERED,
+    call_bound, Callee, Code, Context, Host, Interpreter, Native, NativeCall, NativeMode, Reason, StackArgs,
+    MAX_STACK_ARGS, METERED,
 };
 
 use crate::error::{ExecError, MemoryError, Result, VmError};
@@ -28,6 +29,13 @@ pub const REG_ARGS: usize = 5;
 /// Most arguments of a call: those in registers, and those the caller passes on the stack.
 pub const MAX_ARGS: usize = REG_ARGS + MAX_STACK_ARGS;
 
+/// Resolved target of an `&extern` token in a loaded program.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Token {
+    Slot { slot: u32, stack: bool },
+    Native { index: u32, mode: NativeMode },
+}
+
 /// Runs the functions of one program, with BPF-to-BPF calls on their own stack frames.
 ///
 /// Each call borrows the code and the memory, so the memory survives errors. Code is a separate instruction slice, so
@@ -43,12 +51,13 @@ pub struct Executor {
 impl Executor {
     /// An executor whose calls start with r10 at `stack_top`, with the frame size, instruction limit and raw calls of
     /// `config`.
-    pub fn new(helpers: Arc<HelperRegistry>, stack_top: u64, config: &VmConfig) -> Self {
+    pub fn new(helpers: Arc<HelperRegistry>, tokens: Box<[Token]>, stack_top: u64, config: &VmConfig) -> Self {
         let host = HostCalls {
             table: CallTable::new(helpers),
             state: HostState::default(),
             stop: None,
             raw_calls: config.raw_calls.is_on(),
+            tokens,
         };
         #[cfg_attr(not(feature = "fuel"), expect(unused_mut))]
         let mut executor = Self {
@@ -66,6 +75,11 @@ impl Executor {
     /// Replace the extern table that helper and kfunc calls use.
     pub fn set_helpers(&mut self, helpers: Arc<HelperRegistry>) {
         self.interp.host.table.set(helpers);
+    }
+
+    /// Set the resolved `&extern` tokens for this program.
+    pub fn set_tokens(&mut self, tokens: Box<[Token]>) {
+        self.interp.host.tokens = tokens;
     }
 
     /// The maps passed to helpers through [`HostState::maps`].
@@ -232,7 +246,7 @@ fn run_on(
 ) -> Result<u64> {
     loop {
         pc = match interp.host.take_fuel_wanted(reason) {
-            Some(slot) => call_with_fuel(slot, pc, code, ctx, interp)?,
+            Some((slot, stack_token)) => call_with_fuel(slot, stack_token, pc, code, ctx, interp)?,
             None => resume_at(reason, pc, code, interp)?,
         };
         let stop = interp.resume(ctx, code, pc);
@@ -259,6 +273,7 @@ impl Drop for FuelGuard<'_> {
 #[inline(never)]
 fn call_with_fuel(
     slot: u32,
+    stack_token: bool,
     pc: u64,
     code: &Code,
     ctx: &mut Context<VmMemory>,
@@ -266,7 +281,7 @@ fn call_with_fuel(
 ) -> Result<u64> {
     let fuel = interp.fuel().expect("only a metered caller asks for its fuel");
     // the call passes the stack arguments again if it passed them the first time
-    let stack = code.passes_stack_args(pc).then(|| *interp.stack_args());
+    let stack = (stack_token || code.passes_stack_args(pc)).then(|| *interp.stack_args());
     let host = &mut interp.host;
     host.state.fuel = CallerFuel::Left(fuel);
     let state = FuelGuard(&mut host.state);
@@ -322,6 +337,11 @@ fn failure(stop: Stop, pc: u64) -> VmError {
         Stop::Failed(error) => error.into(),
         Stop::UnknownHelper(id) => ExecError::UnknownHelper { pc, id }.into(),
         Stop::UnknownSlot(slot) => ExecError::UnknownExtern { pc, slot }.into(),
+        Stop::MemoryFault(addr) => ExecError::MemoryFault {
+            pc,
+            error: MemoryError { addr, size: 1 },
+        }
+        .into(),
         Stop::FuelWanted => unreachable!("`run_on` answers fuel requests"),
     }
 }
@@ -334,26 +354,73 @@ struct HostCalls {
     stop: Option<Stop>,
     /// Whether a `callx` through a raw address calls it: [`RawCalls::on`](crate::RawCalls::on).
     raw_calls: bool,
+    /// Resolved `&extern` tokens for this program, indexed by `(offset >> 3)` when `offset & 7 == 1` in `CODE_REGION`.
+    tokens: Box<[Token]>,
 }
 
 impl HostCalls {
-    /// The extern-table slot of the host function that stopped the run with `reason` asking for the caller's fuel, if
-    /// it did; takes the request.
+    /// The extern-table slot (and whether it takes stack args) of the host function that stopped the run with `reason`
+    /// asking for the caller's fuel, if it did; takes the request.
     #[cold]
-    fn take_fuel_wanted(&mut self, reason: Reason<u64>) -> Option<u32> {
+    fn take_fuel_wanted(&mut self, reason: Reason<u64>) -> Option<(u32, bool)> {
         if !matches!(self.stop, Some(Stop::FuelWanted)) {
             return None;
         }
-        let slot = match reason {
-            Reason::CallKfunc(slot) => Some(slot),
-            Reason::CallHelper(id) => self.table.registry().slot_of_id(id),
-            Reason::CallIndirect(target) => u32::try_from(target)
-                .ok()
-                .and_then(|id| self.table.registry().slot_of_id(id)),
+        let found = match reason {
+            Reason::CallKfunc(slot) => Some((slot, false)),
+            Reason::CallHelper(id) => self.table.registry().slot_of_id(id).map(|s| (s, false)),
+            Reason::CallIndirect(target) => {
+                if let Some(Token::Slot { slot, stack }) = self.token_at(target) {
+                    Some((slot, stack))
+                } else {
+                    u32::try_from(target)
+                        .ok()
+                        .and_then(|id| self.table.registry().slot_of_id(id))
+                        .map(|s| (s, false))
+                }
+            }
             _ => None,
         }?;
         self.stop = None;
-        Some(slot)
+        Some(found)
+    }
+
+    /// Look up an `&extern` token encoded at `target` in `CODE_REGION` (`offset % 8 == 1`).
+    fn token_at(&self, target: u64) -> Option<Token> {
+        let offset = target.checked_sub(region_tag(CODE_REGION))?;
+        if offset & 7 != 1 {
+            return None;
+        }
+        self.tokens.get((offset >> 3) as usize).copied()
+    }
+
+    /// Invoke an `&extern` token on the cold side of `call_indirect`.
+    #[cold]
+    #[inline(never)]
+    fn call_token(&mut self, ctx: &mut Context<VmMemory>, token: Token, native: NativeCall<'_, u64>) -> Option<Callee> {
+        match token {
+            Token::Slot { slot, stack } => {
+                let r0 = match stack.then(|| native.stack()).flatten() {
+                    Some(stack) => self.call_kfunc_stack(ctx, slot, stack),
+                    None => self.call_kfunc(ctx, slot),
+                };
+                r0.map(Callee::Host)
+            }
+            Token::Native { index, mode } => {
+                let Some(&nat) = self.table.natives().get(index as usize) else {
+                    self.stop = Some(Stop::UnknownSlot(index));
+                    return None;
+                };
+                // SAFETY: `bind_externs` validated `nat` against the import's prototype for `mode`
+                match unsafe { call_bound(nat, mode, &mut ctx.regs, native.stack(), &*ctx.memory) } {
+                    Ok(()) => Some(Callee::Host(ctx.regs[0])),
+                    Err(addr) => {
+                        self.stop = Some(Stop::MemoryFault(addr));
+                        None
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -403,6 +470,9 @@ impl Host<VmMemory> for HostCalls {
         // the register allocator serves the helper call first.
         if target >= RAW_START {
             core::hint::cold_path();
+            if let Some(token) = self.token_at(target) {
+                return self.call_token(ctx, token, native);
+            }
             if self.raw_calls && target < RAW_END {
                 // SAFETY: `RawCalls::on` leaves every target and its arguments to the host
                 return Some(Callee::Host(unsafe { native.call(target, &ctx.regs) }));
@@ -474,7 +544,7 @@ mod tests {
         let code = Code::new(Instruction::decode(code));
         let len = config.frame_size as usize;
         let stack_top = memory.map_any(STACK_REGION, len, Perms::RW).unwrap() + config.frame_size;
-        Executor::new(Arc::new(helpers.clone()), stack_top, config).call(&code, &mut memory, 0, &[])
+        Executor::new(Arc::new(helpers.clone()), Box::default(), stack_top, config).call(&code, &mut memory, 0, &[])
     }
 
     fn run(asm: &Assembler) -> Result<u64> {

@@ -333,3 +333,49 @@ fn resolver_rejects_missing_null_and_mismatched() {
         VmError::Link(LinkError::NativeMismatch { name, .. }) if name == "res_strlen"
     ));
 }
+
+/// `&extern` tokens in code, `.rodata` tables, and `.data` tables call host closures and plugin exports (including
+/// stack arguments and metered fuel) with `RawCalls::OFF` and `Passthrough::OFF`, and round-trip in prepared images.
+#[test]
+fn tokens_call_host_closures_and_exports_without_raw_calls() {
+    use rvm::{Plugin, VmConfig};
+
+    let config = VmConfig {
+        #[cfg(feature = "fuel")]
+        instruction_limit: 100_000,
+        ..VmConfig::default()
+    };
+    let vm = Vm::with_config(config).unwrap();
+    vm.register_extern("tok_host", |(a, b): (u64, u64)| a.wrapping_add(b));
+    vm.register_extern_with_memory("tok_checked", |mem, (buf, len): (u64, u64)| {
+        let bytes = mem.read_vec(buf, len as usize)?;
+        Ok::<_, rvm::MemoryError>(bytes.iter().map(|&b| u64::from(b)).sum::<u64>())
+    });
+    type Six = (u64, u64, u64, u64, u64, u64);
+    vm.register_extern("tok_stack", |(a, b, c, d, e, f): Six| a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6);
+
+    // Export a guest function as `tok_nat` to exercise metered plugin-export token calls too.
+    let mut asm = ebpf_asm::Assembler::new();
+    asm.mov64(ebpf_asm::R0, ebpf_asm::R1)
+        .mul64(ebpf_asm::R0, ebpf_asm::R2)
+        .exit();
+    let mut exp_img = Image::from_code(asm.assemble().unwrap());
+    exp_img.functions[0].0 = "tok_nat".into();
+    let provider = Plugin::new("provider", vm.load_image(exp_img).unwrap());
+    vm.export(&provider, "tok_nat").unwrap();
+
+    let image = Vm::new().prepare_elf(&object("tests/tokens.o")).unwrap();
+    assert!(!image.tokens.is_empty());
+    let bytes = image.to_bytes();
+    assert_eq!(Image::from_bytes(&bytes).unwrap(), image);
+
+    let mut prog = vm.load_image_bytes(&bytes).unwrap();
+    assert_eq!(prog.call("call_code_token", &[0, 6, 7]).unwrap(), 13);
+    assert_eq!(prog.call("call_code_token", &[1, 6, 7]).unwrap(), 42);
+    assert_eq!(prog.call("call_ro_token", &[0, 6, 7]).unwrap(), 13);
+    assert_eq!(prog.call("call_ro_token", &[1, 6, 7]).unwrap(), 42);
+    assert_eq!(prog.call("call_rw_token", &[0, 6, 7]).unwrap(), 42);
+    assert_eq!(prog.call("call_rw_token", &[1, 6, 7]).unwrap(), 13);
+    assert_eq!(prog.call("call_checked_token", &[0]).unwrap(), 10);
+    assert_eq!(prog.call("call_stack_token", &[1]).unwrap(), 1 + 2 * 2 + 3 * 3 + 4 * 4 + 5 * 5 + 6 * 6);
+}

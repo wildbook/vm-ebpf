@@ -11,7 +11,7 @@ use hashbrown::HashMap;
 use rvm_core::Code;
 
 use crate::error::{MemoryError, Result, VmError};
-use crate::executor::{fuel_for, Executor, MAX_ARGS};
+use crate::executor::{fuel_for, Executor, Token, MAX_ARGS};
 use crate::helper::{SharedHelpers, Snapshot};
 #[cfg(feature = "maps")]
 use crate::maps::{MapRef, Maps};
@@ -132,8 +132,14 @@ impl Program {
             functions,
             shared_helpers,
             helpers_version: helpers.version,
-            executor: Executor::new(helpers.table, stack_top, config),
+            executor: Executor::new(helpers.table, Box::default(), stack_top, config),
         }
+    }
+
+    /// Attach resolved `&extern` tokens to the program's executor.
+    pub(crate) fn with_tokens(mut self, tokens: Box<[Token]>) -> Self {
+        self.executor.set_tokens(tokens);
+        self
     }
 
     /// The program's guest memory.

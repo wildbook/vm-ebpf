@@ -288,6 +288,10 @@ impl ExternDecls {
         Ok(Self { decls })
     }
 
+    fn has(&self, name: &str) -> bool {
+        self.decls.contains_key(name)
+    }
+
     fn import_for(&self, name: String) -> Import {
         match self.decls.get(&name) {
             Some(decl) => Import::Name {
@@ -420,6 +424,25 @@ fn apply_relocation(
         // Call to an extern function, recorded with its prototype and bound at load time.
         let import = externs.import_for(symbol.name.clone());
         mark_extern(image, at, import)?;
+        return Ok(());
+    } else if reloc.addend == 0 && externs.has(&symbol.name) {
+        // `&extern` token: resolved to an executable token in `CODE_REGION` at load time.
+        let site = match (reloc.rel_type, patch) {
+            (reloc::bpf::BPF_64_64, Addr::Code(at)) => {
+                image.set_ld_imm64(at, 0)?;
+                Site::Code((at / INSN_SIZE) as u32)
+            }
+            (reloc::bpf::BPF_64_ABS64, Addr::Data(at)) => {
+                image.data_mut(at, 8)?.copy_from_slice(&0u64.to_le_bytes());
+                match split_addr(at) {
+                    (RODATA_REGION, offset) => Site::RoData(offset as u32),
+                    (_, offset) => Site::Data(offset as u32),
+                }
+            }
+            _ => return Err(LinkError::UnresolvedSymbol(symbol.name.clone()).into()),
+        };
+        let import_idx = image.add_import(externs.import_for(symbol.name.clone()));
+        image.tokens.push((site, import_idx));
         return Ok(());
     } else {
         return Err(LinkError::UnresolvedSymbol(symbol.name.clone()).into());

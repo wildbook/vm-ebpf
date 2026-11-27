@@ -112,6 +112,8 @@ pub const fn usual(byte: u8) -> u8 {
         (MOVSX32, _) => MOV32_REG,
         (MOVSX64 | TO_HOST | TO_GUEST, _) => MOV64_REG,
         (CALL_HELPER | CALL_KFUNC | native::RAW, _) => CALL,
+        #[cfg(feature = "ffi")]
+        (native::GENERAL, _) => CALL,
         (args::LOAD, _) => LDX_DW,
         (args::STORE, _) => STX_DW,
         (args::STORE_IMM, _) => ST_DW,
@@ -146,5 +148,7 @@ const _: () = {
     const_for!(byte in native::STRIP => claim(&mut used, byte));
     const_for!(byte in native::STACK => claim(&mut used, byte));
     claim(&mut used, native::RAW);
+    #[cfg(feature = "ffi")]
+    claim(&mut used, native::GENERAL);
     const_for!(byte in [args::LOAD, args::STORE, args::STORE_IMM, args::CALL, args::CALLX] => claim(&mut used, byte));
 };

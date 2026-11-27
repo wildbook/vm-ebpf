@@ -5,6 +5,8 @@ use std::fmt::{self, Debug, Formatter};
 #[cfg(feature = "fuel")]
 use crate::fuel::Rests;
 use crate::handler::{CALL_HELPER, CALL_KFUNC};
+#[cfg(feature = "ffi")]
+use crate::native::GeneralProto;
 use crate::native::{NativeBind, NativeMode};
 use crate::opcode::OpCode;
 use crate::slot::Slot;
@@ -15,6 +17,8 @@ pub struct Code {
     /// The code, then the slots [`transfer::bound`] appends.
     slots: Box<[Slot]>,
     len: usize,
+    #[cfg(feature = "ffi")]
+    general: Box<[GeneralProto]>,
     #[cfg(feature = "fuel")]
     rests: Rests,
 }
@@ -68,18 +72,39 @@ impl Code {
         i32::try_from(len).expect("fewer than 2^31 slots");
 
         rewrite::rewrite(&mut insns);
+        #[cfg(feature = "ffi")]
+        let mut general: Vec<GeneralProto> = Vec::new();
         for &bind in natives {
             let Some(insn) = insns.get_mut(bind.pc) else {
                 return Err(bind.pc);
             };
             let args = usize::from(bind.args);
-            if !matches!(insn.byte(), CALL_HELPER | CALL_KFUNC)
-                || (bind.mode != NativeMode::Raw && args > MAX_NATIVE_ARGS)
-            {
+            let unlimited = matches!(bind.mode, NativeMode::Raw);
+            #[cfg(feature = "ffi")]
+            let unlimited = unlimited || matches!(bind.mode, NativeMode::General(_));
+            if !matches!(insn.byte(), CALL_HELPER | CALL_KFUNC) || (!unlimited && args > MAX_NATIVE_ARGS) {
                 return Err(bind.pc);
             }
             let byte = native::byte(args, bind.mode);
-            *insn = Instruction::new(OpCode(byte), 0, 0, 0, bind.index as i32);
+            let offset = match bind.mode {
+                #[cfg(feature = "ffi")]
+                NativeMode::General(proto) => {
+                    let idx = match general.iter().position(|existing| existing == &proto) {
+                        Some(idx) => idx,
+                        None => {
+                            let idx = general.len();
+                            if idx > usize::from(u16::MAX) {
+                                return Err(bind.pc);
+                            }
+                            general.push(proto);
+                            idx
+                        }
+                    };
+                    idx as u16 as i16
+                }
+                _ => 0,
+            };
+            *insn = Instruction::new(OpCode(byte), 0, 0, offset, bind.index as i32);
         }
         fuse::fuse(&mut insns);
         transfer::bound(&mut insns);
@@ -89,6 +114,8 @@ impl Code {
         Ok(Self {
             slots: slots.into_boxed_slice(),
             len,
+            #[cfg(feature = "ffi")]
+            general: general.into_boxed_slice(),
             #[cfg(feature = "fuel")]
             rests: Rests::default(),
         })
@@ -206,6 +233,14 @@ impl<'a> Slots<'a> {
     #[inline(always)]
     pub fn pc_at(self, addr: usize) -> u64 {
         ((addr - self.first.addr()) / size_of::<Slot>()) as u64
+    }
+
+    /// The [`GeneralProto`] at `index` recorded by [`Code::with_natives`].
+    #[cfg(feature = "ffi")]
+    #[inline(always)]
+    pub fn general(self, index: u16) -> &'a GeneralProto {
+        // SAFETY: `index` came from a `GENERAL` slot written by `Code::with_natives`
+        unsafe { self.code.general.get_unchecked(usize::from(index)) }
     }
 
     /// The `rest` of each slot, which metered runs read.

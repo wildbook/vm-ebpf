@@ -5,6 +5,8 @@ use std::ops::Range;
 
 #[cfg(feature = "link")]
 use btf::{Btf, BtfType};
+#[cfg(feature = "ffi")]
+use rvm_core::{GeneralArg, GeneralProto, GeneralRet};
 use rvm_core::{NativeArg, NativeSig, MAX_NATIVE_ARGS};
 
 use crate::error::{LinkError, Result};
@@ -73,14 +75,33 @@ impl Proto {
         matches!(self.ret, ReturnKind::Agg(9..=16))
     }
 
+    /// Whether a native call with this prototype needs the `GENERAL` marshalling handler instead of the fast
+    /// integer/pointer handlers.
+    pub fn needs_general(&self) -> bool {
+        self.variadic
+            || matches!(self.ret, ReturnKind::Float(_) | ReturnKind::Agg(_))
+            || self
+                .args
+                .iter()
+                .any(|a| matches!(a, ArgKind::Float(_) | ArgKind::Copy(_)))
+    }
+
     /// Check that this prototype matches a host-registered native signature `sig`.
     pub fn check_native_sig(&self, name: &str, sig: NativeSig) -> Result<()> {
         let mismatch = |reason: String| LinkError::NativeMismatch {
             name: name.to_string(),
             reason,
         };
+        if self.variadic != sig.is_variadic() {
+            let reason = match self.variadic {
+                true => "the extern is variadic",
+                false => "the host's signature is variadic",
+            };
+            return Err(mismatch(reason.into()).into());
+        }
+        #[cfg(not(feature = "ffi"))]
         if self.variadic {
-            return Err(mismatch("the extern is variadic".into()).into());
+            return Err(mismatch("the extern is variadic (enable the `ffi` feature)".into()).into());
         }
         if self.args.len() != usize::from(sig.args()) {
             let (name, declared, host) = (name.to_string(), self.args.len(), sig.args());
@@ -107,6 +128,87 @@ impl Proto {
             }
         }
         Ok(())
+    }
+
+    /// Build a [`GeneralProto`] for `GENERAL` marshalling. When `host_sig` is `Some`, pointer parameters are checked
+    /// against it in tagged programs; when `None`, pointer parameters lose their tags unchecked.
+    #[cfg(feature = "ffi")]
+    pub fn general_proto(&self, name: &str, host_sig: Option<NativeSig>, tagged: bool) -> Result<GeneralProto> {
+        let mismatch = |reason: String| LinkError::NativeMismatch {
+            name: name.to_string(),
+            reason,
+        };
+        let ret = match self.ret {
+            ReturnKind::Void | ReturnKind::Int | ReturnKind::Ptr => GeneralRet::Int,
+            ReturnKind::Float(4) => GeneralRet::F32,
+            ReturnKind::Float(8) => GeneralRet::F64,
+            ReturnKind::Agg(3 | 5 | 6 | 7) => GeneralRet::SmallAgg,
+            ReturnKind::Agg(9..=16) => GeneralRet::WideAgg,
+            ReturnKind::Agg(size) if size > 16 => GeneralRet::Sret(size),
+            ReturnKind::Agg(size) => return Err(mismatch(format!("unsupported return struct size {size}")).into()),
+            ReturnKind::Float(size) => return Err(mismatch(format!("unsupported float return size {size}")).into()),
+        };
+
+        let guest_regs = self.reg_count();
+        if guest_regs > MAX_NATIVE_ARGS {
+            return Err(LinkError::TooManyRegisters {
+                name: name.to_string(),
+                registers: guest_regs,
+            }
+            .into());
+        }
+        let native_slots = usize::from(matches!(ret, GeneralRet::SmallAgg | GeneralRet::WideAgg | GeneralRet::Sret(_)))
+            + self.args.len();
+        if native_slots > MAX_NATIVE_ARGS {
+            return Err(LinkError::TooManyRegisters {
+                name: name.to_string(),
+                registers: native_slots,
+            }
+            .into());
+        }
+
+        let mut args = [GeneralArg::Value; MAX_NATIVE_ARGS];
+        for (i, &arg) in self.args.iter().enumerate() {
+            args[i] = match arg {
+                ArgKind::Int | ArgKind::Float(4 | 8) => GeneralArg::Value,
+                ArgKind::Ptr | ArgKind::Callback => {
+                    if !tagged {
+                        GeneralArg::Value
+                    } else if let Some(sig) = host_sig {
+                        match sig.arg((i + 1) as u8) {
+                            Some(NativeArg::Read(len)) => GeneralArg::Checked {
+                                write: false,
+                                len_arg: len.unwrap_or(0),
+                            },
+                            Some(NativeArg::Write(len)) => GeneralArg::Checked {
+                                write: true,
+                                len_arg: len.unwrap_or(0),
+                            },
+                            _ => GeneralArg::Value,
+                        }
+                    } else {
+                        GeneralArg::Strip
+                    }
+                }
+                ArgKind::Copy(3 | 5 | 6 | 7) => GeneralArg::Copy1,
+                ArgKind::Copy(9..=16) => GeneralArg::Copy2,
+                ArgKind::Copy(size) => {
+                    let n = i + 1;
+                    return Err(mismatch(format!("parameter {n}: unsupported struct size {size}")).into());
+                }
+                ArgKind::Float(size) => {
+                    let n = i + 1;
+                    return Err(mismatch(format!("parameter {n}: unsupported float size {size}")).into());
+                }
+            };
+        }
+
+        Ok(GeneralProto {
+            args,
+            nargs: self.args.len() as u8,
+            ret,
+            variadic: self.variadic,
+        })
     }
 
     /// Build a [`NativeSig`] from this prototype when the resolver trusts the plugin's BTF (`Resolved::sig` is

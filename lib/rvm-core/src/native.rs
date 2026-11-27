@@ -72,8 +72,9 @@ pub struct NativeSig(u128);
 const POINTERS: u32 = 8;
 const WRITES: u32 = 24;
 const LENS: u32 = 40;
+const VARIADIC: u32 = 88;
 
-const _: () = assert!(LENS + 4 * REG_ARGS as u32 <= u64::BITS && LENS + 4 * MAX_ARGS as u32 <= u128::BITS);
+const _: () = assert!(LENS + 4 * REG_ARGS as u32 <= u64::BITS && LENS + 4 * MAX_ARGS as u32 <= VARIADIC);
 
 /// One argument of a [`NativeSig`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -139,6 +140,31 @@ impl NativeSig {
         }
     }
 
+    /// Signature of a variadic native function with `named` fixed parameters, or `None` if `named` is invalid.
+    pub const fn try_variadic(named: &[NativeArg]) -> Option<Self> {
+        match Self::try_new(named) {
+            Some(sig) => Some(Self(sig.0 | (1u128 << VARIADIC))),
+            None => None,
+        }
+    }
+
+    /// [`try_variadic`](Self::try_variadic) for a signature known to be valid.
+    ///
+    /// # Panics
+    ///
+    /// Panics where `try_variadic` returns `None`.
+    pub const fn variadic(named: &[NativeArg]) -> Self {
+        match Self::try_variadic(named) {
+            Some(sig) => sig,
+            None => panic!("more than 12 named arguments, or a length argument that isn't an integer argument"),
+        }
+    }
+
+    /// Whether the signature describes a variadic function.
+    pub const fn is_variadic(self) -> bool {
+        (self.0 >> VARIADIC) & 1 != 0
+    }
+
     /// The number of arguments.
     pub const fn args(self) -> u8 {
         self.0 as u8
@@ -167,7 +193,52 @@ impl NativeSig {
     }
 }
 
-/// How a bound native call handles pointer arguments.
+/// One parameter's marshalling rule for [`NativeMode::General`].
+#[cfg(feature = "ffi")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GeneralArg {
+    /// Integer, enum, float/double (copied to xmm by the trampoline), or 1/2/4/8-byte struct.
+    Value,
+    /// Pointer whose region tag is stripped via [`Memory::host_address`].
+    Strip,
+    /// Pointer checked via [`Memory::native_ptr`]; `len_arg` is 0 for 1 byte or 1-based guest argument slot.
+    Checked { write: bool, len_arg: u8 },
+    /// Struct or union of 3, 5, 6 or 7 bytes: 1 guest register copied to a 16-byte-aligned scratch slot.
+    Copy1,
+    /// Struct or union of 9 to 16 bytes: 2 guest registers copied to a 16-byte-aligned scratch slot.
+    Copy2,
+}
+
+/// Return value marshalling rule for [`NativeMode::General`].
+#[cfg(feature = "ffi")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GeneralRet {
+    /// Void, integer, pointer, or 1/2/4/8-byte struct (`rax` -> `r0`).
+    Int,
+    /// `float` (`xmm0` low 32 bits -> `r0`, zero-extended).
+    F32,
+    /// `double` (`xmm0` -> `r0`).
+    F64,
+    /// Struct of 3, 5, 6 or 7 bytes: hidden scratch pointer in arg 0, result loaded into `r0`.
+    SmallAgg,
+    /// Struct of 9 to 16 bytes: hidden scratch pointer in arg 0, result loaded into `r0` and `r2`.
+    WideAgg,
+    /// Struct larger than 16 bytes: guest passes hidden buffer pointer in `r1` (`size` writable bytes checked).
+    Sret(u32),
+}
+
+/// Marshalling prototype for one [`NativeMode::General`] call site.
+#[cfg(feature = "ffi")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GeneralProto {
+    /// Fixed (or named, when `variadic` is true) parameters in C order.
+    pub args: [GeneralArg; MAX_ARGS],
+    pub nargs: u8,
+    pub ret: GeneralRet,
+    pub variadic: bool,
+}
+
+/// How a bound native call handles pointer arguments and ABI marshalling.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NativeMode {
     /// Pass every argument as the guest's registers and stack slots hold it.
@@ -178,6 +249,9 @@ pub enum NativeMode {
     Strip,
     /// No prototype: pass r1 to r5 unchanged through `rvm_call_regs`.
     Raw,
+    /// Full ABI marshalling for structs, float returns, and variadics.
+    #[cfg(feature = "ffi")]
+    General(GeneralProto),
 }
 
 /// One native call binding for [`Code::with_natives`](crate::Code::with_natives).
@@ -214,6 +288,10 @@ pub const STACK: [u8; 3] = [0x0e, 0xdf, 0x32];
 /// The byte of a native call without a prototype: passes r1 to r5 through `rvm_call_regs`.
 pub const RAW: u8 = 0x4a;
 
+/// The byte of a [`NativeMode::General`] call: `imm` is the native index, `offset` is the `GeneralProto` index.
+#[cfg(feature = "ffi")]
+pub const GENERAL: u8 = 0x4b;
+
 pub const fn install<M: Memory, H: Host<M>, F: Fuel>(table: &mut [Handler<M, H>; 256]) {
     table[PLAIN[0] as usize] = native_call::<M, H, F, 0, MODE_PLAIN>;
     table[PLAIN[1] as usize] = native_call::<M, H, F, 1, MODE_PLAIN>;
@@ -235,12 +313,18 @@ pub const fn install<M: Memory, H: Host<M>, F: Fuel>(table: &mut [Handler<M, H>;
     table[STACK[1] as usize] = stack_call::<M, H, F, MODE_CHECKED>;
     table[STACK[2] as usize] = stack_call::<M, H, F, MODE_STRIP>;
     table[RAW as usize] = raw_call::<M, H, F>;
+    #[cfg(feature = "ffi")]
+    {
+        table[GENERAL as usize] = general_call::<M, H, F>;
+    }
 }
 
 /// The byte of a native call with `args` arguments and `mode`.
 pub const fn byte(args: usize, mode: NativeMode) -> u8 {
     match mode {
         NativeMode::Raw => RAW,
+        #[cfg(feature = "ffi")]
+        NativeMode::General(_) => GENERAL,
         NativeMode::Plain if args > REG_ARGS => STACK[MODE_PLAIN as usize],
         NativeMode::Checked if args > REG_ARGS => STACK[MODE_CHECKED as usize],
         NativeMode::Strip if args > REG_ARGS => STACK[MODE_STRIP as usize],
@@ -382,6 +466,220 @@ extern "rust-preserve-none" fn raw_call<M: Memory, H: Host<M>, F: Fuel>(
     become_enter!(ctx, code, ip.offset(1), interp, table)
 }
 
+/// The handler of [`GENERAL`]: marshals structs, float returns, pointers, and variadic arguments according to its
+/// [`GeneralProto`] and calls through `rvm_call_args`.
+#[cfg(feature = "ffi")]
+#[inline(never)]
+extern "rust-preserve-none" fn general_call<M: Memory, H: Host<M>, F: Fuel>(
+    ctx: &mut Context<M>,
+    code: Slots,
+    ip: Ip,
+    interp: &mut Interpreter<M, H>,
+    table: &Table<M, H>,
+    _: Spare,
+    slot: Slot,
+) {
+    // SAFETY: a handler's ip lies below `len`, and `GENERAL` has `Layout::Raw`
+    let view = unsafe { ip.view(slot, const { Shape::of(GENERAL) }) };
+    let index = view.imm() as u32;
+    let proto_idx = view.offset() as u16;
+    let (stack, host) = interp.stack_args_and_host();
+    let Some(&Native { func, .. }) = host.natives().get(index as usize) else {
+        core::hint::cold_path();
+        return interp.stop.at(ip, Reason::CallKfunc(index));
+    };
+    let proto = code.general(proto_idx);
+
+    // SAFETY: `Code::with_natives` guarantees `func` matches `proto`
+    if let Err(error) = unsafe { call_general(func, proto, &mut ctx.regs, Some(stack), &*ctx.memory) } {
+        return interp.stop.at(ip, Reason::MemoryFault(error));
+    }
+
+    become_enter!(ctx, code, ip.offset(1), interp, table)
+}
+
+/// Marshal guest registers and optional stack arguments according to `proto`, invoke `func`, and write the guest
+/// return register(s).
+///
+/// # Safety
+///
+/// `func` must match the host C ABI described by `proto` and must never unwind.
+#[cfg(feature = "ffi")]
+#[inline(never)]
+pub unsafe fn call_general<M: Memory>(
+    func: NativeFn,
+    proto: &GeneralProto,
+    regs: &mut [u64; 16],
+    stack: Option<&StackArgs>,
+    memory: &M,
+) -> Result<(), M::Error> {
+    #[repr(C, align(16))]
+    struct Scratch([[u64; 2]; MAX_ARGS + 1]);
+
+    let mut guest = [0u64; MAX_ARGS];
+    guest[..REG_ARGS].copy_from_slice(reg_args(regs));
+    if let Some(stack) = stack {
+        guest[REG_ARGS..].copy_from_slice(stack);
+    }
+
+    let mut scratch = Scratch([[0; 2]; MAX_ARGS + 1]);
+    let mut scratch_idx = 0usize;
+    let mut native_args = [0u64; MAX_ARGS];
+    let mut g_idx = 0usize;
+    let mut n_idx = 0usize;
+
+    match proto.ret {
+        GeneralRet::SmallAgg | GeneralRet::WideAgg => {
+            native_args[0] = scratch.0[0].as_mut_ptr() as u64;
+            scratch_idx = 1;
+            n_idx = 1;
+        }
+        GeneralRet::Sret(size) => {
+            native_args[0] = resolve(memory, guest[0], u64::from(size), true)?;
+            g_idx = 1;
+            n_idx = 1;
+        }
+        GeneralRet::Int | GeneralRet::F32 | GeneralRet::F64 => {}
+    }
+
+    for &arg in &proto.args[..usize::from(proto.nargs)] {
+        match arg {
+            GeneralArg::Value => {
+                native_args[n_idx] = guest[g_idx];
+                g_idx += 1;
+                n_idx += 1;
+            }
+            GeneralArg::Strip => {
+                native_args[n_idx] = memory.host_address(guest[g_idx]);
+                g_idx += 1;
+                n_idx += 1;
+            }
+            GeneralArg::Checked { write, len_arg } => {
+                let len = match len_arg {
+                    0 => 1,
+                    n => guest[usize::from(n) - 1],
+                };
+                native_args[n_idx] = resolve(memory, guest[g_idx], len, write)?;
+                g_idx += 1;
+                n_idx += 1;
+            }
+            GeneralArg::Copy1 => {
+                scratch.0[scratch_idx][0] = guest[g_idx];
+                native_args[n_idx] = scratch.0[scratch_idx].as_ptr() as u64;
+                scratch_idx += 1;
+                g_idx += 1;
+                n_idx += 1;
+            }
+            GeneralArg::Copy2 => {
+                scratch.0[scratch_idx][0] = guest[g_idx];
+                scratch.0[scratch_idx][1] = guest[g_idx + 1];
+                native_args[n_idx] = scratch.0[scratch_idx].as_ptr() as u64;
+                scratch_idx += 1;
+                g_idx += 2;
+                n_idx += 1;
+            }
+        }
+    }
+
+    if proto.variadic {
+        while g_idx < MAX_ARGS && n_idx < MAX_ARGS {
+            native_args[n_idx] = guest[g_idx];
+            g_idx += 1;
+            n_idx += 1;
+        }
+    }
+
+    let func = func as usize as u64;
+    let (regs_slice, stack_slice) = native_args.split_at(REG_ARGS);
+    let regs_arr = regs_slice.first_chunk().expect("first five");
+    let stack_arr = stack_slice.first_chunk().expect("other seven");
+
+    // SAFETY: the caller's
+    match proto.ret {
+        GeneralRet::Int => {
+            regs[0] = unsafe { rvm_call_args(func, regs_arr, stack_arr) };
+        }
+        GeneralRet::F32 => {
+            let v = unsafe { rvm_call_args_f32(func, regs_arr, stack_arr) };
+            regs[0] = u64::from(v.to_bits());
+        }
+        GeneralRet::F64 => {
+            let v = unsafe { rvm_call_args_f64(func, regs_arr, stack_arr) };
+            regs[0] = v.to_bits();
+        }
+        GeneralRet::SmallAgg => {
+            unsafe { rvm_call_args(func, regs_arr, stack_arr) };
+            regs[0] = scratch.0[0][0];
+        }
+        GeneralRet::WideAgg => {
+            unsafe { rvm_call_args(func, regs_arr, stack_arr) };
+            regs[0] = scratch.0[0][0];
+            regs[2] = scratch.0[0][1];
+        }
+        GeneralRet::Sret(_) => {
+            unsafe { rvm_call_args(func, regs_arr, stack_arr) };
+            regs[0] = guest[0];
+        }
+    }
+    Ok(())
+}
+
+/// Invoke `native` according to `mode` from an indirect call (e.g. an `&extern` token), writing guest return
+/// register(s) in `regs`.
+///
+/// # Safety
+///
+/// `native.func` must match `mode` and `native.sig`, and must never unwind.
+#[inline(never)]
+pub unsafe fn call_bound<M: Memory>(
+    native: Native,
+    mode: NativeMode,
+    regs: &mut [u64; 16],
+    stack: Option<&StackArgs>,
+    memory: &M,
+) -> Result<(), M::Error> {
+    match mode {
+        #[cfg(feature = "ffi")]
+        NativeMode::General(ref proto) => return unsafe { call_general(native.func, proto, regs, stack, memory) },
+        NativeMode::Raw => {
+            let func = native.func as usize as u64;
+            regs[0] = match stack {
+                None => unsafe { rvm_call_regs(func, regs) },
+                Some(stack) => unsafe { rvm_call_args(func, reg_args(regs), stack) },
+            };
+            return Ok(());
+        }
+        NativeMode::Plain | NativeMode::Checked | NativeMode::Strip => {}
+    }
+
+    let mut a = [0u64; MAX_ARGS];
+    a[..REG_ARGS].copy_from_slice(reg_args(regs));
+    if let Some(stack) = stack {
+        a[REG_ARGS..].copy_from_slice(stack);
+    }
+    match mode {
+        NativeMode::Checked => resolve_all(memory, native.sig, &mut a)?,
+        NativeMode::Strip => strip_all(memory, native.sig, &mut a),
+        NativeMode::Plain => {}
+        _ => unreachable!(),
+    }
+    let args = usize::from(native.sig.args());
+    regs[0] = if args <= REG_ARGS {
+        let mut small = [0u64; REG_ARGS];
+        small.copy_from_slice(&a[..REG_ARGS]);
+        // SAFETY: the caller's
+        unsafe { call(native.func, args, small) }
+    } else {
+        let func = native.func as usize as u64;
+        let (r, s) = a.split_at(REG_ARGS);
+        let r = r.first_chunk().expect("first five");
+        let s = s.first_chunk().expect("other seven");
+        // SAFETY: the caller's
+        unsafe { rvm_call_args(func, r, s) }
+    };
+    Ok(())
+}
+
 /// Replaces each pointer argument of `sig` among `a` with its host address via [`Memory::host_address`].
 fn strip_all<M: Memory>(memory: &M, sig: NativeSig, a: &mut [u64; MAX_ARGS]) {
     for n in 1..=sig.args() {
@@ -463,6 +761,12 @@ impl<'a, E> NativeCall<'a, E> {
         Self { stop, ip, stack }
     }
 
+    /// The stack arguments of the calling frame, if the program stores any.
+    #[inline(always)]
+    pub fn stack(&self) -> Option<&'a StackArgs> {
+        self.stack
+    }
+
     /// Call the function at `func` with r1 to r5 of `regs` in the host C convention, the first register arguments also
     /// in xmm registers, and return its rax. No signature says what the function takes, so nothing is checked or
     /// converted.
@@ -492,6 +796,14 @@ impl<'a, E> NativeCall<'a, E> {
 unsafe extern "C" {
     fn rvm_call_regs(func: u64, regs: &[u64; 16]) -> u64;
     fn rvm_call_args(func: u64, regs: &[u64; REG_ARGS], stack: &StackArgs) -> u64;
+    #[cfg(feature = "ffi")]
+    #[expect(clashing_extern_declarations)]
+    #[link_name = "rvm_call_args"]
+    fn rvm_call_args_f32(func: u64, regs: &[u64; REG_ARGS], stack: &StackArgs) -> f32;
+    #[cfg(feature = "ffi")]
+    #[expect(clashing_extern_declarations)]
+    #[link_name = "rvm_call_args"]
+    fn rvm_call_args_f64(func: u64, regs: &[u64; REG_ARGS], stack: &StackArgs) -> f64;
 }
 
 // rvm_call_regs(func, regs): func(regs[1], ..., regs[5]). The register arguments go to xmm registers as well, where a
