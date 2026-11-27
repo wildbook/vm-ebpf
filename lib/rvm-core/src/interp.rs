@@ -6,7 +6,7 @@ use crate::args::{self, Row, StackArgs};
 use crate::code::Slots;
 use crate::context::FP;
 use crate::dispatch::{Table, SPARE};
-use crate::fuel::Meter;
+use crate::fuel::{FuelLeft, Meter};
 use crate::native::NativeCall;
 use crate::transfer::Ip;
 use crate::windows::Windows;
@@ -65,10 +65,13 @@ pub enum Reason<E> {
 /// and the helper, kfunc and `callx` calls that the host runs or resolves, so each of those costs a single dispatch.
 /// They stop at the instruction that needs the caller: a call that the host declined, a `gotox`, the `exit` of the
 /// entry frame, or a fault.
-// `repr(C)` keeps the scalars ahead of the frames, so every handler reaches all of them but the last fields of the
-// windows with a one-byte displacement, and the stack arguments behind everything a program without them uses.
+// `repr(C)` puts the hot fuel counter at offset 0 (zero displacement in `Fuel::enter`), followed by `depth`,
+// `frame_size`, `stop` and `windows.stack` all within one-byte displacement (0..128), and the cold meter config,
+// `frames` and `args` behind them.
 #[repr(C)]
 pub struct Interpreter<M: Memory, H> {
+    /// The fuel left in the run in progress (zero-sized without the `fuel` feature).
+    pub(crate) fuel: FuelLeft,
     depth: usize,
     /// Bytes r10 moves down per nested call.
     frame_size: u64,
@@ -79,7 +82,7 @@ pub struct Interpreter<M: Memory, H> {
 
     /// `frames[..depth]` are initialised.
     frames: [MaybeUninit<Frame>; MAX_CALL_DEPTH],
-    /// The limit of the runs and the fuel of the run in progress.
+    /// The limit of the runs and the table they start through.
     pub(crate) meter: Meter<M, H>,
     /// The stack arguments by call depth: the frame at `depth` received those in `args[depth]`, and stores those of
     /// the calls it makes in `args[depth + 1]`. The entry frame is at depth 0, and `push` keeps `depth` at or below
@@ -104,6 +107,7 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
     #[inline]
     pub fn new(frame_size: u64, host: H) -> Self {
         Self {
+            fuel: FuelLeft::default(),
             depth: 0,
             frame_size,
             stop: StopRecord::NONE,
@@ -122,14 +126,14 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
     #[inline]
     pub fn run(&mut self, ctx: &mut Context<M>, code: &Code, pc: u64) -> Stop<M::Error> {
         self.depth = 0;
-        let table = self.meter.start();
+        let table = self.meter.start(&mut self.fuel);
         self.enter(ctx, code, pc, table, true)
     }
 
     /// Continues the call at `pc` of `code`, with the frames and the fuel that the last stop left.
     #[inline]
     pub fn resume(&mut self, ctx: &mut Context<M>, code: &Code, pc: u64) -> Stop<M::Error> {
-        let table = self.meter.resume(code.slots(), pc);
+        let table = self.meter.resume(&mut self.fuel, code.slots(), pc);
         self.enter(ctx, code, pc, table, false)
     }
 
@@ -170,7 +174,8 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
     #[inline(never)]
     fn stopped(&mut self, code: &Code) -> Stop<M::Error> {
         let code = code.slots();
-        self.meter.settle(code, self.stop.ip(code), &mut self.stop.reason);
+        self.meter
+            .settle(&mut self.fuel, code, self.stop.ip(code), &mut self.stop.reason);
         Stop {
             pc: self.stop.pc(code),
             // moved out, as the error of the memory needn't be `Copy`
@@ -181,7 +186,7 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
     /// The stop of a call that starts or resumes at a `pc` outside the code.
     #[cold]
     fn outside(&mut self, pc: u64, fresh: bool) -> Stop<M::Error> {
-        let reason = self.meter.outside(fresh);
+        let reason = self.meter.outside(&mut self.fuel, fresh);
         Stop { reason, pc }
     }
 
@@ -193,7 +198,7 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
     /// exactly where charging each instruction would.
     #[cfg(feature = "fuel")]
     pub fn set_limit(&mut self, limit: Option<u64>) {
-        self.meter = Meter::new(limit);
+        (self.meter, self.fuel) = Meter::new(limit);
     }
 
     /// The fuel each [`run`](Self::run) starts with, if runs are metered.
@@ -203,13 +208,13 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
 
     /// The fuel that the last stop left, if runs are metered.
     pub fn fuel(&self) -> Option<u64> {
-        self.meter.left()
+        self.meter.left(&self.fuel)
     }
 
     /// Set the fuel that the next [`resume`](Self::resume) continues with, at most `i64::MAX`. It has no effect on
     /// runs that aren't metered.
     pub fn set_fuel(&mut self, fuel: u64) {
-        self.meter.set_left(fuel);
+        self.meter.set_left(&mut self.fuel, fuel);
     }
 
     /// Save the caller's state for the call at `call_pc` and give the callee its stack frame. Returns false, changing

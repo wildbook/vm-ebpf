@@ -6,7 +6,7 @@ use crate::dispatch::Handler;
 use crate::fuel::{Fuel, Unmetered};
 use crate::opcode::{AluOpc, Class, JmpOpc, MemMode, MemSize, OpCode, Source, LD_IMM64};
 use crate::slot::{Fields, Reg};
-use crate::{windows, Host, Instruction, Memory};
+use crate::{Host, Instruction, Memory};
 
 macro_rules! superinstructions {
     ($($byte:literal: $($op:ident $($operand:tt),*);+;)*) => {
@@ -316,14 +316,9 @@ impl Super {
         self.opcode(1 + self.is_data(1) as usize)
     }
 
-    /// The opcode byte whose handler runs the load or store at slot `k` of the sequence alone: that of the r10
-    /// access ([`windows::stack_byte_of`]) if its base is `fp`, else its own.
-    pub const fn access_byte(self, k: usize) -> u8 {
-        let part = self.parts[k];
-        match part.base() {
-            Field::Fp => windows::stack_byte_of(part.op),
-            _ => part.op,
-        }
+    /// Whether the load or store at slot `k` of the sequence addresses through `fp` (r10).
+    pub const fn is_fp_access(self, k: usize) -> bool {
+        matches!(self.parts[k].base(), Field::Fp)
     }
 
     /// The first instruction of the sequence whose first slot holds `slot`.

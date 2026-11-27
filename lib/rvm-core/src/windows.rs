@@ -48,16 +48,12 @@ pub struct Windows {
 /// A [`Window`] as the handlers check it.
 struct Cache {
     base: u64,
-    ptr: *mut u8,
+    /// `window.ptr.expose_provenance().wrapping_sub(base)`, so `addr + bias` gives the host address in parallel with
+    /// the bounds check `addr - base`.
+    bias: usize,
     /// By [`kind`]: the number of offsets from `base` at which the access fits in the window. All 0 when empty.
     fits: [u64; 8],
 }
-
-// SAFETY: the handlers dereference the pointers only through `&mut Interpreter`, while the memory that the run was
-// given is at `epoch`. Only one memory ever takes an epoch (see `Memory`), so the pointers are only used together with
-// the memory they point into, on whichever thread holds that memory.
-unsafe impl Send for Windows {}
-unsafe impl Sync for Windows {}
 
 impl Windows {
     pub const EMPTY: Self = Self {
@@ -120,14 +116,14 @@ const fn small(size: MemSize) -> bool {
 impl Cache {
     const EMPTY: Self = Self {
         base: 0,
-        ptr: ptr::null_mut(),
+        bias: 0,
         fits: [0; 8],
     };
 
     fn fill(&mut self, window: Window) {
         let fits = |len: u64, size: u64| len.saturating_sub(size - 1);
         self.base = window.base;
-        self.ptr = window.ptr;
+        self.bias = window.ptr.expose_provenance().wrapping_sub(window.base as usize);
         self.fits = [
             fits(window.read_len, 1),
             fits(window.read_len, 2),
@@ -167,9 +163,9 @@ impl Cache {
             return None;
         }
 
-        // from the address, not `self.ptr`: a window over raw host addresses has no allocation `self.ptr` points into
-        // (see `Window::new`)
-        let host = ptr::with_exposed_provenance_mut::<u8>(self.ptr.expose_provenance() + at as usize);
+        // from the exposed address, not a derived pointer: a window over raw host addresses has no allocation its
+        // `ptr` points into (see `Window::new`), and `addr + bias` computes the host address in parallel with `at`
+        let host = ptr::with_exposed_provenance_mut::<u8>((addr as usize).wrapping_add(self.bias));
         // SAFETY: the access fits in the window at `at`, and the memory is at the window's epoch (see `Windows`), so
         // the host bytes there are the guest bytes and valid for the access
         unsafe {
@@ -233,6 +229,34 @@ pub fn data_step<R: Regs>(windows: &Windows, regs: &mut R, insn: impl Fields) ->
     true
 }
 
+/// The direct fuel-independent handler for a windowed load or store `op`, through r10 if `fp` else through another
+/// register, or `None` for any other opcode.
+pub const fn access_handler<M: Memory, H: Host<M>>(op: u8, fp: bool) -> Option<Handler<M, H>> {
+    macro_rules! dispatch {
+        ($($opc:expr),*) => {
+            match (fp, op) {
+                $((true, x) if x == $opc => Some(stack_access::<M, H, { $opc }>),)*
+                $((false, x) if x == $opc => Some(data_access::<M, H, { $opc }>),)*
+                _ => None,
+            }
+        };
+    }
+    dispatch!(
+        OpCode::ldx(MemSize::Byte, MemMode::Mem).0,
+        OpCode::ldx(MemSize::Half, MemMode::Mem).0,
+        OpCode::ldx(MemSize::Word, MemMode::Mem).0,
+        OpCode::ldx(MemSize::DWord, MemMode::Mem).0,
+        OpCode::stx(MemSize::Byte, MemMode::Mem).0,
+        OpCode::stx(MemSize::Half, MemMode::Mem).0,
+        OpCode::stx(MemSize::Word, MemMode::Mem).0,
+        OpCode::stx(MemSize::DWord, MemMode::Mem).0,
+        OpCode::st(MemSize::Byte, MemMode::Mem).0,
+        OpCode::st(MemSize::Half, MemMode::Mem).0,
+        OpCode::st(MemSize::Word, MemMode::Mem).0,
+        OpCode::st(MemSize::DWord, MemMode::Mem).0
+    )
+}
+
 /// Make [`data_access`] the handler of the plain `ldx`, `stx` and `st` of every size, and [`stack_access`] that of
 /// the r10 access bytes.
 pub const fn install<M: Memory, H: Host<M>>(table: &mut [Handler<M, H>; 256]) {
@@ -286,14 +310,6 @@ const STACK_BYTES: [Option<NonZeroU8>; 256] = {
     const_for!((byte, opcode) in STACK_ACCESSES => table[opcode as usize] = NonZeroU8::new(byte));
     table
 };
-
-/// The byte of the r10 access with opcode `op`.
-pub const fn stack_byte_of(op: u8) -> u8 {
-    match STACK_BYTES[op as usize] {
-        Some(byte) => byte.get(),
-        None => panic!("an access through r10 without a byte of its own"),
-    }
-}
 
 /// The r10 access byte for `insn`, if it is a load or store through r10 that has one.
 pub fn stack_byte(insn: Instruction) -> Option<u8> {

@@ -4,7 +4,8 @@ use std::fmt::{self, Debug, Formatter};
 
 #[cfg(feature = "fuel")]
 use crate::fuel::Rests;
-use crate::opcode::{call, OpCode, CALL};
+use crate::handler::{CALL_HELPER, CALL_KFUNC};
+use crate::opcode::{OpCode, CALL};
 use crate::slot::Slot;
 use crate::{args, bytes, fuse, native, rewrite, transfer, Instruction, MAX_NATIVE_ARGS};
 
@@ -92,7 +93,7 @@ impl Code {
         let Some(slot) = self.slots[..self.len].get_mut(pc) else {
             return false;
         };
-        if slot.byte() != CALL || args > MAX_NATIVE_ARGS {
+        if !matches!(slot.byte(), CALL | CALL_HELPER | CALL_KFUNC) || args > MAX_NATIVE_ARGS {
             return false;
         }
         let byte = native::byte(args, checked && args != 0);
@@ -108,13 +109,10 @@ impl Code {
         let Some(slot) = self.slots[..self.len].get_mut(pc) else {
             return false;
         };
-        if slot.byte() != CALL {
+        if slot.byte() != CALL_KFUNC {
             return false;
         }
         let insn = slot.instruction();
-        if insn.src_reg() != call::KFUNC {
-            return false;
-        }
         *slot = Slot::new(insn.with_byte(args::CALL));
         true
     }

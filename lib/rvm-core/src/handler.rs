@@ -2,7 +2,7 @@
 //! for the jump classes, with the host calls it hands on to.
 
 use crate::code::Slots;
-use crate::dispatch::{self, Spare, Table, SPARE};
+use crate::dispatch::{self, Handler, Spare, Table, SPARE};
 use crate::fuel::Fuel;
 use crate::host::Callee;
 use crate::opcode::{CALL, CALLX};
@@ -10,6 +10,19 @@ use crate::slot::{Fields, Shape, Slot};
 use crate::step::{self, Regs, Step};
 use crate::transfer::{self, Ip};
 use crate::{Context, Host, Interpreter, Memory, Reason};
+
+/// Dedicated opcode byte for `call <helper id>` (`src_reg == 0`), dispatched straight to [`host_call`].
+pub const CALL_HELPER: u8 = 0x22;
+/// Dedicated opcode byte for `call <kfunc slot>` (`src_reg == 2`), dispatched straight to [`host_call`].
+pub const CALL_KFUNC: u8 = 0x23;
+
+/// Install direct handlers for local, helper, kfunc and indirect calls, bypassing [`jump`]'s extra dispatch.
+pub const fn install<M: Memory, H: Host<M>, F: Fuel>(table: &mut [Handler<M, H>; 256]) {
+    table[CALL as usize] = local_call::<M, H, F>;
+    table[CALL_HELPER as usize] = host_call::<M, H, F, false>;
+    table[CALL_KFUNC as usize] = host_call::<M, H, F, true>;
+    table[CALLX as usize] = indirect_call::<M, H, F, false>;
+}
 
 /// The [`Handler`](dispatch::Handler) of opcode `OP` of the ALU, load and store classes.
 #[inline(never)]
@@ -80,6 +93,26 @@ pub extern "rust-preserve-none" fn jump<M: Memory, H: Host<M>, F: Fuel, const OP
 
     // `ip` is at `insn` or precedes the target of a jump or local call
     become_enter!(ctx, code, ip.offset(1), interp, table)
+}
+
+/// Direct handler for local `call` (`src_reg == 1`): pushes the caller frame and enters the target without checking
+/// `src_reg`.
+#[inline(never)]
+extern "rust-preserve-none" fn local_call<M: Memory, H: Host<M>, F: Fuel>(
+    ctx: &mut Context<M>,
+    code: Slots,
+    ip: Ip,
+    interp: &mut Interpreter<M, H>,
+    table: &Table<M, H>,
+    _: Spare,
+    slot: Slot,
+) {
+    // SAFETY: `rewrite` leaves `CALL` only for local calls, and `transfer::bound` proves the target lies in `0..=len`
+    let offset = unsafe { ip.view(slot, const { Shape::of(CALL) }) }.imm();
+    if !interp.push(&mut ctx.regs, ip.pc(code)) {
+        return interp.stop.at(ip, Reason::StackOverflow);
+    }
+    become_enter!(ctx, code, ip.offset(i64::from(offset) + 1), interp, table)
 }
 
 /// The rest of the handler of a helper `call`, or with `KFUNC` a kfunc `call`: runs it on the host and continues with

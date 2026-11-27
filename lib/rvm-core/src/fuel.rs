@@ -81,9 +81,9 @@ impl Fuel for Unmetered {
 }
 
 #[cfg(feature = "fuel")]
-pub use metered::{Meter, Rests};
+pub use metered::{FuelLeft, Meter, Rests};
 #[cfg(not(feature = "fuel"))]
-pub use unmetered::Meter;
+pub use unmetered::{FuelLeft, Meter};
 
 #[cfg(feature = "fuel")]
 mod metered {
@@ -95,6 +95,12 @@ mod metered {
     use crate::opcode::{OpCode, LD_IMM64};
     use crate::transfer::{FAR, GUARD};
     use crate::{bytes, fuse, Reason};
+
+    /// The fuel left in the run in progress, placed at offset 0 of [`Interpreter`] so `Fuel::enter` reaches it with
+    /// zero displacement while `windows.stack` stays within one-byte displacement.
+    #[repr(transparent)]
+    #[derive(Default)]
+    pub struct FuelLeft(pub(super) u64);
 
     impl<M: Memory, H: Host<M>> Tables<M, H> {
         /// The table of a metered run.
@@ -117,9 +123,8 @@ mod metered {
             // SAFETY: the ip a handler continues at lies in the slots of its code (see `Ip`), and a handler of
             // `Tables::METERED` runs only after `step` or `Meter::resume` read the code's rests
             let rest = unsafe { code.rests().at(ip) };
-            let meter = &mut interp.meter;
-            meter.left = meter.left.wrapping_sub(rest);
-            !short(meter.left)
+            interp.fuel.0 = interp.fuel.0.wrapping_sub(rest);
+            !short(interp.fuel.0)
         }
 
         /// Runs the instruction if charging per slot leaves a unit for it (two for LD_IMM64), and stops with
@@ -148,10 +153,9 @@ mod metered {
                 become first_run::<M, H>(ctx, code, ip, interp, table, SPARE, slot)
             };
             let metered = &Tables::<M, H>::METERED;
-            let meter = &mut interp.meter;
-            if !short(meter.left) {
-                meter.left = meter.limit.wrapping_sub(rest);
-                if !short(meter.left) {
+            if !short(interp.fuel.0) {
+                interp.fuel.0 = interp.meter.limit.wrapping_sub(rest);
+                if !short(interp.fuel.0) {
                     become metered.of(slot)(ctx, code, ip, interp, metered, SPARE, slot)
                 }
             }
@@ -159,14 +163,14 @@ mod metered {
             // SAFETY: as above
             let slot = unsafe { ip.get() };
             let alone = ALONE[usize::from(slot.byte())];
-            let before = meter.left.wrapping_add(rest);
+            let before = interp.fuel.0.wrapping_add(rest);
             let units = match alone {
                 LD_IMM64 => 2,
                 _ => 1,
             };
             if before < units {
                 // LD_IMM64 with one unit left keeps it
-                meter.left = before;
+                interp.fuel.0 = before;
                 return interp.stop.at(ip, Reason::OutOfFuel);
             }
             // a slot with the first fused instruction alone keeps the layout of its superinstruction (see
@@ -206,15 +210,12 @@ mod metered {
         None => byte,
     });
 
-    /// The fuel of an [`Interpreter`]: the limit of its runs, the table they start through, and what the run in
-    /// progress has left.
+    /// The fuel configuration of an [`Interpreter`]: the limit of its runs and the table they start through. The
+    /// mutable counter lives in [`FuelLeft`] at offset 0 of `Interpreter`.
     pub struct Meter<M: Memory, H> {
         start: NonNull<Table<M, H>>,
         /// 0 without a limit.
         limit: u64,
-        /// The fuel as the handlers of a run keep it (see the [module](super)), and between runs what the last one
-        /// left, which isn't short.
-        left: u64,
         metered: bool,
     }
 
@@ -224,13 +225,13 @@ mod metered {
 
     impl<M: Memory, H: Host<M>> Default for Meter<M, H> {
         fn default() -> Self {
-            Self::new(None)
+            Self::new(None).0
         }
     }
 
     impl<M: Memory, H: Host<M>> Meter<M, H> {
-        /// `limit` units of fuel per run, at most `i64::MAX`, or none for runs without fuel.
-        pub fn new(limit: Option<u64>) -> Self {
+        /// `limit` units of fuel per run, at most `i64::MAX`, or none for runs without fuel, and its initial counter.
+        pub fn new(limit: Option<u64>) -> (Self, FuelLeft) {
             // Each is a reference to a constant without interior mutability or drop glue, which the compiler places
             // in static memory. It has no `'static` type, because `M` and `H` needn't be `'static`.
             let start: &Table<M, H> = match limit {
@@ -238,12 +239,14 @@ mod metered {
                 None => &Tables::<M, H>::PLAIN,
             };
             let fuel = limit.unwrap_or(0).min(i64::MAX as u64);
-            Self {
-                start: NonNull::from(start),
-                limit: fuel,
-                left: fuel,
-                metered: limit.is_some(),
-            }
+            (
+                Self {
+                    start: NonNull::from(start),
+                    limit: fuel,
+                    metered: limit.is_some(),
+                },
+                FuelLeft(fuel),
+            )
         }
 
         /// The table [`Interpreter::run`] starts through, without modifying `left`.
@@ -257,21 +260,21 @@ mod metered {
         /// block cannot leave `left` negative and bypass fuel on the next run. The reference outlives the borrow of
         /// the meter, as the table lives in static memory.
         #[inline(always)]
-        pub fn start<'a>(&mut self) -> &'a Table<M, H> {
-            self.left = self.limit;
+        pub fn start<'a>(&self, left: &mut FuelLeft) -> &'a Table<M, H> {
+            left.0 = self.limit;
             self.start_table()
         }
 
         /// The table [`Interpreter::resume`] continues through at `pc` of `code`, with the fuel left: a metered run
         /// enters the block there.
-        pub fn resume<'a>(&mut self, code: Slots, pc: u64) -> &'a Table<M, H> {
+        pub fn resume<'a>(&self, left: &mut FuelLeft, code: Slots, pc: u64) -> &'a Table<M, H> {
             if !self.metered || code.get(pc).is_none() {
                 return self.start_table();
             }
             // SAFETY: the code has a slot at `pc`
             let rest = unsafe { code.rests().of(code, Ip::at(code, pc)) };
-            self.left = self.left.wrapping_sub(rest);
-            match short(self.left) {
+            left.0 = left.0.wrapping_sub(rest);
+            match short(left.0) {
                 true => &Tables::<M, H>::STEPS,
                 false => &Tables::<M, H>::METERED,
             }
@@ -279,11 +282,11 @@ mod metered {
 
         /// Why a call can't start, if `fresh`, or resume at a pc outside the code. A fresh call has the fuel of the
         /// limit, and a metered one without fuel is out of it, as an instruction there would be charged first.
-        pub fn outside<E>(&mut self, fresh: bool) -> Reason<E> {
+        pub fn outside<E>(&self, left: &mut FuelLeft, fresh: bool) -> Reason<E> {
             if fresh {
-                self.left = self.limit;
+                left.0 = self.limit;
             }
-            match self.metered && self.left == 0 {
+            match self.metered && left.0 == 0 {
                 true => Reason::OutOfFuel,
                 false => Reason::BadPc,
             }
@@ -295,34 +298,34 @@ mod metered {
         }
 
         /// The fuel left, if runs are metered.
-        pub fn left(&self) -> Option<u64> {
-            self.metered.then_some(self.left)
+        pub fn left(&self, left: &FuelLeft) -> Option<u64> {
+            self.metered.then_some(left.0)
         }
 
         /// Sets the fuel left, at most `i64::MAX`.
-        pub fn set_left(&mut self, fuel: u64) {
-            self.left = fuel.min(i64::MAX as u64);
+        pub fn set_left(&self, left: &mut FuelLeft, fuel: u64) {
+            left.0 = fuel.min(i64::MAX as u64);
         }
 
         /// Turns the fuel that the handlers of a metered run of `code` kept into what charging per slot leaves
         /// where the run stopped with `reason`: at `ip`, or with `None` at a pc outside the code. There, a run
         /// without fuel stops with [`Reason::OutOfFuel`], as an instruction would be charged first.
-        pub fn settle<E>(&mut self, code: Slots, ip: Option<Ip>, reason: &mut Reason<E>) {
+        pub fn settle<E>(&self, left: &mut FuelLeft, code: Slots, ip: Option<Ip>, reason: &mut Reason<E>) {
             if !self.metered {
                 return;
             }
             let Some(ip) = ip else {
                 // the handler that continued there ended its block, so the fuel is charged up to it
-                if self.left == 0 {
+                if left.0 == 0 {
                     *reason = Reason::OutOfFuel;
                 }
                 return;
             };
             // SAFETY: a handler stops at its own ip, which lies in the slots of its code (see `Ip`)
-            let before = self.left.wrapping_add(unsafe { code.rests().of(code, ip) });
-            self.left = match reason {
+            let before = left.0.wrapping_add(unsafe { code.rests().of(code, ip) });
+            left.0 = match reason {
                 // `Metered::step` left the fuel before the slot
-                Reason::OutOfFuel => self.left,
+                Reason::OutOfFuel => left.0,
                 // the guard, or an LD_IMM64 that the code ends in: no instruction ran, so it keeps its unit
                 Reason::BadPc => before,
                 _ => before - 1,
@@ -440,6 +443,10 @@ mod unmetered {
     use crate::dispatch::Tables;
     use crate::Reason;
 
+    /// The fuel counter of a build that can't meter: it holds nothing.
+    #[derive(Default)]
+    pub struct FuelLeft;
+
     /// The meter of a build that can't meter: it holds nothing.
     pub struct Meter<M, H>(PhantomData<fn(M, H)>);
 
@@ -451,16 +458,16 @@ mod unmetered {
 
     impl<M: Memory, H: Host<M>> Meter<M, H> {
         #[inline(always)]
-        pub fn start<'a>(&mut self) -> &'a Table<M, H> {
+        pub fn start<'a>(&self, _: &mut FuelLeft) -> &'a Table<M, H> {
             &Tables::<M, H>::PLAIN
         }
 
         #[inline(always)]
-        pub fn resume<'a>(&mut self, _: Slots, _: u64) -> &'a Table<M, H> {
-            self.start()
+        pub fn resume<'a>(&self, left: &mut FuelLeft, _: Slots, _: u64) -> &'a Table<M, H> {
+            self.start(left)
         }
 
-        pub fn outside<E>(&mut self, _: bool) -> Reason<E> {
+        pub fn outside<E>(&self, _: &mut FuelLeft, _: bool) -> Reason<E> {
             Reason::BadPc
         }
 
@@ -468,13 +475,13 @@ mod unmetered {
             None
         }
 
-        pub fn left(&self) -> Option<u64> {
+        pub fn left(&self, _: &FuelLeft) -> Option<u64> {
             None
         }
 
-        pub fn set_left(&mut self, _: u64) {}
+        pub fn set_left(&self, _: &mut FuelLeft, _: u64) {}
 
-        pub fn settle<E>(&mut self, _: Slots, _: Option<Ip>, _: &mut Reason<E>) {}
+        pub fn settle<E>(&self, _: &mut FuelLeft, _: Slots, _: Option<Ip>, _: &mut Reason<E>) {}
     }
 }
 

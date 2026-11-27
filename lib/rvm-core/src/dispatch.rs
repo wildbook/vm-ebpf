@@ -47,7 +47,7 @@ use std::mem::MaybeUninit;
 
 use crate::code::Slots;
 use crate::fuel::{Fuel, Unmetered};
-use crate::handler::{handler, jump};
+use crate::handler::{self, handler, jump};
 use crate::opcode::{Class, OpCode};
 use crate::slot::Slot;
 use crate::transfer::Ip;
@@ -196,6 +196,7 @@ pub const fn table<M: Memory, H: Host<M>, F: Fuel>() -> Table<M, H> {
         0xe0 0xe1 0xe2 0xe3 0xe4 0xe5 0xe6 0xe7 0xe8 0xe9 0xea 0xeb 0xec 0xed 0xee 0xef
         0xf0 0xf1 0xf2 0xf3 0xf4 0xf5 0xf6 0xf7 0xf8 0xf9 0xfa 0xfb 0xfc 0xfd 0xfe 0xff
     );
+    handler::install::<M, H, F>(&mut table);
     fuse::install::<M, H, F>(&mut table);
     transfer::install::<M, H, F>(&mut table);
     windows::install::<M, H>(&mut table);

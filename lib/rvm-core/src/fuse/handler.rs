@@ -23,7 +23,7 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
     interp: &mut Interpreter<M, H>,
     table: &Table<M, H>,
     _: Spare,
-    _slot: Slot,
+    slot: Slot,
 ) {
     let sup = const { Super::of(S) };
     let len = const { Super::of(S).len() };
@@ -38,7 +38,10 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
         macro_rules! view {
             ($($k:literal),*) => {
                 match k {
-                    $($k => unsafe { View::new(&sequence[$k], None, const { Shape::of(Super::of(S).opcode($k)) }) },)*
+                    $($k => unsafe {
+                        let cached = if $k == 0 { Some(slot) } else { None };
+                        View::new(&sequence[$k], cached, const { Shape::of(Super::of(S).opcode($k)) })
+                    },)*
                     _ => unreachable!("a slot past `MAX_LEN`"),
                 }
             };
@@ -84,12 +87,17 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
                 let step = match const { windows::windowed(Super::of(S).opcode($k)) } {
                     true if windows::data_step(&interp.windows, &mut roles, decoded) => Step::Next,
                     // the access missed its window: the sequence continues unfused from it, as a jump into its middle
-                    // would, but through the handler of the access alone, since its slot may hold a superinstruction
-                    // (this one at slot 0); the slot has the access's layout either way (see `slot_of`)
+                    // would, directly to the fuel-independent window handler of the access alone
                     true => {
                         roles.save(registers, sup.unsaved[$k]);
-                        let access = table.0[usize::from(const { Super::of(S).access_byte($k) })];
-                        become access(ctx, code, at, interp, table, SPARE, sequence[$k])
+                        let miss_slot = if $k == 0 { slot } else { sequence[$k] };
+                        let Some(access) = (const {
+                            let sup = Super::of(S);
+                            windows::access_handler::<M, H>(sup.opcode($k), sup.is_fp_access($k))
+                        }) else {
+                            unreachable!("windowed opcode has a window handler")
+                        };
+                        become access(ctx, code, at, interp, table, SPARE, miss_slot)
                     }
                     false => step::step(&mut roles, ctx.memory, decoded),
                 };

@@ -12,6 +12,7 @@
 
 use crate::bytes::{canonical, INVALID, LDX_DW, MISSING, MOV32_REG, MOV64_REG, MOVSX32, MOVSX64, STX_DW, ST_DW};
 use crate::context::FP;
+use crate::handler::{CALL_HELPER, CALL_KFUNC};
 use crate::opcode::atomic::{CMPXCHG, FETCH, LOAD_ACQ};
 use crate::opcode::{call, AluOpc, Class, JmpOpc, MemMode, OpCode, Source, CALL, CALLX, LD_IMM64};
 use crate::{args, Instruction};
@@ -91,8 +92,13 @@ impl Rewrite {
             (Some(byte), ..) => byte,
             (None, true, _) => INVALID,
             (None, false, Some(byte)) => byte,
+            (None, false, None) if insn.byte() == CALL => match insn.src_reg() {
+                call::HELPER => CALL_HELPER,
+                call::KFUNC => CALL_KFUNC,
+                _ => return false,
+            },
             (None, false, None) if insn.0 & field_bits(self.nonzero) != 0 => self.nonzero_byte,
-            // an atomic, `call` or LD_IMM64 that needs no rewrite
+            // an atomic, local `call` or LD_IMM64 that needs no rewrite
             (None, false, None) => return false,
         };
         code[i] = insn.with_byte(byte);
