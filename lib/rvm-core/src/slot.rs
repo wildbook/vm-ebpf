@@ -31,10 +31,12 @@
 
 use std::fmt::{self, Debug, Formatter};
 
+use crate::bytes::{MOV32_REG, MOV64_REG};
+use crate::context::{ARCH_REGS, TOTAL_REGS, VIRT_REGS};
 use crate::opcode::{AluOpc, Class, JmpOpc, MemMode, OpCode, Source, LD_IMM64};
 use crate::{bytes, rewrite, Instruction};
 
-/// A register number below 16, which indexes [`Context::regs`](crate::Context::regs) without a check.
+/// A register number below [`TOTAL_REGS`], which indexes [`Context::regs`](crate::Context::regs) without a check.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Reg(u8);
 
@@ -47,12 +49,19 @@ impl Reg {
         Self(bits & 0xF)
     }
 
+    /// Virtual register `index` (`0..VIRT_REGS`) for promoted stack slots.
+    #[inline(always)]
+    pub const fn virt(index: u8) -> Self {
+        debug_assert!((index as usize) < VIRT_REGS);
+        Self(ARCH_REGS as u8 + index)
+    }
+
     /// # Safety
     ///
-    /// `n` must be below 16.
+    /// `n` must be below [`TOTAL_REGS`].
     #[inline(always)]
     const unsafe fn new_unchecked(n: u8) -> Self {
-        debug_assert!(n < 16);
+        debug_assert!((n as usize) < TOTAL_REGS);
         Self(n)
     }
 
@@ -209,6 +218,40 @@ impl Slot {
         self.byte
     }
 
+    /// Copy `self` with opcode byte replaced by `byte`.
+    #[inline(always)]
+    pub fn with_byte(mut self, byte: u8) -> Self {
+        self.byte = byte;
+        self
+    }
+
+    /// Portable `mov64`/`mov32 dst, src` slot accepting architectural or virtual registers.
+    #[inline(always)]
+    pub fn mov_reg(bits64: bool, dst: Reg, src: Reg) -> Self {
+        Self {
+            byte: if bits64 { MOV64_REG } else { MOV32_REG },
+            regs: dst.get(),
+            offset: 0,
+            imm: [0, 0, 0, src.get()],
+        }
+    }
+
+    /// Portable `mov64`/`mov32 dst, imm` slot accepting architectural or virtual registers.
+    #[inline(always)]
+    pub fn mov_imm(bits64: bool, dst: Reg, imm: i32) -> Self {
+        let byte = if bits64 {
+            OpCode::alu64(AluOpc::Mov, Source::Imm).0
+        } else {
+            OpCode::alu32(AluOpc::Mov, Source::Imm).0
+        };
+        Self {
+            byte,
+            regs: dst.get(),
+            offset: 0,
+            imm: imm.to_le_bytes(),
+        }
+    }
+
     /// `imm`, which every layout but [`Layout::DstSrc`] keeps.
     #[inline(always)]
     pub fn imm(self) -> i32 {
@@ -227,16 +270,16 @@ impl Slot {
     /// The `dst_reg` field of a slot whose layout is [`Layout::Dst`] or [`Layout::DstSrc`].
     #[inline(always)]
     pub fn dst_reg_decoded(self) -> Reg {
-        debug_assert!(LAYOUTS[usize::from(self.byte)] != Layout::Raw && self.regs < 16);
-        // SAFETY: `Slot::new` established `self.regs < 16` for non-Raw layouts.
+        debug_assert!(LAYOUTS[usize::from(self.byte)] != Layout::Raw && usize::from(self.regs) < TOTAL_REGS);
+        // SAFETY: `Slot::new` / `mov_*` established `self.regs < TOTAL_REGS` for non-Raw layouts.
         unsafe { Reg::new_unchecked(self.regs) }
     }
 
     /// The `src_reg` field of a slot whose layout is [`Layout::DstSrc`].
     #[inline(always)]
     pub fn src_reg_decoded(self) -> Reg {
-        debug_assert!(LAYOUTS[usize::from(self.byte)] == Layout::DstSrc && self.imm[3] < 16);
-        // SAFETY: `Slot::new` established `self.imm[3] < 16` for `Layout::DstSrc`.
+        debug_assert!(LAYOUTS[usize::from(self.byte)] == Layout::DstSrc && usize::from(self.imm[3]) < TOTAL_REGS);
+        // SAFETY: `Slot::new` / `mov_reg` established `self.imm[3] < TOTAL_REGS` for `Layout::DstSrc`.
         unsafe { Reg::new_unchecked(self.imm[3]) }
     }
 
@@ -494,8 +537,8 @@ impl<'a> View<'a, true> {
         debug_assert!(held.is_none_or(|held| held == *slot));
         debug_assert!(match shape.layout {
             Layout::Raw => true,
-            Layout::Dst => slot.regs < 16,
-            Layout::DstSrc => slot.byte < 16 && slot.regs < 16,
+            Layout::Dst => usize::from(slot.regs) < TOTAL_REGS,
+            Layout::DstSrc => usize::from(slot.byte) < TOTAL_REGS && usize::from(slot.regs) < TOTAL_REGS,
         });
         Self { slot, held, shape }
     }

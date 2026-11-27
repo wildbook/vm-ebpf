@@ -23,6 +23,7 @@ use crate::fuel::RestsPtr;
 use crate::handler::handler;
 use crate::memory::Window;
 use crate::opcode::{Class, MemMode, MemSize, OpCode};
+use crate::promote::PROMOTE_FRAME;
 use crate::slot::{Fields, Reg, Shape, Slot, View};
 use crate::step::{self, Regs};
 use crate::transfer::Ip;
@@ -68,6 +69,69 @@ impl Windows {
         spare: Cache::EMPTY,
         epoch: 0,
     };
+
+    /// Host address of `fp` (`r10`) when `[fp - PROMOTE_FRAME .. fp)` lies inside the RW stack window, else `0`.
+    #[inline(always)]
+    pub fn stack_fp_host(&self, fp: u64) -> usize {
+        if fp < PROMOTE_FRAME {
+            return 0;
+        }
+        // `fits[4]` holds `read_len` and `fits[6]` holds `write_len` (1-byte accesses).
+        let rw_len = self.stack.fits[4].min(self.stack.fits[6]);
+        let limit = rw_len.saturating_sub(PROMOTE_FRAME - 1);
+        let at = fp.wrapping_sub(self.stack.base);
+        if at.wrapping_sub(PROMOTE_FRAME) < limit {
+            (fp as usize).wrapping_add(self.stack.bias)
+        } else {
+            0
+        }
+    }
+
+    /// Populate the stack window around `addr` when empty or stale.
+    #[inline(never)]
+    pub fn take_stack<M: Memory>(&mut self, memory: &M, addr: u64) {
+        self.take::<M, false>(memory, addr, MemSize::DWord);
+    }
+
+    /// Clear any cached data window whose address span overlaps `[lo .. hi)`.
+    #[inline(always)]
+    pub fn clear_overlapping(&mut self, lo: u64, hi: u64) {
+        if self.data.overlaps(lo, hi) {
+            self.data = Cache::EMPTY;
+        }
+        if self.small.overlaps(lo, hi) {
+            self.small = Cache::EMPTY;
+        }
+        if self.spare.overlaps(lo, hi) {
+            self.spare = Cache::EMPTY;
+        }
+    }
+
+    /// Install a data window around `addr` only if it is non-empty and disjoint from `[lo .. hi)`.
+    /// Returns `true` if the caller must bail out of promoted mode (empty or overlapping window).
+    #[cold]
+    #[inline(never)]
+    pub fn take_checked<M: Memory>(&mut self, memory: &M, addr: u64, size: MemSize, lo: u64, hi: u64) -> bool {
+        self.revalidate(memory);
+        let window = memory.window(addr);
+        if window.epoch == 0 || window.epoch != memory.epoch() {
+            return true;
+        }
+        let span = window.read_len.max(window.write_len);
+        if range_overlaps(window.base, span, lo, hi) {
+            return true;
+        }
+        self.epoch = window.epoch;
+        let cache = match small(size) {
+            true => {
+                self.spare = std::mem::replace(&mut self.small, Cache::EMPTY);
+                &mut self.small
+            }
+            false => &mut self.data,
+        };
+        cache.fill(window);
+        false
+    }
 
     /// Forget the windows unless `memory` is still at their epoch.
     #[inline(always)]
@@ -147,10 +211,16 @@ impl Cache {
         ];
     }
 
+    #[inline(always)]
+    fn overlaps(&self, lo: u64, hi: u64) -> bool {
+        let len = self.fits[4].max(self.fits[6]);
+        range_overlaps(self.base, len, lo, hi)
+    }
+
     /// Run the load or store `OP` of `insn` at `addr` on the host memory, or return false if it doesn't fit in the
     /// window.
     #[inline(always)]
-    fn access<const OP: u8>(&self, regs: &mut [u64; 16], insn: View<'_, true>, addr: u64) -> bool {
+    fn access<const OP: u8>(&self, regs: &mut impl Regs, insn: View<'_, true>, addr: u64) -> bool {
         let opc = OpCode(OP);
         let value = match opc.class() {
             Class::Stx => regs.get(insn.src_reg()),
@@ -405,6 +475,18 @@ pub extern "rust-preserve-none" fn data_access<M: Memory, H: Host<M>, const OP: 
     become data_miss::<M, H, OP>(ctx, code, ip, interp, rests, SPARE, slot)
 }
 
+/// Whether `[base .. base + len)` overlaps `[lo .. hi)`, conservatively returning `true` on `u64` wraparound.
+#[inline(always)]
+pub fn range_overlaps(base: u64, len: u64, lo: u64, hi: u64) -> bool {
+    if len == 0 {
+        return false;
+    }
+    match base.checked_add(len) {
+        Some(end) => base < hi && lo < end,
+        None => true,
+    }
+}
+
 /// Runs a load or store that missed the data window through the window around r10 if it fits there, as one through
 /// a pointer into the stack does, and in [`miss`] otherwise.
 // out of line from `miss`, whose call of `Windows::take` needs a stack frame
@@ -421,6 +503,12 @@ extern "rust-preserve-none" fn data_miss<M: Memory, H: Host<M>, const OP: u8>(
     // SAFETY: as in `data_access`, which continues here
     let insn = unsafe { ip.view(slot, const { Shape::of(OP) }) };
     let addr = step::address(ctx.regs.get(base_reg::<OP>(insn)), insn);
+    if interp.promo_overlaps(addr, const { OpCode(OP).mem_size().bytes() as u64 }) {
+        let (unpromoted, new_ip) = interp.bail_promoted(ctx, code, ip);
+        // SAFETY: `new_ip` points at the same in-bounds pc in the unpromoted stream.
+        let new_slot = unsafe { new_ip.get() };
+        become handler::<M, H, OP>(ctx, unpromoted, new_ip, interp, rests, SPARE, new_slot)
+    }
     if !interp.windows.stack.access::<OP>(&mut ctx.regs, insn, addr) {
         become miss::<M, H, OP, true>(ctx, code, ip, interp, rests, SPARE, slot)
     }
@@ -447,9 +535,28 @@ extern "rust-preserve-none" fn miss<M: Memory, H: Host<M>, const OP: u8, const D
         // the frame is the bytes below r10
         false => ctx.regs[FP].wrapping_sub(1),
     };
-    interp
-        .windows
-        .take::<M, DATA>(ctx.memory, around, OpCode(OP).mem_size());
+    let (mut code, mut ip, mut slot) = (code, ip, slot);
+    if interp.is_promoted() {
+        let size = const { OpCode(OP).mem_size().bytes() as u64 };
+        let (lo, hi) = interp.promo_range();
+        let need_bail = !DATA
+            || range_overlaps(around, size, lo, hi)
+            || interp
+                .windows
+                .take_checked(ctx.memory, around, OpCode(OP).mem_size(), lo, hi);
+        if need_bail {
+            (code, ip) = interp.bail_promoted(ctx, code, ip);
+            // SAFETY: `ip` points at the same in-bounds pc in the unpromoted stream.
+            slot = unsafe { ip.get() };
+            interp
+                .windows
+                .take::<M, DATA>(ctx.memory, around, OpCode(OP).mem_size());
+        }
+    } else {
+        interp
+            .windows
+            .take::<M, DATA>(ctx.memory, around, OpCode(OP).mem_size());
+    }
     become handler::<M, H, OP>(ctx, code, ip, interp, rests, SPARE, slot)
 }
 

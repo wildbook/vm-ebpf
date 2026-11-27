@@ -133,6 +133,7 @@ mod instruction;
 mod interp;
 mod memory;
 mod native;
+mod promote;
 mod rewrite;
 mod slot;
 mod step;

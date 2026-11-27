@@ -5,9 +5,9 @@ use crate::code::Slots;
 use crate::dispatch::{Handler, Spare};
 use crate::fuel::{Fuel, RestsPtr};
 use crate::host::Callee;
-use crate::opcode::{CALL, CALLX};
+use crate::opcode::{Class, OpCode, CALL, CALLX};
 use crate::slot::{Fields, Layout, Shape, Slot, LAYOUTS};
-use crate::step::{self, Regs, Step};
+use crate::step::{self, Regs, Step, BITS_32, BITS_64};
 use crate::transfer::{self, Ip};
 use crate::{Context, Host, Interpreter, Memory, Reason};
 
@@ -76,8 +76,8 @@ pub extern "rust-preserve-none" fn alu3_imm<M: Memory, H: Host<M>, const ALU64: 
         true => slot.alu3_imm_val() as i64 as u64,
         false => slot.alu3_imm_val() as u32 as u64,
     };
-    let res = eval_alu3::<ALU64, OP>(ctx.regs.get(src1), imm);
-    ctx.regs.set(dst, res);
+    let res = eval_alu3::<ALU64, OP>(ctx.reg_get(src1), imm);
+    ctx.reg_set(dst, res);
 
     become_at!(ctx, code, ip.offset(2), interp, rests)
 }
@@ -97,8 +97,8 @@ pub extern "rust-preserve-none" fn alu3_reg<M: Memory, H: Host<M>, const ALU64: 
     let src1 = unsafe { slot.alu3_src1() };
     let dst = unsafe { slot.alu3_dst() };
     let src2 = unsafe { slot.alu3_src2() };
-    let res = eval_alu3::<ALU64, OP>(ctx.regs.get(src1), ctx.regs.get(src2));
-    ctx.regs.set(dst, res);
+    let res = eval_alu3::<ALU64, OP>(ctx.reg_get(src1), ctx.reg_get(src2));
+    ctx.reg_set(dst, res);
 
     become_at!(ctx, code, ip.offset(2), interp, rests)
 }
@@ -116,7 +116,22 @@ pub extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const OP: u8>(
 ) {
     // SAFETY: a handler's ip lies below `len`, and its slot has the layout of its opcode (see `Handler`)
     let insn = unsafe { ip.view(slot, const { Shape::of(OP) }) };
-    match step::step(&mut ctx.regs, ctx.memory, insn) {
+    let res: Step<M::Error> = match const { OpCode(crate::bytes::usual(OP)).class() } {
+        Class::Alu32 => {
+            let mut regs = ctx.regs_view_mut();
+            step::alu::<M::Error, _, BITS_32>(&mut regs, insn).into()
+        }
+        Class::Alu64 => {
+            let mut regs = ctx.regs_view_mut();
+            step::alu::<M::Error, _, BITS_64>(&mut regs, insn).into()
+        }
+        Class::Ld => step::ld(insn),
+        _ => {
+            let (mut regs, memory) = ctx.split_mut();
+            step::step(&mut regs, memory, insn)
+        }
+    };
+    match res {
         Step::Next => {}
         Step::LdImm64 => {
             // SAFETY: this handler runs a slot below `len` (see `Ip`), so the next one lies in `0..=len`
@@ -126,7 +141,8 @@ pub extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const OP: u8>(
                 return interp.stop.at(ip, Reason::BadPc);
             };
             ip = ip.offset(1);
-            step::ld_imm64(&mut ctx.regs, insn, upper);
+            let mut regs = ctx.regs_view_mut();
+            step::ld_imm64(&mut regs, insn, upper);
         }
         Step::Stop(reason) => return interp.stop.at(ip, reason),
         _ => unreachable!("only the jump classes jump, call or exit"),
@@ -149,7 +165,12 @@ pub extern "rust-preserve-none" fn jump<M: Memory, H: Host<M>, F: Fuel, const OP
 ) {
     // SAFETY: as in `handler`
     let insn = unsafe { ip.view(slot, const { Shape::of(OP) }) };
-    match step::step(&mut ctx.regs, ctx.memory, insn) {
+    let step: Step<M::Error> = match const { OpCode(crate::bytes::usual(OP)).class() } {
+        Class::Jmp32 => step::jump::<M::Error, _, BITS_32>(&ctx.regs_view(), insn),
+        Class::Jmp64 => step::jump::<M::Error, _, BITS_64>(&ctx.regs_view(), insn),
+        _ => unreachable!("only the jump classes use `jump`"),
+    };
+    match step {
         Step::Next => become_enter!(ctx, code, ip.offset(1), interp, rests),
         Step::Jump(offset) => {
             if const { matches!(LAYOUTS[OP as usize], Layout::DstSrc) } {

@@ -138,6 +138,9 @@ mod metered {
             _: Spare,
             _: Slot,
         ) {
+            if interp.is_promoted() {
+                interp.flush_promoted(ctx);
+            }
             let mut pc = ip.pc(code);
             // SAFETY: `ip` lies in `code`, and `rests` points to `code.total_len()` entries.
             let mut fuel = interp

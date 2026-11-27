@@ -15,10 +15,11 @@ use crate::fuel::{FuelLeft, Meter};
 use crate::native::NativeCall;
 #[cfg(feature = "ffi")]
 use crate::native::NativeFail;
+use crate::promote::{PromotedRegion, PROMOTE_FRAME};
 #[cfg(feature = "fuel")]
 use crate::slot::Slot;
 use crate::transfer::Ip;
-use crate::windows::Windows;
+use crate::windows::{range_overlaps, Windows};
 use crate::{Code, Context, Host, Memory};
 
 /// Maximum nesting of local calls below the entry frame.
@@ -110,7 +111,31 @@ pub struct Interpreter<M: Memory, H> {
     native_fail: Option<NativeFail>,
     /// Base slot address of the `Code` that `frames[..depth]` point into, recorded whenever live frames outlive a run.
     frame_code_first: usize,
+    /// Active stack-slot promotion state during a promoted leaf run (null region when inactive).
+    active_promo: ActivePromo,
 }
+
+/// Live state while a promoted leaf function runs with stack slots held in `Context::regs` virtual registers.
+#[derive(Clone, Copy)]
+struct ActivePromo {
+    region: *const PromotedRegion,
+    fp_host: usize,
+    fp: u64,
+    bailed: bool,
+}
+
+impl ActivePromo {
+    const NONE: Self = Self {
+        region: ptr::null(),
+        fp_host: 0,
+        fp: 0,
+        bailed: false,
+    };
+}
+
+// SAFETY: `region` is only non-null while `&Code` is borrowed during `Interpreter::enter`.
+unsafe impl Send for ActivePromo {}
+unsafe impl Sync for ActivePromo {}
 
 /// Caller state saved across a local call.
 // Aligned to 16 bytes: `call` and `exit` move the registers 16 bytes at a time, and a move that crosses a cache line
@@ -155,7 +180,56 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
             #[cfg(feature = "ffi")]
             native_fail: None,
             frame_code_first: 0,
+            active_promo: ActivePromo::NONE,
         }
+    }
+
+    /// Whether a promoted leaf region currently holds stack slots in `Context::regs` virtual registers.
+    #[inline(always)]
+    pub(crate) fn is_promoted(&self) -> bool {
+        !self.active_promo.region.is_null()
+    }
+
+    /// Protected guest stack frame range `[fp - PROMOTE_FRAME .. fp)` of the active promoted region.
+    #[inline(always)]
+    pub(crate) fn promo_range(&self) -> (u64, u64) {
+        (self.active_promo.fp.wrapping_sub(PROMOTE_FRAME), self.active_promo.fp)
+    }
+
+    /// Whether an active promoted region exists and `[addr .. addr + size)` overlaps its stack frame.
+    #[inline(always)]
+    pub(crate) fn promo_overlaps(&self, addr: u64, size: u64) -> bool {
+        if self.active_promo.region.is_null() {
+            return false;
+        }
+        let (lo, hi) = self.promo_range();
+        range_overlaps(addr, size, lo, hi)
+    }
+
+    /// Flush active promoted virtual registers back to stack memory and clear the active promotion state.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn flush_promoted(&mut self, ctx: &Context<M>) {
+        let region = self.active_promo.region;
+        if region.is_null() {
+            return;
+        }
+        let fp_host = self.active_promo.fp_host;
+        self.active_promo.region = ptr::null();
+        // SAFETY: `region` points into the live `&Code` borrowed by `enter_promoted`, `fp_host` was validated as a
+        // writable `PROMOTE_FRAME`-byte stack window, and `load` initialized `0..region.slots.len()`.
+        unsafe { (*region).flush(ctx, fp_host) };
+    }
+
+    /// Flush active promoted virtual registers and switch dispatch to the unpromoted stream at the same `pc`.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn bail_promoted<'a>(&mut self, ctx: &Context<M>, code: Slots<'a>, ip: Ip) -> (Slots<'a>, Ip) {
+        self.flush_promoted(ctx);
+        self.active_promo.bailed = true;
+        let pc = ip.pc(code);
+        let unpromoted = code.code().threaded(self.meter.table());
+        (unpromoted, Ip::at(unpromoted, pc))
     }
 
     #[cfg(feature = "ffi")]
@@ -242,6 +316,16 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
     #[inline(always)]
     fn enter(&mut self, ctx: &mut Context<M>, code: &Code, pc: u64, fresh: bool) -> Stop<M::Error> {
         self.windows.revalidate(ctx.memory);
+        if self.depth == 0 && !code.promoted().is_empty() {
+            if let Some(region) = code.promoted_at(pc) {
+                return self.enter_promoted(ctx, code, pc, region);
+            }
+        }
+        self.enter_unpromoted(ctx, code, pc, fresh)
+    }
+
+    #[inline(always)]
+    fn enter_unpromoted(&mut self, ctx: &mut Context<M>, code: &Code, pc: u64, fresh: bool) -> Stop<M::Error> {
         let table = self.meter.table();
         let slots = code.threaded(table);
         if !fresh && self.depth != 0 {
@@ -277,17 +361,84 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
                 reason: Reason::Exit,
                 pc: self.stop.pc(slots),
             },
-            _ => self.stopped(code),
+            _ => self.stopped_with(slots),
         }
     }
 
-    /// The stop of a run of `code` that didn't end with [`Reason::Exit`].
-    // Out of line and from the code, not its slots: a caller then keeps nothing of the slots across the chain of
-    // handlers, which saves no registers.
+    /// Runs a closed leaf `region` with its disjoint `r10` stack slots promoted to virtual registers `r16..r47`.
+    #[inline(never)]
+    fn enter_promoted(
+        &mut self,
+        ctx: &mut Context<M>,
+        code: &Code,
+        pc: u64,
+        region: &PromotedRegion,
+    ) -> Stop<M::Error> {
+        let fp = ctx.regs[FP];
+        let mut fp_host = self.windows.stack_fp_host(fp);
+        if fp_host == 0 && fp >= PROMOTE_FRAME {
+            self.windows.take_stack(ctx.memory, fp.wrapping_sub(1));
+            fp_host = self.windows.stack_fp_host(fp);
+        }
+        if fp_host == 0 {
+            return self.enter_unpromoted(ctx, code, pc, false);
+        }
+
+        #[cfg(feature = "fuel")]
+        let (rests, is_short) = self
+            .meter
+            .enter_block(&mut self.fuel, code.raw_slots(), code.rests(), pc);
+        #[cfg(not(feature = "fuel"))]
+        let rests = RestsPtr::NULL;
+
+        let table = self.meter.table();
+        #[cfg(feature = "fuel")]
+        if is_short {
+            let slots = code.threaded(table);
+            let ip = Ip::at(slots, pc);
+            Metered::step(ctx, slots, ip, self, rests, SPARE, Slot::UNREAD);
+            return self.stopped_with(slots);
+        }
+
+        self.windows.clear_overlapping(fp.wrapping_sub(PROMOTE_FRAME), fp);
+        let slots = code.threaded_promoted(table);
+        let ip = Ip::at(slots, pc);
+
+        // SAFETY: `fp_host != 0` proves `[fp - PROMOTE_FRAME .. fp)` lies in the RW stack window.
+        unsafe { region.load(ctx, fp_host) };
+        let prev = self.active_promo;
+        self.active_promo = ActivePromo {
+            region: ptr::from_ref(region),
+            fp_host,
+            fp,
+            bailed: false,
+        };
+
+        // SAFETY: `pc < region.end <= code.len()`, so `ip` lies in `slots`, built for `<M, H>`.
+        let (next, slot) = unsafe { ip.fetch::<M, H>() };
+        next(ctx, slots, ip, self, rests, SPARE, slot);
+
+        let bailed = self.active_promo.bailed;
+        if !self.active_promo.region.is_null() {
+            // SAFETY: `region.load` initialized the virtual slots and `fp_host` stayed valid (no calls in region).
+            unsafe { region.flush(ctx, fp_host) };
+        }
+        self.active_promo = prev;
+
+        let stop_slots = if bailed { code.threaded(table) } else { slots };
+        match self.stop.reason {
+            Reason::Exit => Stop {
+                reason: Reason::Exit,
+                pc: self.stop.pc(stop_slots),
+            },
+            _ => self.stopped_with(stop_slots),
+        }
+    }
+
+    /// The stop of a run on `slots` that didn't end with [`Reason::Exit`].
     #[cold]
     #[inline(never)]
-    fn stopped(&mut self, code: &Code) -> Stop<M::Error> {
-        let slots = code.threaded(self.meter.table());
+    fn stopped_with(&mut self, slots: Slots<'_>) -> Stop<M::Error> {
         if self.depth != 0 {
             self.frame_code_first = slots.first().addr();
         }

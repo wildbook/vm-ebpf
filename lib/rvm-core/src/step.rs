@@ -8,8 +8,9 @@ mod mem;
 #[cfg(test)]
 mod tests;
 
+pub use alu::alu;
 pub use jump::jump;
-pub use mem::address;
+pub use mem::{address, ld};
 
 use crate::opcode::{Class, Source, LD_IMM64};
 use crate::slot::{Fields, Reg};
@@ -68,13 +69,13 @@ pub trait Regs {
 impl Regs for [u64; 16] {
     #[inline(always)]
     fn get(&self, reg: Reg) -> u64 {
-        // SAFETY: a `Reg` is below 16 (see `slot::Reg`)
+        // SAFETY: a `Reg` in unpromoted code is below 16 (see `slot::Reg`)
         unsafe { *self.as_ptr().add(usize::from(reg.get())) }
     }
 
     #[inline(always)]
     fn set(&mut self, reg: Reg, value: u64) {
-        // SAFETY: a `Reg` is below 16 (see `slot::Reg`)
+        // SAFETY: a `Reg` in unpromoted code is below 16 (see `slot::Reg`)
         unsafe { *self.as_mut_ptr().add(usize::from(reg.get())) = value }
     }
 }

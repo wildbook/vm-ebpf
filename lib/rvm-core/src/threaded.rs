@@ -294,7 +294,7 @@ extern "rust-preserve-none" fn mov_ja_imm<M: Memory, H: Host<M>, F: Fuel, const 
         true => slot.imm_i32() as i64 as u64,
         false => slot.imm_i32() as u32 as u64,
     };
-    ctx.regs.set(dst, val);
+    ctx.reg_set(dst, val);
     let byte_off = slot.offset_raw() as isize;
     become_enter!(ctx, code, ip.byte_offset(byte_off), interp, rests)
 }
@@ -312,9 +312,9 @@ extern "rust-preserve-none" fn mov_ja_reg<M: Memory, H: Host<M>, F: Fuel, const 
     // SAFETY: `fold_mov_ja` packed `dst` into byte 0 and `src` into byte 1.
     let dst = unsafe { slot.reg0() };
     let src = unsafe { slot.reg1() };
-    let raw = ctx.regs.get(src);
+    let raw = ctx.reg_get(src);
     let val = if BITS64 { raw } else { raw as u32 as u64 };
-    ctx.regs.set(dst, val);
+    ctx.reg_set(dst, val);
     let byte_off = slot.imm_i32() as isize;
     become_enter!(ctx, code, ip.byte_offset(byte_off), interp, rests)
 }
@@ -436,8 +436,8 @@ extern "rust-preserve-none" fn mov_add_ldx<M: Memory, H: Host<M>, const OP: u8>(
     let base = unsafe { slot.reg1() };
     let idx = unsafe { slot.reg2() };
     let dst = unsafe { slot.reg3() };
-    let addr_reg = ctx.regs.get(base).wrapping_add(ctx.regs.get(idx));
-    ctx.regs.set(a, addr_reg);
+    let addr_reg = ctx.reg_get(base).wrapping_add(ctx.reg_get(idx));
+    ctx.reg_set(a, addr_reg);
     let addr = addr_reg.wrapping_add_signed(i64::from(slot.imm_i32()));
     let Some(loaded) = interp
         .windows
@@ -448,7 +448,7 @@ extern "rust-preserve-none" fn mov_add_ldx<M: Memory, H: Host<M>, const OP: u8>(
         let next_slot = unsafe { next.get() };
         become windows::data_access::<M, H, OP>(ctx, code, next, interp, rests, SPARE, next_slot)
     };
-    ctx.regs.set(dst, loaded);
+    ctx.reg_set(dst, loaded);
     become_at!(ctx, code, ip.offset(3), interp, rests)
 }
 
@@ -467,10 +467,10 @@ extern "rust-preserve-none" fn mov_add_stx<M: Memory, H: Host<M>, const OP: u8>(
     let base = unsafe { slot.reg1() };
     let idx = unsafe { slot.reg2() };
     let val_reg = unsafe { slot.reg3() };
-    let addr_reg = ctx.regs.get(base).wrapping_add(ctx.regs.get(idx));
-    ctx.regs.set(a, addr_reg);
+    let addr_reg = ctx.reg_get(base).wrapping_add(ctx.reg_get(idx));
+    ctx.reg_set(a, addr_reg);
     let addr = addr_reg.wrapping_add_signed(i64::from(slot.imm_i32()));
-    let val = ctx.regs.get(val_reg);
+    let val = ctx.reg_get(val_reg);
     if interp
         .windows
         .run_data(OpCode(OP), const { windows::kind(OpCode(OP)) }, addr, val)
@@ -498,8 +498,8 @@ extern "rust-preserve-none" fn mov_add_st<M: Memory, H: Host<M>, const OP: u8>(
     let a = unsafe { slot.reg0() };
     let base = unsafe { slot.reg1() };
     let idx = unsafe { slot.reg2() };
-    let addr_reg = ctx.regs.get(base).wrapping_add(ctx.regs.get(idx));
-    ctx.regs.set(a, addr_reg);
+    let addr_reg = ctx.reg_get(base).wrapping_add(ctx.reg_get(idx));
+    ctx.reg_set(a, addr_reg);
     let val = i64::from(slot.imm_i32()) as u64;
     if interp
         .windows

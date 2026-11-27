@@ -16,6 +16,7 @@ use crate::handler::{CALL_HELPER, CALL_KFUNC};
 use crate::native::GeneralProto;
 use crate::native::{NativeBind, NativeMode};
 use crate::opcode::{AluOpc, Class, JmpOpc, OpCode, Source, CALL};
+use crate::promote::{self, PromotedRegion};
 use crate::slot::{Layout, Slot, LAYOUTS};
 use crate::{
     args, bytes, fuse, native, rewrite, threaded, transfer, windows, Host, Instruction, Memory, MAX_NATIVE_ARGS,
@@ -98,6 +99,8 @@ pub struct Code {
     len: usize,
     /// Lazily compiled 16-byte direct-threaded streams per dispatch table (`PLAIN`, `METERED`, `FLAT_*`).
     compiled: CompiledCache,
+    /// Non-escaping leaf functions eligible for stack-slot promotion to virtual registers.
+    promoted: Box<[PromotedRegion]>,
     #[cfg(feature = "ffi")]
     general: Box<[GeneralProto]>,
     #[cfg(feature = "fuel")]
@@ -198,10 +201,12 @@ impl Code {
 
         // in place, as `Slot` and `Instruction` have the same size and alignment
         let slots: Vec<Slot> = insns.into_iter().map(Slot::new).collect();
+        let promoted = promote::analyze(&slots, len);
         Ok(Self {
             slots: slots.into_boxed_slice(),
             len,
             compiled: CompiledCache::default(),
+            promoted,
             #[cfg(feature = "ffi")]
             general: general.into_boxed_slice(),
             #[cfg(feature = "fuel")]
@@ -261,10 +266,39 @@ impl Code {
         &self.slots
     }
 
+    /// Non-escaping leaf functions eligible for stack-slot promotion.
+    #[inline(always)]
+    pub(crate) fn promoted(&self) -> &[PromotedRegion] {
+        &self.promoted
+    }
+
+    /// Promoted region containing `pc`, if any.
+    #[inline(always)]
+    pub(crate) fn promoted_at(&self, pc: u64) -> Option<&PromotedRegion> {
+        for region in &self.promoted {
+            let start = u64::from(region.start);
+            let end = u64::from(region.end);
+            if pc >= start && pc < end {
+                return Some(region);
+            }
+        }
+        None
+    }
+
     /// The direct-threaded [`Slots`] for `table`, compiling and caching them on first use.
     #[inline(always)]
     pub(crate) fn threaded<M: Memory, H: Host<M>>(&self, table: &DispatchTable<M, H>) -> Slots<'_> {
-        let key = ptr::from_ref(table).addr();
+        self.threaded_by_key(ptr::from_ref(table).addr(), table)
+    }
+
+    /// The direct-threaded [`Slots`] for `table` with stack-slot promotion applied to [`Self::promoted`].
+    #[inline(always)]
+    pub(crate) fn threaded_promoted<M: Memory, H: Host<M>>(&self, table: &DispatchTable<M, H>) -> Slots<'_> {
+        self.threaded_by_key(ptr::from_ref(table).addr() | 1, table)
+    }
+
+    #[inline(always)]
+    fn threaded_by_key<M: Memory, H: Host<M>>(&self, key: usize, table: &DispatchTable<M, H>) -> Slots<'_> {
         let first = if self.compiled.fast[0].key.load(Ordering::Acquire) == key {
             self.compiled.fast[0].ptr.load(Ordering::Relaxed)
         } else if self.compiled.fast[1].key.load(Ordering::Acquire) == key {
@@ -294,7 +328,8 @@ impl Code {
             return ptr;
         }
 
-        let compiled = compile_threaded(&self.slots, self.len, table);
+        let promote = (key & 1 != 0).then_some(self.promoted.as_ref());
+        let compiled = compile_threaded(&self.slots, self.len, table, promote);
         let ptr = Box::into_raw(compiled).cast::<ThreadedSlot>();
         for entry in &self.compiled.fast {
             if entry.key.load(Ordering::Relaxed) == 0 {
@@ -323,10 +358,26 @@ impl Code {
 /// - pre-scales unconditional `ja` and local `call` displacements into byte offsets;
 /// - routes all plain `r10` loads/stores (including 1- and 2-byte) to `windows::stack_access`.
 fn compile_threaded<M: Memory, H: Host<M>>(
-    slots: &[Slot],
+    raw_slots: &[Slot],
     len: usize,
     table: &DispatchTable<M, H>,
+    promote: Option<&[PromotedRegion]>,
 ) -> Box<[ThreadedSlot]> {
+    let rewritten;
+    let slots: &[Slot] = match promote {
+        Some(regions) if !regions.is_empty() => {
+            let mut buf = raw_slots.to_vec();
+            for region in regions {
+                let start = region.start as usize;
+                let end = region.end as usize;
+                let patched = promote::rewrite_region(raw_slots, region);
+                buf[start..end].copy_from_slice(&patched);
+            }
+            rewritten = buf;
+            &rewritten
+        }
+        _ => raw_slots,
+    };
     const STRIDE: i64 = size_of::<ThreadedSlot>() as i64;
     let mut out = Vec::with_capacity(slots.len());
     // Slots inside an active superinstruction must keep their opcode's threaded layout intact because `fuse::handler`
@@ -515,7 +566,6 @@ impl<'a> Slots<'a> {
     }
 
     /// The code these slots belong to.
-    #[cfg(feature = "callbacks")]
     #[inline(always)]
     pub fn code(self) -> &'a Code {
         self.code
