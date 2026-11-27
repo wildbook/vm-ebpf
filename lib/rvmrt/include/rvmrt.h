@@ -83,8 +83,8 @@ typedef struct rvm_native {
 //   checked. Native functions get each argument as the register holds it, without the checks of rvm_native. rvm_map
 //   returns a host address. Includes RVM_RAW_POINTERS.
 // - RVM_RAW_CALLS: a call through a function pointer that holds an address without a region tag, from 64 KiB up,
-//   calls the native function there, with up to 5 arguments in the Windows x64 convention, the first four also in
-//   xmm0 to xmm3. Nothing validates the address, so the guest can call any code in the process with any arguments.
+//   calls the native function there, with up to 5 arguments in the host C convention, with register arguments also in
+//   xmm registers. Nothing validates the address, so the guest can call any code in the process with any arguments.
 //   The arguments pass as the registers hold them: a pointer into guest memory keeps its region tag unless the
 //   program is loaded with RVM_UNTAGGED or the guest strips the tag (UNTAG in rvm's bpf/rvm_bpf.h). In a program
 //   with a call of more than five arguments anywhere, every such call passes 12: the five registers, and the seven

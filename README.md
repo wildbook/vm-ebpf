@@ -119,11 +119,11 @@ The host decides what a plugin can reach. The only built-in helpers are the map 
 
 ### Native functions
 
-A native function is a plain function pointer that the interpreter calls directly, in the Windows x64 convention. A
-call from a plugin loop costs 18 host instructions without arguments and 31 with one, against 38 and 50 for a host
-function from `register_extern`; a pointer argument that rvm checks adds about 30. The plugin declares a native as an
-`extern` like any host function, and the host registers it with its signature, which says which arguments are
-pointers to plugin memory and how many bytes each covers:
+A native function is a plain function pointer that the interpreter calls directly, in the host C convention (Windows x64
+on Windows, System V AMD64 on Unix). A call from a plugin loop costs 18 host instructions without arguments and 31 with
+one, against 38 and 50 for a host function from `register_extern`; a pointer argument that rvm checks adds about 30. The
+plugin declares a native as an `extern` like any host function, and the host registers it with its signature, which says
+which arguments are pointers to plugin memory and how many bytes each covers:
 
 ```c
 extern u64 checksum(const u8 *buf BORROW_RO(1), u64 len);
@@ -132,7 +132,7 @@ extern u64 checksum(const u8 *buf BORROW_RO(1), u64 len);
 ```rust
 use rvm::{NativeArg, NativeSig};
 
-unsafe extern "win64" fn checksum(buf: *const u8, len: u64) -> u64 {
+unsafe extern "C" fn checksum(buf: *const u8, len: u64) -> u64 {
     // ...
 }
 
@@ -144,12 +144,11 @@ unsafe { vm.register_native("checksum", checksum as *const (), CHECKSUM)? };
 
 Loading checks the plugin's declaration against the signature: the same number of arguments, pointers in the same
 places, and a `BORROW` tag, where there is one, on the same length argument. The declaration may return nothing, an
-integer, a pointer, or a struct of 1, 2, 4 or 8 bytes, which the Windows x64 convention returns in rax; loading fails
-for a struct of another size, which that convention returns through a pointer. A prepared image records the
-signature and loads only where the native has the same one. Before each call, rvm checks every pointer the
-signature declares against the plugin's memory, one byte or as many as its length argument says, with the plugin's
-read or write permission, and the native gets the host address of the bytes. A bad pointer stops the plugin call
-with `ExecError::MemoryFault`. With `Passthrough::untagged()` arguments arrive unchanged and unchecked.
+integer, a pointer, or a struct of 1, 2, 4 or 8 bytes, which returns in rax; loading fails for a struct of another size.
+A prepared image records the signature and loads only where the native has the same one. Before each call, rvm checks
+every pointer the signature declares against the plugin's memory, one byte or as many as its length argument says, with
+the plugin's read or write permission, and the native gets the host address of the bytes. A bad pointer stops the plugin
+call with `ExecError::MemoryFault`. With `Passthrough::untagged()` arguments arrive unchanged and unchecked.
 
 Pointers stored inside plugin memory, such as the fields of a struct the plugin fills, keep the plugin's region tag,
 and native code can't follow them; such APIs need `Passthrough::untagged()`. A pointer that a native returns is a
@@ -381,11 +380,12 @@ plugin.call("run", &[&raw const API as u64])?;
 ```
 
 A call through a pointer that holds an address without a region tag, from 64 KiB up, then calls the function at that
-address in the Windows x64 convention, with five arguments (or twelve in a program that stores a stack argument
-anywhere), and the plugin gets what the function leaves in rax. The first four arguments also go to xmm0 to xmm3, where
-a function reads `float` and `double` parameters and a variadic function its copies. Pointers to the plugin's own
-functions and helper IDs below 64 KiB work as before. Without the switch, such a call fails with
-`ExecError::BadCodeAddress`, or with `ExecError::UnknownHelper` if the address fits 32 bits.
+address in the host C convention, with five arguments (or twelve in a program that stores a stack argument anywhere),
+and the plugin gets what the function leaves in rax. Register arguments also go to xmm registers (xmm0 to xmm3 on
+Windows x64, xmm0 to xmm4 or xmm5 on System V AMD64), where a function reads `float` and `double` parameters and a
+variadic function reads its copies. Pointers to the plugin's own functions and helper IDs below 64 KiB work as before.
+Without the switch, such a call fails with `ExecError::BadCodeAddress`, or with `ExecError::UnknownHelper` if the
+address fits 32 bits.
 
 Nothing declares what such a call passes, so each argument arrives as the register holds it, without a check or a
 conversion. A pointer into plugin memory keeps its region tag, which native code can't follow: load the plugin with
@@ -463,8 +463,8 @@ Built with `cargo build --profile embedded` in `lib/rvmrt`, on x86-64 Windows:
 
 | build | `rvmrt.dll` | added to a C host by `rvmrt.lib` |
 |---|---|---|
-| default | 127,488 bytes, 24 imports from 3 DLLs | 116,224 bytes, 7 imports |
-| without `fuel` | 102,400 bytes, 24 imports from 3 DLLs | 91,648 bytes, 7 imports |
+| default | 115,200 bytes, 24 imports from 3 DLLs | 105,984 bytes, 7 imports |
+| without `fuel` | 96,256 bytes, 24 imports from 3 DLLs | 87,040 bytes, 7 imports |
 
 The 7 imports of the static library are the process heap functions, `memcmp`, `memmove` and `memset`. The build
 rebuilds the standard library for size, which needs the `rust-src` component.
@@ -597,10 +597,10 @@ opt-level = 3
 
 | feature | what it adds | size |
 |---|---|---:|
-| (`default-features = false`) | loads prepared images and runs them | 75 KB |
-| `link` | the ELF reader, BTF, CO-RE and the linker: `Vm::load_elf`, `Vm::prepare_elf`, `Vm::with_types` | 87 KB |
-| `fuel` | instruction limits | 19 KB |
-| `maps` | maps, the map helpers, `Vm::share_map` and `Pod` | 20 KB |
+| (`default-features = false`) | loads prepared images and runs them | 82 KiB |
+| `link` | the ELF reader, BTF, CO-RE and the linker: `Vm::load_elf`, `Vm::prepare_elf`, `Vm::with_types` | 94 KiB |
+| `fuel` | instruction limits | 18 KiB |
+| `maps` | maps, the map helpers, `Vm::share_map` and `Pod` | 28 KiB |
 
 The size column is what rvm adds to a small Rust host on x86-64 Windows, built with the workspace's `embedded`
 profile (`cargo build --profile embedded`), which also strips symbols and panic locations. Without `maps`, an image
@@ -609,7 +609,8 @@ that declares maps fails to load. `fixed-hash-seed` makes hash maps use a fixed 
 ## Limitations
 
 - rvm is an interpreter. Compute-bound plugins run about 15 to 30 times slower than native code; there is no JIT.
-- rvm is developed and measured on x86-64 Windows only.
+- rvm is developed and measured on x86-64 Windows. System V AMD64 native calls and Linux LA57 raw addresses are
+  implemented for x86-64 Unix, but not regularly tested on Unix hardware.
 - It needs nightly Rust.
 - Plugins are limited by eBPF: twelve arguments per call (five in registers and seven on the stack), no floating point,
   a 512-byte stack frame and 8 nested calls.
@@ -617,9 +618,9 @@ that declares maps fails to load. `fixed-hash-seed` makes hash maps use a fixed 
   `VmError::PluginBusy`; load one program per thread to run them in parallel.
 - A struct of 9 to 16 bytes comes back in two registers, which only a host function from `register_extern` returns.
   Native functions, the functions that plugins export and calls from the host carry r0.
-- Native functions use the Windows x64 convention only. They take integers and pointers and return integers,
-  pointers and structs of 1, 2, 4 or 8 bytes: no struct parameters, no floats and no variadic functions. They run
-  unmetered.
+- Native functions use the host x86-64 C convention (Windows x64 on Windows, System V AMD64 on Unix). They take
+  integers and pointers and return integers, pointers and structs of 1, 2, 4 or 8 bytes: no struct parameters, no floats
+  and no variadic functions. They run unmetered.
 - A call through a function pointer to native code has no signature. It passes five registers as they are, plus the
   seven stack slots in a program that stores any: pointers keep their region tags, a struct by value passes and comes
   back only if it is 1, 2, 4 or 8 bytes long, and a `float` or `double` result is lost. Nothing validates the target,
@@ -677,7 +678,7 @@ checks the unsafe memory code; the tests that list fixture directories run under
 ```bash
 cargo miri test -p rvm-core
 cargo miri test -p rvm --lib
-MIRIFLAGS=-Zmiri-disable-isolation cargo miri test -p rvm --test integration --test conformance --target x86_64-unknown-linux-gnu
+MIRIFLAGS=-Zmiri-disable-isolation cargo miri test -p rvm --test integration --test conformance --target x86_64-unknown-linux-gnu -- --test-threads=1
 ```
 
 `cargo bench -p rvm --bench exec` and `--bench workloads` run the benchmarks. To compare two versions, build both with

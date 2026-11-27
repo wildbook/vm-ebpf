@@ -1,4 +1,4 @@
-//! Gives a plugin native functions, which the interpreter calls directly in the Windows x64 convention:
+//! Gives a plugin native functions, which the interpreter calls directly in the host C convention:
 //! `bpf/examples/natives.c` mixes integers, upper-cases a buffer on its stack in place and checksums it, calls a
 //! seven-argument native whose checked buffer and length travel on the stack, and follows a pointer to a host struct
 //! that a native returns. The VM checks each buffer against the guest's memory before the native gets its host
@@ -120,7 +120,7 @@ fn native_vm(passthrough: Passthrough) -> Result<Vm, VmError> {
         passthrough,
         ..VmConfig::default()
     };
-    // SAFETY: each native takes its signature's arguments in the Windows x64 convention, never unwinds, keeps to the
+    // SAFETY: each native takes its signature's arguments in the host C convention, never unwinds, keeps to the
     // bytes the checks of its buffer cover, and is safe on any thread.
     unsafe { Vm::with_natives(config, &NATIVES) }
 }
