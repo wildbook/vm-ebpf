@@ -79,6 +79,12 @@ pub trait Fields: Copy {
     /// `src_reg`, which `call` reads as the kind of call.
     fn src_reg(self) -> Reg;
     fn offset(self) -> i16;
+    /// Sign-extended `offset`. Threaded [`Layout::DstSrc`] slots store `i32::from(offset)` in `RCX >> 32`, so reading
+    /// `i64` directly avoids truncating to `i16` and sign-extending back.
+    #[inline(always)]
+    fn offset_i64(self) -> i64 {
+        i64::from(self.offset())
+    }
     fn imm(self) -> i32;
 
     /// The instruction with these fields.
@@ -608,6 +614,17 @@ impl<const THREADED: bool> Fields for View<'_, THREADED> {
             true => 0,
             false if THREADED && matches!(self.layout(), Layout::DstSrc) => i32::from_le_bytes(self.imm_bytes()) as i16,
             false => self.slot.offset,
+        }
+    }
+
+    #[inline(always)]
+    fn offset_i64(self) -> i64 {
+        match self.shape.offset_is_zero {
+            true => 0,
+            false if THREADED && matches!(self.layout(), Layout::DstSrc) => {
+                i64::from(i32::from_le_bytes(self.imm_bytes()))
+            }
+            false => i64::from(self.slot.offset),
         }
     }
 

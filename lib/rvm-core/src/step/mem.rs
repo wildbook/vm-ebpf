@@ -13,7 +13,7 @@ pub const SOURCE_IMM: bool = false;
 /// The address `insn` accesses through the base register value `base`.
 #[inline(always)]
 pub fn address(base: u64, insn: impl Fields) -> u64 {
-    base.wrapping_add_signed(i64::from(insn.offset()))
+    base.wrapping_add_signed(insn.offset_i64())
 }
 
 fn store_plain<M: Memory>(mem: &mut M, size: MemSize, addr: u64, value: u64) -> Result<(), M::Error> {

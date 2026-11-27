@@ -278,6 +278,7 @@ fn size_idx(op: u8) -> usize {
 
 // --- Handlers ---
 
+#[rustc_align(64)]
 #[inline(never)]
 extern "rust-preserve-none" fn mov_ja_imm<M: Memory, H: Host<M>, F: Fuel, const BITS64: bool>(
     ctx: &mut Context<M>,
@@ -299,6 +300,7 @@ extern "rust-preserve-none" fn mov_ja_imm<M: Memory, H: Host<M>, F: Fuel, const 
     become_enter!(ctx, code, ip.byte_offset(byte_off), interp, rests)
 }
 
+#[rustc_align(64)]
 #[inline(never)]
 extern "rust-preserve-none" fn mov_ja_reg<M: Memory, H: Host<M>, F: Fuel, const BITS64: bool>(
     ctx: &mut Context<M>,
@@ -319,6 +321,7 @@ extern "rust-preserve-none" fn mov_ja_reg<M: Memory, H: Host<M>, F: Fuel, const 
     become_enter!(ctx, code, ip.byte_offset(byte_off), interp, rests)
 }
 
+#[rustc_align(64)]
 #[inline(never)]
 extern "rust-preserve-none" fn rot<M: Memory, H: Host<M>, const BITS64: bool, const LSH_FIRST: bool>(
     ctx: &mut Context<M>,
@@ -360,6 +363,7 @@ extern "rust-preserve-none" fn rot<M: Memory, H: Host<M>, const BITS64: bool, co
     become_at!(ctx, code, ip.offset(4), interp, rests)
 }
 
+#[rustc_align(64)]
 #[inline(never)]
 extern "rust-preserve-none" fn add_ldx<M: Memory, H: Host<M>, const OP: u8>(
     ctx: &mut Context<M>,
@@ -390,6 +394,7 @@ extern "rust-preserve-none" fn add_ldx<M: Memory, H: Host<M>, const OP: u8>(
     become_at!(ctx, code, ip.offset(2), interp, rests)
 }
 
+#[rustc_align(64)]
 #[inline(never)]
 extern "rust-preserve-none" fn add_stx<M: Memory, H: Host<M>, const OP: u8>(
     ctx: &mut Context<M>,
@@ -421,6 +426,7 @@ extern "rust-preserve-none" fn add_stx<M: Memory, H: Host<M>, const OP: u8>(
     become_at!(ctx, code, ip.offset(2), interp, rests)
 }
 
+#[rustc_align(64)]
 #[inline(never)]
 extern "rust-preserve-none" fn mov_add_ldx<M: Memory, H: Host<M>, const OP: u8>(
     ctx: &mut Context<M>,
@@ -452,6 +458,7 @@ extern "rust-preserve-none" fn mov_add_ldx<M: Memory, H: Host<M>, const OP: u8>(
     become_at!(ctx, code, ip.offset(3), interp, rests)
 }
 
+#[rustc_align(64)]
 #[inline(never)]
 extern "rust-preserve-none" fn mov_add_stx<M: Memory, H: Host<M>, const OP: u8>(
     ctx: &mut Context<M>,
@@ -484,6 +491,7 @@ extern "rust-preserve-none" fn mov_add_stx<M: Memory, H: Host<M>, const OP: u8>(
     become_at!(ctx, code, ip.offset(3), interp, rests)
 }
 
+#[rustc_align(64)]
 #[inline(never)]
 extern "rust-preserve-none" fn mov_add_st<M: Memory, H: Host<M>, const OP: u8>(
     ctx: &mut Context<M>,

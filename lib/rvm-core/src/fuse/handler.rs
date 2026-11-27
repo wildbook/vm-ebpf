@@ -15,6 +15,7 @@ use crate::{windows, Context, Host, Interpreter, Memory};
 /// and stores the written ones back once, after the last instruction that writes one or before an instruction that
 /// stops. A sequence that names each role once runs on the registers themselves ([`Super::direct`]). The sequence lies
 /// in one block, which it ends if its last instruction branches; only then does `F` matter.
+#[rustc_align(64)]
 #[inline(never)]
 pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S: u8>(
     ctx: &mut Context<M>,

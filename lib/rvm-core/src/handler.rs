@@ -5,7 +5,7 @@ use crate::code::Slots;
 use crate::dispatch::{Handler, Spare};
 use crate::fuel::{Fuel, RestsPtr};
 use crate::host::Callee;
-use crate::opcode::{Class, OpCode, CALL, CALLX};
+use crate::opcode::{Class, MemMode, MemSize, OpCode, CALL, CALLX};
 use crate::slot::{Fields, Layout, Shape, Slot, LAYOUTS};
 use crate::step::{self, Regs, Step, BITS_32, BITS_64};
 use crate::transfer::{self, Ip};
@@ -59,6 +59,7 @@ fn eval_alu3<const ALU64: bool, const OP: u8>(a: u64, b: u64) -> u64 {
 }
 
 /// Folded 3-operand ALU with immediate: `dst = src1 op imm` (replaces `mov dst, src1; op dst, imm`).
+#[rustc_align(64)]
 #[inline(never)]
 pub extern "rust-preserve-none" fn alu3_imm<M: Memory, H: Host<M>, const ALU64: bool, const OP: u8>(
     ctx: &mut Context<M>,
@@ -83,6 +84,7 @@ pub extern "rust-preserve-none" fn alu3_imm<M: Memory, H: Host<M>, const ALU64: 
 }
 
 /// Folded 3-operand ALU with register: `dst = src1 op src2` (replaces `mov dst, src1; op dst, src2`).
+#[rustc_align(64)]
 #[inline(never)]
 pub extern "rust-preserve-none" fn alu3_reg<M: Memory, H: Host<M>, const ALU64: bool, const OP: u8>(
     ctx: &mut Context<M>,
@@ -104,6 +106,7 @@ pub extern "rust-preserve-none" fn alu3_reg<M: Memory, H: Host<M>, const ALU64: 
 }
 
 /// The [`Handler`](crate::dispatch::Handler) of opcode `OP` of the ALU, load and store classes.
+#[rustc_align(64)]
 #[inline(never)]
 pub extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const OP: u8>(
     ctx: &mut Context<M>,
@@ -126,6 +129,36 @@ pub extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const OP: u8>(
             step::alu::<M::Error, _, BITS_64>(&mut regs, insn).into()
         }
         Class::Ld => step::ld(insn),
+        Class::Ldx
+            if const {
+                let opc = OpCode(crate::bytes::usual(OP));
+                matches!(opc.mem_mode(), MemMode::MemSX) && !matches!(opc.mem_size(), MemSize::DWord)
+            } =>
+        {
+            let opc = const { OpCode(crate::bytes::usual(OP)) };
+            let addr = step::address(ctx.reg_get(insn.src_reg()), insn);
+            if let Some(raw) =
+                interp
+                    .windows
+                    .run_data(opc, const { crate::windows::kind(OpCode(crate::bytes::usual(OP))) }, addr, 0)
+            {
+                let val = match const { OpCode(crate::bytes::usual(OP)).mem_size() } {
+                    MemSize::Byte => raw as u8 as i8 as i64 as u64,
+                    MemSize::Half => raw as u16 as i16 as i64 as u64,
+                    MemSize::Word => raw as u32 as i32 as i64 as u64,
+                    MemSize::DWord => unreachable!(),
+                };
+                ctx.reg_set(insn.dst_reg(), val);
+                become_next!(ctx, code, ip, interp, rests)
+            }
+            core::hint::cold_path();
+            let size = const { OpCode(crate::bytes::usual(OP)).mem_size().bytes() as u64 };
+            if interp.promo_overlaps(addr, size) {
+                become ldx_memsx_bail::<M, H, OP>(ctx, code, ip, interp, rests, crate::dispatch::SPARE, slot)
+            }
+            let (mut regs, memory) = ctx.split_mut();
+            step::step(&mut regs, memory, insn)
+        }
         _ => {
             let (mut regs, memory) = ctx.split_mut();
             step::step(&mut regs, memory, insn)
@@ -152,7 +185,27 @@ pub extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const OP: u8>(
     become_next!(ctx, code, ip, interp, rests)
 }
 
+/// Cold bailout path for an `LDX_MEMSX` whose address overlaps the active promoted stack frame.
+// Out of line so `handler::<LDX_MEMSX>` calls no function and needs no stack frame.
+#[cold]
+#[inline(never)]
+extern "rust-preserve-none" fn ldx_memsx_bail<M: Memory, H: Host<M>, const OP: u8>(
+    ctx: &mut Context<M>,
+    code: Slots,
+    ip: Ip,
+    interp: &mut Interpreter<M, H>,
+    rests: RestsPtr,
+    _: Spare,
+    _slot: Slot,
+) {
+    let (unpromoted, new_ip) = interp.bail_promoted(ctx, code, ip);
+    // SAFETY: `new_ip` points at the same in-bounds pc in the unpromoted stream.
+    let new_slot = unsafe { new_ip.get() };
+    become handler::<M, H, OP>(ctx, unpromoted, new_ip, interp, rests, crate::dispatch::SPARE, new_slot)
+}
+
 /// The [`Handler`](crate::dispatch::Handler) of opcode `OP` of the jump classes. Every such instruction ends its block.
+#[rustc_align(64)]
 #[inline(never)]
 pub extern "rust-preserve-none" fn jump<M: Memory, H: Host<M>, F: Fuel, const OP: u8>(
     ctx: &mut Context<M>,
@@ -198,6 +251,7 @@ pub extern "rust-preserve-none" fn jump<M: Memory, H: Host<M>, F: Fuel, const OP
 }
 
 /// Direct handler for unconditional `ja` whose byte displacement `(offset + 1) * 16` was pre-scaled into `slot`.
+#[rustc_align(64)]
 #[inline(never)]
 pub extern "rust-preserve-none" fn ja_scaled<M: Memory, H: Host<M>, F: Fuel>(
     ctx: &mut Context<M>,
@@ -213,6 +267,7 @@ pub extern "rust-preserve-none" fn ja_scaled<M: Memory, H: Host<M>, F: Fuel>(
 }
 
 /// Direct handler for local `call` whose byte displacement `(offset + 1) * 16` was pre-scaled into `slot`.
+#[rustc_align(64)]
 #[inline(never)]
 pub extern "rust-preserve-none" fn local_call_scaled<M: Memory, H: Host<M>, F: Fuel>(
     ctx: &mut Context<M>,

@@ -428,6 +428,7 @@ pub fn stack_byte(insn: Instruction) -> Option<u8> {
 }
 
 /// The handler of the r10 access that stands for the load or store `OP`.
+#[rustc_align(64)]
 #[inline(never)]
 pub extern "rust-preserve-none" fn stack_access<M: Memory, H: Host<M>, const OP: u8>(
     ctx: &mut Context<M>,
@@ -448,6 +449,7 @@ pub extern "rust-preserve-none" fn stack_access<M: Memory, H: Host<M>, const OP:
 }
 
 /// The handler of the load or store `OP` through a register other than r10.
+#[rustc_align(64)]
 #[inline(never)]
 pub extern "rust-preserve-none" fn data_access<M: Memory, H: Host<M>, const OP: u8>(
     ctx: &mut Context<M>,
@@ -468,7 +470,8 @@ pub extern "rust-preserve-none" fn data_access<M: Memory, H: Host<M>, const OP: 
     {
         become_next!(ctx, code, ip, interp, rests)
     }
-    // a dispatch of its own, so that the hit above keeps its instructions
+    // Keep the primary window hit straight-line by placing the spare check after its dispatch.
+    core::hint::cold_path();
     if small(OpCode(OP).mem_size()) && interp.windows.spare.access::<OP>(&mut ctx.regs, insn, addr) {
         become_next!(ctx, code, ip, interp, rests)
     }

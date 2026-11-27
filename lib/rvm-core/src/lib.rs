@@ -113,7 +113,7 @@
 //! `slot`, where handlers continue in `transfer` (`Ip`), the `rest` of each slot in `fuel`, the windows in
 //! [`Memory`] and `windows`, and the frames in `interp`.
 
-#![feature(explicit_tail_calls, rust_preserve_none_cc)]
+#![feature(explicit_tail_calls, fn_align, rust_preserve_none_cc)]
 #![allow(incomplete_features)]
 
 #[macro_use]

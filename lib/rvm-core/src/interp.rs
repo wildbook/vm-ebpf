@@ -100,8 +100,8 @@ pub struct Interpreter<M: Memory, H> {
     /// The host that runs the guest's calls of host functions.
     pub host: H,
 
-    /// `frames[..depth]` are initialised.
-    frames: [MaybeUninit<Frame>; MAX_CALL_DEPTH],
+    /// Saved caller state for local calls `0..depth`.
+    frames: Frames,
     /// The stack arguments by call depth: the frame at `depth` received those in `args[depth]`, and stores those of
     /// the calls it makes in `args[depth + 1]`. The entry frame is at depth 0, and `push` keeps `depth` at or below
     /// [`MAX_CALL_DEPTH`].
@@ -137,18 +137,31 @@ impl ActivePromo {
 unsafe impl Send for ActivePromo {}
 unsafe impl Sync for ActivePromo {}
 
-/// Caller state saved across a local call.
-// Aligned to 16 bytes: `call` and `exit` move the registers 16 bytes at a time, and a move that crosses a cache line
-// costs them several cycles.
-#[repr(align(16))]
-struct Frame {
-    /// r6-r9 (callee-saved) and r10 (frame pointer).
-    regs: [u64; 5],
+/// Caller state saved across local calls in structure-of-arrays layout.
+// Separate per-register arrays index directly by `8 * depth` with no stride multiply and keep every save and restore 8
+// bytes wide so `call` and `exit` forward cleanly from 8-byte ALU stores to `ctx.regs`.
+struct Frames {
+    r6: [MaybeUninit<u64>; MAX_CALL_DEPTH],
+    r7: [MaybeUninit<u64>; MAX_CALL_DEPTH],
+    r8: [MaybeUninit<u64>; MAX_CALL_DEPTH],
+    r9: [MaybeUninit<u64>; MAX_CALL_DEPTH],
+    fp: [MaybeUninit<u64>; MAX_CALL_DEPTH],
     /// Return slot in `0..=len` of the code, or a tagged odd sentinel for `RETURN_PC` or an out-of-range pc.
-    return_ip: ReturnIp,
+    return_ip: [MaybeUninit<ReturnIp>; MAX_CALL_DEPTH],
 }
 
-/// A saved return [`Ip`] in [`Frame`].
+impl Frames {
+    const UNINIT: Self = Self {
+        r6: [const { MaybeUninit::uninit() }; MAX_CALL_DEPTH],
+        r7: [const { MaybeUninit::uninit() }; MAX_CALL_DEPTH],
+        r8: [const { MaybeUninit::uninit() }; MAX_CALL_DEPTH],
+        r9: [const { MaybeUninit::uninit() }; MAX_CALL_DEPTH],
+        fp: [const { MaybeUninit::uninit() }; MAX_CALL_DEPTH],
+        return_ip: [const { MaybeUninit::uninit() }; MAX_CALL_DEPTH],
+    };
+}
+
+/// A saved return [`Ip`] in [`Frames`].
 #[derive(Clone, Copy)]
 #[repr(transparent)]
 struct ReturnIp(Ip);
@@ -175,7 +188,7 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
             windows: Windows::EMPTY,
             meter: Meter::default(),
             host,
-            frames: [const { MaybeUninit::uninit() }; MAX_CALL_DEPTH],
+            frames: Frames::UNINIT,
             args: [[0; args::MAX_STACK_ARGS + 1]; MAX_CALL_DEPTH + 2],
             #[cfg(feature = "ffi")]
             native_fail: None,
@@ -467,15 +480,15 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
         let new_first = code.first();
         let new_len = code.len();
         let old_first = self.frame_code_first;
-        for frame in &mut self.frames[..self.depth] {
-            // SAFETY: `frames[..self.depth]` are initialised.
-            let frame = unsafe { frame.assume_init_mut() };
-            let addr = frame.return_ip.0.addr();
+        for slot in &mut self.frames.return_ip[..self.depth] {
+            // SAFETY: `frames` entries in `0..self.depth` are initialised.
+            let return_ip = unsafe { slot.assume_init_mut() };
+            let addr = return_ip.0.addr();
             if addr & 1 != 0 {
                 continue;
             }
             let pc = addr.wrapping_sub(old_first) / size_of::<ThreadedSlot>();
-            frame.return_ip = if pc <= new_len {
+            *return_ip = if pc <= new_len {
                 ReturnIp(Ip(new_first.wrapping_add(pc)))
             } else {
                 ReturnIp(Ip(ptr::without_provenance((pc << 1) | 1)))
@@ -535,17 +548,20 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
     #[inline(always)]
     #[must_use]
     pub(crate) fn push(&mut self, regs: &mut [u64; 16], return_ip: Ip) -> bool {
-        let Some(frame) = self.frames.get_mut(self.depth) else {
+        let depth = self.depth;
+        if depth >= MAX_CALL_DEPTH {
             return false;
-        };
+        }
         let Some(callee_fp) = regs[FP].checked_sub(self.frame_size) else {
             return false;
         };
-        frame.write(Frame {
-            regs: [regs[6], regs[7], regs[8], regs[9], regs[FP]],
-            return_ip: ReturnIp(return_ip),
-        });
-        self.depth += 1;
+        self.frames.r6[depth].write(regs[6]);
+        self.frames.r7[depth].write(regs[7]);
+        self.frames.r8[depth].write(regs[8]);
+        self.frames.r9[depth].write(regs[9]);
+        self.frames.fp[depth].write(regs[FP]);
+        self.frames.return_ip[depth].write(ReturnIp(return_ip));
+        self.depth = depth + 1;
         regs[FP] = callee_fp;
         true
     }
@@ -555,12 +571,19 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
     pub(crate) fn pop(&mut self, regs: &mut [u64; 16]) -> Option<Ip> {
         // depth 0 wraps and fails the bounds check
         let depth = self.depth.wrapping_sub(1);
-        let frame = self.frames.get(depth)?;
-        // SAFETY: `depth` is below `self.depth`, and `push` wrote every frame up to it
-        let frame = unsafe { frame.assume_init_ref() };
-        regs[6..=FP].copy_from_slice(&frame.regs);
-        self.depth = depth;
-        Some(frame.return_ip.0)
+        if depth >= MAX_CALL_DEPTH {
+            return None;
+        }
+        // SAFETY: `depth` is below `self.depth`, and `push` wrote every slot up to it
+        unsafe {
+            regs[6] = self.frames.r6[depth].assume_init();
+            regs[7] = self.frames.r7[depth].assume_init();
+            regs[8] = self.frames.r8[depth].assume_init();
+            regs[9] = self.frames.r9[depth].assume_init();
+            regs[FP] = self.frames.fp[depth].assume_init();
+            self.depth = depth;
+            Some(self.frames.return_ip[depth].assume_init().0)
+        }
     }
 
     /// The stack arguments that the entry frame of each [`run`](Self::run) receives: argument `5 + k` at index

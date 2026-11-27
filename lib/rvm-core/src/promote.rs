@@ -11,7 +11,7 @@ use std::ptr;
 use crate::bytes::{INVALID, MISSING};
 use crate::context::{FP, VIRT_REGS};
 use crate::fuse::Super;
-use crate::opcode::{Class, JmpOpc, MemMode, MemSize, OpCode, Source, CALL, LD_IMM64};
+use crate::opcode::{AluOpc, Class, JmpOpc, MemMode, MemSize, OpCode, Source, CALL, LD_IMM64};
 use crate::slot::{Layout, Reg, Slot, LAYOUTS};
 use crate::transfer::{FAR, GUARD};
 use crate::{args, bytes, windows, Context, Memory};
@@ -204,7 +204,8 @@ fn record_edge(from: usize, target: i64, len: usize, reach: &mut [usize], bad: &
 fn analyze_region(slots: &[Slot], start: usize, end: usize) -> Option<PromotedRegion> {
     // Byte ownership over `[-PROMOTE_FRAME .. 0)`: size 0 is untouched, `u8::MAX` is overlapping, else `(off, size)`.
     let mut owners = [(0i16, 0u8); PROMOTE_FRAME as usize];
-    let mut counts: Vec<(i16, u8, u32)> = Vec::new();
+    // `(off, size, total_accesses, folded_dispatches)`
+    let mut counts: Vec<(i16, u8, u32, u32)> = Vec::new();
 
     let mut i = start;
     while i < end {
@@ -222,6 +223,15 @@ fn analyze_region(slots: &[Slot], start: usize, end: usize) -> Option<PromotedRe
 
         let step = if usual == LD_IMM64 && i + 1 < end { 2 } else { 1 };
 
+        // Keep `0x19` (`ldxdw fp; mul64`), `0x1a` (`ldxw fp; add32`), and `0x1b` (`ldxw mem; stxw fp`) fused by
+        // leaving their `r10` slots unpromoted because unfusing them splits 1 dispatch into 2.
+        match byte {
+            0x19 => mark_fp_conflict(slot.offset_raw(), MemSize::DWord, &mut owners)?,
+            0x1a => mark_fp_conflict(slot.offset_raw(), MemSize::Word, &mut owners)?,
+            0x1b if i + 1 < end => mark_fp_conflict(slots[i + 1].offset_raw(), MemSize::Word, &mut owners)?,
+            _ => {}
+        }
+
         match opc.class() {
             Class::Ld if usual == LD_IMM64 => {
                 if usize::from(slot.dst_reg_decoded().get()) == FP {
@@ -230,7 +240,7 @@ fn analyze_region(slots: &[Slot], start: usize, end: usize) -> Option<PromotedRe
             }
             Class::Ld => return None,
             Class::Ldx => {
-                if !matches!(opc.mem_mode(), MemMode::Mem) {
+                if !matches!(opc.mem_mode(), MemMode::Mem | MemMode::MemSX) {
                     return None;
                 }
                 let dst = usize::from(slot.dst_reg_decoded().get());
@@ -239,7 +249,12 @@ fn analyze_region(slots: &[Slot], start: usize, end: usize) -> Option<PromotedRe
                     return None;
                 }
                 if src == FP {
-                    record_fp_access(slot.offset_raw(), opc.mem_size(), &mut owners, &mut counts)?;
+                    if matches!(opc.mem_mode(), MemMode::MemSX) {
+                        mark_fp_conflict(slot.offset_raw(), opc.mem_size(), &mut owners)?;
+                    } else {
+                        let folds = ldx_folds(slots, i, end, opc.mem_size(), slot.dst_reg_decoded());
+                        record_fp_access(slot.offset_raw(), opc.mem_size(), folds, &mut owners, &mut counts)?;
+                    }
                 }
             }
             Class::Stx => {
@@ -252,7 +267,8 @@ fn analyze_region(slots: &[Slot], start: usize, end: usize) -> Option<PromotedRe
                     return None;
                 }
                 if dst == FP {
-                    record_fp_access(slot.offset_raw(), opc.mem_size(), &mut owners, &mut counts)?;
+                    let folds = st_folds(slots, i, end, opc.mem_size());
+                    record_fp_access(slot.offset_raw(), opc.mem_size(), folds, &mut owners, &mut counts)?;
                 }
             }
             Class::St => {
@@ -261,7 +277,8 @@ fn analyze_region(slots: &[Slot], start: usize, end: usize) -> Option<PromotedRe
                 }
                 let dst = usize::from(slot.dst_reg_decoded().get());
                 if dst == FP {
-                    record_fp_access(slot.offset_raw(), opc.mem_size(), &mut owners, &mut counts)?;
+                    let folds = st_folds(slots, i, end, opc.mem_size());
+                    record_fp_access(slot.offset_raw(), opc.mem_size(), folds, &mut owners, &mut counts)?;
                 }
             }
             Class::Alu32 | Class::Alu64 => match LAYOUTS[usize::from(usual)] {
@@ -305,15 +322,15 @@ fn analyze_region(slots: &[Slot], start: usize, end: usize) -> Option<PromotedRe
     }
 
     // Keep disjoint 4- and 8-byte slots accessed at least twice.
-    let mut candidates: Vec<(i16, bool, u32)> = Vec::new();
-    for (off, size, count) in counts {
+    let mut candidates: Vec<(i16, bool, u32, u32)> = Vec::new();
+    for (off, size, count, folds) in counts {
         if count < 2 || !matches!(size, 4 | 8) {
             continue;
         }
         let base = (i32::from(off) + PROMOTE_FRAME as i32) as usize;
         let disjoint = (0..usize::from(size)).all(|k| owners[base + k] == (off, size));
         if disjoint {
-            candidates.push((off, size == 8, count));
+            candidates.push((off, size == 8, folds, count));
         }
     }
 
@@ -321,13 +338,13 @@ fn analyze_region(slots: &[Slot], start: usize, end: usize) -> Option<PromotedRe
         return None;
     }
 
-    // Rank by static access count descending, then closer to `r10` first.
-    candidates.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| b.0.cmp(&a.0)));
+    // Rank by folded dispatches descending, then total accesses descending, then closer to `r10`.
+    candidates.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| b.3.cmp(&a.3)).then_with(|| b.0.cmp(&a.0)));
     candidates.truncate(VIRT_REGS);
 
     let promoted_slots: Box<[PromotedSlot]> = candidates
         .into_iter()
-        .map(|(off, wide, _)| PromotedSlot { off, wide })
+        .map(|(off, wide, _, _)| PromotedSlot { off, wide })
         .collect();
 
     Some(PromotedRegion {
@@ -337,11 +354,66 @@ fn analyze_region(slots: &[Slot], start: usize, end: usize) -> Option<PromotedRe
     })
 }
 
+fn ldx_folds(slots: &[Slot], i: usize, end: usize, size: MemSize, dst: Reg) -> bool {
+    let mov64 = match size {
+        MemSize::DWord => true,
+        MemSize::Word => false,
+        _ => return false,
+    };
+    if i + 1 >= end {
+        return false;
+    }
+    let next = slots[i + 1];
+    let opc = OpCode(next.byte());
+    match opc.class() {
+        Class::Alu32 => is_foldable_alu(opc.alu_opc()) && next.dst_reg_decoded() == dst,
+        Class::Alu64 if mov64 => is_foldable_alu(opc.alu_opc()) && next.dst_reg_decoded() == dst,
+        Class::Jmp32 | Class::Jmp64 => matches!(opc.jmp_opc(), JmpOpc::Ja) && matches!(opc.source(), Source::Imm),
+        _ => false,
+    }
+}
+
+fn is_foldable_alu(op: AluOpc) -> bool {
+    matches!(
+        op,
+        AluOpc::Add
+            | AluOpc::Sub
+            | AluOpc::Mul
+            | AluOpc::Or
+            | AluOpc::And
+            | AluOpc::Xor
+            | AluOpc::Lsh
+            | AluOpc::Rsh
+            | AluOpc::Arsh
+    )
+}
+
+fn st_folds(slots: &[Slot], i: usize, end: usize, size: MemSize) -> bool {
+    if !matches!(size, MemSize::Word | MemSize::DWord) || i + 1 >= end {
+        return false;
+    }
+    let opc = OpCode(slots[i + 1].byte());
+    matches!(opc.jmp_opc(), JmpOpc::Ja) && matches!(opc.source(), Source::Imm)
+}
+
+fn mark_fp_conflict(off: i16, mem_size: MemSize, owners: &mut [(i16, u8); PROMOTE_FRAME as usize]) -> Option<()> {
+    let size = mem_size.bytes() as u8;
+    if off < -(PROMOTE_FRAME as i16) || i32::from(off) + i32::from(size) > 0 {
+        return None;
+    }
+    let base = (i32::from(off) + PROMOTE_FRAME as i32) as usize;
+    for k in 0..usize::from(size) {
+        owners[base + k] = (0, u8::MAX);
+    }
+    Some(())
+}
+
 fn record_fp_access(
     off: i16,
     mem_size: MemSize,
+    folds: bool,
     owners: &mut [(i16, u8); PROMOTE_FRAME as usize],
-    counts: &mut Vec<(i16, u8, u32)>,
+    counts: &mut Vec<(i16, u8, u32, u32)>,
 ) -> Option<()> {
     let size = mem_size.bytes() as u8;
     if off < -(PROMOTE_FRAME as i16) || i32::from(off) + i32::from(size) > 0 {
@@ -356,10 +428,12 @@ fn record_fp_access(
             *entry = (0, u8::MAX);
         }
     }
-    if let Some(existing) = counts.iter_mut().find(|(o, s, _)| *o == off && *s == size) {
+    let add_fold = u32::from(folds);
+    if let Some(existing) = counts.iter_mut().find(|(o, s, _, _)| *o == off && *s == size) {
         existing.2 += 1;
+        existing.3 += add_fold;
     } else {
-        counts.push((off, size, 1));
+        counts.push((off, size, 1, add_fold));
     }
     Some(())
 }
@@ -371,11 +445,12 @@ pub fn rewrite_region(slots: &[Slot], region: &PromotedRegion) -> Vec<Slot> {
     let end = region.end as usize;
     let mut out = slots[start..end].to_vec();
 
-    // Unfuse superinstructions that touch `fp` so promoted slots never bypass virtual registers.
+    // Unfuse `0x41` (`ldxw a, [fp + off]; add32 a, imm`) only when its `r10` slot is promoted so `fold_alu3` folds it
+    // into `alu3_imm`. Slots of `0x19`, `0x1a`, and `0x1b` are excluded from promotion and stay fused.
     for slot in &mut out {
         let byte = slot.byte();
         if let Some(sup) = Super::with_byte(byte) {
-            if sup.has_fp() {
+            if sup.has_fp() && byte == 0x41 && region.find(slot.offset_raw(), false).is_some() {
                 *slot = slot.with_byte(sup.opcode(0));
             }
         }
@@ -390,7 +465,11 @@ pub fn rewrite_region(slots: &[Slot], region: &PromotedRegion) -> Vec<Slot> {
             i += 2;
             continue;
         }
-        if windows::windowed(usual) {
+        if let Some(sup) = Super::with_byte(byte) {
+            i += sup.len();
+            continue;
+        }
+        if windows::windowed(usual) && matches!(OpCode(usual).mem_mode(), MemMode::Mem) {
             let opc = OpCode(usual);
             let wide = match opc.mem_size() {
                 MemSize::DWord => Some(true),
