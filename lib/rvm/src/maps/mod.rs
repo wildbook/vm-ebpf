@@ -256,17 +256,22 @@ impl<'a> MapRef<'a> {
     }
 
     /// The value for `key`, read in place from guest memory; `Ok(None)` if the key is absent. Fails with
-    /// [`MapError::Shared`] on a shared map, whose values other programs may change during the borrow.
+    /// [`MapError::Shared`] on a shared map, whose values other programs may change during the borrow, and with
+    /// [`MapError::Invalid`] if `key` has the wrong length.
     pub fn get(&self, key: &[u8]) -> std::result::Result<Option<&[u8]>, MapError> {
         if self.maps.is_shared(self.handle) {
             return Err(MapError::Shared);
+        }
+        let def = self.def();
+        if key.len() != def.key_size as usize {
+            return Err(MapError::Invalid);
         }
         let Some(addr) = self.maps.lookup(self.handle, key) else {
             return Ok(None);
         };
         Ok(Some(
             self.memory
-                .bytes(addr, self.def().value_size as usize)
+                .bytes(addr, def.value_size as usize)
                 .expect("map slots are mapped"),
         ))
     }
@@ -285,9 +290,13 @@ impl<'a> MapRef<'a> {
         Ok(())
     }
 
-    /// Remove `key` and zero its value.
+    /// Remove `key` and zero its value. Fails with [`MapError::Invalid`] if `key` has the wrong length.
     pub fn delete(&mut self, key: &[u8]) -> std::result::Result<(), MapError> {
-        let len = self.def().value_size as usize;
+        let def = self.def();
+        if key.len() != def.key_size as usize {
+            return Err(MapError::Invalid);
+        }
+        let len = def.value_size as usize;
         let slot = self.maps.remove(self.handle, key)?;
         self.memory.zero(slot.addr, len).expect("map slots are mapped");
         Ok(())

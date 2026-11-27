@@ -54,8 +54,10 @@ typedef signed long long   s64;
  */
 
 /* The callee uses the caller's buffer in place for one call; parameter `len_arg` holds its size in bytes. */
-#define BORROW(len_arg)    __attribute__((btf_decl_tag("borrow:" #len_arg)))
-#define BORROW_RO(len_arg) __attribute__((btf_decl_tag("borrow_ro:" #len_arg)))
+#define RVM_STR_(x) #x
+#define RVM_STR(x)  RVM_STR_(x)
+#define BORROW(len_arg)    __attribute__((btf_decl_tag("borrow:" RVM_STR(len_arg))))
+#define BORROW_RO(len_arg) __attribute__((btf_decl_tag("borrow_ro:" RVM_STR(len_arg))))
 
 /* Names the DLL (or `"dll!symbol"`) that provides an extern for the host's native resolver. */
 #define IMPORT_FROM(dll)   __attribute__((btf_decl_tag("import:" dll)))

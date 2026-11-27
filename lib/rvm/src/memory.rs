@@ -679,9 +679,12 @@ impl<'a> GuestMemory<'a> {
         Ok(())
     }
 
-    /// Copy `len` bytes from guest address `addr` into a new vector. The range is checked before anything is allocated,
-    /// so a guest-supplied length is safe.
+    /// Copy `len` bytes from guest address `addr` into a new vector. The range and length are checked before anything
+    /// is allocated, so a guest-supplied length is safe (including under `Passthrough`, capped at [`MAX_REGION_LEN`]).
     pub fn read_vec(&self, addr: u64, len: usize) -> Result<Vec<u8>, MemoryError> {
+        if len > MAX_REGION_LEN {
+            return Err(MemoryError { addr, size: len });
+        }
         let src = self.memory.host_ptr(addr, len, Perms::R)?;
         let mut bytes = Vec::with_capacity(len);
         // SAFETY: as `read_bytes`; the copy initializes all `len` bytes, and the new allocation's provenance isn't

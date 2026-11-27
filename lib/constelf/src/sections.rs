@@ -91,9 +91,19 @@ impl<'a> ElfSections<'a> {
         Err(ElfError::SectionMissing)
     }
 
-    /// The contents of `.strtab`, which holds the symbol names.
+    /// The contents of the symbol string table linked from `SHT_SYMTAB`'s `sh_link`, or `.strtab` as fallback.
     pub const fn sym_strtab(self) -> ElfResult<&'a [u8]> {
-        const_for!(header in &self.headers() => {
+        let headers = self.headers();
+        const_for!(header in &headers => {
+            if header.sh_type == sht::SYMTAB && header.sh_link != 0 {
+                let link = header.sh_link as usize;
+                if link < headers.len() && headers[link].sh_type == sht::STRTAB {
+                    return self.bytes(&headers[link]);
+                }
+                return Err(ElfError::InvalidData);
+            }
+        });
+        const_for!(header in &headers => {
             if header.sh_type == sht::STRTAB {
                 if let Ok(name) = self.name(header) {
                     if util::slice_eq(name.to_bytes(), b".strtab") {

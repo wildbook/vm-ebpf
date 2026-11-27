@@ -540,6 +540,9 @@ pub fn load_bytes(
     shared: &Shared,
     config: &VmConfig,
 ) -> Result<Program> {
+    if bytes.len() > config.memory_limit {
+        return Err(VmError::MemoryLimit(config.memory_limit));
+    }
     load_with_shared_resolver(Sections::parse(bytes)?, helpers, resolver, shared, config)
 }
 
@@ -550,6 +553,9 @@ pub fn load_bytes_once(
     resolver: Option<&mut OnceResolver<'_>>,
     config: &VmConfig,
 ) -> Result<Program> {
+    if bytes.len() > config.memory_limit {
+        return Err(VmError::MemoryLimit(config.memory_limit));
+    }
     let sections = Sections::parse(bytes)?;
     if let Some(resolve) = resolver {
         let resolved = resolve_imports(&sections.imports, &registry, resolve)?;

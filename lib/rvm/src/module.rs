@@ -289,14 +289,20 @@ fn rel_implicit_addend(data: &[u8], offset: u64, typ: u32) -> Option<i64> {
 /// older versions return it through a pointer in r1.
 const MIN_CLANG: u32 = 23;
 
-/// Fails if `debug_str`, the strings of the object's debug info, name a clang older than [`MIN_CLANG`] as a compiler:
-/// `clang version 22.1.8 (...)`. An object without that string passes: nothing else in it tells the compiler.
+/// Fails if `debug_str`, the NUL-terminated strings of the object's debug info, contains a producer string naming a
+/// clang older than [`MIN_CLANG`] (`clang version 22.1.8 (...)`). Strings that look like file paths are skipped so a
+/// directory name cannot trigger a false positive.
 fn check_compiler(debug_str: &[u8]) -> Result<()> {
     const MARK: &[u8] = b"clang version ";
 
-    let mut rest = debug_str;
-    while let Some(at) = rest.windows(MARK.len()).position(|window| window == MARK) {
-        rest = &rest[at + MARK.len()..];
+    for entry in debug_str.split(|&b| b == 0) {
+        if entry.contains(&b'/') || entry.contains(&b'\\') {
+            continue;
+        }
+        let Some(at) = entry.windows(MARK.len()).position(|window| window == MARK) else {
+            continue;
+        };
+        let rest = &entry[at + MARK.len()..];
         let len = rest.iter().take_while(|b| b.is_ascii_digit() || **b == b'.').count();
         let version = String::from_utf8_lossy(&rest[..len]);
         let major = version.split('.').next().and_then(|major| major.parse::<u32>().ok());

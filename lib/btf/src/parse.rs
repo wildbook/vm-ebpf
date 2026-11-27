@@ -68,7 +68,7 @@ pub fn check_header(data: &[u8], min_len: usize) -> Result<usize, BtfError> {
 
 /// The `len` bytes at `off` past a header of `hdr_len` bytes.
 pub fn section(data: &[u8], hdr_len: usize, off: u32, len: u32) -> Result<&[u8], BtfError> {
-    let start = data.get(hdr_len + off as usize..);
+    let start = hdr_len.checked_add(off as usize).and_then(|pos| data.get(pos..));
     start
         .and_then(|s| s.get(..len as usize))
         .ok_or(BtfError::SectionOverflow)

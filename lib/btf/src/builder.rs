@@ -113,7 +113,7 @@ impl BtfBuilder {
     }
 
     fn members_of(&mut self, owner: u32) -> &mut Vec<MemberEntry> {
-        match self.types.get_mut(owner as usize - 1) {
+        match owner.checked_sub(1).and_then(|i| self.types.get_mut(i as usize)) {
             Some(TypeEntry::Struct { members, .. } | TypeEntry::Union { members, .. }) => members,
             _ => panic!("BTF type {owner} is not a struct or union"),
         }
@@ -138,7 +138,7 @@ impl BtfBuilder {
     /// Panics if `owner` is not an enum previously returned by this builder.
     pub fn enumerator(&mut self, owner: u32, name: &str, value: i64) {
         let name = self.string(name);
-        match self.types.get_mut(owner as usize - 1) {
+        match owner.checked_sub(1).and_then(|i| self.types.get_mut(i as usize)) {
             Some(TypeEntry::Enum { variants, .. }) => variants.push((name, value)),
             _ => panic!("BTF type {owner} is not an enum"),
         }
