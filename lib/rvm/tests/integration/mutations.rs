@@ -126,7 +126,7 @@ fn image_regions(image: &[u8]) -> Vec<Range<usize>> {
     // magic, format version, rvm version string
     let mut at = 12 + u32_at(8);
     let mut regions = vec![0..image.len(), 0..at];
-    for _ in 0..6 {
+    while at < image.len() {
         let len = 8 + u64_at(at);
         regions.push(at..at + len);
         at += len;

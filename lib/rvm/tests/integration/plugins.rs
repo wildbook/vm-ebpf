@@ -44,11 +44,7 @@ fn instruction_limit_covers_plugin_calls() {
     asm.mov64_imm(R1, SPINS).call(0).sub64_imm(R6, 1).jne_imm(R6, 0, again);
     asm.mov64_imm(R0, 0).exit();
     let mut image = Image::from_code(asm.assemble().unwrap());
-    let main = Import::Name {
-        name: "main".into(),
-        stack: false,
-    };
-    image.externs.push((2, main));
+    image.add_call(2, Import::name("main"));
     let mut caller = vm.load_image(image).unwrap();
 
     // the third call into the callee runs out of what the first two left
@@ -325,11 +321,7 @@ fn borrowed_buffers() {
         0x95, 0x00, 0, 0, 0, 0, 0, 0, // exit
     ];
     let mut image = Image::from_code(code.to_vec());
-    let sum = Import::Name {
-        name: "sum".into(),
-        stack: false,
-    };
-    image.externs.push((2, sum));
+    image.add_call(2, Import::name("sum"));
     assert_eq!(vm.load_image(image).unwrap().call("main", &[]).unwrap(), 0);
 }
 
@@ -406,13 +398,7 @@ fn borrow_over_max_region_len_under_passthrough_returns_error() {
         .call(0)
         .exit();
     let mut image = Image::from_code(asm.assemble().unwrap());
-    image.externs.push((
-        4,
-        Import::Name {
-            name: "sum".into(),
-            stack: false,
-        },
-    ));
+    image.add_call(4, Import::name("sum"));
     // SAFETY: the guest never dereferences the raw address; the borrow check rejects the oversize length before mapping
     let passthrough = unsafe { Passthrough::on() };
     let mut caller = vm.loader().passthrough(passthrough).load_image(image).unwrap();
@@ -452,13 +438,7 @@ fn failed_load_does_not_poison_shared_map() {
         value_size: 4,
         max_entries: 1,
     });
-    bad_extern.externs.push((
-        0,
-        Import::Name {
-            name: "does_not_exist".into(),
-            stack: false,
-        },
-    ));
+    bad_extern.add_call(0, Import::name("does_not_exist"));
     assert!(vm.load_image(bad_extern).is_err());
 
     // Also fail inside `Maps::new` on a second map (duplicate / invalid def) after the shared map entry.
@@ -513,13 +493,7 @@ fn panic_in_metered_export_restores_caller_fuel() {
     asm.sub64_imm(R1, 1).jne_imm(R1, 0, spin);
     asm.mov64_imm(R0, 7).exit();
     let mut callee_img = Image::from_code(asm.assemble().unwrap());
-    callee_img.externs.push((
-        0,
-        Import::Name {
-            name: "maybe_panic".into(),
-            stack: false,
-        },
-    ));
+    callee_img.add_call(0, Import::name("maybe_panic"));
     let callee = Plugin::new("callee", vm.load_image(callee_img).unwrap());
     vm.export(&callee, "main").unwrap();
 
@@ -527,13 +501,7 @@ fn panic_in_metered_export_restores_caller_fuel() {
     let mut asm = Assembler::new();
     asm.call(0).exit();
     let mut caller_img = Image::from_code(asm.assemble().unwrap());
-    caller_img.externs.push((
-        0,
-        Import::Name {
-            name: "main".into(),
-            stack: false,
-        },
-    ));
+    caller_img.add_call(0, Import::name("main"));
     let mut caller = vm.load_image(caller_img).unwrap();
 
     // First call unwinds while `call_with_fuel` is active.

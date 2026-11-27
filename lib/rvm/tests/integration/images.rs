@@ -131,12 +131,12 @@ fn malformed_images_fail_to_load() {
     let not_a_call = good.code.chunks(8).position(|insn| insn[0] != CALL).unwrap() as u32;
     for at in [insns, not_a_call] {
         let mut image = good.clone();
-        image.externs.push((at, Import::Helper(1)));
+        image.add_call(at, Import::Helper(1));
         assert!(is_invalid(load(&image)), "extern at {at}");
     }
 
     let mut image = good.clone();
-    image.externs[0].1 = Import::Helper(999);
+    image.imports[0] = Import::Helper(999);
     assert!(matches!(load(&image), Err(VmError::Link(LinkError::UnknownHelper(999)))));
 
     let mut image = good.clone();
@@ -200,4 +200,136 @@ fn oversized_images_fail_to_load() {
     assert_eq!(over_limit(&small, &image), 1 << 20);
     image.maps.pop();
     small.load_image_bytes(&image.to_bytes()).unwrap();
+}
+
+/// Preparing an image needs no registered externs or resolver: it records deduplicated imports with their `IMPORT_FROM`
+/// tags and BTF prototypes, and round-trips them through bytes.
+#[test]
+fn prepared_image_carries_imports_and_prototypes() {
+    use rvm::{ArgKind, ReturnKind};
+
+    let image = Vm::new().prepare_elf(&object("tests/resolver.o")).unwrap();
+    let bytes = image.to_bytes();
+    assert_eq!(Image::from_bytes(&bytes).unwrap(), image);
+
+    let find = |wanted: &str| {
+        image
+            .imports()
+            .iter()
+            .find_map(|imp| match imp {
+                Import::Name {
+                    name,
+                    dll,
+                    symbol,
+                    proto,
+                    stack,
+                } if name == wanted => Some((dll.as_deref(), symbol.as_deref(), proto.as_ref(), *stack)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing import {wanted}"))
+    };
+
+    let (dll, sym, proto, stack) = find("res_add");
+    assert_eq!((dll, sym, stack), (Some("host.dll"), None, false));
+    let proto = proto.unwrap();
+    assert_eq!(proto.args, vec![ArgKind::Int, ArgKind::Int]);
+    assert_eq!(proto.ret, ReturnKind::Int);
+
+    let (dll, sym, proto, stack) = find("res_aliased");
+    assert_eq!((dll, sym, stack), (Some("host.dll"), Some("alias_target"), false));
+    assert_eq!(proto.unwrap().args, vec![ArgKind::Int]);
+
+    let (dll, sym, proto, stack) = find("res_strlen");
+    assert_eq!((dll, sym, stack), (Some("ucrtbase.dll"), Some("strlen"), false));
+    assert_eq!(proto.unwrap().args, vec![ArgKind::Ptr]);
+
+    let (dll, sym, proto, stack) = find("res_stack_sum");
+    assert_eq!((dll, sym, stack), (Some("host.dll"), None, true));
+    let proto = proto.unwrap();
+    assert_eq!(proto.args.len(), 7);
+    assert_eq!(proto.args[6], ArgKind::Ptr);
+
+    let (dll, sym, proto, stack) = find("res_small_structs");
+    assert_eq!((dll, sym, stack), (Some("host.dll"), None, false));
+    let proto = proto.unwrap();
+    assert_eq!(proto.args, vec![ArgKind::Int; 4]);
+    assert_eq!(proto.ret, ReturnKind::Int);
+
+    let (dll, sym, proto, stack) = find("res_plain");
+    assert_eq!((dll, sym, stack), (None, None, false));
+    assert_eq!(proto.unwrap().args, vec![ArgKind::Int, ArgKind::Int]);
+}
+
+/// A resolver that declines a name, returns a null pointer, or returns a signature disagreeing with the plugin's
+/// prototype fails the load with the expected error.
+#[test]
+fn resolver_rejects_missing_null_and_mismatched() {
+    use rvm::{NativeArg, NativeSig, Resolved};
+
+    extern "C" fn stub() -> u64 {
+        0
+    }
+
+    let bytes = Vm::new().prepare_elf(&object("tests/resolver.o")).unwrap().to_bytes();
+
+    // Declined name -> UnresolvedSymbol (reports the C extern name)
+    let vm = Vm::new();
+    // SAFETY: resolver returns None for every name
+    unsafe { vm.set_native_resolver(|_| None) };
+    assert!(matches!(vm.load_image_bytes(&bytes).unwrap_err(), VmError::Link(LinkError::UnresolvedSymbol(_))));
+
+    // Null function pointer -> InvalidArgument
+    let vm = Vm::new();
+    // SAFETY: load fails before binding because func is null
+    unsafe {
+        vm.set_native_resolver(|_| {
+            Some(Resolved {
+                func: std::ptr::null(),
+                sig: None,
+            })
+        });
+    }
+    assert!(matches!(vm.load_image_bytes(&bytes).unwrap_err(), VmError::InvalidArgument(_)));
+
+    // Wrong arity in returned sig -> SignatureMismatch
+    let vm = Vm::new();
+    // SAFETY: load fails on signature check before any call
+    unsafe {
+        vm.set_native_resolver(|imp| {
+            let sig = if imp.name == "res_add" {
+                Some(NativeSig::ints(3))
+            } else {
+                None
+            };
+            Some(Resolved {
+                func: stub as *const (),
+                sig,
+            })
+        });
+    }
+    assert!(matches!(
+        vm.load_image_bytes(&bytes).unwrap_err(),
+        VmError::Link(LinkError::SignatureMismatch { name, declared: 2, host: 3 }) if name == "res_add"
+    ));
+
+    // Integer in sig where plugin declared a pointer -> NativeMismatch
+    let vm = Vm::new();
+    // SAFETY: load fails on signature check before any call
+    unsafe {
+        vm.set_native_resolver(|imp| {
+            let sig = if imp.name == "strlen" {
+                Some(NativeSig::new(&[NativeArg::Int]))
+            } else {
+                None
+            };
+            Some(Resolved {
+                func: stub as *const (),
+                sig,
+            })
+        });
+    }
+    assert!(matches!(
+        vm.load_image_bytes(&bytes).unwrap_err(),
+        VmError::Link(LinkError::NativeMismatch { name, .. }) if name == "res_strlen"
+    ));
 }

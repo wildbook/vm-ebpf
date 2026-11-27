@@ -14,7 +14,10 @@ const N: i32 = 10_000;
 fn load(vm: &Vm, asm: &Assembler, slot_calls: bool) -> Program {
     let mut image = Image::from_code(asm.assemble().unwrap());
     if slot_calls {
-        image.externs = image.helper_calls().map(|(at, id)| (at, Import::Helper(id))).collect();
+        let calls: Vec<_> = image.helper_calls().collect();
+        for (at, id) in calls {
+            image.add_call(at, Import::Helper(id));
+        }
     }
     vm.load_image(image).unwrap()
 }

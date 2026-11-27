@@ -5,7 +5,8 @@ use std::fmt::{self, Debug, Formatter};
 #[cfg(feature = "fuel")]
 use crate::fuel::Rests;
 use crate::handler::{CALL_HELPER, CALL_KFUNC};
-use crate::opcode::{OpCode, CALL};
+use crate::native::{NativeBind, NativeMode};
+use crate::opcode::OpCode;
 use crate::slot::Slot;
 use crate::{args, bytes, fuse, native, rewrite, transfer, Instruction, MAX_NATIVE_ARGS};
 
@@ -45,22 +46,52 @@ impl Code {
     ///
     /// Panics if `insns` has 2^31 slots or more.
     pub fn new(insns: impl Into<Vec<Instruction>>) -> Self {
+        // SAFETY: no native bindings
+        unsafe { Self::with_natives(insns, &[]) }.expect("no native bindings")
+    }
+
+    /// [`Code::new`] with native call bindings applied before fusion.
+    ///
+    /// Each entry of `natives` binds the helper or kfunc `call` at `bind.pc` to `Host::natives()[bind.index]`. Fails
+    /// with the offending `pc` if `bind.pc` is out of bounds, holds no helper or kfunc `call`, or `bind.args` exceeds
+    /// [`MAX_NATIVE_ARGS`].
+    ///
+    /// # Safety
+    ///
+    /// For every run of this code, each bound `bind.index` in the host's `natives` must be callable as `bind.mode`
+    /// invokes it (`unsafe extern "C" fn(u64, ...) -> u64` with `bind.args` arguments, or through `rvm_call_regs` for
+    /// [`NativeMode::Raw`]), with a matching [`NativeSig`](crate::NativeSig), and sound for any argument values not
+    /// checked by [`NativeMode::Checked`]. It must not unwind.
+    pub unsafe fn with_natives(insns: impl Into<Vec<Instruction>>, natives: &[NativeBind]) -> Result<Self, usize> {
         let mut insns = insns.into();
         let len = insns.len();
         i32::try_from(len).expect("fewer than 2^31 slots");
 
         rewrite::rewrite(&mut insns);
+        for &bind in natives {
+            let Some(insn) = insns.get_mut(bind.pc) else {
+                return Err(bind.pc);
+            };
+            let args = usize::from(bind.args);
+            if !matches!(insn.byte(), CALL_HELPER | CALL_KFUNC)
+                || (bind.mode != NativeMode::Raw && args > MAX_NATIVE_ARGS)
+            {
+                return Err(bind.pc);
+            }
+            let byte = native::byte(args, bind.mode);
+            *insn = Instruction::new(OpCode(byte), 0, 0, 0, bind.index as i32);
+        }
         fuse::fuse(&mut insns);
         transfer::bound(&mut insns);
 
         // in place, as `Slot` and `Instruction` have the same size and alignment
         let slots: Vec<Slot> = insns.into_iter().map(Slot::new).collect();
-        Self {
+        Ok(Self {
             slots: slots.into_boxed_slice(),
             len,
             #[cfg(feature = "fuel")]
             rests: Rests::default(),
-        }
+        })
     }
 
     /// The number of instruction slots.
@@ -72,31 +103,21 @@ impl Code {
         self.len == 0
     }
 
-    /// Make the `call` in slot `pc` a call of the native function at `index` in
-    /// [`Host::natives`](crate::Host::natives), which takes `args` arguments in the host C convention and
-    /// returns r0: r1 to r5, and from the sixth argument on the stack arguments of the frame. With `checked`, the
-    /// call first passes each pointer argument of the function's [`NativeSig`](crate::NativeSig) through
-    /// [`Memory::native_ptr`](crate::Memory::native_ptr) and stops with
-    /// [`Reason::MemoryFault`](crate::Reason::MemoryFault) where that fails. A call counts as one instruction, and its
-    /// native function runs unmetered.
-    ///
-    /// Returns false and leaves the code as it is if slot `pc` holds no `call` or `args` exceeds
-    /// [`MAX_NATIVE_ARGS`].
+    /// Make the helper or kfunc `call` in slot `pc` a call of the native function at `index` in
+    /// [`Host::natives`](crate::Host::natives). See [`Code::with_natives`] for the contract.
     ///
     /// # Safety
     ///
-    /// For every run of this code, an entry at `index` in the host's `natives` must be a function callable as
-    /// `unsafe extern "C" fn(u64, ...) -> u64` with `args` arguments, with a signature of `args` arguments, and
-    /// sound to call with any argument values but the pointers that `checked` resolves. It must not unwind.
-    pub unsafe fn bind_native(&mut self, pc: usize, index: u32, args: u8, checked: bool) -> bool {
+    /// As [`Code::with_natives`].
+    pub unsafe fn bind_native(&mut self, pc: usize, index: u32, args: u8, mode: NativeMode) -> bool {
         let args = usize::from(args);
         let Some(slot) = self.slots[..self.len].get_mut(pc) else {
             return false;
         };
-        if !matches!(slot.byte(), CALL | CALL_HELPER | CALL_KFUNC) || args > MAX_NATIVE_ARGS {
+        if !matches!(slot.byte(), CALL_HELPER | CALL_KFUNC) || (mode != NativeMode::Raw && args > MAX_NATIVE_ARGS) {
             return false;
         }
-        let byte = native::byte(args, checked && args != 0);
+        let byte = native::byte(args, mode);
         *slot = Slot::new(Instruction::new(OpCode(byte), 0, 0, 0, index as i32));
         true
     }

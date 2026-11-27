@@ -1,26 +1,29 @@
 //! Prepared programs.
 //!
 //! An [`Image`] is everything linking produces except runtime binding and allocation: the final code with every
-//! relocation, CO-RE adjustment and jump table applied, the initial data, map declarations, exported functions, and the
-//! call sites that bind to host and native functions: natives with the signature they were linked against, and host
-//! functions with whether the call passes arguments on the stack. [`crate::Vm::load_image`] binds those call sites in
-//! the loading VM, allocates memory and maps, maps the VM's shared maps and regions, and returns a [`Program`].
+//! relocation, CO-RE adjustment and jump table applied, the initial data, map declarations, exported functions,
+//! deduplicated imports with their BTF prototypes, and the call sites that refer to them. [`crate::Vm::load_image`]
+//! resolves and binds those imports in the loading VM, allocates memory and maps, maps the VM's shared maps and
+//! regions, and returns a [`Program`].
 //!
 //! # Format
 //!
 //! Little endian. A header: `RVMI`, the format version as `u32`, and the version of rvm that wrote the image as a
-//! string. Then seven sections, each a `u64` byte length and its contents: code, rodata, data, maps, functions,
-//! externs, addresses.
+//! string. Then eight sections, each a `u64` byte length and its contents: code, rodata, data, maps, functions,
+//! imports, calls, addresses.
 //! A string is a `u32` length and UTF-8 bytes. An image loads only into the rvm version that wrote it. The code and
 //! data hold link addresses (see [`crate::memory`]), which loading moves to guest addresses.
 
 use std::sync::Arc;
 
 use rvm_core::opcode::{call, MemMode, MemSize, OpCode, CALL, LD_IMM64};
-use rvm_core::{Code, Instruction, NativeArg, NativeSig, MAX_CALL_DEPTH, MAX_NATIVE_ARGS, MAX_STACK_ARGS};
+use rvm_core::{
+    Code, Instruction, Native, NativeBind, NativeMode, NativeSig, MAX_CALL_DEPTH, MAX_NATIVE_ARGS, MAX_STACK_ARGS,
+};
 
 use crate::error::{LinkError, Result, VmError};
-use crate::helper::{HelperRegistry, SharedHelpers};
+use crate::executor::{MAX_ARGS, REG_ARGS};
+use crate::helper::{HelperRegistry, NativeKind, SharedHelpers};
 #[cfg(feature = "maps")]
 use crate::layout::MAPS_REGION;
 use crate::layout::{BORROW_REGIONS, DATA_REGION, RODATA_REGION, STACK_REGION};
@@ -29,21 +32,32 @@ use crate::map_def::{MapDef, MapKind};
 use crate::maps::Maps;
 use crate::memory::{region_tag, MemoryBudget, Perms, VmMemory, MAX_REGION_LEN};
 use crate::program::{Borrow, FunctionInfo, Functions, Program};
-use crate::vm::{Shared, VmConfig};
+use crate::proto::{ArgKind, Proto, ReturnKind};
+use crate::vm::{NativeImport, NativeResolver, OnceResolver, Resolved, Shared, VmConfig};
 
 const MAGIC: &[u8; 4] = b"RVMI";
-const FORMAT_VERSION: u32 = 4;
+const FORMAT_VERSION: u32 = 5;
 const RVM_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// tag bytes of the `MapKind`, `Import` and `Site` variants
+// tag bytes of the serialized variants
 const MAP_ARRAY: u8 = 0;
 const MAP_HASH: u8 = 1;
 const IMPORT_NAME: u8 = 0;
 const IMPORT_HELPER: u8 = 1;
-const IMPORT_NATIVE: u8 = 2;
+const FLAG_STACK: u8 = 1;
+const FLAG_PROTO: u8 = 2;
+const RET_VOID: u8 = 0;
+const RET_INT: u8 = 1;
+const RET_PTR: u8 = 2;
+const RET_F32: u8 = 3;
+const RET_F64: u8 = 4;
+const RET_AGG: u8 = 5;
 const ARG_INT: u8 = 0;
-const ARG_READ: u8 = 1;
-const ARG_WRITE: u8 = 2;
+const ARG_PTR: u8 = 1;
+const ARG_CALLBACK: u8 = 2;
+const ARG_F32: u8 = 3;
+const ARG_F64: u8 = 4;
+const ARG_COPY: u8 = 5;
 const SITE_CODE: u8 = 0;
 const SITE_RODATA: u8 = 1;
 const SITE_DATA: u8 = 2;
@@ -68,23 +82,45 @@ pub struct Image {
     pub maps: Vec<MapDef>,
     /// Exported functions, sorted by name.
     pub functions: Vec<(String, FunctionInfo)>,
-    /// Call instructions, by index, that bind to a host function at load time.
-    pub externs: Vec<(u32, Import)>,
+    /// Deduplicated imports referenced by [`calls`](Self::calls).
+    pub imports: Vec<Import>,
+    /// Call instructions, as `(instruction index, import index into imports)`.
+    pub calls: Vec<(u32, u32)>,
     /// The link addresses of `.rodata` and `.data` bytes in the code and data, which loading moves to the guest
     /// addresses of those bytes.
     pub addresses: Vec<Address>,
 }
 
-/// The host function an extern call binds to.
+/// A host, native, or plugin function that an [`Image`] imports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Import {
-    /// A function registered by name, such as a plugin export. With `stack`, the call passes arguments on the stack,
-    /// which the function gets: the program declares it with more than five argument registers.
-    Name { name: String, stack: bool },
+    /// A named function: native, host closure, plugin export, or resolved at load time.
+    Name {
+        name: String,
+        /// DLL name from `IMPORT_FROM("dll")` or `IMPORT_FROM("dll!symbol")`.
+        dll: Option<String>,
+        /// Symbol name override from `IMPORT_FROM("dll!symbol")`.
+        symbol: Option<String>,
+        /// Prototype from BTF, if the module carried BTF for this extern.
+        proto: Option<Proto>,
+        /// Whether calls pass arguments on the stack (more than five argument registers).
+        stack: bool,
+    },
     /// A helper registered by ID.
     Helper(u32),
-    /// A native function registered by name, with the signature it had where the image was linked.
-    Native { name: String, sig: NativeSig },
+}
+
+impl Import {
+    /// A named import without a DLL tag, prototype, or stack arguments.
+    pub fn name(name: impl Into<String>) -> Self {
+        Self::Name {
+            name: name.into(),
+            dll: None,
+            symbol: None,
+            proto: None,
+            stack: false,
+        }
+    }
 }
 
 /// A link address in an image: `region_tag(region)` plus an offset that an addend may take past the region's ends.
@@ -122,8 +158,26 @@ impl Image {
         }
     }
 
+    /// The imports this image requires when loaded.
+    pub fn imports(&self) -> &[Import] {
+        &self.imports
+    }
+
+    /// Record a call at instruction index `at` to `import`, deduplicating `import` in [`Image::imports`].
+    pub fn add_call(&mut self, at: u32, import: Import) {
+        let idx = match self.imports.iter().position(|existing| existing == &import) {
+            Some(idx) => idx as u32,
+            None => {
+                let idx = self.imports.len() as u32;
+                self.imports.push(import);
+                idx
+            }
+        };
+        self.calls.push((at, idx));
+    }
+
     /// Each `call <helper id>` in the code, as its instruction index and the helper ID. Linking records these as
-    /// [`Import::Helper`] externs.
+    /// [`Import::Helper`] imports.
     pub fn helper_calls(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
         helper_calls(&self.code)
     }
@@ -163,40 +217,42 @@ impl Image {
                 w.str(name);
                 w.u64(info.pc);
                 w.u64(info.size);
-                w.0.push(info.borrows.len() as u8);
-                for borrow in &info.borrows {
-                    w.0.extend_from_slice(&[borrow.arg, borrow.len_arg, borrow.writable.into()]);
-                }
+                w.borrows(&info.borrows);
             }
         });
         w.section(|w| {
-            w.u32(self.externs.len() as u32);
-            for (at, import) in &self.externs {
-                w.u32(*at);
+            w.u32(self.imports.len() as u32);
+            for import in &self.imports {
                 match import {
-                    Import::Name { name, stack } => {
+                    Import::Name {
+                        name,
+                        dll,
+                        symbol,
+                        proto,
+                        stack,
+                    } => {
                         w.0.push(IMPORT_NAME);
                         w.str(name);
-                        w.0.push((*stack).into());
+                        w.str(dll.as_deref().unwrap_or(""));
+                        w.str(symbol.as_deref().unwrap_or(""));
+                        let flags = (u8::from(*stack) * FLAG_STACK) | (u8::from(proto.is_some()) * FLAG_PROTO);
+                        w.0.push(flags);
+                        if let Some(proto) = proto {
+                            w.proto(proto);
+                        }
                     }
                     Import::Helper(id) => {
                         w.0.push(IMPORT_HELPER);
                         w.u32(*id);
                     }
-                    Import::Native { name, sig } => {
-                        w.0.push(IMPORT_NATIVE);
-                        w.str(name);
-                        w.0.push(sig.args());
-                        for n in 1..=sig.args() {
-                            let (kind, len) = match sig.arg(n) {
-                                Some(NativeArg::Read(len)) => (ARG_READ, len),
-                                Some(NativeArg::Write(len)) => (ARG_WRITE, len),
-                                _ => (ARG_INT, None),
-                            };
-                            w.0.extend_from_slice(&[kind, len.unwrap_or(0)]);
-                        }
-                    }
                 }
+            }
+        });
+        w.section(|w| {
+            w.u32(self.calls.len() as u32);
+            for &(at, idx) in &self.calls {
+                w.u32(at);
+                w.u32(idx);
             }
         });
         w.section(|w| {
@@ -226,7 +282,8 @@ impl Image {
             data_len: s.data_len,
             maps: s.maps,
             functions: s.functions,
-            externs: s.externs,
+            imports: s.imports,
+            calls: s.calls,
             addresses: s.addresses,
         })
     }
@@ -242,7 +299,8 @@ struct Sections<'a> {
     data_len: usize,
     maps: Vec<MapDef>,
     functions: Vec<(String, FunctionInfo)>,
-    externs: Vec<(u32, Import)>,
+    imports: Vec<Import>,
+    calls: Vec<(u32, u32)>,
     addresses: Vec<Address>,
 }
 
@@ -288,34 +346,46 @@ impl<'a> Sections<'a> {
         for _ in 0..s.u32()? {
             let name = s.str()?;
             let (pc, size) = (s.u64()?, s.u64()?);
-            let mut borrows = Vec::new();
-            for _ in 0..s.u8()? {
-                let [arg, len_arg, writable] = s.array()?;
-                let writable = writable != 0;
-                borrows.push(Borrow { arg, len_arg, writable });
-            }
+            let borrows = s.borrows()?;
             functions.push((name, FunctionInfo { pc, size, borrows }));
         }
         s.end()?;
 
         let mut s = r.section()?;
-        let mut externs = Vec::new();
+        let mut imports = Vec::new();
         for _ in 0..s.u32()? {
-            let at = s.u32()?;
             let import = match s.u8()? {
-                IMPORT_NAME => Import::Name {
-                    name: s.str()?,
-                    stack: s.u8()? != 0,
-                },
-                IMPORT_HELPER => Import::Helper(s.u32()?),
-                IMPORT_NATIVE => {
+                IMPORT_NAME => {
                     let name = s.str()?;
-                    let sig = s.native_sig(&name)?;
-                    Import::Native { name, sig }
+                    let dll = s.opt_str()?;
+                    let symbol = s.opt_str()?;
+                    let flags = s.u8()?;
+                    if flags & !(FLAG_STACK | FLAG_PROTO) != 0 {
+                        return Err(invalid(format!("import {name}: unknown flags {flags:#x}")));
+                    }
+                    let proto = match flags & FLAG_PROTO != 0 {
+                        true => Some(s.proto(&name)?),
+                        false => None,
+                    };
+                    Import::Name {
+                        name,
+                        dll,
+                        symbol,
+                        proto,
+                        stack: flags & FLAG_STACK != 0,
+                    }
                 }
-                kind => return Err(invalid(format!("extern at instruction {at}: unknown kind {kind}"))),
+                IMPORT_HELPER => Import::Helper(s.u32()?),
+                kind => return Err(invalid(format!("import of unknown kind {kind}"))),
             };
-            externs.push((at, import));
+            imports.push(import);
+        }
+        s.end()?;
+
+        let mut s = r.section()?;
+        let mut calls = Vec::new();
+        for _ in 0..s.u32()? {
+            calls.push((s.u32()?, s.u32()?));
         }
         s.end()?;
 
@@ -345,14 +415,21 @@ impl<'a> Sections<'a> {
             data_len,
             maps,
             functions,
-            externs,
+            imports,
+            calls,
             addresses,
         })
     }
 }
 
-/// Check `image`, bind its extern calls to `helpers`, and allocate its memory and maps.
-pub fn load(image: Image, helpers: &Arc<SharedHelpers>, shared: &Shared, config: &VmConfig) -> Result<Program> {
+/// Check `image`, resolve missing imports through `resolver`, bind calls to `helpers`, and allocate memory and maps.
+pub fn load(
+    image: Image,
+    helpers: &Arc<SharedHelpers>,
+    resolver: Option<&NativeResolver>,
+    shared: &Shared,
+    config: &VmConfig,
+) -> Result<Program> {
     let Image {
         code,
         rodata,
@@ -361,7 +438,8 @@ pub fn load(image: Image, helpers: &Arc<SharedHelpers>, shared: &Shared, config:
         data_len,
         maps,
         functions,
-        externs,
+        imports,
+        calls,
         addresses,
     } = image;
     let sections = Sections {
@@ -372,15 +450,116 @@ pub fn load(image: Image, helpers: &Arc<SharedHelpers>, shared: &Shared, config:
         data_len,
         maps,
         functions,
-        externs,
+        imports,
+        calls,
         addresses,
     };
-    load_sections(sections, helpers, shared, config)
+    load_with_shared_resolver(sections, helpers, resolver, shared, config)
 }
 
 /// [`load`] the image that [`Image::to_bytes`] wrote to `bytes`.
-pub fn load_bytes(bytes: &[u8], helpers: &Arc<SharedHelpers>, shared: &Shared, config: &VmConfig) -> Result<Program> {
-    load_sections(Sections::parse(bytes)?, helpers, shared, config)
+pub fn load_bytes(
+    bytes: &[u8],
+    helpers: &Arc<SharedHelpers>,
+    resolver: Option<&NativeResolver>,
+    shared: &Shared,
+    config: &VmConfig,
+) -> Result<Program> {
+    load_with_shared_resolver(Sections::parse(bytes)?, helpers, resolver, shared, config)
+}
+
+/// Load a serialized image into a fresh `registry` with an optional one-shot resolver, without taking any mutex.
+pub fn load_bytes_once(
+    bytes: &[u8],
+    mut registry: HelperRegistry,
+    resolver: Option<&mut OnceResolver<'_>>,
+    config: &VmConfig,
+) -> Result<Program> {
+    let sections = Sections::parse(bytes)?;
+    if let Some(resolve) = resolver {
+        let resolved = resolve_imports(&sections.imports, &registry, resolve)?;
+        for (name, nat, kind) in resolved {
+            registry.put_native_if_absent(name, nat, kind);
+        }
+    }
+    let helpers = Arc::new(SharedHelpers::new(registry));
+    load_sections(sections, &helpers, &Shared::default(), config)
+}
+
+fn load_with_shared_resolver(
+    s: Sections<'_>,
+    helpers: &Arc<SharedHelpers>,
+    resolver: Option<&NativeResolver>,
+    shared: &Shared,
+    config: &VmConfig,
+) -> Result<Program> {
+    if let Some(resolve) = resolver {
+        let table = helpers.read();
+        let resolved = resolve_imports(&s.imports, &table, &mut |import| resolve(import))?;
+        if !resolved.is_empty() {
+            helpers.update(|h| {
+                for (name, nat, kind) in resolved {
+                    h.put_native_if_absent(name, nat, kind);
+                }
+            });
+        }
+    }
+    load_sections(s, helpers, shared, config)
+}
+
+/// Ask `resolve` for every `Import::Name` not already present in `table`, checking the returned signature or deriving
+/// one from the plugin's prototype.
+fn resolve_imports(
+    imports: &[Import],
+    table: &HelperRegistry,
+    resolve: &mut dyn FnMut(&NativeImport<'_>) -> Option<Resolved>,
+) -> Result<Vec<(String, Native, NativeKind)>> {
+    let mut resolved = Vec::new();
+    for import in imports {
+        let Import::Name {
+            name,
+            dll,
+            symbol,
+            proto,
+            ..
+        } = import
+        else {
+            continue;
+        };
+        if table.native(name).is_some()
+            || table.slot_of_name(name).is_some()
+            || resolved.iter().any(|(n, _, _)| n == name)
+        {
+            continue;
+        }
+        let query = NativeImport {
+            name: symbol.as_deref().unwrap_or(name),
+            dll: dll.as_deref(),
+            proto: proto.as_ref(),
+        };
+        let Some(Resolved { func, sig }) = resolve(&query) else {
+            continue;
+        };
+        let (native_sig, kind) = match (sig, proto) {
+            (Some(host_sig), Some(p)) => {
+                p.check_native_sig(name, host_sig)?;
+                (host_sig, NativeKind::Checked)
+            }
+            (Some(_), None) => {
+                let reason = "the module has no BTF for the extern to check its signature against".into();
+                return Err(LinkError::NativeMismatch {
+                    name: name.clone(),
+                    reason,
+                }
+                .into());
+            }
+            (None, Some(p)) => (p.native_sig(name)?, NativeKind::Strip),
+            (None, None) => (NativeSig::ints(0), NativeKind::Raw),
+        };
+        let nat = crate::vm::native(name, func, native_sig)?;
+        resolved.push((name.clone(), nat, kind));
+    }
+    Ok(resolved)
 }
 
 fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared, config: &VmConfig) -> Result<Program> {
@@ -402,7 +581,8 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
     // Bind against one version of the table; the program refreshes from there.
     let snapshot = helpers.snapshot();
     bind_helper_calls(&mut insns, s.code, &snapshot.table);
-    let Bound { natives, stack_calls } = bind_externs(&mut insns, &s.externs, &snapshot.table)?;
+    let tagged = !config.passthrough.is_untagged();
+    let Bound { natives, stack_calls } = bind_externs(&mut insns, &s.imports, &s.calls, &snapshot.table, tagged)?;
     let functions = check_functions(s.functions, insns.len() as u64)?;
 
     let mut memory = VmMemory::with_passthrough(config.passthrough);
@@ -411,17 +591,11 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
     memory.map_bytes_any(DATA_REGION, s.data, s.data_len, Perms::RW)?;
     relocate(&s.addresses, &mut insns, &mut memory)?;
 
-    let mut code = Code::new(insns);
-    // tagged pointers resolve to host addresses before the call; untagged ones are host addresses already
-    let tagged = !config.passthrough.is_untagged();
-    for (at, index, sig) in natives {
-        let checked = tagged && sig.has_pointers();
-        // SAFETY: `bind_externs` checked that the native at `index` has the signature `sig`, which a native keeps in
-        // every later table the program refreshes to. `Vm::register_native` vouches for the function.
-        if !unsafe { code.bind_native(at as usize, index, sig.args(), checked) } {
-            return Err(invalid(format!("native call at instruction {at} is not a valid call")));
-        }
-    }
+    // SAFETY: `bind_externs` checked each native's prototype against `snapshot.table`'s signature, which a native
+    // keeps in every later table the program refreshes to. `register_native` and `set_native_resolver` vouch for the
+    // function pointers.
+    let mut code = unsafe { Code::with_natives(insns, &natives) }
+        .map_err(|at| invalid(format!("native call at instruction {at} is not a valid call")))?;
     for at in stack_calls {
         if !code.pass_stack_args(at as usize) {
             return Err(invalid(format!("extern call at instruction {at} is not a valid call")));
@@ -551,61 +725,158 @@ fn bind_helper_calls(insns: &mut [Instruction], code: &[u8], table: &HelperRegis
     }
 }
 
-/// The extern calls of an image that [`bind_externs`] leaves to the prepared code, by instruction index.
+/// The extern calls of an image that [`bind_externs`] leaves to the prepared code.
 struct Bound {
-    /// The calls of native functions, each with the index and the signature of its native.
-    natives: Vec<(u32, u32, NativeSig)>,
-    /// The calls of host functions that pass arguments on the stack.
+    natives: Vec<NativeBind>,
     stack_calls: Vec<u32>,
 }
 
-/// Turn each extern call in `insns` into a call to the slot of its import in `table`, but for native imports, which
-/// it checks against `table`.
-fn bind_externs(insns: &mut [Instruction], externs: &[(u32, Import)], table: &HelperRegistry) -> Result<Bound> {
+enum BoundImport {
+    Slot { slot: u32, stack: bool },
+    Native { index: u32, args: u8, mode: NativeMode },
+}
+
+/// Validate each entry of `imports` against `table`, then bind every call in `calls`.
+fn bind_externs(
+    insns: &mut [Instruction],
+    imports: &[Import],
+    calls: &[(u32, u32)],
+    table: &HelperRegistry,
+    tagged: bool,
+) -> Result<Bound> {
+    let mut resolved = Vec::with_capacity(imports.len());
+    for import in imports {
+        resolved.push(bind_import(import, table, tagged)?);
+    }
+
     let mut bound = Bound {
         natives: Vec::new(),
         stack_calls: Vec::new(),
     };
-    for (at, import) in externs {
+    for &(at, import_idx) in calls {
+        let target = resolved
+            .get(import_idx as usize)
+            .ok_or_else(|| invalid(format!("call at instruction {at}: import index {import_idx} out of range")))?;
         let insn = insns
-            .get_mut(*at as usize)
+            .get_mut(at as usize)
             .filter(|insn| insn.byte() == CALL)
             .ok_or_else(|| invalid(format!("extern at instruction {at} is not a call")))?;
-        let slot = match import {
-            Import::Name { name, stack } => {
-                if *stack {
-                    bound.stack_calls.push(*at);
+        match *target {
+            BoundImport::Slot { slot, stack } => {
+                bind_call(insn, slot);
+                if stack {
+                    bound.stack_calls.push(at);
                 }
-                table
-                    .slot_of_name(name)
-                    .ok_or_else(|| LinkError::UnresolvedSymbol(name.clone()))?
             }
-            Import::Helper(id) => table.slot_of_id(*id).ok_or(LinkError::UnknownHelper(*id))?,
-            Import::Native { name, sig } => {
-                let (index, host) = table
-                    .native(name)
-                    .ok_or_else(|| LinkError::UnresolvedSymbol(name.clone()))?;
-                check_native(name, *sig, host)?;
-                bound.natives.push((*at, index, *sig));
-                continue;
+            BoundImport::Native { index, args, mode } => {
+                bound.natives.push(NativeBind {
+                    pc: at as usize,
+                    index,
+                    args,
+                    mode,
+                });
             }
-        };
-        bind_call(insn, slot);
+        }
     }
     Ok(bound)
 }
 
-/// Fails unless `linked`, the signature an image recorded for the native `name`, is `host`, the loading VM's.
-fn check_native(name: &str, linked: NativeSig, host: NativeSig) -> Result<()> {
-    if linked.args() != host.args() {
-        let (name, declared, host) = (name.to_string(), usize::from(linked.args()), host.args());
-        return Err(LinkError::SignatureMismatch { name, declared, host }.into());
+fn bind_import(import: &Import, table: &HelperRegistry, tagged: bool) -> Result<BoundImport> {
+    match import {
+        Import::Helper(id) => {
+            let slot = table.slot_of_id(*id).ok_or(LinkError::UnknownHelper(*id))?;
+            Ok(BoundImport::Slot { slot, stack: false })
+        }
+        Import::Name { name, proto, stack, .. } => {
+            if let Some((index, host_sig, kind)) = table.native(name) {
+                let mode = match kind {
+                    NativeKind::Checked => {
+                        let Some(p) = proto else {
+                            let reason = "the module has no BTF for the extern to check its signature against".into();
+                            return Err(LinkError::NativeMismatch {
+                                name: name.clone(),
+                                reason,
+                            }
+                            .into());
+                        };
+                        p.check_native_sig(name, host_sig)?;
+                        match tagged && host_sig.has_pointers() {
+                            true => NativeMode::Checked,
+                            false => NativeMode::Plain,
+                        }
+                    }
+                    NativeKind::Strip => {
+                        if let Some(p) = proto {
+                            let declared = p.native_sig(name)?;
+                            check_strip_sig(name, declared, host_sig)?;
+                        }
+                        match tagged && host_sig.has_pointers() {
+                            true => NativeMode::Strip,
+                            false => NativeMode::Plain,
+                        }
+                    }
+                    NativeKind::Raw => NativeMode::Raw,
+                };
+                return Ok(BoundImport::Native {
+                    index,
+                    args: host_sig.args(),
+                    mode,
+                });
+            }
+            if let Some(slot) = table.slot_of_name(name) {
+                if let Some(p) = proto.as_ref().filter(|p| !p.variadic) {
+                    let args = p.reg_count();
+                    if args > MAX_ARGS {
+                        return Err(LinkError::TooManyRegisters {
+                            name: name.clone(),
+                            registers: args,
+                        }
+                        .into());
+                    }
+                    if let Some(host) = table.arity(slot).filter(|&host| usize::from(host) != args) {
+                        return Err(LinkError::SignatureMismatch {
+                            name: name.clone(),
+                            declared: args,
+                            host,
+                        }
+                        .into());
+                    }
+                    let wide = p.wide_return();
+                    if wide != table.wide(slot) {
+                        return Err(LinkError::ReturnMismatch {
+                            name: name.clone(),
+                            wide,
+                        }
+                        .into());
+                    }
+                }
+                let needs_stack = *stack
+                    || table.arity(slot).is_some_and(|a| usize::from(a) > REG_ARGS)
+                    || proto.as_ref().is_some_and(|p| p.reg_count() > REG_ARGS);
+                return Ok(BoundImport::Slot {
+                    slot,
+                    stack: needs_stack,
+                });
+            }
+            Err(LinkError::UnresolvedSymbol(name.clone()).into())
+        }
     }
-    if linked != host {
-        let reason = "the image was linked against other pointer arguments".to_string();
+}
+
+/// Fails unless a resolver-bound native's prototype matches the signature cached in the VM's native table.
+fn check_strip_sig(name: &str, declared: NativeSig, cached: NativeSig) -> Result<()> {
+    if declared.args() != cached.args() {
+        return Err(LinkError::SignatureMismatch {
+            name: name.to_string(),
+            declared: usize::from(declared.args()),
+            host: cached.args(),
+        }
+        .into());
+    }
+    if declared != cached {
         return Err(LinkError::NativeMismatch {
             name: name.to_string(),
-            reason,
+            reason: "the extern disagrees with the prototype this VM resolved the native under".into(),
         }
         .into());
     }
@@ -704,6 +975,44 @@ impl Writer {
         self.0.extend_from_slice(s.as_bytes());
     }
 
+    fn borrows(&mut self, borrows: &[Borrow]) {
+        self.0.push(borrows.len() as u8);
+        for borrow in borrows {
+            self.0
+                .extend_from_slice(&[borrow.arg, borrow.len_arg, borrow.writable.into()]);
+        }
+    }
+
+    fn proto(&mut self, proto: &Proto) {
+        match proto.ret {
+            ReturnKind::Void => self.0.push(RET_VOID),
+            ReturnKind::Int => self.0.push(RET_INT),
+            ReturnKind::Ptr => self.0.push(RET_PTR),
+            ReturnKind::Float(4) => self.0.push(RET_F32),
+            ReturnKind::Float(_) => self.0.push(RET_F64),
+            ReturnKind::Agg(size) => {
+                self.0.push(RET_AGG);
+                self.u32(size);
+            }
+        }
+        self.0.push(proto.variadic.into());
+        self.0.push(proto.args.len() as u8);
+        for &arg in &proto.args {
+            match arg {
+                ArgKind::Int => self.0.push(ARG_INT),
+                ArgKind::Ptr => self.0.push(ARG_PTR),
+                ArgKind::Callback => self.0.push(ARG_CALLBACK),
+                ArgKind::Float(4) => self.0.push(ARG_F32),
+                ArgKind::Float(_) => self.0.push(ARG_F64),
+                ArgKind::Copy(size) => {
+                    self.0.push(ARG_COPY);
+                    self.0.push(size);
+                }
+            }
+        }
+        self.borrows(&proto.borrows);
+    }
+
     /// Write what `f` writes, prefixed with its length.
     fn section(&mut self, f: impl FnOnce(&mut Self)) {
         let at = self.0.len();
@@ -750,6 +1059,68 @@ impl<'a> Reader<'a> {
         String::from_utf8(bytes.to_vec()).map_err(|_| invalid("string is not UTF-8"))
     }
 
+    fn opt_str(&mut self) -> Result<Option<String>> {
+        let s = self.str()?;
+        Ok((!s.is_empty()).then_some(s))
+    }
+
+    fn borrows(&mut self) -> Result<Vec<Borrow>> {
+        let count = self.u8()?;
+        let mut borrows = Vec::with_capacity(usize::from(count));
+        for _ in 0..count {
+            let [arg, len_arg, writable] = self.array()?;
+            let writable = writable != 0;
+            borrows.push(Borrow { arg, len_arg, writable });
+        }
+        Ok(borrows)
+    }
+
+    fn proto(&mut self, name: &str) -> Result<Proto> {
+        let ret = match self.u8()? {
+            RET_VOID => ReturnKind::Void,
+            RET_INT => ReturnKind::Int,
+            RET_PTR => ReturnKind::Ptr,
+            RET_F32 => ReturnKind::Float(4),
+            RET_F64 => ReturnKind::Float(8),
+            RET_AGG => ReturnKind::Agg(self.u32()?),
+            kind => return Err(invalid(format!("import {name}: unknown return kind {kind}"))),
+        };
+        let variadic = self.u8()? != 0;
+        let count = self.u8()?;
+        if usize::from(count) > MAX_NATIVE_ARGS {
+            return Err(invalid(format!("import {name}: {count} parameters")));
+        }
+        let mut args = Vec::with_capacity(usize::from(count));
+        for _ in 0..count {
+            let kind = match self.u8()? {
+                ARG_INT => ArgKind::Int,
+                ARG_PTR => ArgKind::Ptr,
+                ARG_CALLBACK => ArgKind::Callback,
+                ARG_F32 => ArgKind::Float(4),
+                ARG_F64 => ArgKind::Float(8),
+                ARG_COPY => {
+                    let size = self.u8()?;
+                    if !matches!(size, 3 | 5 | 6 | 7 | 9..=16) {
+                        return Err(invalid(format!("import {name}: bad copy size {size}")));
+                    }
+                    ArgKind::Copy(size)
+                }
+                kind => return Err(invalid(format!("import {name}: unknown argument kind {kind}"))),
+            };
+            args.push(kind);
+        }
+        let borrows = self.borrows()?;
+        if borrows.len() > BORROW_REGIONS || !borrows.iter().all(Borrow::in_range) {
+            return Err(invalid(format!("import {name}: borrow tag out of range")));
+        }
+        Ok(Proto {
+            args,
+            ret,
+            variadic,
+            borrows,
+        })
+    }
+
     fn section(&mut self) -> Result<Self> {
         let len = self.len()?;
         Ok(Self(self.take(len)?))
@@ -766,26 +1137,5 @@ impl<'a> Reader<'a> {
             return Err(invalid(format!("{} unexpected bytes", self.0.len())));
         }
         Ok(())
-    }
-
-    /// The [`NativeSig`] of the native `name`, as [`Image::to_bytes`] writes it.
-    fn native_sig(&mut self, name: &str) -> Result<NativeSig> {
-        let args = self.u8()?;
-        if usize::from(args) > MAX_NATIVE_ARGS {
-            return Err(invalid(format!("native {name}: {args} arguments")));
-        }
-        let mut list = [NativeArg::Int; MAX_NATIVE_ARGS];
-        for arg in &mut list[..usize::from(args)] {
-            let [kind, len] = self.array()?;
-            let len = (len != 0).then_some(len);
-            *arg = match kind {
-                ARG_INT => NativeArg::Int,
-                ARG_READ => NativeArg::Read(len),
-                ARG_WRITE => NativeArg::Write(len),
-                kind => return Err(invalid(format!("native {name}: argument of unknown kind {kind}"))),
-            };
-        }
-        let sig = NativeSig::try_new(&list[..usize::from(args)]);
-        sig.ok_or_else(|| invalid(format!("native {name}: a length that isn't an integer argument")))
     }
 }

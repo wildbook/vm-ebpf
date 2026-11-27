@@ -25,6 +25,7 @@ use crate::memory::{region_tag, GuestMemory, Perms, SharedBuffer, SharedRegion, 
 use crate::module::Module;
 use crate::plugin::Plugin;
 use crate::program::Program;
+use crate::proto::Proto;
 use crate::std_helpers;
 use crate::sync::{lock, Published};
 
@@ -197,11 +198,40 @@ impl RawCalls {
     }
 }
 
+/// An unresolved extern that [`Vm::set_native_resolver`] asks the host to bind at load time.
+#[derive(Debug, Clone, Copy)]
+pub struct NativeImport<'a> {
+    /// The symbol name to resolve (the override from `IMPORT_FROM("dll!symbol")`, or the C extern name).
+    pub name: &'a str,
+    /// The DLL name from `IMPORT_FROM("dll")`, if declared.
+    pub dll: Option<&'a str>,
+    /// What the plugin declared in C, or `None` if its object had no BTF for this extern.
+    pub proto: Option<&'a Proto>,
+}
+
+/// What a native resolver returns for an import.
+#[derive(Debug, Clone, Copy)]
+pub struct Resolved {
+    /// Pointer to the native function.
+    pub func: *const (),
+    /// `None`: trust the plugin's prototype (pointer tags are stripped unchecked in tagged programs). `Some(sig)`:
+    /// check the plugin's prototype against `sig` and check pointer bounds in tagged programs.
+    pub sig: Option<NativeSig>,
+}
+
+/// Resolver callback stored on a [`Vm`].
+pub type NativeResolver = dyn Fn(&NativeImport<'_>) -> Option<Resolved> + Send + Sync;
+
+/// One-shot resolver callback for [`Vm::load_image_bytes_once`].
+pub type OnceResolver<'a> = dyn FnMut(&NativeImport<'_>) -> Option<Resolved> + 'a;
+
 /// The entry point: holds the host functions, the host types for CO-RE, and the maps and regions shared between the
 /// programs it links and loads.
 pub struct Vm {
     /// Extern table shared with every program this VM links.
     helpers: Arc<SharedHelpers>,
+    /// Optional fallback resolver for unresolved extern names at load time.
+    resolver: Published<Option<Arc<NativeResolver>>>,
     /// Maps and regions shared between the programs this VM links.
     shared: Shared,
     /// Host BTF the program's own BTF resolves CO-RE relocations against. Reentrant, so that a link inside
@@ -246,6 +276,28 @@ impl Vm {
         Ok(Self::with_registry(config, registry))
     }
 
+    /// Load a serialized image into a fresh VM with `natives` and an optional one-shot `resolver`, without taking
+    /// any lock. Used by the C library (`rvmrt`).
+    ///
+    /// # Safety
+    ///
+    /// As [`register_native`](Self::register_native) and [`set_native_resolver`](Self::set_native_resolver).
+    pub unsafe fn load_image_bytes_once(
+        config: VmConfig,
+        bytes: &[u8],
+        natives: &[(&str, *const (), NativeSig)],
+        resolver: Option<&mut OnceResolver<'_>>,
+    ) -> Result<Program> {
+        Self::check(&config)?;
+        let mut registry = HelperRegistry::default();
+        #[cfg(feature = "maps")]
+        maps::register_helpers(&mut registry);
+        for &(name, func, sig) in natives {
+            registry.put_native(name.to_string(), native(name, func, sig)?)?;
+        }
+        image::load_bytes_once(bytes, registry, resolver, &config)
+    }
+
     fn check(config: &VmConfig) -> Result<()> {
         match !rvm_core::METERED && config.instruction_limit != 0 {
             true => Err(VmError::FuelNotEnabled),
@@ -265,6 +317,7 @@ impl Vm {
         maps::register_helpers(&mut registry);
         Self {
             helpers: Arc::new(SharedHelpers::new(registry)),
+            resolver: Published::default(),
             shared: Shared::default(),
             #[cfg(feature = "link")]
             types: ReentrantLock::default(),
@@ -435,6 +488,22 @@ impl Vm {
         self.helpers.update(|h| h.put_native(name, native))
     }
 
+    /// Set a fallback callback asked at load time for each extern name that no registered native, host function or
+    /// plugin export provides. A resolved function enters this VM's native table under its name, so later loads reuse
+    /// it and [`register_native`](Self::register_native) can replace it.
+    ///
+    /// # Safety
+    ///
+    /// Each function the resolver returns must meet the contract of [`register_native`](Self::register_native) for the
+    /// prototype a plugin declares for it, or for [`Resolved::sig`] when the resolver returns one.
+    pub unsafe fn set_native_resolver(
+        &self,
+        resolve: impl Fn(&NativeImport<'_>) -> Option<Resolved> + Send + Sync + 'static,
+    ) {
+        let resolver: Arc<NativeResolver> = Arc::new(resolve);
+        drop(self.resolver.replace(Arc::new(Some(resolver))));
+    }
+
     /// Enable `ktime_get_ns` (helper 5).
     pub fn enable_time(&self) {
         self.helpers.update(std_helpers::register_time);
@@ -516,13 +585,15 @@ impl Vm {
     /// # Ok::<_, rvm::VmError>(())
     /// ```
     pub fn load_image(&self, image: Image) -> Result<Program> {
-        image::load(image, &self.helpers, &self.shared, &self.config)
+        let resolver = self.resolver.get();
+        image::load(image, &self.helpers, resolver.as_deref(), &self.shared, &self.config)
     }
 
     /// [`load_image`](Self::load_image) straight from the bytes [`Image::to_bytes`] wrote, without the copy that
     /// [`Image::from_bytes`] makes.
     pub fn load_image_bytes(&self, bytes: &[u8]) -> Result<Program> {
-        image::load_bytes(bytes, &self.helpers, &self.shared, &self.config)
+        let resolver = self.resolver.get();
+        image::load_bytes(bytes, &self.helpers, resolver.as_deref(), &self.shared, &self.config)
     }
 
     /// A [`Loader`], which loads programs with a [`Passthrough`] mode or a [`RawCalls`] switch other than this VM's.
@@ -572,8 +643,9 @@ impl Vm {
     /// Link one ELF file into an image, to load later with [`Vm::load_image`] or, written out,
     /// [`Vm::load_image_bytes`].
     ///
-    /// Externs and helper IDs must be registered here as they will be in the loading VM, so the link checks signatures
-    /// and fails on unknown names early; CO-RE resolves against the types from [`Vm::with_types`].
+    /// Records each import and its BTF prototype without requiring the linking VM to have them registered;
+    /// [`Image::imports`] lists them for build scripts that want an early check. CO-RE resolves against the types from
+    /// [`Vm::with_types`].
     pub fn prepare_elf(&self, elf_bytes: &[u8]) -> Result<Image> {
         let module = Module::from_elf(elf_bytes)?;
         self.prepare_modules(&[&module])
@@ -583,7 +655,7 @@ impl Vm {
     pub fn prepare_modules(&self, modules: &[&Module]) -> Result<Image> {
         let types = self.types.lock();
         let types = types.try_borrow().map_err(|_| VmError::TypesBusy)?;
-        linker::link(&self.helpers.read(), &types, modules, self.config.memory_limit)
+        linker::link(&types, modules, self.config.memory_limit)
     }
 
     /// Link modules into an executable program: [`Vm::prepare_modules`], then [`Vm::load_image`].
@@ -665,12 +737,14 @@ impl Loader<'_> {
 
     /// [`Vm::load_image`].
     pub fn load_image(&self, image: Image) -> Result<Program> {
-        image::load(image, &self.vm.helpers, &self.vm.shared, &self.config)
+        let resolver = self.vm.resolver.get();
+        image::load(image, &self.vm.helpers, resolver.as_deref(), &self.vm.shared, &self.config)
     }
 
     /// [`Vm::load_image_bytes`].
     pub fn load_image_bytes(&self, bytes: &[u8]) -> Result<Program> {
-        image::load_bytes(bytes, &self.vm.helpers, &self.vm.shared, &self.config)
+        let resolver = self.vm.resolver.get();
+        image::load_bytes(bytes, &self.vm.helpers, resolver.as_deref(), &self.vm.shared, &self.config)
     }
 
     /// [`Vm::load_modules`].
@@ -687,7 +761,7 @@ impl Loader<'_> {
 }
 
 /// `func` with `sig`, as the extern table keeps a native function; fails on a null `func`.
-fn native(name: &str, func: *const (), sig: NativeSig) -> Result<Native> {
+pub fn native(name: &str, func: *const (), sig: NativeSig) -> Result<Native> {
     if func.is_null() {
         return Err(VmError::InvalidArgument(format!("native {name}: null function")));
     }

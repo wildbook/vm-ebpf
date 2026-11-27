@@ -9,22 +9,19 @@
 //! and loads and stores reject. Data sections go into guest memory regions; see [`crate::layout`] for the complete
 //! table.
 
-use std::ops::Range;
-
 use btf::{apply_core_relocations, Btf, BtfBuilder, BtfType, BTF_FUNC_EXTERN};
 use constelf::raw::reloc;
-use hashbrown::{HashMap, HashSet};
-use rvm_core::{NativeArg, NativeSig};
+use hashbrown::HashMap;
 
 use crate::error::{LinkError, Result, VmError};
 use crate::executor::{CORE_POISON_HELPER, MAX_ARGS, REG_ARGS};
-use crate::helper::HelperRegistry;
 use crate::image::{set_imm, set_slot_call, Address, Image, Import, Site, INSN_SIZE};
 use crate::layout::{BORROW_REGIONS, CODE_REGION, DATA_REGION, RODATA_REGION};
 use crate::map_def::map_defs;
 use crate::memory::{region_tag, split_addr, MemoryBudget, MAX_REGION_LEN};
 use crate::module::{Module, Relocation};
 use crate::program::{Borrow, FunctionInfo};
+use crate::proto::{self, Proto};
 use crate::section::SectionKind;
 
 const _: () = assert!(CORE_POISON_HELPER == btf::CORE_POISON_HELPER);
@@ -97,14 +94,9 @@ impl Image {
     }
 }
 
-/// Link modules into an image, binding extern calls against `helpers` and CO-RE relocations against `types`. Fails
-/// with [`VmError::MemoryLimit`] before the image's code and data grow past `memory_limit` bytes.
-pub fn link<'m>(
-    helpers: &HelperRegistry,
-    types: &BtfBuilder,
-    modules: &[&'m Module],
-    memory_limit: usize,
-) -> Result<Image> {
+/// Link modules into an image, recording extern prototypes and applying CO-RE relocations against `types`. Fails with
+/// [`VmError::MemoryLimit`] before the image's code and data grow past `memory_limit` bytes.
+pub fn link<'m>(types: &BtfBuilder, modules: &[&'m Module], memory_limit: usize) -> Result<Image> {
     if modules.is_empty() {
         return Err(VmError::InvalidArgument("no modules to link".to_string()));
     }
@@ -124,7 +116,7 @@ pub fn link<'m>(
     let global_symbols = build_symbol_table(modules, &layouts)?;
     let externs = btfs
         .iter()
-        .map(|btf| Externs::check(helpers, btf.as_ref()))
+        .map(|btf| ExternDecls::parse(btf.as_ref()))
         .collect::<Result<Vec<_>>>()?;
 
     for (module, btf) in modules.iter().zip(&btfs) {
@@ -136,13 +128,13 @@ pub fn link<'m>(
         }
     }
 
-    // Relocations bind maps and named externs; then numeric helper calls.
+    // Relocations record maps and named externs; then numeric helper calls.
     for ((module, layout), externs) in modules.iter().zip(&layouts).zip(&externs) {
         for reloc in &module.relocations {
-            apply_relocation(helpers, externs, module, layout, &global_symbols, reloc, &mut image)?;
+            apply_relocation(externs, module, layout, &global_symbols, reloc, &mut image)?;
         }
     }
-    mark_helper_calls(helpers, &mut image)?;
+    mark_helper_calls(&mut image)?;
     apply_core_relocations_pass(modules, &layouts, &btfs, &target, &mut image)?;
 
     image.functions = build_function_table(modules, &layouts, &btfs)?.into_iter().collect();
@@ -249,222 +241,107 @@ fn lay_out_jump_tables(
     Ok(())
 }
 
-/// What the BTF of a module says of the externs it calls.
+/// Parsed BTF declarations of extern functions in one module.
 #[derive(Default)]
-struct Externs {
-    /// The native functions with a prototype, which are the only natives the module may call.
-    natives: HashSet<String>,
-    /// The host functions with a prototype of more than [`REG_ARGS`] argument registers: a call passes the others on
-    /// the stack.
-    stack: HashSet<String>,
+struct ExternDecls {
+    decls: HashMap<String, ExternDecl>,
 }
 
-impl Externs {
-    /// Checks the externs in `btf` against the functions of `helpers`.
-    fn check(helpers: &HelperRegistry, btf: Option<&Btf<'_>>) -> Result<Self> {
+struct ExternDecl {
+    dll: Option<String>,
+    symbol: Option<String>,
+    proto: Proto,
+}
+
+impl ExternDecls {
+    fn parse(btf: Option<&Btf<'_>>) -> Result<Self> {
         let Some(btf) = btf else {
             return Ok(Self::default());
         };
-        Ok(Self {
-            natives: check_native_externs(helpers, btf)?,
-            stack: check_extern_signatures(helpers, btf)?,
-        })
-    }
-}
-
-/// Compare the BTF prototype of each host-bound extern in `btf` with the registered function, counting registers as
-/// clang uses them (see [`registers`]). Fails for an extern that needs more than [`MAX_ARGS`] argument registers, for
-/// a host function with a known arity that differs, and for a result in r0 and r2 where the host function sets only
-/// r0 or the reverse. Variadic prototypes are not checked. Returns the externs with more than [`REG_ARGS`] argument
-/// registers.
-fn check_extern_signatures(helpers: &HelperRegistry, btf: &Btf<'_>) -> Result<HashSet<String>> {
-    let mut stack = HashSet::new();
-    for (_, ty) in btf.types() {
-        let BtfType::Func {
-            name,
-            proto_type,
-            linkage: BTF_FUNC_EXTERN,
-        } = ty
-        else {
-            continue;
-        };
-        // a native has a check of its own
-        let Some(slot) = helpers.slot_of_name(name).filter(|_| helpers.native(name).is_none()) else {
-            continue;
-        };
-        // a trailing unnamed void parameter marks a variadic prototype
-        let variadic = |proto: &BtfType| match proto {
-            BtfType::FuncProto { params, .. } => params.last().is_some_and(|p| p.type_id == 0),
-            _ => false,
-        };
-        if btf.type_by_id(*proto_type).is_some_and(variadic) {
-            continue;
-        }
-
-        let name = name.to_string();
-        let Some(Registers { args, returns, .. }) = registers(btf, *proto_type) else {
-            let msg = format!("extern {name}: a parameter or return type no register holds");
-            return Err(LinkError::InvalidReference(msg).into());
-        };
-        if args > MAX_ARGS {
-            return Err(LinkError::TooManyRegisters { name, registers: args }.into());
-        }
-        if let Some(host) = helpers.arity(slot).filter(|&host| usize::from(host) != args) {
-            let declared = args;
-            return Err(LinkError::SignatureMismatch { name, declared, host }.into());
-        }
-        let wide = returns == Returns::R0R2;
-        if wide != helpers.wide(slot) {
-            return Err(LinkError::ReturnMismatch { name, wide }.into());
-        }
-        if args > REG_ARGS {
-            stack.insert(name);
-        }
-    }
-    Ok(stack)
-}
-
-/// Compare each extern in `btf` that names a native function with the native's signature: the same number of argument
-/// registers, an integer or enum where it takes an integer and a pointer where it takes a pointer, a result that the
-/// Windows x64 convention returns in rax, and a `borrow` or `borrow_ro` tag only on a pointer with the same length
-/// argument and access. Returns the names it checked, which are the only natives the module may call.
-fn check_native_externs(helpers: &HelperRegistry, btf: &Btf<'_>) -> Result<HashSet<String>> {
-    let mut checked = HashSet::new();
-    let borrows = function_borrows(Some(btf))?;
-    for (_, ty) in btf.types() {
-        let BtfType::Func {
-            name,
-            proto_type,
-            linkage: BTF_FUNC_EXTERN,
-        } = ty
-        else {
-            continue;
-        };
-        let Some((_, sig)) = helpers.native(name) else {
-            continue;
-        };
-        let mismatch = |reason: String| LinkError::NativeMismatch {
-            name: name.to_string(),
-            reason,
-        };
-
-        let Some(BtfType::FuncProto { return_type, params }) = btf.type_by_id(*proto_type) else {
-            return Err(mismatch("the extern has no prototype".into()).into());
-        };
-        if params.last().is_some_and(|p| p.type_id == 0) {
-            return Err(mismatch("the extern is variadic".into()).into());
-        }
-        if params.len() != usize::from(sig.args()) {
-            let (name, declared, host) = (name.to_string(), params.len(), sig.args());
-            return Err(LinkError::SignatureMismatch { name, declared, host }.into());
-        }
-        // rax returns an integer, a pointer, or a struct of 1, 2, 4 or 8 bytes. The convention returns every other
-        // struct through a pointer in rcx.
-        match btf.resolve_type(*return_type).map(|(_, ty)| ty) {
-            Some(BtfType::Void | BtfType::Int { size: ..=8, .. } | BtfType::Enum { .. } | BtfType::Ptr { .. }) => {}
-            Some(BtfType::Struct { size, .. } | BtfType::Union { size, .. }) => {
-                if !matches!(size, 0 | 1 | 2 | 4 | 8) {
-                    let reason = format!("the extern returns a struct of {size} bytes, not of 1, 2, 4 or 8");
-                    return Err(mismatch(reason).into());
-                }
-            }
-            _ => {
-                let reason = "the extern returns something other than an integer, a pointer or a struct";
-                return Err(mismatch(reason.into()).into());
-            }
-        }
-        for (n, param) in (1..).zip(params) {
-            let pointer = match btf.resolve_type(param.type_id).map(|(_, ty)| ty) {
-                Some(BtfType::Int { size: ..=8, .. } | BtfType::Enum { .. }) => false,
-                Some(BtfType::Ptr { .. }) => true,
-                _ => return Err(mismatch(format!("parameter {n} is neither an integer nor a pointer")).into()),
+        let mut borrows = function_borrows(Some(btf))?;
+        let mut imports = import_tags(btf)?;
+        let mut decls = HashMap::new();
+        for (_, ty) in btf.types() {
+            let BtfType::Func {
+                name,
+                proto_type,
+                linkage: BTF_FUNC_EXTERN,
+            } = ty
+            else {
+                continue;
             };
-            if pointer != !matches!(sig.arg(n), Some(NativeArg::Int)) {
-                let host = if pointer { "an integer" } else { "a pointer" };
-                return Err(mismatch(format!("parameter {n} is {host} in the host's signature")).into());
+            let func_borrows = borrows.remove(*name).unwrap_or_default();
+            let Some(proto) = proto::from_btf(btf, *proto_type, func_borrows) else {
+                let msg = format!("extern {name}: a parameter or return type no register holds");
+                return Err(LinkError::InvalidReference(msg).into());
+            };
+            if !proto.variadic && proto.reg_count() > MAX_ARGS {
+                return Err(LinkError::TooManyRegisters {
+                    name: (*name).to_string(),
+                    registers: proto.reg_count(),
+                }
+                .into());
             }
+            let ImportTag { dll, symbol } = imports.remove(*name).unwrap_or_default();
+            decls.insert((*name).to_string(), ExternDecl { dll, symbol, proto });
         }
-        for borrow in borrows.get(*name).into_iter().flatten() {
-            if !borrow_matches(borrow, sig) {
-                let n = borrow.arg + 1;
-                return Err(
-                    mismatch(format!("parameter {n} has a borrow tag the host's signature doesn't match")).into()
-                );
-            }
-        }
-        checked.insert(name.to_string());
+        Ok(Self { decls })
     }
-    Ok(checked)
-}
 
-/// Whether the native signature `sig` declares the pointer that `borrow` tags, with its length argument and access.
-fn borrow_matches(borrow: &Borrow, sig: NativeSig) -> bool {
-    let len = Some(borrow.len_arg + 1);
-    match sig.arg(borrow.arg + 1) {
-        Some(NativeArg::Read(l)) => !borrow.writable && l == len,
-        Some(NativeArg::Write(l)) => borrow.writable && l == len,
-        _ => false,
-    }
-}
-
-/// The argument positions clang 23 uses for the function prototype `proto_type`: r1 to r5, then the 8-byte slots of
-/// the stack arguments, in order and without gaps, so a parameter of two positions may take r5 and the first slot.
-/// `None` for a missing prototype or a parameter or return type no register holds.
-fn registers(btf: &Btf<'_>, proto_type: u32) -> Option<Registers> {
-    let Some(BtfType::FuncProto { return_type, params }) = btf.type_by_id(proto_type) else {
-        return None;
-    };
-    let returns = match btf.resolve_type(*return_type)?.1 {
-        BtfType::Int { size, .. } | BtfType::Struct { size, .. } | BtfType::Union { size, .. } => match size {
-            0..=8 => Returns::R0,
-            9..=16 => Returns::R0R2,
-            _ => Returns::Pointer,
-        },
-        _ => Returns::R0,
-    };
-
-    let mut next = usize::from(returns == Returns::Pointer);
-    let mut ranges = Vec::with_capacity(params.len());
-    for param in params {
-        let width = match btf.resolve_type(param.type_id)?.1 {
-            BtfType::Enum { .. } | BtfType::Ptr { .. } | BtfType::Float { .. } => 1,
-            // Clang packs a struct of up to 16 bytes into registers and passes nothing for an empty one. A function
-            // gets a larger one by pointer, though calls to it fail to compile. `__int128` takes two registers.
-            BtfType::Int { size, .. } | BtfType::Struct { size, .. } | BtfType::Union { size, .. } => match size {
-                0 => 0,
-                9..=16 => 2,
-                _ => 1,
+    fn import_for(&self, name: String) -> Import {
+        match self.decls.get(&name) {
+            Some(decl) => Import::Name {
+                name,
+                dll: decl.dll.clone(),
+                symbol: decl.symbol.clone(),
+                stack: decl.proto.reg_count() > REG_ARGS,
+                proto: Some(decl.proto.clone()),
             },
-            _ => return None,
-        };
-        ranges.push(next..next + width);
-        next += width;
+            None => Import::name(name),
+        }
     }
-    Some(Registers {
-        params: ranges,
-        args: next,
-        returns,
-    })
 }
 
-/// How a call passes the parameters of a function prototype and where its result comes back.
-struct Registers {
-    /// The argument positions of each parameter: 0 to 4 for r1 to r5, then 5 on for the stack arguments.
-    params: Vec<Range<usize>>,
-    /// The argument positions in all, the result pointer of [`Returns::Pointer`] included.
-    args: usize,
-    returns: Returns,
+#[derive(Default)]
+struct ImportTag {
+    dll: Option<String>,
+    symbol: Option<String>,
 }
 
-/// Where the result of a function comes back.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Returns {
-    /// In r0: a value of up to 8 bytes, or nothing.
-    R0,
-    /// In r0 and r2: a struct, union or integer of 9 to 16 bytes, with bytes 0 to 7 in r0.
-    R0R2,
-    /// In the caller's memory: a larger struct or union, through a pointer in r1 ahead of the parameters.
-    Pointer,
+/// `import:dll` or `import:dll!symbol` decl tags on extern functions.
+fn import_tags(btf: &Btf<'_>) -> Result<HashMap<String, ImportTag>> {
+    let mut tags = HashMap::new();
+    for (_, ty) in btf.types() {
+        let BtfType::DeclTag {
+            name: tag,
+            type_id,
+            component_idx: -1,
+        } = ty
+        else {
+            continue;
+        };
+        let Some(spec) = tag.strip_prefix("import:") else {
+            continue;
+        };
+        let Some(BtfType::Func {
+            name,
+            linkage: BTF_FUNC_EXTERN,
+            ..
+        }) = btf.type_by_id(*type_id)
+        else {
+            continue;
+        };
+        let (dll, symbol) = match spec.split_once('!') {
+            Some((dll, sym)) if !dll.is_empty() && !sym.is_empty() => (Some(dll.to_string()), Some(sym.to_string())),
+            Some(_) => {
+                return Err(LinkError::InvalidReference(format!("{name}: bad tag {tag}")).into());
+            }
+            None if !spec.is_empty() => (Some(spec.to_string()), None),
+            None => return Err(LinkError::InvalidReference(format!("{name}: empty import tag")).into()),
+        };
+        tags.insert((*name).to_string(), ImportTag { dll, symbol });
+    }
+    Ok(tags)
 }
 
 /// Every module's exported symbols by name; two different definitions of one name fail.
@@ -489,8 +366,7 @@ fn build_symbol_table(modules: &[&Module], layouts: &[ModuleLayout]) -> Result<H
 
 /// Patch the instruction or data that `reloc` points at.
 fn apply_relocation(
-    helpers: &HelperRegistry,
-    externs: &Externs,
+    externs: &ExternDecls,
     module: &Module,
     layout: &ModuleLayout,
     global_symbols: &HashMap<String, Addr>,
@@ -541,22 +417,8 @@ fn apply_relocation(
     } else if let Some(&addr) = global_symbols.get(&symbol.name) {
         addr
     } else if let (reloc::bpf::BPF_64_32, Addr::Code(at)) = (reloc.rel_type, patch) {
-        // Call to an extern function, bound to its slot in the extern table on load, or to a native function.
-        let name = symbol.name.clone();
-        let import = match (helpers.native(&name), helpers.slot_of_name(&name)) {
-            (Some((_, sig)), _) if externs.natives.contains(&name) => Import::Native { name, sig },
-            (Some(_), _) => {
-                let reason = "the module has no BTF for the extern to check its signature against".into();
-                return Err(LinkError::NativeMismatch { name, reason }.into());
-            }
-            (None, Some(slot)) => {
-                // without a prototype, a host function with typed arguments says how many a call passes
-                let typed = helpers.arity(slot).is_some_and(|arity| usize::from(arity) > REG_ARGS);
-                let stack = typed || externs.stack.contains(&name);
-                Import::Name { name, stack }
-            }
-            (None, None) => return Err(LinkError::UnresolvedSymbol(name).into()),
-        };
+        // Call to an extern function, recorded with its prototype and bound at load time.
+        let import = externs.import_for(symbol.name.clone());
         mark_extern(image, at, import)?;
         return Ok(());
     } else {
@@ -604,23 +466,19 @@ fn apply_relocation(
     Ok(())
 }
 
-/// Record every `call <helper id>` as an extern, so loaded programs never look helpers up at runtime. Unregistered IDs
-/// fail the link.
-fn mark_helper_calls(helpers: &HelperRegistry, image: &mut Image) -> Result<()> {
+/// Record every `call <helper id>` as an import, so loaded programs check and bind helpers at load time.
+fn mark_helper_calls(image: &mut Image) -> Result<()> {
     let calls: Vec<(u32, u32)> = image.helper_calls().collect();
     for (at, id) in calls {
-        if helpers.slot_of_id(id).is_none() {
-            return Err(LinkError::UnknownHelper(id).into());
-        }
         mark_extern(image, at as u64 * INSN_SIZE, Import::Helper(id))?;
     }
     Ok(())
 }
 
-/// Record the call at code offset `at` as an extern. Until loading binds it, it calls a slot no table has.
+/// Record the call at code offset `at` as an import. Until loading binds it, it calls a slot no table has.
 fn mark_extern(image: &mut Image, at: u64, import: Import) -> Result<()> {
     set_slot_call(image.insn_mut(at)?, u32::MAX);
-    image.externs.push(((at / INSN_SIZE) as u32, import));
+    image.add_call((at / INSN_SIZE) as u32, import);
     Ok(())
 }
 
@@ -704,7 +562,7 @@ fn build_function_table(
 }
 
 /// `borrow:N` / `borrow_ro:N` decl tags on function parameters, by function name, with each parameter mapped to its
-/// argument register (see [`registers`]). Both parameters must take one register each.
+/// argument register. Both parameters must take one register each.
 fn function_borrows(btf: Option<&Btf<'_>>) -> Result<HashMap<String, Vec<Borrow>>> {
     let mut borrows: HashMap<String, Vec<Borrow>> = HashMap::new();
     let Some(btf) = btf else {
@@ -727,7 +585,7 @@ fn function_borrows(btf: Option<&Btf<'_>>) -> Result<HashMap<String, Vec<Borrow>
         let Some(BtfType::Func { name, proto_type, .. }) = btf.type_by_id(*type_id) else {
             continue;
         };
-        let params = registers(btf, *proto_type).map(|registers| registers.params);
+        let params = proto::param_ranges(btf, *proto_type);
         let register = |param: usize| {
             let range = params.as_ref()?.get(param)?;
             u8::try_from(range.start).ok().filter(|_| range.len() == 1)

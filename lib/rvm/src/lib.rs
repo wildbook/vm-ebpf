@@ -115,6 +115,7 @@ mod memory;
 mod module;
 mod plugin;
 mod program;
+mod proto;
 #[cfg(feature = "link")]
 mod section;
 mod std_helpers;
@@ -151,10 +152,14 @@ pub use memory::{
 pub use module::Module;
 pub use plugin::{Plugin, PluginFunc, WeakPlugin};
 pub use program::{Borrow, Func, FunctionInfo, LimitedCall, Program, ProgramMemory};
+pub use proto::{ArgKind, Proto, ReturnKind};
 pub use rvm_core::{AtomicOp, NativeArg, NativeSig, MAX_CALL_DEPTH, MAX_NATIVE_ARGS};
 pub use std_helpers::{
     BPF_FUNC_GET_PRANDOM_U32, BPF_FUNC_KTIME_GET_NS, BPF_FUNC_MAP_DELETE_ELEM, BPF_FUNC_MAP_LOOKUP_ELEM,
     BPF_FUNC_MAP_UPDATE_ELEM, BPF_FUNC_TRACE_PRINTK,
 };
 pub use sync::TryLockGuard;
-pub use vm::{Loader, Passthrough, RawCalls, Vm, VmConfig, DEFAULT_INSTRUCTION_LIMIT, DEFAULT_MEMORY_LIMIT};
+pub use vm::{
+    Loader, NativeImport, Passthrough, RawCalls, Resolved, Vm, VmConfig, DEFAULT_INSTRUCTION_LIMIT,
+    DEFAULT_MEMORY_LIMIT,
+};

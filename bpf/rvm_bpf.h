@@ -57,6 +57,9 @@ typedef signed long long   s64;
 #define BORROW(len_arg)    __attribute__((btf_decl_tag("borrow:" #len_arg)))
 #define BORROW_RO(len_arg) __attribute__((btf_decl_tag("borrow_ro:" #len_arg)))
 
+/* Names the DLL (or `"dll!symbol"`) that provides an extern for the host's native resolver. */
+#define IMPORT_FROM(dll)   __attribute__((btf_decl_tag("import:" dll)))
+
 /* Map types and update flags, as in lib/rvm/src/map_def/btf.rs and lib/rvm/src/maps/mod.rs. */
 #define BPF_MAP_TYPE_HASH  1
 #define BPF_MAP_TYPE_ARRAY 2

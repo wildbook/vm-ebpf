@@ -69,7 +69,12 @@ int main(int argc, char **argv) {
         {"n12", 3, (const void *)n12, 12, {0}, {0}},
         {"n_buf", 5, (const void *)n_buf, 8, {0, 0, 0, 0, 0, 0, RVM_ARG_READ, 0}, {0, 0, 0, 0, 0, 0, 8, 0}},
     };
-    rvm_options options = {sizeof(rvm_options), natives, 3, RVM_RAW_CALLS};
+    rvm_options options = {
+        .size = sizeof(rvm_options),
+        .natives = natives,
+        .native_count = 3,
+        .flags = RVM_RAW_CALLS,
+    };
 
     rvm_program *program = NULL;
     if (rvm_load_with(image, len, &options, &program) != RVM_OK) {

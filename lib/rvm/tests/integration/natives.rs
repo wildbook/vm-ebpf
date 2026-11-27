@@ -245,3 +245,214 @@ fn native_follows_host_pointer_in_struct() {
         assert_eq!(program.call("sum_parts", &[]).unwrap(), 1 + 2 + 3 + 4 + 10 + 20 + 30);
     }
 }
+
+/// A native resolver binds imports at load time, caches each name once per VM, strips pointers in tagged programs when
+/// returning `sig: None`, checks them when returning `sig: Some`, passes 1/2/4/8-byte structs by value, and coexists
+/// with host closures and no-BTF raw calls.
+#[test]
+fn native_resolver_binds_and_caches() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use rvm::{Image, Import, NativeImport, Resolved};
+
+    extern "C" fn res_add(a: u64, b: u64) -> u64 {
+        a.wrapping_mul(10).wrapping_add(b)
+    }
+
+    extern "C" fn alias_target(x: u64) -> u64 {
+        x.wrapping_mul(7).wrapping_add(3)
+    }
+
+    /// # Safety
+    ///
+    /// `s` must be null or point to a NUL-terminated string.
+    unsafe extern "C" fn c_strlen(s: *const u8) -> u64 {
+        if s.is_null() {
+            return 0xffff;
+        }
+        let mut len = 0usize;
+        while unsafe { *s.add(len) } != 0 {
+            len += 1;
+        }
+        len as u64
+    }
+
+    /// # Safety
+    ///
+    /// `buf` must point to 4 readable bytes.
+    unsafe extern "C" fn res_stack_sum(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, buf: *const u8) -> u64 {
+        let bytes = unsafe { std::slice::from_raw_parts(buf, 4) };
+        a + b + c + d + e + f + bytes.iter().map(|&x| u64::from(x)).sum::<u64>()
+    }
+
+    #[repr(C)]
+    struct S1 {
+        a: u8,
+    }
+    #[repr(C)]
+    struct S2 {
+        a: u16,
+    }
+    #[repr(C)]
+    struct S4 {
+        a: u16,
+        b: u16,
+    }
+    #[repr(C)]
+    struct S8 {
+        a: u32,
+        b: u32,
+    }
+
+    extern "C" fn res_small_structs(a: S1, b: S2, c: S4, d: S8) -> S8 {
+        S8 {
+            a: u32::from(a.a) + u32::from(b.a) + u32::from(c.a) + d.a,
+            b: u32::from(c.b) + d.b,
+        }
+    }
+
+    extern "C" fn res_plain(a: u64, b: u64) -> u64 {
+        a ^ b
+    }
+
+    let lookup = |imp: &NativeImport<'_>, checked: bool| -> Option<Resolved> {
+        let (func, sig) = match (imp.dll, imp.name) {
+            (Some("host.dll"), "res_add") => (res_add as *const (), NativeSig::ints(2)),
+            (Some("host.dll"), "alias_target") => (alias_target as *const (), NativeSig::ints(1)),
+            (Some("ucrtbase.dll"), "strlen") => (c_strlen as *const (), NativeSig::new(&[NativeArg::Read(None)])),
+            (Some("host.dll"), "res_stack_sum") => (
+                res_stack_sum as *const (),
+                NativeSig::new(&[
+                    NativeArg::Int,
+                    NativeArg::Int,
+                    NativeArg::Int,
+                    NativeArg::Int,
+                    NativeArg::Int,
+                    NativeArg::Int,
+                    NativeArg::Read(None),
+                ]),
+            ),
+            (Some("host.dll"), "res_small_structs") => (res_small_structs as *const (), NativeSig::ints(4)),
+            (None, "res_plain") => (res_plain as *const (), NativeSig::ints(2)),
+            _ => return None,
+        };
+        Some(Resolved {
+            func,
+            sig: checked.then_some(sig),
+        })
+    };
+
+    // Prepare in an empty VM (no natives, no host closures, no resolver).
+    let image_bytes = Vm::new().prepare_elf(&object("tests/resolver.o")).unwrap().to_bytes();
+
+    // SAFETY: `resolver.c` only passes valid stack, `.rodata`, null, or the host string below.
+    let (on, untagged) = unsafe { (Passthrough::on(), Passthrough::untagged()) };
+    for passthrough in [Passthrough::OFF, on, untagged] {
+        let vm = Vm::with_config(VmConfig {
+            passthrough,
+            ..VmConfig::default()
+        })
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        // SAFETY: all resolved functions match the prototypes in `resolver.c`
+        unsafe {
+            vm.set_native_resolver(move |imp| {
+                count.fetch_add(1, Ordering::Relaxed);
+                lookup(imp, false)
+            });
+        }
+
+        let mut program = vm.load_image_bytes(&image_bytes).unwrap();
+        // Six unique imports resolved once each, even though `res_add` has two call sites.
+        assert_eq!(calls.load(Ordering::Relaxed), 6);
+
+        assert_eq!(program.call("call_add", &[3, 4]).unwrap(), (3 * 10 + 4) + (4 * 10 + 3));
+        assert_eq!(program.call("call_aliased", &[6]).unwrap(), 45);
+        assert_eq!(program.call("call_strlen_rodata", &[]).unwrap(), 14);
+        assert_eq!(program.call("call_strlen_stack", &[b'd' as u64]).unwrap(), 4);
+        assert_eq!(program.call("call_strlen_ptr", &[0]).unwrap(), 0xffff);
+        assert_eq!(program.call("call_stack_sum", &[5]).unwrap(), (5 + 6 + 7 + 8 + 9 + 10) + (10 + 20 + 30 + 5));
+        assert_eq!(program.call("call_small_structs", &[10]).unwrap(), (((13u64 + 15) << 32) | (10 + 11 + 12 + 14)));
+        assert_eq!(program.call("call_plain", &[0x55, 0x0f]).unwrap(), 0x5a);
+
+        // Passing a raw host pointer through a STRIP pointer parameter preserves it untouched.
+        let host_str = b"raw-host\0";
+        assert_eq!(program.call("call_strlen_ptr", &[host_str.as_ptr() as u64]).unwrap(), 8);
+
+        // Second load in the same VM reuses cached entries without calling the resolver again.
+        let mut again = vm.load_image_bytes(&image_bytes).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 6);
+        assert_eq!(again.call("call_add", &[2, 9]).unwrap(), (2 * 10 + 9) + (9 * 10 + 2));
+    }
+
+    // Returning `sig: Some` enforces checked bounds in tagged mode (null pointer faults before entering `c_strlen`).
+    let checked_vm = Vm::new();
+    // SAFETY: all resolved functions match their signatures
+    unsafe { checked_vm.set_native_resolver(move |imp| lookup(imp, true)) };
+    let mut checked = checked_vm.load_image_bytes(&image_bytes).unwrap();
+    assert_eq!(checked.call("call_strlen_rodata", &[]).unwrap(), 14);
+    assert!(matches!(checked.call("call_strlen_ptr", &[0]), Err(VmError::Exec(ExecError::MemoryFault { .. }))));
+
+    // The same prepared image loads when `res_plain` is a host closure and the rest come from the resolver.
+    let mixed = Vm::new();
+    mixed.register_extern("res_plain", |(a, b): (u64, u64)| a.wrapping_add(b));
+    // SAFETY: resolved functions match `resolver.c`
+    unsafe { mixed.set_native_resolver(move |imp| lookup(imp, false)) };
+    let mut mixed_prog = mixed.load_image_bytes(&image_bytes).unwrap();
+    assert_eq!(mixed_prog.call("call_plain", &[20, 22]).unwrap(), 42);
+    assert_eq!(mixed_prog.call("call_aliased", &[6]).unwrap(), 45);
+
+    // A no-BTF import (`proto: None`) resolved without a signature uses the `RAW` trampoline handler.
+    let raw_code = [
+        0x85, 0x00, 0, 0, 0, 0, 0, 0, // call
+        0x95, 0x00, 0, 0, 0, 0, 0, 0, // exit
+    ];
+    let mut raw_img = Image::from_code(raw_code.to_vec());
+    raw_img.add_call(0, Import::name("raw_add"));
+    let raw_vm = Vm::new();
+    // SAFETY: `res_add` takes two integer arguments
+    unsafe {
+        raw_vm.set_native_resolver(|imp| {
+            (imp.name == "raw_add" && imp.proto.is_none()).then_some(Resolved {
+                func: res_add as *const (),
+                sig: None,
+            })
+        });
+    }
+    let mut raw_prog = raw_vm.load_image(raw_img).unwrap();
+    assert_eq!(raw_prog.call("main", &[7, 8]).unwrap(), 78);
+
+    // End-to-end real DLL resolution on Windows: `ucrtbase.dll!strlen` via LoadLibraryA + GetProcAddress.
+    #[cfg(windows)]
+    {
+        use std::ffi::CString;
+
+        unsafe extern "system" {
+            fn LoadLibraryA(name: *const i8) -> *mut std::ffi::c_void;
+            fn GetProcAddress(module: *mut std::ffi::c_void, name: *const i8) -> *const ();
+        }
+
+        let win_vm = Vm::new();
+        // SAFETY: `ucrtbase.dll!strlen` is `size_t strlen(const char *)`, matching `resolver.c`
+        unsafe {
+            win_vm.set_native_resolver(move |imp| {
+                if imp.dll == Some("ucrtbase.dll") {
+                    let dll = CString::new(imp.dll?).ok()?;
+                    let sym = CString::new(imp.name).ok()?;
+                    let module = LoadLibraryA(dll.as_ptr());
+                    if module.is_null() {
+                        return None;
+                    }
+                    let proc = GetProcAddress(module, sym.as_ptr());
+                    return (!proc.is_null()).then_some(Resolved { func: proc, sig: None });
+                }
+                lookup(imp, false)
+            });
+        }
+        let mut win_prog = win_vm.load_image_bytes(&image_bytes).unwrap();
+        assert_eq!(win_prog.call("call_strlen_rodata", &[]).unwrap(), 14);
+        assert_eq!(win_prog.call("call_strlen_stack", &[b'!' as u64]).unwrap(), 4);
+    }
+}

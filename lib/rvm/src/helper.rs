@@ -234,7 +234,6 @@ pub struct HostFn {
     owner: Arc<dyn Send + Sync>,
     // for a function that takes arguments from the stack; the others run through the slot whatever the call passes
     call_stack: Option<StackTrampoline>,
-    #[cfg(feature = "link")]
     meta: SlotMeta,
 }
 
@@ -252,8 +251,7 @@ const _: () = assert!(size_of::<CallSlot>() == 16);
 unsafe impl Send for CallSlot {}
 unsafe impl Sync for CallSlot {}
 
-/// Link-time metadata of a host function slot.
-#[cfg(feature = "link")]
+/// Load-time metadata of a host function slot.
 #[derive(Clone, Copy)]
 struct SlotMeta {
     // argument count, if registered with typed arguments; `None` for raw helpers, which read registers themselves
@@ -262,14 +260,25 @@ struct SlotMeta {
     wide: bool,
 }
 
+/// How a registered or resolved native handles pointer arguments in a tagged program.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NativeKind {
+    /// Registered with an explicit [`NativeSig`]: pointer arguments are checked against guest memory.
+    Checked,
+    /// Resolved from a plugin's BTF prototype (`Resolved::sig` was `None`): pointer tags are stripped unchecked.
+    Strip,
+    /// Resolved without BTF (`Resolved::sig` and `Proto` were both `None`): passes r1 to r5 via `rvm_call_regs`.
+    Raw,
+}
+
 impl HostFn {
     /// `func` called through `call` and `call_stack`, which must take `data` as a pointer to an `F`.
     fn with_trampoline<F: Send + Sync + 'static>(
         func: F,
         call: Trampoline,
         call_stack: Option<StackTrampoline>,
-        #[cfg_attr(not(feature = "link"), expect(unused_variables))] arity: Option<u8>,
-        #[cfg_attr(not(feature = "link"), expect(unused_variables))] wide: bool,
+        arity: Option<u8>,
+        wide: bool,
     ) -> Self {
         let owner = Arc::new(func);
         let slot = CallSlot {
@@ -280,7 +289,6 @@ impl HostFn {
             slot,
             owner,
             call_stack,
-            #[cfg(feature = "link")]
             meta: SlotMeta { arity, wide },
         }
     }
@@ -498,13 +506,13 @@ pub struct HelperRegistry {
     owners: Vec<Arc<dyn Send + Sync>>,
     /// By slot, [`HostFn::call_stack`]: apart from the slots, which keep their size without it.
     stack_calls: Vec<Option<StackTrampoline>>,
-    #[cfg(feature = "link")]
     meta: Vec<SlotMeta>,
     by_id: Vec<(u32, u32)>, // (helper ID, slot)
     by_name: HashMap<String, u32>,
     natives: Vec<Native>,
     // by index; few enough to search
     native_names: Vec<String>,
+    native_kinds: Vec<NativeKind>,
 }
 
 impl HelperRegistry {
@@ -524,12 +532,18 @@ impl HelperRegistry {
         self.by_name.insert(name, slot);
     }
 
-    /// Put `native` under `name`: in the index of the native the name had, which must have the same signature, or at a
-    /// new index. The caller of [`Vm::register_native`](crate::Vm::register_native) vouches for the function.
+    /// Put `native` under `name` as an explicitly registered native ([`NativeKind::Checked`]): in the index of the
+    /// native the name had, which must have the same signature, or at a new index.
     pub fn put_native(&mut self, name: String, native: Native) -> Result<(), VmError> {
+        self.put_native_kind(name, native, NativeKind::Checked)
+    }
+
+    /// Put `native` under `name` with `kind`, replacing an existing entry only when its signature matches.
+    pub fn put_native_kind(&mut self, name: String, native: Native, kind: NativeKind) -> Result<(), VmError> {
         let Some(index) = self.native_names.iter().position(|n| *n == name) else {
             self.natives.push(native);
             self.native_names.push(name);
+            self.native_kinds.push(kind);
             return Ok(());
         };
         let old = &mut self.natives[index];
@@ -538,13 +552,26 @@ impl HelperRegistry {
             return Err(VmError::InvalidArgument(msg));
         }
         *old = native;
+        self.native_kinds[index] = kind;
         Ok(())
     }
 
-    /// The index and signature of the native function `name`.
-    pub fn native(&self, name: &str) -> Option<(u32, NativeSig)> {
+    /// Insert `native` under `name` if `name` is not yet present in `natives` or `by_name`, returning whether it was
+    /// inserted. Used when publishing resolver results so concurrent loads or explicit registrations never conflict.
+    pub fn put_native_if_absent(&mut self, name: String, native: Native, kind: NativeKind) -> bool {
+        if self.by_name.contains_key(&name) || self.native_names.contains(&name) {
+            return false;
+        }
+        self.natives.push(native);
+        self.native_names.push(name);
+        self.native_kinds.push(kind);
+        true
+    }
+
+    /// The index, signature and kind of the native function `name`.
+    pub fn native(&self, name: &str) -> Option<(u32, NativeSig, NativeKind)> {
         let index = self.native_names.iter().position(|n| n == name)?;
-        Some((index as u32, self.natives[index].sig))
+        Some((index as u32, self.natives[index].sig, self.native_kinds[index]))
     }
 
     /// Replace the function in `slot`, or append a new slot.
@@ -554,17 +581,13 @@ impl HelperRegistry {
                 self.slots[slot as usize] = func.slot;
                 self.owners[slot as usize] = func.owner;
                 self.stack_calls[slot as usize] = func.call_stack;
-                #[cfg(feature = "link")]
-                {
-                    self.meta[slot as usize] = func.meta;
-                }
+                self.meta[slot as usize] = func.meta;
                 slot
             }
             None => {
                 self.slots.push(func.slot);
                 self.owners.push(func.owner);
                 self.stack_calls.push(func.call_stack);
-                #[cfg(feature = "link")]
                 self.meta.push(func.meta);
                 (self.slots.len() - 1) as u32
             }
@@ -572,13 +595,11 @@ impl HelperRegistry {
     }
 
     /// Argument count of the function in `slot`, if it was registered with typed arguments.
-    #[cfg(feature = "link")]
     pub fn arity(&self, slot: u32) -> Option<u8> {
         self.meta.get(slot as usize)?.arity
     }
 
     /// Whether the function in `slot` sets r2 as well as r0.
-    #[cfg(feature = "link")]
     pub fn wide(&self, slot: u32) -> bool {
         self.meta.get(slot as usize).is_some_and(|m| m.wide)
     }
@@ -756,7 +777,6 @@ impl SharedHelpers {
     }
 
     /// The current table.
-    #[cfg(feature = "link")]
     pub fn read(&self) -> Arc<HelperRegistry> {
         self.current.get()
     }

@@ -148,4 +148,6 @@ pub use host::{Callee, Host};
 pub use instruction::Instruction;
 pub use interp::{Interpreter, Reason, Stop, MAX_CALL_DEPTH, METERED};
 pub use memory::{AtomicOp, Memory, Window};
-pub use native::{Native, NativeArg, NativeCall, NativeFn, NativeSig, MAX_ARGS as MAX_NATIVE_ARGS};
+pub use native::{
+    Native, NativeArg, NativeBind, NativeCall, NativeFn, NativeMode, NativeSig, MAX_ARGS as MAX_NATIVE_ARGS,
+};

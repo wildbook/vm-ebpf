@@ -98,6 +98,11 @@ pub const fn usual(byte: u8) -> u8 {
             return CALL;
         }
     });
+    const_for!(native in native::STRIP => {
+        if native == byte {
+            return CALL;
+        }
+    });
     const_for!(native in native::STACK => {
         if native == byte {
             return CALL;
@@ -106,7 +111,7 @@ pub const fn usual(byte: u8) -> u8 {
     match (byte, Super::with_byte(byte)) {
         (MOVSX32, _) => MOV32_REG,
         (MOVSX64 | TO_HOST | TO_GUEST, _) => MOV64_REG,
-        (CALL_HELPER | CALL_KFUNC, _) => CALL,
+        (CALL_HELPER | CALL_KFUNC | native::RAW, _) => CALL,
         (args::LOAD, _) => LDX_DW,
         (args::STORE, _) => STX_DW,
         (args::STORE_IMM, _) => ST_DW,
@@ -138,6 +143,8 @@ const _: () = {
     claim(&mut used, TO_GUEST);
     const_for!(byte in native::PLAIN => claim(&mut used, byte));
     const_for!(byte in native::CHECKED => claim(&mut used, byte));
+    const_for!(byte in native::STRIP => claim(&mut used, byte));
     const_for!(byte in native::STACK => claim(&mut used, byte));
+    claim(&mut used, native::RAW);
     const_for!(byte in [args::LOAD, args::STORE, args::STORE_IMM, args::CALL, args::CALLX] => claim(&mut used, byte));
 };

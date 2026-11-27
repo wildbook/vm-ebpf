@@ -303,8 +303,8 @@ fn instruction_limit_at_every_instruction() {
 fn prepared_image() {
     let image = vm().prepare_elf(&object("tests/stack_args.o")).unwrap();
     let stack = |wanted: &str| {
-        let found = image.externs.iter().find_map(|(_, import)| match import {
-            Import::Name { name, stack } if name == wanted => Some(*stack),
+        let found = image.imports().iter().find_map(|import| match import {
+            Import::Name { name, stack, .. } if name == wanted => Some(*stack),
             _ => None,
         });
         found.unwrap_or_else(|| panic!("no call of {wanted}"))

@@ -93,13 +93,45 @@ typedef struct rvm_native {
 //   instruction limit.
 enum { RVM_UNTAGGED = 1, RVM_RAW_POINTERS = 2, RVM_RAW_CALLS = 4 };
 
+// Prototype return and parameter kinds reported to `rvm_options.resolve`.
+enum { RVM_RET_VOID = 0, RVM_RET_INT = 1, RVM_RET_PTR = 2, RVM_RET_F32 = 3, RVM_RET_F64 = 4, RVM_RET_STRUCT = 5 };
+enum {
+    RVM_PROTO_INT = 0, RVM_PROTO_PTR = 1, RVM_PROTO_CALLBACK = 2,
+    RVM_PROTO_F32 = 3, RVM_PROTO_F64 = 4, RVM_PROTO_STRUCT = 5
+};
+
+// An unresolved extern that `rvm_options.resolve` is asked to bind at load time.
+typedef struct rvm_import {
+    // symbol name to resolve (the override from IMPORT_FROM("dll!symbol"), or the C extern name), UTF-8, not NUL-terminated
+    const char *name;
+    size_t name_len;
+    // DLL name from IMPORT_FROM("dll"), or NULL when the extern carries no IMPORT_FROM tag; UTF-8, not NUL-terminated
+    const char *dll;
+    size_t dll_len;
+    // 1 when the image carries a BTF prototype for this extern, 0 otherwise
+    uint8_t has_proto;
+    // number of parameters in `kind` (0 to 12) when `has_proto` is 1
+    uint8_t args;
+    // return kind: RVM_RET_* when `has_proto` is 1
+    uint8_t ret;
+    // 1 when the extern is variadic
+    uint8_t variadic;
+    // per parameter: RVM_PROTO_* when `has_proto` is 1
+    uint8_t kind[12];
+} rvm_import;
+
 typedef struct rvm_options {
     // sizeof(rvm_options)
     size_t size;
     // the native functions the image imports, `native_count` entries; may be NULL when the count is 0. Each native
-    // import of the image must name one of them with the signature the image was linked against.
+    // import of the image must match one of them or be resolved by `resolve`.
     const rvm_native *natives;
     size_t native_count;
+    // optional fallback resolver asked once per unresolved import name during rvm_load_with; returns the native
+    // function address, or NULL to fail the load with RVM_ERR_LINK. Pointer arguments declared in the image's BTF
+    // prototype lose their region tags unchecked in tagged programs.
+    const void *(*resolve)(void *user, const rvm_import *import);
+    void *resolve_user;
     // RVM_UNTAGGED, RVM_RAW_POINTERS and RVM_RAW_CALLS, or 0
     uint32_t flags;
 } rvm_options;

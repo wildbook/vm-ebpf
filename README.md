@@ -143,12 +143,22 @@ unsafe { vm.register_native("checksum", checksum as *const (), CHECKSUM)? };
 ```
 
 Loading checks the plugin's declaration against the signature: the same number of arguments, pointers in the same
-places, and a `BORROW` tag, where there is one, on the same length argument. The declaration may return nothing, an
-integer, a pointer, or a struct of 1, 2, 4 or 8 bytes, which returns in rax; loading fails for a struct of another size.
-A prepared image records the signature and loads only where the native has the same one. Before each call, rvm checks
-every pointer the signature declares against the plugin's memory, one byte or as many as its length argument says, with
-the plugin's read or write permission, and the native gets the host address of the bytes. A bad pointer stops the plugin
-call with `ExecError::MemoryFault`. With `Passthrough::untagged()` arguments arrive unchanged and unchecked.
+places, and a `BORROW` tag, where there is one, on the same length argument. Structs and unions of 1, 2, 4 or 8 bytes
+pass as integers. The declaration may return nothing, an integer, a pointer, or a struct of 1, 2, 4 or 8 bytes, which
+returns in rax. Loading fails for a struct of another size. A prepared image records each import's BTF prototype (and
+any `IMPORT_FROM` tag) without requiring externs to be registered during `prepare_elf`, and checks it at load time.
+Before each call, rvm checks every pointer the signature declares against the plugin's memory, one byte or as many as
+its length argument says, with the plugin's read or write permission, and the native gets the host address of the
+bytes. A bad pointer stops the plugin call with `ExecError::MemoryFault`. With `Passthrough::untagged()` arguments
+arrive unchanged and unchecked.
+
+For externs not registered ahead of time, `Vm::set_native_resolver` (or `rvm_options.resolve` in `rvmrt`) asks a host
+callback once per unresolved import name at load time and caches the result in the VM. A plugin can tag an extern with
+`IMPORT_FROM("user32.dll")` or `IMPORT_FROM("ucrtbase.dll!strlen")` from `rvm_bpf.h` to pass a DLL name and optional
+symbol override to the resolver. When the resolver returns a `NativeSig`, loading checks the plugin's prototype and
+checks pointer bounds as for `register_native`. When it returns `sig: None`, the plugin's prototype decides which
+arguments are pointers, and rvm strips their region tags in tagged programs without bounds checks. Without BTF,
+arguments pass unchanged through the native trampoline.
 
 Pointers stored inside plugin memory, such as the fields of a struct the plugin fills, keep the plugin's region tag,
 and native code can't follow them. Either load the plugin with `Passthrough::untagged()`, where every pointer is a

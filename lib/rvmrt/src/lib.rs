@@ -4,11 +4,12 @@
 //! `rvm::Image::to_bytes`; the runtime has no helpers and no maps, only the native functions the host passes to
 //! [`rvm_load_with`]. With the `fuel` feature it limits each call to `rvm::DEFAULT_INSTRUCTION_LIMIT` instructions.
 
+use std::ffi::c_void;
 use std::slice;
 
 use rvm::{
-    ExecError, Func, NativeArg, NativeSig, Passthrough, Perms, Program, RawCalls, Region, Vm, VmConfig, VmError,
-    MAX_NATIVE_ARGS,
+    ArgKind, ExecError, Func, NativeArg, NativeImport, NativeSig, Passthrough, Perms, Program, RawCalls, Region,
+    Resolved, ReturnKind, Vm, VmConfig, VmError, MAX_NATIVE_ARGS,
 };
 
 /// The limit of each call; 0 is no limit.
@@ -101,6 +102,23 @@ pub struct RvmNative {
     pub len_arg: [u8; MAX_NATIVE_ARGS],
 }
 
+/// An unresolved extern reported to [`RvmOptions::resolve`]; `rvm_import` in the header.
+#[repr(C)]
+pub struct RvmImport {
+    pub name: *const u8,
+    pub name_len: usize,
+    pub dll: *const u8,
+    pub dll_len: usize,
+    pub has_proto: u8,
+    pub args: u8,
+    pub ret: u8,
+    pub variadic: u8,
+    pub kind: [u8; MAX_NATIVE_ARGS],
+}
+
+/// Native resolver callback type for [`RvmOptions::resolve`].
+pub type RvmResolve = unsafe extern "C" fn(user: *mut c_void, import: *const RvmImport) -> *const ();
+
 /// How [`rvm_load_with`] loads an image; `rvm_options` in the header.
 #[repr(C)]
 pub struct RvmOptions {
@@ -108,6 +126,9 @@ pub struct RvmOptions {
     pub size: usize,
     pub natives: *const RvmNative,
     pub native_count: usize,
+    /// Optional fallback resolver called once per unresolved import name during [`rvm_load_with`].
+    pub resolve: Option<RvmResolve>,
+    pub resolve_user: *mut c_void,
     /// `RVM_UNTAGGED`, `RVM_RAW_POINTERS` and `RVM_RAW_CALLS`.
     pub flags: u32,
 }
@@ -120,13 +141,15 @@ const RAW_POINTERS: u32 = 2;
 const RAW_CALLS: u32 = 4;
 
 /// [`rvm_load`] with `options` (or default options if `options` is null): its natives registered as
-/// `rvm::Vm::register_native` registers them, and the memory mode and raw calls its flags name.
+/// `rvm::Vm::register_native` registers them, an optional fallback resolver, and the memory mode and raw calls its
+/// flags name.
 ///
 /// # Safety
 ///
 /// As [`rvm_load`]; when non-null, `options` must point to an `rvm_options` whose `natives` point to `native_count`
-/// entries when `native_count` is not 0. Each function must meet the contract of `rvm::Vm::register_native`, and the
-/// host those of `rvm::Passthrough::on`, `rvm::Passthrough::untagged` and `rvm::RawCalls::on` for the flags it sets.
+/// entries when `native_count` is not 0. Each function from `natives` or `resolve` must meet the contract of
+/// `rvm::Vm::register_native`, and the host those of `rvm::Passthrough::on`, `rvm::Passthrough::untagged` and
+/// `rvm::RawCalls::on` for the flags it sets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rvm_load_with(
     image: *const u8,
@@ -141,8 +164,8 @@ pub unsafe extern "C" fn rvm_load_with(
         return Status::Argument;
     };
 
-    let (flags, natives): (u32, &[RvmNative]) = if options.is_null() {
-        (0, &[])
+    let (flags, natives, resolve, resolve_user) = if options.is_null() {
+        (0u32, &[][..], None, std::ptr::null_mut())
     } else {
         // the size comes first in every layout, and says whether the rest is this one
         if unsafe { options.cast::<usize>().read() } != size_of::<RvmOptions>() {
@@ -155,7 +178,7 @@ pub unsafe extern "C" fn rvm_load_with(
         let Some(natives) = (unsafe { slice_or_empty(options.natives, options.native_count) }) else {
             return Status::Argument;
         };
-        (options.flags, natives)
+        (options.flags, natives, options.resolve, options.resolve_user)
     };
 
     let mut list = Vec::with_capacity(natives.len());
@@ -186,11 +209,65 @@ pub unsafe extern "C" fn rvm_load_with(
         raw_calls,
         ..VmConfig::default()
     };
+
+    let mut resolve_cb = |imp: &NativeImport<'_>| -> Option<Resolved> {
+        let resolve = resolve?;
+        let c_imp = c_import(imp);
+        // SAFETY: the caller's resolver callback contract
+        let func = unsafe { resolve(resolve_user, &c_imp) };
+        (!func.is_null()).then_some(Resolved { func, sig: None })
+    };
+    let resolver = resolve.map(|_| &mut resolve_cb as &mut dyn FnMut(&NativeImport<'_>) -> Option<Resolved>);
+
     // SAFETY: the caller's
-    let loaded = unsafe { Vm::with_natives(config, &list) }
-        .and_then(|vm| vm.load_image_bytes(bytes))
+    let loaded = unsafe { Vm::load_image_bytes_once(config, bytes, &list, resolver) }
         .map(|p| Box::into_raw(Box::new(RvmProgram::new(p))));
     unsafe { finish(loaded, program) }
+}
+
+/// Convert a [`NativeImport`] to the C `rvm_import` struct for [`RvmOptions::resolve`].
+fn c_import(imp: &NativeImport<'_>) -> RvmImport {
+    let (dll, dll_len) = match imp.dll {
+        Some(dll) => (dll.as_ptr(), dll.len()),
+        None => (std::ptr::null(), 0),
+    };
+    let mut kind = [0u8; MAX_NATIVE_ARGS];
+    let (has_proto, args, ret, variadic) = match imp.proto {
+        Some(proto) => {
+            let n = proto.args.len().min(MAX_NATIVE_ARGS);
+            for (slot, &arg) in kind[..n].iter_mut().zip(&proto.args[..n]) {
+                *slot = match arg {
+                    ArgKind::Int => 0,
+                    ArgKind::Ptr => 1,
+                    ArgKind::Callback => 2,
+                    ArgKind::Float(4) => 3,
+                    ArgKind::Float(_) => 4,
+                    ArgKind::Copy(_) => 5,
+                };
+            }
+            let ret = match proto.ret {
+                ReturnKind::Void => 0,
+                ReturnKind::Int => 1,
+                ReturnKind::Ptr => 2,
+                ReturnKind::Float(4) => 3,
+                ReturnKind::Float(_) => 4,
+                ReturnKind::Agg(_) => 5,
+            };
+            (1, n as u8, ret, u8::from(proto.variadic))
+        }
+        None => (0, 0, 0, 0),
+    };
+    RvmImport {
+        name: imp.name.as_ptr(),
+        name_len: imp.name.len(),
+        dll,
+        dll_len,
+        has_proto,
+        args,
+        ret,
+        variadic,
+        kind,
+    }
 }
 
 /// The signature `native` describes, or `None` for an invalid one.
@@ -502,6 +579,9 @@ mod tests {
             .lines()
             .filter_map(|line| {
                 let (name, value) = line.trim().strip_suffix(',')?.split_once(" = ")?;
+                if name != "RVM_OK" && !name.starts_with("RVM_ERR_") {
+                    return None;
+                }
                 Some((name, value.parse().ok()?))
             })
             .collect();
@@ -557,6 +637,8 @@ mod tests {
             size: size_of::<RvmOptions>(),
             natives: ptr::null(),
             native_count: 1,
+            resolve: None,
+            resolve_user: ptr::null_mut(),
             flags: 0,
         };
         assert!(matches!(
@@ -627,6 +709,77 @@ mod tests {
         assert!(matches!(unsafe { rvm_call_func(ptr::null_mut(), idx, &arg, 1, &mut ret) }, Status::Argument));
         assert!(matches!(unsafe { rvm_call_func(prog, idx, ptr::null(), 1, ptr::null_mut()) }, Status::Argument));
         assert!(matches!(unsafe { rvm_call_func(prog, idx, &arg, 1, ptr::null_mut()) }, Status::Ok));
+
+        unsafe { rvm_free(prog) };
+    }
+
+    #[test]
+    fn options_resolver_receives_imports() {
+        use std::ptr;
+
+        use super::*;
+
+        extern "C" fn add_two(a: u64, b: u64) -> u64 {
+            a + b
+        }
+
+        #[derive(Default)]
+        struct Seen {
+            names: Vec<String>,
+            allow: bool,
+        }
+
+        unsafe extern "C" fn resolve(user: *mut c_void, import: *const RvmImport) -> *const () {
+            let seen = unsafe { &mut *user.cast::<Seen>() };
+            let imp = unsafe { &*import };
+            let name = unsafe { str_or_none(imp.name, imp.name_len) }.unwrap();
+            seen.names.push(name.to_string());
+            if seen.allow && name == "add_two" {
+                add_two as *const ()
+            } else {
+                ptr::null()
+            }
+        }
+
+        // call add_two(r1, r2); exit
+        let code = [
+            0x85, 0x00, 0, 0, 0, 0, 0, 0, // call
+            0x95, 0x00, 0, 0, 0, 0, 0, 0, // exit
+        ];
+        let mut image = rvm::Image::from_code(code.to_vec());
+        image.add_call(0, rvm::Import::name("add_two"));
+        let bytes = image.to_bytes();
+
+        let mut seen = Seen::default();
+        let mut options = RvmOptions {
+            size: size_of::<RvmOptions>(),
+            natives: ptr::null(),
+            native_count: 0,
+            resolve: Some(resolve),
+            resolve_user: (&raw mut seen).cast(),
+            flags: 0,
+        };
+        let mut prog: *mut RvmProgram = ptr::null_mut();
+        assert!(matches!(unsafe { rvm_load_with(bytes.as_ptr(), bytes.len(), &options, &mut prog) }, Status::Link));
+        assert_eq!(seen.names, ["add_two"]);
+
+        seen.allow = true;
+        seen.names.clear();
+        options.resolve_user = (&raw mut seen).cast();
+        assert!(matches!(unsafe { rvm_load_with(bytes.as_ptr(), bytes.len(), &options, &mut prog) }, Status::Ok));
+        assert_eq!(seen.names, ["add_two"]);
+
+        #[cfg(not(miri))]
+        {
+            let args = [20u64, 22];
+            let mut ret = 0u64;
+            let main = b"main";
+            assert!(matches!(
+                unsafe { rvm_call(prog, main.as_ptr(), main.len(), args.as_ptr(), args.len(), &mut ret) },
+                Status::Ok
+            ));
+            assert_eq!(ret, 42);
+        }
 
         unsafe { rvm_free(prog) };
     }
