@@ -87,7 +87,8 @@ impl Plugin {
     /// Swap in a new build of this plugin. Exports keep working; they find their function by name in the new program.
     /// Fails with [`VmError::PluginBusy`] while a call into the plugin runs, on any thread.
     pub fn replace(&self, program: Program) -> Result<()> {
-        *self.lock()? = program;
+        // drop the replaced program outside the plugin lock
+        let _old = std::mem::replace(&mut *self.lock()?, program);
         Ok(())
     }
 

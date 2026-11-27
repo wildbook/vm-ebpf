@@ -682,21 +682,21 @@ impl SharedHelpers {
         self.current.get()
     }
 
-    /// A copy of the current table.
+    /// A snapshot of the current table.
     pub fn snapshot(&self) -> Snapshot {
         // the table is published before the version moves, so reading the version first never pairs it with an older
         // table
         let version = self.version();
         Snapshot {
-            table: HelperRegistry::clone(&self.current.get()),
+            table: self.current.get(),
             version,
         }
     }
 }
 
-/// A copy of the extern table a [`SharedHelpers`] held.
+/// A shared snapshot of the extern table a [`SharedHelpers`] held.
 pub struct Snapshot {
-    pub table: HelperRegistry,
+    pub table: Arc<HelperRegistry>,
     /// A version no newer than `table`, so comparing it against [`SharedHelpers::version`] never misses a change.
     pub version: u64,
 }

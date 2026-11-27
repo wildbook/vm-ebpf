@@ -153,8 +153,9 @@ pub struct VmMemory {
     passthrough: Passthrough,
 }
 
-/// The last epoch any `VmMemory` took.
-static EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Next 2^32-epoch block handed to a `VmMemory` on its first mapping (or after 2^32 remaps), so per-mapping epoch
+/// bumps stay local without global atomic contention.
+static EPOCH_BLOCK: AtomicU64 = AtomicU64::new(1 << 32);
 
 /// The last ID any `VmMemory` took.
 static LAST_ID: AtomicU64 = AtomicU64::new(0);
@@ -368,7 +369,18 @@ impl VmMemory {
         }
         self.lens[idx] = len;
         self.perms[idx] = perms;
-        self.epoch = EPOCH.fetch_add(1, Relaxed) + 1;
+        self.bump_epoch();
+    }
+
+    /// Advance to a non-zero epoch no `VmMemory` has used before, claiming a new 2^32-epoch block only on the first
+    /// mapping or after 2^32 remaps.
+    fn bump_epoch(&mut self) {
+        let next = self.epoch.wrapping_add(1);
+        if self.epoch == 0 || next & 0xFFFF_FFFF == 0 {
+            self.epoch = EPOCH_BLOCK.fetch_add(1 << 32, Relaxed) | 1;
+        } else {
+            self.epoch = next;
+        }
     }
 
     fn free(&self, idx: usize) {
@@ -1113,7 +1125,7 @@ mod tests {
             asm.stxw(R6, 4, R7);
             asm.call(1).ldxw(R0, if old { R6 } else { R0 }, 0).add64(R0, R7).exit();
             let code = rvm_core::Code::new(rvm_core::Instruction::decode(&asm.assemble().unwrap()));
-            let result = Executor::new(helpers.clone(), stack_top, &config).call(&code, &mut mem, 0, &[]);
+            let result = Executor::new(Arc::new(helpers.clone()), stack_top, &config).call(&code, &mut mem, 0, &[]);
             (result, base)
         };
         assert_eq!(run(false).0.unwrap(), 21);
@@ -1280,7 +1292,7 @@ mod tests {
             let len = config.frame_size as usize;
             let stack_top = mem.map_any(STACK_REGION, len, Perms::RW).unwrap() + config.frame_size;
 
-            let mut executor = Executor::new(HelperRegistry::default(), stack_top, &config);
+            let mut executor = Executor::new(Arc::new(HelperRegistry::default()), stack_top, &config);
             assert_eq!(executor.call(&code, &mut mem, 0, &[next]).unwrap(), 2 + 2 + 3);
             // the first 64 KiB fault
             assert!(executor.call(&code, &mut mem, 0, &[RAW_START - 8]).is_err());

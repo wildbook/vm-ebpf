@@ -1,6 +1,7 @@
 //! Runs eBPF bytecode on rvm-core and dispatches helper calls to a [`HelperRegistry`].
 
 use std::fmt;
+use std::sync::Arc;
 
 use rvm_core::{
     Callee, Code, Context, Host, Interpreter, Native, NativeCall, Reason, StackArgs, MAX_STACK_ARGS, METERED,
@@ -42,7 +43,7 @@ pub struct Executor {
 impl Executor {
     /// An executor whose calls start with r10 at `stack_top`, with the frame size, instruction limit and raw calls of
     /// `config`.
-    pub fn new(helpers: HelperRegistry, stack_top: u64, config: &VmConfig) -> Self {
+    pub fn new(helpers: Arc<HelperRegistry>, stack_top: u64, config: &VmConfig) -> Self {
         let host = HostCalls {
             registry: helpers,
             state: HostState::default(),
@@ -63,7 +64,7 @@ impl Executor {
     }
 
     /// Replace the extern table that helper and kfunc calls use.
-    pub fn set_helpers(&mut self, helpers: HelperRegistry) {
+    pub fn set_helpers(&mut self, helpers: Arc<HelperRegistry>) {
         self.interp.host.registry = helpers;
     }
 
@@ -327,7 +328,7 @@ fn failure(stop: Stop, pc: u64) -> VmError {
 
 /// The extern table and the state that helper, kfunc and `callx` calls reach from inside [`Interpreter::run`].
 struct HostCalls {
-    registry: HelperRegistry,
+    registry: Arc<HelperRegistry>,
     state: HostState,
     /// Why the host call that stopped the run did, until the executor takes it.
     stop: Option<Stop>,
@@ -471,7 +472,7 @@ mod tests {
         let code = Code::new(Instruction::decode(code));
         let len = config.frame_size as usize;
         let stack_top = memory.map_any(STACK_REGION, len, Perms::RW).unwrap() + config.frame_size;
-        Executor::new(helpers.clone(), stack_top, config).call(&code, &mut memory, 0, &[])
+        Executor::new(Arc::new(helpers.clone()), stack_top, config).call(&code, &mut memory, 0, &[])
     }
 
     fn run(asm: &Assembler) -> Result<u64> {

@@ -1,5 +1,5 @@
 //! Locks. The std locks here ignore poisoning: every structure behind them stays valid if a holder panics.
-//! [`TryLock`] never waits, and [`Published`] spins on one only for an `Arc` clone or swap.
+//! [`TryLock`] never waits, and [`Published`] holds a `Mutex` only for an `Arc` clone or swap.
 
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
@@ -90,36 +90,26 @@ impl<T> Drop for TryLockGuard<'_, T> {
     }
 }
 
-/// An `Arc<T>` that readers clone and writers replace, behind a [`TryLock`] held only for that clone or swap. Neither
-/// waits on the other's work, and nothing here needs the OS to park a thread.
+/// An `Arc<T>` that readers clone and writers replace, behind a `Mutex` held only for that clone or swap.
 pub struct Published<T: ?Sized> {
-    value: TryLock<Arc<T>>,
+    value: Mutex<Arc<T>>,
 }
 
 impl<T: ?Sized> Published<T> {
     pub fn new(value: Arc<T>) -> Self {
         Self {
-            value: TryLock::new(value),
+            value: Mutex::new(value),
         }
     }
 
     /// The current value.
     pub fn get(&self) -> Arc<T> {
-        self.with(|value| value.clone())
+        lock(&self.value).clone()
     }
 
     /// Publish `value` and return the previous one, which the caller drops outside the lock.
     pub fn replace(&self, value: Arc<T>) -> Arc<T> {
-        self.with(|current| std::mem::replace(current, value))
-    }
-
-    fn with<R>(&self, f: impl FnOnce(&mut Arc<T>) -> R) -> R {
-        loop {
-            if let Some(mut value) = self.value.try_lock() {
-                return f(&mut value);
-            }
-            std::hint::spin_loop();
-        }
+        std::mem::replace(&mut *lock(&self.value), value)
     }
 }
 
