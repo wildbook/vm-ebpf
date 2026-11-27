@@ -940,10 +940,14 @@ unsafe impl Memory for VmMemory {
 
     // The native function reaches the bytes in place, so they need the guest's permissions for its access, which the
     // fits of 1-byte accesses give: the region's length where its perms allow the access, else 0. Every guest address
-    // is its host address under the region's tag. An empty buffer may be null, as C passes it, so it only loses its
-    // tag.
+    // is its host address under the region's tag. An empty buffer gets a canonical non-null, 16-byte-aligned dangling
+    // address regardless of the guest pointer, so Rust and C natives never receive NULL or an unaligned/forged pointer.
     #[inline(always)]
     fn native_ptr(&self, addr: u64, len: u64, write: bool) -> Result<u64, u64> {
+        const EMPTY_NATIVE_PTR: u64 = 16;
+        if len == 0 {
+            return Ok(EMPTY_NATIVE_PTR);
+        }
         let idx = region_of(addr);
         let mut fits = self.read_fits[0][idx];
         if write {
@@ -951,7 +955,7 @@ unsafe impl Memory for VmMemory {
         }
         let at = addr.wrapping_sub(self.bases[idx]);
         let host = addr & (region_tag(1) - 1);
-        match (at < fits && len <= fits - at) || len == 0 {
+        match at < fits && len <= fits - at {
             true => Ok(host),
             false => Err(self.unreachable_byte(addr, if write { Perms::RW } else { Perms::R })),
         }
@@ -1352,5 +1356,17 @@ mod tests {
         let len = len as u64;
         let ok = perms.0 & need.0 == need.0 && len <= region_len && off <= region_len - len;
         ok.then(|| host + off as usize)
+    }
+
+    #[test]
+    fn native_ptr_empty_returns_canonical_aligned_address() {
+        let mut mem = VmMemory::new();
+        let base = mem.map_any(1, 64, Perms::RW).unwrap();
+        for addr in [0, 1, 0xDEAD_BEEF, base, base + 1, region_tag(7) | 0x1234] {
+            for write in [false, true] {
+                let ptr = mem.native_ptr(addr, 0, write).unwrap();
+                assert_eq!(ptr, 16, "addr={addr:#x} write={write}");
+            }
+        }
     }
 }

@@ -146,9 +146,14 @@ pub unsafe trait Memory {
     /// call ([`Code::bind_native`](crate::Code::bind_native)) gets in place of `addr` and reads, or with `write` reads
     /// and writes. Fails with the error of the first of those bytes the guest may not access so.
     ///
+    /// When `len` is 0, implementations should return a canonical non-null, aligned dangling address (such as `16`)
+    /// rather than forwarding an unchecked or null guest pointer, so Rust and C natives can pass the pointer directly
+    /// to zero-length slice or byte operations without undefined behavior.
+    ///
     /// The host bytes must stay valid for that access until the memory next changes its mapping, which no native
-    /// function can do. They may instead be host memory that the embedder lets the guest name directly, as a
-    /// [`Window`] may cover.
+    /// function can do, and the address must carry provenance independent of any `&self`/`&mut self` reference to the
+    /// memory (as [`Window::new`] requires), so subsequent `&mut self` calls on the memory cannot invalidate it. They
+    /// may instead be host memory that the embedder lets the guest name directly, as a [`Window`] may cover.
     fn native_ptr(&self, addr: u64, len: u64, write: bool) -> Result<u64, Self::Error>;
 }
 

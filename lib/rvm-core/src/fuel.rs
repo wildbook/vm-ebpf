@@ -246,19 +246,27 @@ mod metered {
             }
         }
 
-        /// The table [`Interpreter::run`] starts through. The reference outlives the borrow of the meter, as the
-        /// table lives in static memory.
+        /// The table [`Interpreter::run`] starts through, without modifying `left`.
         #[inline(always)]
-        pub fn start<'a>(&self) -> &'a Table<M, H> {
+        fn start_table<'a>(&self) -> &'a Table<M, H> {
             // SAFETY: `new` took the pointer from a table in static memory
             unsafe { self.start.as_ref() }
+        }
+
+        /// The table [`Interpreter::run`] starts through. Resets `left` to `limit` so an unwound panic during a short
+        /// block cannot leave `left` negative and bypass fuel on the next run. The reference outlives the borrow of
+        /// the meter, as the table lives in static memory.
+        #[inline(always)]
+        pub fn start<'a>(&mut self) -> &'a Table<M, H> {
+            self.left = self.limit;
+            self.start_table()
         }
 
         /// The table [`Interpreter::resume`] continues through at `pc` of `code`, with the fuel left: a metered run
         /// enters the block there.
         pub fn resume<'a>(&mut self, code: Slots, pc: u64) -> &'a Table<M, H> {
             if !self.metered || code.get(pc).is_none() {
-                return self.start();
+                return self.start_table();
             }
             // SAFETY: the code has a slot at `pc`
             let rest = unsafe { code.rests().of(code, Ip::at(code, pc)) };
@@ -443,7 +451,7 @@ mod unmetered {
 
     impl<M: Memory, H: Host<M>> Meter<M, H> {
         #[inline(always)]
-        pub fn start<'a>(&self) -> &'a Table<M, H> {
+        pub fn start<'a>(&mut self) -> &'a Table<M, H> {
             &Tables::<M, H>::PLAIN
         }
 
@@ -467,5 +475,82 @@ mod unmetered {
         pub fn set_left(&mut self, _: u64) {}
 
         pub fn settle<E>(&mut self, _: Slots, _: Option<Ip>, _: &mut Reason<E>) {}
+    }
+}
+
+#[cfg(all(test, feature = "fuel"))]
+mod tests {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    use crate::{Callee, Code, Context, Host, Instruction, Interpreter, Memory, NativeCall, Reason};
+
+    struct PanicMemory {
+        panic_on_load: bool,
+    }
+
+    // SAFETY: uses default `window` (`Window::NONE`) and `epoch` (`0`).
+    unsafe impl Memory for PanicMemory {
+        type Error = ();
+
+        fn load_u8(&self, _addr: u64) -> Result<u8, ()> {
+            assert!(!self.panic_on_load, "memory load panicked");
+            Ok(0)
+        }
+
+        fn store_u8(&mut self, _addr: u64, _value: u8) -> Result<(), ()> {
+            Ok(())
+        }
+
+        fn native_ptr(&self, _: u64, _: u64, _: bool) -> Result<u64, ()> {
+            Err(())
+        }
+    }
+
+    struct NoHost;
+    impl Host<PanicMemory> for NoHost {
+        fn call_helper(&mut self, _: &mut Context<PanicMemory>, _: u32) -> Option<u64> {
+            None
+        }
+        fn call_kfunc(&mut self, _: &mut Context<PanicMemory>, _: u32) -> Option<u64> {
+            None
+        }
+        fn call_indirect(&mut self, _: &mut Context<PanicMemory>, _: u64, _: NativeCall<'_, ()>) -> Option<Callee> {
+            None
+        }
+    }
+
+    /// A caught panic inside a custom `Memory` during a short-fuel block must not leave `meter.left` negative and
+    /// bypass the fuel limit on the next `run()`.
+    #[test]
+    fn panic_in_short_block_does_not_bypass_fuel() {
+        // 5-instruction single basic block:
+        //   0: r0 = *(u8 *)(r1 + 0)   (ldxb)
+        //   1: r0 += 1
+        //   2: r0 += 1
+        //   3: r0 += 1
+        //   4: exit
+        let insns = [
+            Instruction(u64::from_le_bytes([0x71, 0x10, 0, 0, 0, 0, 0, 0])),
+            Instruction(u64::from_le_bytes([0x07, 0x00, 0, 0, 1, 0, 0, 0])),
+            Instruction(u64::from_le_bytes([0x07, 0x00, 0, 0, 1, 0, 0, 0])),
+            Instruction(u64::from_le_bytes([0x07, 0x00, 0, 0, 1, 0, 0, 0])),
+            Instruction(u64::from_le_bytes([0x95, 0x00, 0, 0, 0, 0, 0, 0])),
+        ];
+        let code = Code::new(insns);
+        let mut interp = Interpreter::new(512, NoHost);
+        interp.set_limit(Some(2));
+
+        let mut mem = PanicMemory { panic_on_load: true };
+        let res = catch_unwind(AssertUnwindSafe(|| {
+            let mut ctx = Context::new(&mut mem);
+            interp.run(&mut ctx, &code, 0)
+        }));
+        assert!(res.is_err());
+
+        mem.panic_on_load = false;
+        let mut ctx = Context::new(&mut mem);
+        let stop = interp.run(&mut ctx, &code, 0);
+        assert_eq!(stop.reason, Reason::OutOfFuel);
+        assert_eq!(stop.pc, 2);
     }
 }

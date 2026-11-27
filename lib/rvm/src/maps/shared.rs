@@ -44,48 +44,71 @@ impl SharedMaps {
         }
     }
 
-    /// The shared instance for `def`, created by the first program that declares it, which pays for it from `budget`.
-    /// `None` if maps with this name aren't shared.
-    pub fn bind(&self, def: &MapDef, budget: &mut MemoryBudget) -> Result<Option<Arc<SharedMap>>> {
+    /// Bind every shared map in `defs`, validating layout, region limits and `budget`, and staging any newly created
+    /// instances until `build_private` succeeds. If any map or `build_private` fails, no new shared map is committed.
+    pub(super) fn bind_all(
+        &self,
+        defs: &[MapDef],
+        budget: &mut MemoryBudget,
+        build_private: impl FnOnce(&[bool], &mut MemoryBudget) -> Result<()>,
+    ) -> Result<Vec<Option<Arc<SharedMap>>>> {
         use crate::layout::{CODE_REGION, SHARED_MAPS_FIRST_REGION};
 
         let mut state = lock(&self.state);
-        if let Some(map) = state.bound.iter().find(|m| m.def.name == def.name) {
-            if map.def != *def {
-                return Err(LinkError::MapMismatch(def.name.clone()).into());
-            }
-            return Ok(Some(map.clone()));
-        }
-        let Some(&Declared { spacing, .. }) = state.declared.iter().find(|d| d.name == def.name) else {
-            return Ok(None);
-        };
+        let mut is_shared = Vec::with_capacity(defs.len());
+        let mut bound = Vec::with_capacity(defs.len());
+        let mut staged = Vec::new();
 
-        let region = SHARED_MAPS_FIRST_REGION + state.next_region;
-        if region >= CODE_REGION {
-            return Err(LinkError::InvalidMap(format!("too many shared maps for {}", def.name)).into());
+        for def in defs {
+            if let Some(map) = state.bound.iter().find(|m| m.def.name == def.name) {
+                if map.def != *def {
+                    return Err(LinkError::MapMismatch(def.name.clone()).into());
+                }
+                is_shared.push(true);
+                bound.push(Some(map.clone()));
+                continue;
+            }
+            let Some(&Declared { spacing, .. }) = state.declared.iter().find(|d| d.name == def.name) else {
+                is_shared.push(false);
+                bound.push(None);
+                continue;
+            };
+
+            let region = SHARED_MAPS_FIRST_REGION + state.next_region + staged.len();
+            if region >= CODE_REGION {
+                return Err(LinkError::InvalidMap(format!("too many shared maps for {}", def.name)).into());
+            }
+            let align = match spacing {
+                ValueSpacing::Packed => VALUE_ALIGN,
+                ValueSpacing::CacheLine => CACHE_LINE,
+            };
+            let stride = u64::from(def.value_size).next_multiple_of(align);
+            let values = stride * u64::from(def.max_entries);
+            budget.take(values)?;
+            let storage = Arc::new(SharedBuffer::new(values as usize)?);
+            let index = match def.kind {
+                MapKind::Array => None,
+                MapKind::Hash => Some(RwLock::new(HashIndex::new(def.key_size, def.max_entries, budget)?)),
+            };
+            let map = Arc::new(SharedMap {
+                def: def.clone(),
+                region,
+                stride,
+                storage,
+                index,
+            });
+            staged.push(map.clone());
+            is_shared.push(true);
+            bound.push(Some(map));
         }
-        let align = match spacing {
-            ValueSpacing::Packed => VALUE_ALIGN,
-            ValueSpacing::CacheLine => CACHE_LINE,
-        };
-        let stride = u64::from(def.value_size).next_multiple_of(align);
-        let values = stride * u64::from(def.max_entries);
-        budget.take(values)?;
-        let storage = Arc::new(SharedBuffer::new(values as usize)?);
-        let index = match def.kind {
-            MapKind::Array => None,
-            MapKind::Hash => Some(RwLock::new(HashIndex::new(def.key_size, def.max_entries, budget)?)),
-        };
-        let map = Arc::new(SharedMap {
-            def: def.clone(),
-            region,
-            stride,
-            storage,
-            index,
-        });
-        state.next_region += 1;
-        state.bound.push(map.clone());
-        Ok(Some(map))
+
+        build_private(&is_shared, budget)?;
+
+        let added = staged.len();
+        state.bound.reserve(added);
+        state.bound.extend(staged);
+        state.next_region += added;
+        Ok(bound)
     }
 }
 

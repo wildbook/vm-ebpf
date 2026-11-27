@@ -81,16 +81,10 @@ impl Status {
 ///
 /// # Safety
 ///
-/// `image` must point to `len` readable bytes, and `program` must be valid for writes.
+/// `image` must point to `len` readable bytes when `len` is not 0, and `program` must be valid for writes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rvm_load(image: *const u8, len: usize, program: *mut *mut RvmProgram) -> Status {
-    let options = RvmOptions {
-        size: size_of::<RvmOptions>(),
-        natives: std::ptr::null(),
-        native_count: 0,
-        flags: 0,
-    };
-    unsafe { rvm_load_with(image, len, &options, program) }
+    unsafe { rvm_load_with(image, len, std::ptr::null(), program) }
 }
 
 /// A native function the image imports by name; `rvm_native` in the header.
@@ -125,14 +119,14 @@ const RAW_POINTERS: u32 = 2;
 /// `RVM_RAW_CALLS`: `rvm::RawCalls::on`.
 const RAW_CALLS: u32 = 4;
 
-/// [`rvm_load`] with `options`: its natives registered as `rvm::Vm::register_native` registers them, and the memory
-/// mode and raw calls its flags name.
+/// [`rvm_load`] with `options` (or default options if `options` is null): its natives registered as
+/// `rvm::Vm::register_native` registers them, and the memory mode and raw calls its flags name.
 ///
 /// # Safety
 ///
-/// As [`rvm_load`]; `options` must point to an `rvm_options` whose `natives` point to `native_count` entries. Each
-/// function must meet the contract of `rvm::Vm::register_native`, and the host those of `rvm::Passthrough::on`,
-/// `rvm::Passthrough::untagged` and `rvm::RawCalls::on` for the flags it sets.
+/// As [`rvm_load`]; when non-null, `options` must point to an `rvm_options` whose `natives` point to `native_count`
+/// entries when `native_count` is not 0. Each function must meet the contract of `rvm::Vm::register_native`, and the
+/// host those of `rvm::Passthrough::on`, `rvm::Passthrough::untagged` and `rvm::RawCalls::on` for the flags it sets.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rvm_load_with(
     image: *const u8,
@@ -140,18 +134,32 @@ pub unsafe extern "C" fn rvm_load_with(
     options: *const RvmOptions,
     program: *mut *mut RvmProgram,
 ) -> Status {
-    // the size comes first in every layout, and says whether the rest is this one
-    if unsafe { options.cast::<usize>().read() } != size_of::<RvmOptions>() {
+    if program.is_null() {
         return Status::Argument;
     }
-    let options = unsafe { &*options };
-    if options.flags & !(UNTAGGED | RAW_POINTERS | RAW_CALLS) != 0 {
+    let Some(bytes) = (unsafe { slice_or_empty(image, len) }) else {
         return Status::Argument;
-    }
+    };
 
-    let bytes = unsafe { slice_or_empty(image, len) };
-    let mut list = Vec::with_capacity(options.native_count);
-    for native in unsafe { slice_or_empty(options.natives, options.native_count) } {
+    let (flags, natives): (u32, &[RvmNative]) = if options.is_null() {
+        (0, &[])
+    } else {
+        // the size comes first in every layout, and says whether the rest is this one
+        if unsafe { options.cast::<usize>().read() } != size_of::<RvmOptions>() {
+            return Status::Argument;
+        }
+        let options = unsafe { &*options };
+        if options.flags & !(UNTAGGED | RAW_POINTERS | RAW_CALLS) != 0 {
+            return Status::Argument;
+        }
+        let Some(natives) = (unsafe { slice_or_empty(options.natives, options.native_count) }) else {
+            return Status::Argument;
+        };
+        (options.flags, natives)
+    };
+
+    let mut list = Vec::with_capacity(natives.len());
+    for native in natives {
         let name = unsafe { str_or_none(native.name, native.name_len) };
         let (Some(name), Some(sig)) = (name, native_sig(native)) else {
             return Status::Argument;
@@ -161,12 +169,12 @@ pub unsafe extern "C" fn rvm_load_with(
 
     // SAFETY: the caller's, for each flag
     let (passthrough, raw_calls) = unsafe {
-        let passthrough = match options.flags {
+        let passthrough = match flags {
             flags if flags & UNTAGGED != 0 => Passthrough::untagged(),
             flags if flags & RAW_POINTERS != 0 => Passthrough::on(),
             _ => Passthrough::OFF,
         };
-        let raw_calls = match options.flags & RAW_CALLS {
+        let raw_calls = match flags & RAW_CALLS {
             0 => RawCalls::OFF,
             _ => RawCalls::on(),
         };
@@ -220,6 +228,9 @@ pub unsafe extern "C" fn rvm_free(program: *mut RvmProgram) {
 /// `program` must be a live program from [`rvm_load`], and `addr` must be valid for writes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rvm_map(program: *mut RvmProgram, len: usize, addr: *mut u64) -> Status {
+    if program.is_null() || addr.is_null() {
+        return Status::Argument;
+    }
     let RvmProgram { program, regions, .. } = unsafe { &mut *program };
     let mapped = program.memory_mut().map(len, Perms::RW).map(|region| {
         let base = region.base();
@@ -236,6 +247,9 @@ pub unsafe extern "C" fn rvm_map(program: *mut RvmProgram, len: usize, addr: *mu
 /// `program` must be a live program from [`rvm_load`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rvm_unmap(program: *mut RvmProgram, addr: u64) -> Status {
+    if program.is_null() {
+        return Status::Argument;
+    }
     let RvmProgram { program, regions, .. } = unsafe { &mut *program };
     let Some(found) = regions.iter().position(|region| region.base() == addr) else {
         return Status::Argument;
@@ -251,9 +265,15 @@ pub unsafe extern "C" fn rvm_unmap(program: *mut RvmProgram, addr: u64) -> Statu
 /// when `len` is 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rvm_read(program: *const RvmProgram, addr: u64, buf: *mut u8, len: usize) -> Status {
+    if program.is_null() {
+        return Status::Argument;
+    }
     let program = unsafe { &(*program).program };
     if len == 0 {
         return Status::Ok;
+    }
+    if buf.is_null() {
+        return Status::Argument;
     }
     let copied = program.memory().host_ptr(addr, len, Perms::R).map(|src| {
         // SAFETY: `host_ptr` checked that the range lies in a live region; `buf` is the caller's own memory.
@@ -271,9 +291,15 @@ pub unsafe extern "C" fn rvm_read(program: *const RvmProgram, addr: u64, buf: *m
 /// when `len` is 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rvm_write(program: *mut RvmProgram, addr: u64, buf: *const u8, len: usize) -> Status {
+    if program.is_null() {
+        return Status::Argument;
+    }
     let program = unsafe { &mut (*program).program };
     if len == 0 {
         return Status::Ok;
+    }
+    if buf.is_null() {
+        return Status::Argument;
     }
     let memory = program.memory_mut();
     let copied = memory.host_ptr(addr, len, Perms::W).map(|dst| {
@@ -284,12 +310,13 @@ pub unsafe extern "C" fn rvm_write(program: *mut RvmProgram, addr: u64, buf: *co
 }
 
 /// Calls the function `name` with up to 12 `args`, the first five in r1 to r5 and the others as a caller passes them
-/// on the stack, and stores its r0 in `*ret`.
+/// on the stack, and stores its r0 in `*ret` when `ret` is non-null.
 ///
 /// # Safety
 ///
 /// `program` must be a live program from [`rvm_load`], `name` must point to `name_len` readable bytes, `args` to
-/// `nargs` values, and `ret` must be valid for writes. `name` and `args` may be null when their length is 0.
+/// `nargs` values, and `ret`, if non-null, must be valid for writes. `name` and `args` may be null when their length
+/// is 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rvm_call(
     program: *mut RvmProgram,
@@ -299,11 +326,16 @@ pub unsafe extern "C" fn rvm_call(
     nargs: usize,
     ret: *mut u64,
 ) -> Status {
+    if program.is_null() {
+        return Status::Argument;
+    }
     let program = unsafe { &mut (*program).program };
     let Some(name) = (unsafe { str_or_none(name, name_len) }) else {
         return Status::Argument;
     };
-    let args = unsafe { slice_or_empty(args, nargs) };
+    let Some(args) = (unsafe { slice_or_empty(args, nargs) }) else {
+        return Status::Argument;
+    };
     unsafe { finish(program.call(name, args), ret) }
 }
 
@@ -320,6 +352,9 @@ pub unsafe extern "C" fn rvm_func(
     name_len: usize,
     index: *mut usize,
 ) -> Status {
+    if program.is_null() || index.is_null() {
+        return Status::Argument;
+    }
     let functions = unsafe { &*program }.program.functions();
     let Some(name) = (unsafe { str_or_none(name, name_len) }) else {
         return Status::Argument;
@@ -331,12 +366,13 @@ pub unsafe extern "C" fn rvm_func(
     Status::Ok
 }
 
-/// Calls the function at `index` with `args` as [`rvm_call`] passes them and stores its r0 in `*ret`.
+/// Calls the function at `index` with `args` as [`rvm_call`] passes them and stores its r0 in `*ret` when `ret` is
+/// non-null.
 ///
 /// # Safety
 ///
-/// `program` must be a live program from [`rvm_load`], `args` must point to `nargs` values, and `ret` must be valid
-/// for writes. `args` may be null when `nargs` is 0.
+/// `program` must be a live program from [`rvm_load`], `args` must point to `nargs` values, and `ret`, if non-null,
+/// must be valid for writes. `args` may be null when `nargs` is 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rvm_call_func(
     program: *mut RvmProgram,
@@ -345,21 +381,29 @@ pub unsafe extern "C" fn rvm_call_func(
     nargs: usize,
     ret: *mut u64,
 ) -> Status {
+    if program.is_null() {
+        return Status::Argument;
+    }
     let RvmProgram { program, funcs, .. } = unsafe { &mut *program };
     let Some(&func) = funcs.get(index) else {
         return Status::NotFound;
     };
-    let args = unsafe { slice_or_empty(args, nargs) };
+    let Some(args) = (unsafe { slice_or_empty(args, nargs) }) else {
+        return Status::Argument;
+    };
     unsafe { finish(program.call_func(func, args), ret) }
 }
 
-/// The number of functions. Indices go from 0 to this count minus 1, in name order.
+/// The number of functions, or 0 if `program` is null. Indices go from 0 to this count minus 1, in name order.
 ///
 /// # Safety
 ///
-/// `program` must be a live program from [`rvm_load`].
+/// `program` must be null or a live program from [`rvm_load`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rvm_function_count(program: *const RvmProgram) -> usize {
+    if program.is_null() {
+        return 0;
+    }
     unsafe { &*program }.funcs.len()
 }
 
@@ -376,6 +420,9 @@ pub unsafe extern "C" fn rvm_function_name(
     name: *mut *const u8,
     name_len: *mut usize,
 ) -> Status {
+    if program.is_null() || name.is_null() || name_len.is_null() {
+        return Status::Argument;
+    }
     let functions = unsafe { &*program }.program.functions();
     let Some((found, _)) = functions.get(index) else {
         return Status::NotFound;
@@ -387,40 +434,46 @@ pub unsafe extern "C" fn rvm_function_name(
     Status::Ok
 }
 
-/// Stores the value of `result` in `*out`, or returns the error's status.
+/// Stores the value of `result` in `*out` when `out` is non-null, or returns the error's status.
 ///
 /// # Safety
 ///
-/// `out` must be valid for writes.
+/// `out`, if non-null, must be valid for writes.
 unsafe fn finish<T>(result: rvm::Result<T>, out: *mut T) -> Status {
     match result {
         Ok(value) => {
-            unsafe { out.write(value) };
+            if !out.is_null() {
+                unsafe { out.write(value) };
+            }
             Status::Ok
         }
         Err(error) => Status::of(&error),
     }
 }
 
-/// `ptr..ptr+len` as a slice; C callers pass null for empty arrays, which `slice::from_raw_parts` doesn't allow.
+/// `ptr..ptr+len` as a slice, or `None` if `ptr` is null with a non-zero `len`. C callers pass null for empty arrays,
+/// which `slice::from_raw_parts` doesn't allow.
 ///
 /// # Safety
 ///
-/// `ptr` must point to `len` readable values when `len` is not 0, and they must outlive `'a`.
-unsafe fn slice_or_empty<'a, T>(ptr: *const T, len: usize) -> &'a [T] {
+/// `ptr` must point to `len` readable values when `len` is not 0 and `ptr` is non-null, and they must outlive `'a`.
+unsafe fn slice_or_empty<'a, T>(ptr: *const T, len: usize) -> Option<&'a [T]> {
     if len == 0 {
-        return &[];
+        return Some(&[]);
     }
-    unsafe { slice::from_raw_parts(ptr, len) }
+    if ptr.is_null() {
+        return None;
+    }
+    Some(unsafe { slice::from_raw_parts(ptr, len) })
 }
 
-/// [`slice_or_empty`] as a string, or `None` if the bytes aren't UTF-8.
+/// [`slice_or_empty`] as a string, or `None` if `ptr` is null with non-zero `len` or the bytes aren't UTF-8.
 ///
 /// # Safety
 ///
 /// As [`slice_or_empty`].
 unsafe fn str_or_none<'a>(ptr: *const u8, len: usize) -> Option<&'a str> {
-    std::str::from_utf8(unsafe { slice_or_empty(ptr, len) }).ok()
+    std::str::from_utf8(unsafe { slice_or_empty(ptr, len)? }).ok()
 }
 
 #[cfg(test)]
@@ -480,5 +533,101 @@ mod tests {
             Status::Helper => "RVM_ERR_HELPER",
             Status::Other => "RVM_ERR_OTHER",
         }
+    }
+
+    #[test]
+    fn null_pointer_guards() {
+        use std::ptr;
+
+        use super::*;
+
+        // r0 = r1 + 1; exit
+        let code = [
+            0xbf, 0x10, 0, 0, 0, 0, 0, 0, // mov64 r0, r1
+            0x07, 0x00, 0, 0, 1, 0, 0, 0, // add64 r0, 1
+            0x95, 0x00, 0, 0, 0, 0, 0, 0, // exit
+        ];
+        let bytes = rvm::Image::from_code(code.to_vec()).to_bytes();
+
+        let mut prog: *mut RvmProgram = ptr::null_mut();
+        assert!(matches!(unsafe { rvm_load(ptr::null(), 1, &mut prog) }, Status::Argument));
+        assert!(matches!(unsafe { rvm_load(bytes.as_ptr(), bytes.len(), ptr::null_mut()) }, Status::Argument));
+
+        let bad_natives = RvmOptions {
+            size: size_of::<RvmOptions>(),
+            natives: ptr::null(),
+            native_count: 1,
+            flags: 0,
+        };
+        assert!(matches!(
+            unsafe { rvm_load_with(bytes.as_ptr(), bytes.len(), &bad_natives, &mut prog) },
+            Status::Argument
+        ));
+
+        // NULL options uses defaults
+        assert!(matches!(unsafe { rvm_load_with(bytes.as_ptr(), bytes.len(), ptr::null(), &mut prog) }, Status::Ok));
+        assert!(!prog.is_null());
+
+        // map / unmap / read / write guards
+        let mut addr = 0u64;
+        assert!(matches!(unsafe { rvm_map(ptr::null_mut(), 16, &mut addr) }, Status::Argument));
+        assert!(matches!(unsafe { rvm_map(prog, 16, ptr::null_mut()) }, Status::Argument));
+        assert!(matches!(unsafe { rvm_map(prog, 16, &mut addr) }, Status::Ok));
+        assert!(matches!(unsafe { rvm_unmap(ptr::null_mut(), addr) }, Status::Argument));
+
+        let mut byte = 0u8;
+        assert!(matches!(unsafe { rvm_read(ptr::null(), addr, &mut byte, 1) }, Status::Argument));
+        assert!(matches!(unsafe { rvm_read(prog, addr, ptr::null_mut(), 1) }, Status::Argument));
+        assert!(matches!(unsafe { rvm_read(prog, addr, ptr::null_mut(), 0) }, Status::Ok));
+
+        assert!(matches!(unsafe { rvm_write(ptr::null_mut(), addr, &byte, 1) }, Status::Argument));
+        assert!(matches!(unsafe { rvm_write(prog, addr, ptr::null(), 1) }, Status::Argument));
+        assert!(matches!(unsafe { rvm_write(prog, addr, ptr::null(), 0) }, Status::Ok));
+        assert!(matches!(unsafe { rvm_unmap(prog, addr) }, Status::Ok));
+
+        // function query guards
+        assert_eq!(unsafe { rvm_function_count(ptr::null()) }, 0);
+        assert_eq!(unsafe { rvm_function_count(prog) }, 1);
+
+        let mut idx = 0usize;
+        let main = b"main";
+        assert!(matches!(unsafe { rvm_func(ptr::null(), main.as_ptr(), main.len(), &mut idx) }, Status::Argument));
+        assert!(matches!(unsafe { rvm_func(prog, ptr::null(), 1, &mut idx) }, Status::Argument));
+        assert!(matches!(unsafe { rvm_func(prog, main.as_ptr(), main.len(), ptr::null_mut()) }, Status::Argument));
+        assert!(matches!(unsafe { rvm_func(prog, main.as_ptr(), main.len(), &mut idx) }, Status::Ok));
+
+        let mut name_ptr = ptr::null();
+        let mut name_len = 0usize;
+        assert!(matches!(
+            unsafe { rvm_function_name(ptr::null(), idx, &mut name_ptr, &mut name_len) },
+            Status::Argument
+        ));
+        assert!(matches!(unsafe { rvm_function_name(prog, idx, ptr::null_mut(), &mut name_len) }, Status::Argument));
+        assert!(matches!(unsafe { rvm_function_name(prog, idx, &mut name_ptr, ptr::null_mut()) }, Status::Argument));
+
+        // call / call_func guards and ret == NULL
+        let arg = 41u64;
+        let mut ret = 0u64;
+        assert!(matches!(
+            unsafe { rvm_call(ptr::null_mut(), main.as_ptr(), main.len(), &arg, 1, &mut ret) },
+            Status::Argument
+        ));
+        assert!(matches!(
+            unsafe { rvm_call(prog, ptr::null(), 1, ptr::null(), 0, ptr::null_mut()) },
+            Status::Argument
+        ));
+        assert!(matches!(
+            unsafe { rvm_call(prog, main.as_ptr(), main.len(), ptr::null(), 1, ptr::null_mut()) },
+            Status::Argument
+        ));
+        assert!(matches!(unsafe { rvm_call(prog, main.as_ptr(), main.len(), &arg, 1, ptr::null_mut()) }, Status::Ok));
+        assert!(matches!(unsafe { rvm_call(prog, main.as_ptr(), main.len(), &arg, 1, &mut ret) }, Status::Ok));
+        assert_eq!(ret, 42);
+
+        assert!(matches!(unsafe { rvm_call_func(ptr::null_mut(), idx, &arg, 1, &mut ret) }, Status::Argument));
+        assert!(matches!(unsafe { rvm_call_func(prog, idx, ptr::null(), 1, ptr::null_mut()) }, Status::Argument));
+        assert!(matches!(unsafe { rvm_call_func(prog, idx, &arg, 1, ptr::null_mut()) }, Status::Ok));
+
+        unsafe { rvm_free(prog) };
     }
 }

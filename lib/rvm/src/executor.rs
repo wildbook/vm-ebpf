@@ -242,6 +242,15 @@ fn run_on(
     }
 }
 
+/// Restores `state.fuel` to [`CallerFuel::Unknown`] when [`call_with_fuel`] returns or unwinds.
+struct FuelGuard<'a>(&'a mut HostState);
+
+impl Drop for FuelGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fuel = CallerFuel::Unknown;
+    }
+}
+
 /// Call the host function in extern-table `slot`, which stopped the call at `pc` asking for the caller's fuel, again
 /// with the fuel the caller has left, and return where the caller continues. The caller continues with the fuel the
 /// function leaves.
@@ -259,16 +268,16 @@ fn call_with_fuel(
     let stack = code.passes_stack_args(pc).then(|| *interp.stack_args());
     let host = &mut interp.host;
     host.state.fuel = CallerFuel::Left(fuel);
+    let state = FuelGuard(&mut host.state);
     let mut stop = None;
     let r0 = match &stack {
-        Some(stack) => host
-            .registry
-            .call_slot_stack(slot, ctx, &mut host.state, &mut stop, stack),
-        None => host.registry.call_slot(slot, ctx, &mut host.state, &mut stop),
+        Some(stack) => host.registry.call_slot_stack(slot, ctx, state.0, &mut stop, stack),
+        None => host.registry.call_slot(slot, ctx, state.0, &mut stop),
     };
-    let CallerFuel::Left(left) = std::mem::replace(&mut host.state.fuel, CallerFuel::Unknown) else {
+    let CallerFuel::Left(left) = state.0.fuel else {
         unreachable!("the fuel stays while the function runs")
     };
+    drop(state);
     interp.set_fuel(left);
     ctx.regs[0] = r0.ok_or_else(|| failure(stop.expect("stopped host call left no reason"), pc))?;
     Ok(pc + 1)

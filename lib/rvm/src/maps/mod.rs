@@ -127,41 +127,56 @@ enum HashRef<'a> {
 impl Maps {
     /// Lay out `defs`, binding those declared shared to the VM-wide instance, and return the maps and the size of the
     /// private region they need. Takes the memory of the values and indexes from `budget` before allocating.
+    /// Validates every definition and private map before committing any newly created shared map.
     pub fn new(defs: Vec<MapDef>, shared: &SharedMaps, budget: &mut MemoryBudget) -> Result<(Self, usize)> {
-        let mut maps = Self::default();
-        let mut len = 0;
-        for def in defs {
-            check_def(&def)?;
-            if maps.by_name.insert(def.name.clone(), maps.maps.len() as u32).is_some() {
+        let mut by_name = HashMap::with_capacity(defs.len());
+        for (i, def) in defs.iter().enumerate() {
+            check_def(def)?;
+            if by_name.insert(def.name.clone(), i as u32).is_some() {
                 return Err(LinkError::InvalidMap(format!("map {}: declared twice", def.name)).into());
             }
-            let (base, stride, index) = match shared.bind(&def, budget)? {
-                Some(map) => (region_tag(map.region), map.stride, Index::Shared(map)),
-                None => {
-                    let stride = u64::from(def.value_size).next_multiple_of(VALUE_ALIGN);
-                    let base = region_tag(MAPS_REGION) + len;
-                    let end = (len + stride * u64::from(def.max_entries)).next_multiple_of(CACHE_LINE);
-                    if end > MAX_REGION_LEN as u64 {
-                        let msg = format!("map {}: maps exceed {MAX_REGION_LEN} bytes", def.name);
-                        return Err(LinkError::InvalidMap(msg).into());
-                    }
-                    budget.take(end - len)?;
-                    len = end;
-                    let index = match def.kind {
-                        MapKind::Array => Index::Array,
-                        MapKind::Hash => Index::Hash(HashIndex::new(def.key_size, def.max_entries, budget)?),
-                    };
-                    (base, stride, index)
+        }
+
+        let mut len = 0u64;
+        let mut private = Vec::new();
+        let bound = shared.bind_all(&defs, budget, |is_shared, budget| {
+            for (def, &shared) in defs.iter().zip(is_shared) {
+                if shared {
+                    continue;
                 }
+                let stride = u64::from(def.value_size).next_multiple_of(VALUE_ALIGN);
+                let base = region_tag(MAPS_REGION) + len;
+                let end = (len + stride * u64::from(def.max_entries)).next_multiple_of(CACHE_LINE);
+                if end > MAX_REGION_LEN as u64 {
+                    let msg = format!("map {}: maps exceed {MAX_REGION_LEN} bytes", def.name);
+                    return Err(LinkError::InvalidMap(msg).into());
+                }
+                budget.take(end - len)?;
+                len = end;
+                let index = match def.kind {
+                    MapKind::Array => Index::Array,
+                    MapKind::Hash => Index::Hash(HashIndex::new(def.key_size, def.max_entries, budget)?),
+                };
+                private.push((base, stride, index));
+            }
+            Ok(())
+        })?;
+
+        let mut private = private.into_iter();
+        let mut maps = Vec::with_capacity(defs.len());
+        for (def, shared_map) in defs.into_iter().zip(bound) {
+            let (base, stride, index) = match shared_map {
+                Some(map) => (region_tag(map.region), map.stride, Index::Shared(map)),
+                None => private.next().expect("one private layout per non-shared map"),
             };
-            maps.maps.push(Map {
+            maps.push(Map {
                 def,
                 base,
                 stride,
                 index,
             });
         }
-        Ok((maps, len as usize))
+        Ok((Self { maps, by_name }, len as usize))
     }
 
     /// Move each map's base from its link address to its guest address in `memory`, where the map regions are mapped.
@@ -329,18 +344,21 @@ enum EntriesIndex<'a> {
 }
 
 impl Entries<'_> {
-    /// Every element of an array map with its index, in index order, or the keys present in a hash map with their
-    /// values, in no particular order.
-    pub fn iter(&self) -> MapIter<'_> {
-        let slots = match &self.index {
+    fn slots(&self) -> Slots<'_> {
+        match &self.index {
             EntriesIndex::Array => Slots::Array(0..self.map.def.max_entries),
             EntriesIndex::Hash(index) => Slots::Hash(index, index.slots()),
             EntriesIndex::Shared(index) => Slots::Hash(index, index.slots()),
-        };
+        }
+    }
+
+    /// Every element of an array map with its index, in index order, or the keys present in a hash map with their
+    /// values, in no particular order.
+    pub fn iter(&self) -> MapIter<'_> {
         MapIter {
             map: self.map,
             memory: self.memory,
-            slots,
+            slots: self.slots(),
         }
     }
 
@@ -349,13 +367,13 @@ impl Entries<'_> {
     /// size from the map's keys or values.
     pub fn iter_as<K: Pod, V: Pod>(&self) -> std::result::Result<impl Iterator<Item = (K, V)> + '_, MapError> {
         check_sizes::<K, V>(&self.map.def)?;
-        Ok(self.iter().map(|(key, value)| {
+        Ok(self.slots().map(|(key, slot)| {
             let key = match key {
                 MapKey::Index(index) => bytemuck::try_pod_read_unaligned(&index.to_le_bytes()),
                 MapKey::Bytes(bytes) => bytemuck::try_pod_read_unaligned(bytes),
             };
-            let value = bytemuck::try_pod_read_unaligned(value);
-            (key.expect("key size checked"), value.expect("value size checked"))
+            let value = self.memory.read_pod(self.map.addr(slot)).expect("map slots are mapped");
+            (key.expect("key size checked"), value)
         }))
     }
 }
@@ -390,21 +408,38 @@ enum Slots<'a> {
     Hash(&'a HashIndex, hash_table::Iter<'a, u32>),
 }
 
-impl<'a> Iterator for MapIter<'a> {
-    type Item = (MapKey<'a>, &'a [u8]);
+impl<'a> Iterator for Slots<'a> {
+    type Item = (MapKey<'a>, u32);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let (key, slot) = match &mut self.slots {
+        match self {
             Slots::Array(indices) => {
                 let index = indices.next()?;
-                (MapKey::Index(index), index)
+                Some((MapKey::Index(index), index))
             }
             Slots::Hash(index, slots) => {
                 let index: &'a HashIndex = index;
                 let slot = *slots.next()?;
-                (MapKey::Bytes(index.key(slot)), slot)
+                Some((MapKey::Bytes(index.key(slot)), slot))
             }
-        };
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Slots::Array(indices) => indices.size_hint(),
+            Slots::Hash(_, slots) => slots.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for Slots<'_> {}
+
+impl<'a> Iterator for MapIter<'a> {
+    type Item = (MapKey<'a>, &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (key, slot) = self.slots.next()?;
         let (addr, len) = (self.map.addr(slot), self.map.def.value_size as usize);
         // a value of a shared map is a reference into shared memory, which the `Vm::share_region` contract covers
         let value = self.memory.slice(addr, len, Perms::NONE).expect("map slots are mapped");
@@ -412,10 +447,7 @@ impl<'a> Iterator for MapIter<'a> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        match &self.slots {
-            Slots::Array(indices) => indices.size_hint(),
-            Slots::Hash(_, slots) => slots.size_hint(),
-        }
+        self.slots.size_hint()
     }
 }
 

@@ -386,3 +386,162 @@ fn panic_during_borrowed_call() {
     fail.store(false, Ordering::Relaxed);
     assert_eq!(caller.call("run", &[]).unwrap(), 42);
 }
+
+/// Borrowing a buffer larger than `MAX_REGION_LEN` from a passthrough caller returns a `MemoryError` instead of
+/// aborting inside `map_host_any`.
+#[test]
+fn borrow_over_max_region_len_under_passthrough_returns_error() {
+    use ebpf_asm::{Assembler, R1, R2};
+
+    let vm = Vm::new();
+    let callee = Plugin::new("callee", vm.load_elf(&object("tests/borrow_callee.o")).unwrap());
+    vm.export(&callee, "sum").unwrap();
+
+    let mut asm = Assembler::new();
+    asm.lddw(R1, rvm::RAW_START as i64)
+        .lddw(R2, (rvm::MAX_REGION_LEN + 1) as i64)
+        .call(0)
+        .exit();
+    let mut image = Image::from_code(asm.assemble().unwrap());
+    image.externs.push((
+        4,
+        Import::Name {
+            name: "sum".into(),
+            stack: false,
+        },
+    ));
+    // SAFETY: the guest never dereferences the raw address; the borrow check rejects the oversize length before mapping
+    let passthrough = unsafe { Passthrough::on() };
+    let mut caller = vm.loader().passthrough(passthrough).load_image(image).unwrap();
+    let err = caller.call("main", &[]).unwrap_err();
+    let VmError::Host(HostError::Plugin { error, .. }) = &err else {
+        panic!("expected plugin error, got {err:?}");
+    };
+    assert!(
+        matches!(
+            **error,
+            VmError::Memory(rvm::MemoryError {
+                addr,
+                size,
+            }) if addr == rvm::RAW_START && size == rvm::MAX_REGION_LEN + 1
+        ),
+        "{err:?}"
+    );
+}
+
+/// A failed image load must not commit newly created shared maps or poison their names for later loads.
+#[test]
+fn failed_load_does_not_poison_shared_map() {
+    use ebpf_asm::{Assembler, R0};
+
+    let vm = Vm::new();
+    // SAFETY: single-threaded test
+    unsafe { vm.share_map("hits", ValueSpacing::CacheLine) };
+
+    // Build an image that declares "hits" with a wrong value_size (4 instead of 8) AND imports a missing extern.
+    let mut asm = Assembler::new();
+    asm.call(0).mov64_imm(R0, 0).exit();
+    let mut bad_extern = Image::from_code(asm.assemble().unwrap());
+    bad_extern.maps.push(rvm::MapDef {
+        name: "hits".into(),
+        kind: rvm::MapKind::Array,
+        key_size: 4,
+        value_size: 4,
+        max_entries: 1,
+    });
+    bad_extern.externs.push((
+        0,
+        Import::Name {
+            name: "does_not_exist".into(),
+            stack: false,
+        },
+    ));
+    assert!(vm.load_image(bad_extern).is_err());
+
+    // Also fail inside `Maps::new` on a second map (duplicate / invalid def) after the shared map entry.
+    let mut asm = Assembler::new();
+    asm.mov64_imm(R0, 0).exit();
+    let mut bad_second_map = Image::from_code(asm.assemble().unwrap());
+    bad_second_map.maps.push(rvm::MapDef {
+        name: "hits".into(),
+        kind: rvm::MapKind::Array,
+        key_size: 4,
+        value_size: 4,
+        max_entries: 1,
+    });
+    bad_second_map.maps.push(rvm::MapDef {
+        name: "broken".into(),
+        kind: rvm::MapKind::Array,
+        key_size: 8, // invalid: array maps require 4-byte keys
+        value_size: 8,
+        max_entries: 1,
+    });
+    assert!(vm.load_image(bad_second_map).is_err());
+
+    // Loading the real `shared_counter.o` (which declares "hits" with value_size 8) must still succeed.
+    let mut prog = vm.load_elf(&object("tests/shared_counter.o")).unwrap();
+    assert_eq!(prog.call("bump", &[]).unwrap(), 1);
+}
+
+/// A caught panic inside a metered plugin export must restore the caller's fuel state so subsequent calls still meter.
+#[cfg(feature = "fuel")]
+#[test]
+fn panic_in_metered_export_restores_caller_fuel() {
+    use ebpf_asm::{Assembler, R0, R1};
+    use rvm::{ExecError, VmConfig};
+
+    let vm = Vm::with_config(VmConfig {
+        instruction_limit: 50,
+        ..VmConfig::default()
+    })
+    .unwrap();
+    let should_panic = Arc::new(AtomicBool::new(true));
+    let flag = should_panic.clone();
+    vm.register_extern("maybe_panic", move |_: ()| {
+        assert!(!flag.load(Ordering::Relaxed), "boom");
+        0u64
+    });
+
+    // Callee: calls `maybe_panic`, then loops `r1` times.
+    let mut asm = Assembler::new();
+    let spin = asm.label();
+    asm.call(0);
+    asm.bind(spin);
+    asm.sub64_imm(R1, 1).jne_imm(R1, 0, spin);
+    asm.mov64_imm(R0, 7).exit();
+    let mut callee_img = Image::from_code(asm.assemble().unwrap());
+    callee_img.externs.push((
+        0,
+        Import::Name {
+            name: "maybe_panic".into(),
+            stack: false,
+        },
+    ));
+    let callee = Plugin::new("callee", vm.load_image(callee_img).unwrap());
+    vm.export(&callee, "main").unwrap();
+
+    // Caller: calls callee::main(r1).
+    let mut asm = Assembler::new();
+    asm.call(0).exit();
+    let mut caller_img = Image::from_code(asm.assemble().unwrap());
+    caller_img.externs.push((
+        0,
+        Import::Name {
+            name: "main".into(),
+            stack: false,
+        },
+    ));
+    let mut caller = vm.load_image(caller_img).unwrap();
+
+    // First call unwinds while `call_with_fuel` is active.
+    assert!(catch_unwind(AssertUnwindSafe(|| caller.call("main", &[1]))).is_err());
+
+    // Subsequent call with a tight limit must still run out of fuel (not reuse stale `CallerFuel::Left`).
+    should_panic.store(false, Ordering::Relaxed);
+    let err = caller.call("main", &[100]).unwrap_err();
+    let VmError::Host(HostError::Plugin { error, .. }) = &err else {
+        panic!("expected plugin limit error, got {err:?}");
+    };
+    assert!(matches!(**error, VmError::Exec(ExecError::InstructionLimit { .. })), "{err:?}");
+    assert_eq!(caller.call("main", &[2]).unwrap(), 7);
+}

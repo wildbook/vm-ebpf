@@ -19,11 +19,11 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Weak};
 
-use crate::error::{HostError, Result, VmError};
+use crate::error::{HostError, MemoryError, Result, VmError};
 use crate::executor::{MAX_ARGS, REG_ARGS};
 use crate::helper::{CallerFuel, HelperContext, Stop};
 use crate::layout::{BORROW_FIRST_REGION, BORROW_REGIONS};
-use crate::memory::{Perms, VmMemory};
+use crate::memory::{Perms, VmMemory, MAX_REGION_LEN};
 use crate::program::{Borrow, Func, FuncSlot, FunctionInfo, LimitedCall, Program};
 use crate::sync::{TryLock, TryLockGuard};
 
@@ -183,6 +183,13 @@ fn call_with_borrows(
         let (Some(&addr), Some(&len)) = (args.get(arg), args.get(len_arg)) else {
             return Err(not_passed(arg.max(len_arg), args.len()));
         };
+        if len > MAX_REGION_LEN as u64 {
+            return Err(MemoryError {
+                addr,
+                size: len.min(usize::MAX as u64) as usize,
+            }
+            .into());
+        }
         let len = len as usize;
         // the caller must itself be allowed what the callee gets
         let perms = if writable { Perms::RW } else { Perms::R };

@@ -396,8 +396,6 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
     for len in [s.code.len() as u64, stack_len, s.rodata_len as u64, s.data_len as u64] {
         budget.take(len)?;
     }
-    #[cfg(feature = "maps")]
-    let (mut maps, maps_len) = Maps::new(s.maps, &shared.maps, &mut budget)?;
 
     let mut insns = Instruction::decode(s.code);
     check_stack_arguments(&insns, &s.functions)?;
@@ -411,20 +409,6 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
     let stack_top = memory.map_any(STACK_REGION, stack_len as usize, Perms::RW)? + stack_len;
     memory.map_bytes_any(RODATA_REGION, s.rodata, s.rodata_len, Perms::R)?;
     memory.map_bytes_any(DATA_REGION, s.data, s.data_len, Perms::RW)?;
-    #[cfg(feature = "maps")]
-    if maps_len != 0 {
-        memory.map_any(MAPS_REGION, maps_len, Perms::RW)?;
-    }
-    // SAFETY: the callers of `Vm::share_map`/`Vm::share_region` accepted the `Vm::share_region` contract.
-    unsafe {
-        #[cfg(feature = "maps")]
-        for map in maps.shared() {
-            memory.map_shared(map.region, map.storage.clone(), Perms::RW);
-        }
-        shared.regions.map_into(&mut memory);
-    }
-    #[cfg(feature = "maps")]
-    maps.locate(&memory);
     relocate(&s.addresses, &mut insns, &mut memory)?;
 
     let mut code = Code::new(insns);
@@ -443,6 +427,26 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
             return Err(invalid(format!("extern call at instruction {at} is not a valid call")));
         }
     }
+
+    // Bind maps only after every other check and allocation has succeeded so a failed load never leaks or poisons
+    // shared maps.
+    #[cfg(feature = "maps")]
+    let (mut maps, maps_len) = Maps::new(s.maps, &shared.maps, &mut budget)?;
+    #[cfg(feature = "maps")]
+    if maps_len != 0 {
+        memory.map_any(MAPS_REGION, maps_len, Perms::RW)?;
+    }
+    // SAFETY: the callers of `Vm::share_map`/`Vm::share_region` accepted the `Vm::share_region` contract.
+    unsafe {
+        #[cfg(feature = "maps")]
+        for map in maps.shared() {
+            memory.map_shared(map.region, map.storage.clone(), Perms::RW);
+        }
+        shared.regions.map_into(&mut memory);
+    }
+    #[cfg(feature = "maps")]
+    maps.locate(&memory);
+
     let program = Program::new(code, memory, stack_top, functions, helpers.clone(), snapshot, config);
     #[cfg(feature = "maps")]
     let program = program.with_maps(maps);

@@ -26,7 +26,7 @@ typedef enum rvm_status {
     // no function with this name
     RVM_ERR_NOT_FOUND = 3,
     // more than 12 call arguments, a length that can't be mapped, no free region to map, an address that rvm_map
-    // didn't return, a name that isn't UTF-8, or an invalid rvm_native or rvm_options
+    // didn't return, a name that isn't UTF-8, a null required pointer, or an invalid rvm_native or rvm_options
     RVM_ERR_ARGUMENT = 4,
     // the call ran more than the runtime's limit of 1,000,000 instructions (rvm's DEFAULT_INSTRUCTION_LIMIT); a
     // library built without its `fuel` feature has no limit
@@ -54,7 +54,8 @@ rvm_status rvm_load(const uint8_t *image, size_t len, rvm_program **program);
 //   and the bytes behind pointers are the guest's choice.
 // Before the call, each pointer argument is checked: the guest must be allowed to read the bytes (RVM_ARG_READ) or
 // read and write them (RVM_ARG_WRITE), one byte at the pointer or as many as its length argument holds. The function
-// then gets the host address of the bytes, and a failed check stops the guest's call with RVM_ERR_FAULT. Pointers
+// then gets the host address of the bytes (or a canonical non-null, 16-byte-aligned dangling address when the length
+// argument is 0), and a failed check stops the guest's call with RVM_ERR_FAULT. Pointers
 // inside guest memory keep the guest's region tags and don't resolve in native code; pointers the function returns
 // don't resolve in the guest. RVM_UNTAGGED and RVM_RAW_POINTERS change both. Native time doesn't count against the
 // instruction limit, and a native function can't fail the guest's call.
@@ -103,8 +104,8 @@ typedef struct rvm_options {
     uint32_t flags;
 } rvm_options;
 
-// rvm_load with `options`. RVM_ERR_ARGUMENT if `size` isn't the library's sizeof(rvm_options) or `flags` has a bit
-// the library doesn't know.
+// rvm_load with `options`, or default options when `options` is NULL. RVM_ERR_ARGUMENT if `size` isn't the library's
+// sizeof(rvm_options) or `flags` has a bit the library doesn't know.
 rvm_status rvm_load_with(const uint8_t *image, size_t len, const rvm_options *options, rvm_program **program);
 
 // Frees a program from rvm_load; NULL is ignored.
@@ -124,9 +125,9 @@ rvm_status rvm_read(const rvm_program *program, uint64_t addr, uint8_t *buf, siz
 // is 0.
 rvm_status rvm_write(rvm_program *program, uint64_t addr, const uint8_t *buf, size_t len);
 
-// Calls the function `name` with up to 12 args and stores its r0 in *ret: the first five go in r1 to r5, the others
-// where a caller passes them on its stack, so the function takes them as clang 23 compiles a function with more
-// than five parameters. name and args may be NULL when their length is 0.
+// Calls the function `name` with up to 12 args and stores its r0 in *ret (or discards it if `ret` is NULL): the first
+// five go in r1 to r5, the others where a caller passes them on its stack, so the function takes them as clang 23
+// compiles a function with more than five parameters. name and args may be NULL when their length is 0.
 rvm_status rvm_call(rvm_program *program, const char *name, size_t name_len, const uint64_t *args, size_t nargs,
                     uint64_t *ret);
 
@@ -135,9 +136,10 @@ rvm_status rvm_call(rvm_program *program, const char *name, size_t name_len, con
 // Stores the index of the function `name` in *index. name may be NULL when name_len is 0.
 rvm_status rvm_func(const rvm_program *program, const char *name, size_t name_len, size_t *index);
 
-// Calls the function at `index` like rvm_call; RVM_ERR_NOT_FOUND if index is out of range.
+// Calls the function at `index` like rvm_call (`ret` may be NULL); RVM_ERR_NOT_FOUND if index is out of range.
 rvm_status rvm_call_func(rvm_program *program, size_t index, const uint64_t *args, size_t nargs, uint64_t *ret);
 
+// Number of functions, or 0 if `program` is NULL.
 size_t rvm_function_count(const rvm_program *program);
 
 // Stores the name of the function at `index` in *name and *name_len; RVM_ERR_NOT_FOUND if index is out of range. The

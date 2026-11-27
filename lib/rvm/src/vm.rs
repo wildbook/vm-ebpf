@@ -379,7 +379,9 @@ impl Vm {
     /// declares before it calls `func`. The guest must be allowed to read the bytes, and for [`NativeArg::Write`](crate::NativeArg::Write) to
     /// write them too: one byte at the pointer, or as many as its length argument holds. `func` then gets the host
     /// address of the bytes, and a failed check stops the guest's call with
-    /// [`ExecError::MemoryFault`](crate::ExecError::MemoryFault) at the call. Untagged, every argument reaches `func`
+    /// [`ExecError::MemoryFault`](crate::ExecError::MemoryFault) at the call. When the length argument is 0, `func`
+    /// receives a canonical non-null, 16-byte-aligned dangling address (`16`) regardless of the guest pointer. Untagged,
+    /// every argument reaches `func`
     /// as the register holds it. Pointers inside guest memory, such as the fields of a struct the guest fills, keep
     /// their region tags, so a function that follows them needs `untagged`. A returned pointer reaches the guest as the
     /// host address, which guest loads and stores resolve only with [`Passthrough::on`] or `untagged`.
