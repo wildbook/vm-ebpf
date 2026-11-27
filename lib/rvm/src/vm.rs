@@ -171,7 +171,7 @@ impl RawCalls {
     ///
     /// - Arguments reach the function as the registers hold them. Nothing declares what a `callx` passes, so no
     ///   pointer is checked or converted: a pointer into the program's memory keeps its region tag, unless the
-    ///   program is [untagged](Passthrough::untagged) or strips the tag itself (`UNTAG` in `bpf/rvm_bpf.h`).
+    ///   program is [untagged](Passthrough::untagged) or converts it with `HOST()` in `bpf/rvm_bpf.h`.
     /// - The function runs unmetered: its call counts as one instruction against the instruction limit, and nothing
     ///   interrupts it.
     /// - A function that calls back into the plugin that called it gets [`VmError::PluginBusy`].

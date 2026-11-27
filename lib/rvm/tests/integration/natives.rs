@@ -208,3 +208,40 @@ fn instruction_limit_counts_native_calls() {
     let err = load(&vm_with(limited(100))).call("count", &[100]).unwrap_err();
     assert!(matches!(err, VmError::Exec(ExecError::InstructionLimit { limit: 100 })), "{err}");
 }
+
+/// A native function follows `__host` pointers that a plugin placed in a struct with `HOST()`, in every memory mode.
+#[test]
+fn native_follows_host_pointer_in_struct() {
+    #[repr(C)]
+    struct IoVec {
+        base: *const u8,
+        len: u64,
+    }
+
+    /// # Safety
+    ///
+    /// `parts` must point to `byte_len` readable bytes holding valid `IoVec`s.
+    unsafe extern "C" fn sum_iovec(parts: *const IoVec, byte_len: u64) -> u64 {
+        let count = byte_len as usize / size_of::<IoVec>();
+        let vecs = unsafe { std::slice::from_raw_parts(parts, count) };
+        vecs.iter()
+            .flat_map(|v| unsafe { std::slice::from_raw_parts(v.base, v.len as usize) })
+            .map(|&b| u64::from(b))
+            .sum()
+    }
+
+    let sig = NativeSig::new(&[NativeArg::Read(Some(2)), NativeArg::Int]);
+    // SAFETY: `sum_parts` fills `parts` with host pointers to live stack and `.rodata` bytes
+    let (on, untagged) = unsafe { (Passthrough::on(), Passthrough::untagged()) };
+    for passthrough in [Passthrough::OFF, on, untagged] {
+        let vm = Vm::with_config(VmConfig {
+            passthrough,
+            ..VmConfig::default()
+        })
+        .unwrap();
+        // SAFETY: `sum_iovec` reads only `byte_len` bytes at `parts` and the valid slices in `parts`
+        unsafe { vm.register_native("sum_iovec", sum_iovec as *const (), sig) }.unwrap();
+        let mut program = vm.load_elf(&object("tests/host_ptr.o")).unwrap();
+        assert_eq!(program.call("sum_parts", &[]).unwrap(), 1 + 2 + 3 + 4 + 10 + 20 + 30);
+    }
+}

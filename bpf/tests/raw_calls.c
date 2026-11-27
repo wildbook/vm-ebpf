@@ -32,10 +32,10 @@ u64 call_own(u64 x) {
     return call_back(twice, x);
 }
 
-/* A plugin whose pointers carry tags strips the tag of a pointer the native function follows. */
-u64 sum_untagged(u64 (*sum)(const u8 *buf, u64 len)) {
+/* A plugin whose pointers carry tags converts a pointer the native function follows with HOST(). */
+u64 sum_host(u64 (*sum)(const u8 __host *buf, u64 len)) {
     u8 buf[4] = {1, 2, 3, 4};
-    return sum(UNTAG(buf), sizeof(buf));
+    return sum(HOST(buf), sizeof(buf));
 }
 
 /* Below 64 KiB: a helper ID. */

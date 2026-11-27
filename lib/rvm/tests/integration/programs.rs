@@ -199,3 +199,51 @@ fn std_helpers() {
     assert_eq!(*lines.lock().unwrap(), ["x=300 neg=-300 hex=12c"]);
     assert_eq!(program.call("draws_differ", &[]).unwrap(), 1);
 }
+
+/// `__host` pointers and `HOST()` convert between guest and host addresses in every memory mode (bpf/tests/host_ptr.c).
+#[test]
+fn host_pointers_convert_between_spaces() {
+    use rvm::{Passthrough, VmConfig};
+
+    let host_word = 0xCAFE_BABEu32;
+    let host_addr = &raw const host_word as u64;
+
+    // SAFETY: the guest only reads `host_word` through `host_addr` when passthrough allows raw addresses
+    let (on, untagged) = unsafe { (Passthrough::on(), Passthrough::untagged()) };
+    for passthrough in [Passthrough::OFF, on, untagged] {
+        let vm = Vm::with_config(VmConfig {
+            passthrough,
+            ..VmConfig::default()
+        })
+        .unwrap();
+        vm.register_extern("sum_iovec", |(_parts, _len): (u64, u64)| 0u64);
+        let mut program = vm.load_elf(&object("tests/host_ptr.o")).unwrap();
+
+        let ro_host = program.call("host_ro_word", &[]).unwrap();
+        let rw_host = program.call("host_rw_word", &[]).unwrap();
+        assert_eq!(ro_host >> REGION_SHIFT, 0);
+        assert_eq!(rw_host >> REGION_SHIFT, 0);
+
+        // A `__host` pointer into the plugin's own memory works in every mode, keeping region permissions when tagged.
+        assert_eq!(program.call("read_host_u32", &[ro_host]).unwrap(), 0x1122_3344);
+        assert_eq!(program.call("read_host_u32", &[rw_host]).unwrap(), 0x5566_7788);
+        assert_eq!(program.call("write_host_u32", &[rw_host, 0x99AA_BBCC]).unwrap(), 0x99AA_BBCC);
+        assert_eq!(program.call("read_rw_word", &[]).unwrap(), 0x99AA_BBCC);
+
+        if passthrough == Passthrough::OFF {
+            assert!(matches!(
+                program.call("write_host_u32", &[ro_host, 1]),
+                Err(VmError::Exec(ExecError::MemoryFault { .. }))
+            ));
+            assert!(matches!(
+                program.call("read_host_u32", &[host_addr]),
+                Err(VmError::Exec(ExecError::MemoryFault { .. }))
+            ));
+        } else {
+            assert_eq!(program.call("read_host_u32", &[host_addr]).unwrap(), 0xCAFE_BABE);
+        }
+
+        // Null faults in every mode.
+        assert!(matches!(program.call("read_host_u32", &[0]), Err(VmError::Exec(ExecError::MemoryFault { .. }))));
+    }
+}

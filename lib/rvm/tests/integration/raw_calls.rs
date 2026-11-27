@@ -77,11 +77,11 @@ fn callback_argument() {
     assert!(matches!(err, VmError::Exec(ExecError::UnknownHelper { id: 0x1234, .. })), "{err}");
 }
 
-/// A guest with tagged pointers strips the tag of the pointer a native function follows.
+/// A guest with tagged pointers converts a pointer the native function follows with `HOST()`.
 #[test]
-fn untag_passes_the_host_address() {
+fn host_macro_passes_the_host_address() {
     let mut program = load(Passthrough::OFF, on());
-    assert_eq!(program.call("sum_untagged", &[API.sum as usize as u64]).unwrap(), 10);
+    assert_eq!(program.call("sum_host", &[API.sum as usize as u64]).unwrap(), 10);
 }
 
 /// Without raw calls, an untagged target is a helper ID if it fits one and no code address otherwise. `call_high`

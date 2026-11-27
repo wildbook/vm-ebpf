@@ -15,13 +15,19 @@ use crate::{Context, Host, Interpreter, Memory, Reason};
 pub const CALL_HELPER: u8 = 0x22;
 /// Dedicated opcode byte for `call <kfunc slot>` (`src_reg == 2`), dispatched straight to [`host_call`].
 pub const CALL_KFUNC: u8 = 0x23;
+/// Dedicated opcode byte for `addr_space_cast` to address space 1 (guest to host address).
+pub const TO_HOST: u8 = 0x2a;
+/// Dedicated opcode byte for `addr_space_cast` to address space 0 (host to guest address).
+pub const TO_GUEST: u8 = 0x2b;
 
-/// Install direct handlers for local, helper, kfunc and indirect calls, bypassing [`jump`]'s extra dispatch.
+/// Install direct handlers for local, helper, kfunc and indirect calls and address-space casts.
 pub const fn install<M: Memory, H: Host<M>, F: Fuel>(table: &mut [Handler<M, H>; 256]) {
     table[CALL as usize] = local_call::<M, H, F>;
     table[CALL_HELPER as usize] = host_call::<M, H, F, false>;
     table[CALL_KFUNC as usize] = host_call::<M, H, F, true>;
     table[CALLX as usize] = indirect_call::<M, H, F, false>;
+    table[TO_HOST as usize] = addr_space_cast::<M, H, true>;
+    table[TO_GUEST as usize] = addr_space_cast::<M, H, false>;
 }
 
 /// The [`Handler`](dispatch::Handler) of opcode `OP` of the ALU, load and store classes.
@@ -177,4 +183,27 @@ pub extern "rust-preserve-none" fn indirect_call<M: Memory, H: Host<M>, F: Fuel,
         }
         None => interp.stop.at(ip, Reason::CallIndirect(target)),
     }
+}
+
+/// The handler of [`TO_HOST`] (`TO_HOST_DIR`) and [`TO_GUEST`]: converts a pointer between address spaces 0 and 1.
+#[inline(never)]
+extern "rust-preserve-none" fn addr_space_cast<M: Memory, H: Host<M>, const TO_HOST_DIR: bool>(
+    ctx: &mut Context<M>,
+    code: Slots,
+    ip: Ip,
+    interp: &mut Interpreter<M, H>,
+    table: &Table<M, H>,
+    _: Spare,
+    slot: Slot,
+) {
+    // SAFETY: a handler's ip lies below `len`, and its slot has the layout of its byte
+    let insn = unsafe { ip.view(slot, const { Shape::of(if TO_HOST_DIR { TO_HOST } else { TO_GUEST }) }) };
+    let src = ctx.regs.get(insn.src_reg());
+    let dst = match TO_HOST_DIR {
+        true => ctx.memory.host_address(src),
+        false => ctx.memory.guest_address(src),
+    };
+    ctx.regs.set(insn.dst_reg(), dst);
+
+    become_next!(ctx, code, ip, interp, table)
 }

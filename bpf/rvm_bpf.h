@@ -105,10 +105,12 @@ static u32 (*bpf_get_prandom_u32)(void) = (void *)7;
     })
 
 /*
- * The pointer `p` without its region tag: the host address of its byte, which native code can follow. A call through
- * a function pointer passes each argument as the register or the stack holds it, so a plugin whose pointers carry
- * tags strips the tag of a pointer argument. An untagged plugin needs no UNTAG: its pointers are host addresses.
+ * A pointer that native code follows, or that native code returns. The compiler rejects implicit conversions between
+ * plain pointers and `__host` pointers: `HOST(p)` converts a plugin pointer to its host address, and dereferencing a
+ * `__host` pointer converts a host address back to a plugin address when it lies in one of the plugin's regions. In an
+ * untagged plugin both directions leave the pointer unchanged.
  */
-#define UNTAG(p) ((__typeof__(0 ? (p) : (p)))((u64)(p) & 0x03ffffffffffffffULL))
+#define __host  __attribute__((address_space(1)))
+#define HOST(p) ((__typeof__(*(p)) __host *)(p))
 
 #endif

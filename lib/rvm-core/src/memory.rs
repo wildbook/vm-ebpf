@@ -155,6 +155,21 @@ pub unsafe trait Memory {
     /// memory (as [`Window::new`] requires), so subsequent `&mut self` calls on the memory cannot invalidate it. They
     /// may instead be host memory that the embedder lets the guest name directly, as a [`Window`] may cover.
     fn native_ptr(&self, addr: u64, len: u64, write: bool) -> Result<u64, Self::Error>;
+
+    /// The host address of guest address `addr`, for `addr_space_cast` to address space 1. The default leaves `addr`
+    /// unchanged.
+    #[inline(always)]
+    fn host_address(&self, addr: u64) -> u64 {
+        addr
+    }
+
+    /// The guest address of host address `addr`, for `addr_space_cast` to address space 0. If `addr` lies in a mapped
+    /// region of this memory, returns its guest address; otherwise returns `addr` unchanged. The default leaves `addr`
+    /// unchanged.
+    #[inline(always)]
+    fn guest_address(&self, addr: u64) -> u64 {
+        addr
+    }
 }
 
 /// A read-modify-write operation for [`Memory::atomic_u32`] and [`Memory::atomic_u64`].

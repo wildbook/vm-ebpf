@@ -151,8 +151,18 @@ the plugin's read or write permission, and the native gets the host address of t
 call with `ExecError::MemoryFault`. With `Passthrough::untagged()` arguments arrive unchanged and unchecked.
 
 Pointers stored inside plugin memory, such as the fields of a struct the plugin fills, keep the plugin's region tag,
-and native code can't follow them; such APIs need `Passthrough::untagged()`. A pointer that a native returns is a
-host address, which the plugin can follow only with passthrough on or untagged.
+and native code can't follow them. Either load the plugin with `Passthrough::untagged()`, where every pointer is a
+plain host address and nothing is checked, or declare those pointers `__host` and convert with `HOST()` from
+`rvm_bpf.h`:
+
+```c
+struct iovec { const u8 __host *base; u64 len; };
+struct iovec part = { HOST(text), 5 };
+```
+
+The compiler rejects a plain pointer where a `__host` pointer is expected, so it finds every conversion site. A pointer
+that a native returns is a host address; declare it `__host` to dereference it when it points into the plugin's own
+memory in any mode, or into host memory with `Passthrough::on()`.
 
 Registration is unsafe: the native must take exactly the signature's arguments (up to twelve), never unwind (no panic,
 C++ exception or `longjmp`), stay loaded while plugins may call it, be safe on any thread, and treat its integer
@@ -389,9 +399,9 @@ address fits 32 bits.
 
 Nothing declares what such a call passes, so each argument arrives as the register holds it, without a check or a
 conversion. A pointer into plugin memory keeps its region tag, which native code can't follow: load the plugin with
-`Passthrough::untagged()`, or strip the tag with `UNTAG(p)` from `rvm_bpf.h`. For an address that the plugin holds as
-a constant, use `NATIVE_AT(type, addr)` from the same header, because clang compiles a call through a constant
-address as a helper call and keeps only the low 32 bits of the address.
+`Passthrough::untagged()`, or declare the parameter `__host` and pass `HOST(p)` from `rvm_bpf.h`. For an address that
+the plugin holds as a constant, use `NATIVE_AT(type, addr)` from the same header, because clang compiles a call through
+a constant address as a helper call and keeps only the low 32 bits of the address.
 
 The switch makes the plugin as trusted as native code, whatever its memory mode. It can call any address in the
 process with any arguments, nothing validates the target, and a call through a pointer that is no function runs

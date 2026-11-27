@@ -9,7 +9,7 @@
 //! stack arguments ([`args`](crate::args)). [`usual`] gives the opcode that a slot with such a byte runs as.
 
 use crate::fuse::{Super, SUPERS};
-use crate::handler::{CALL_HELPER, CALL_KFUNC};
+use crate::handler::{CALL_HELPER, CALL_KFUNC, TO_GUEST, TO_HOST};
 use crate::opcode::{AluEnd, AluOpc, Class, JmpOpc, MemMode, MemSize, OpCode, Source, CALL, CALLX, LD_IMM64};
 use crate::transfer::{FAR, GUARD};
 use crate::windows::STACK_ACCESSES;
@@ -105,7 +105,7 @@ pub const fn usual(byte: u8) -> u8 {
     });
     match (byte, Super::with_byte(byte)) {
         (MOVSX32, _) => MOV32_REG,
-        (MOVSX64, _) => MOV64_REG,
+        (MOVSX64 | TO_HOST | TO_GUEST, _) => MOV64_REG,
         (CALL_HELPER | CALL_KFUNC, _) => CALL,
         (args::LOAD, _) => LDX_DW,
         (args::STORE, _) => STX_DW,
@@ -134,6 +134,8 @@ const _: () = {
     claim(&mut used, MOVSX64);
     claim(&mut used, CALL_HELPER);
     claim(&mut used, CALL_KFUNC);
+    claim(&mut used, TO_HOST);
+    claim(&mut used, TO_GUEST);
     const_for!(byte in native::PLAIN => claim(&mut used, byte));
     const_for!(byte in native::CHECKED => claim(&mut used, byte));
     const_for!(byte in native::STACK => claim(&mut used, byte));

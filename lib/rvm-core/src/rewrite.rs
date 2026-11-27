@@ -12,10 +12,14 @@
 
 use crate::bytes::{canonical, INVALID, LDX_DW, MISSING, MOV32_REG, MOV64_REG, MOVSX32, MOVSX64, STX_DW, ST_DW};
 use crate::context::FP;
-use crate::handler::{CALL_HELPER, CALL_KFUNC};
+use crate::handler::{CALL_HELPER, CALL_KFUNC, TO_GUEST, TO_HOST};
 use crate::opcode::atomic::{CMPXCHG, FETCH, LOAD_ACQ};
 use crate::opcode::{call, AluOpc, Class, JmpOpc, MemMode, OpCode, Source, CALL, CALLX, LD_IMM64};
 use crate::{args, Instruction};
+
+/// `imm` of `addr_space_cast` (`MOV64_REG` with `offset = 1`): `dst_as << 16 | src_as`.
+const ADDR_SPACE_TO_HOST: i32 = 1 << 16;
+const ADDR_SPACE_TO_GUEST: i32 = 1;
 
 /// Runs the pass on `code`.
 pub fn rewrite(code: &mut [Instruction]) {
@@ -97,12 +101,24 @@ impl Rewrite {
                 call::KFUNC => CALL_KFUNC,
                 _ => return false,
             },
+            (None, false, None) if insn.byte() == MOV64_REG => mov64_reg(insn),
             (None, false, None) if insn.0 & field_bits(self.nonzero) != 0 => self.nonzero_byte,
             // an atomic, local `call` or LD_IMM64 that needs no rewrite
             (None, false, None) => return false,
         };
         code[i] = insn.with_byte(byte);
         byte == args::STORE || byte == args::STORE_IMM
+    }
+}
+
+/// The byte of a `MOV64_REG` with a non-zero `offset` or `imm`: an `addr_space_cast` between spaces 0 and 1, a
+/// `MOVSX64`, or [`INVALID`].
+fn mov64_reg(insn: Instruction) -> u8 {
+    match (insn.offset(), insn.imm()) {
+        (1, ADDR_SPACE_TO_HOST) => TO_HOST,
+        (1, ADDR_SPACE_TO_GUEST) => TO_GUEST,
+        (8 | 16 | 32, 0) => MOVSX64,
+        _ => INVALID,
     }
 }
 
@@ -165,7 +181,7 @@ const REWRITES: [Rewrite; 256] = {
             Class::Alu32 | Class::Alu64 => {
                 let (nonzero, nonzero_byte) = match byte {
                     MOV32_REG => (OFFSET, MOVSX32),
-                    MOV64_REG => (OFFSET, MOVSX64),
+                    MOV64_REG => (OFFSET | IMM, MOVSX64),
                     _ => (0, 0),
                 };
                 Rewrite {
@@ -224,8 +240,9 @@ const fn reserved(opc: OpCode) -> u8 {
             AluOpc::UndefE | AluOpc::UndefF => 0,
             AluOpc::Neg => SRC | OFFSET | IMM,
             AluOpc::End => SRC | OFFSET,
-            // the offset of DIV and MOD makes them signed, and that of `mov` from a register MOVSX
+            // the offset of DIV and MOD makes them signed, and that of `mov` from a register MOVSX or addr_space_cast
             AluOpc::Div | AluOpc::Mod => unused,
+            AluOpc::Mov if reg && matches!(opc.class(), Class::Alu64) => 0,
             AluOpc::Mov if reg => IMM,
             _ => unused | OFFSET,
         },
@@ -284,6 +301,13 @@ fn reserved_fields() {
         (insn(alu(AluOpc::Div, Source::Reg), 1, 2, 1, 0), false),
         (insn(alu(AluOpc::Mov, Source::Reg), 1, 2, 8, 0), false),
         (insn(alu(AluOpc::Mov, Source::Reg), 1, 2, 8, 1), true),
+        (insn(alu(AluOpc::Mov, Source::Reg), 1, 2, 0, 1), true),
+        (insn(alu(AluOpc::Mov, Source::Reg), 1, 2, 1, ADDR_SPACE_TO_HOST), false),
+        (insn(alu(AluOpc::Mov, Source::Reg), 1, 2, 1, ADDR_SPACE_TO_GUEST), false),
+        (insn(alu(AluOpc::Mov, Source::Reg), 10, 2, 1, ADDR_SPACE_TO_HOST), true),
+        (insn(alu(AluOpc::Mov, Source::Reg), 1, 2, 1, 0), true),
+        (insn(alu(AluOpc::Mov, Source::Reg), 1, 2, 1, 2 << 16), true),
+        (insn(OpCode::alu32(AluOpc::Mov, Source::Reg), 1, 2, 1, ADDR_SPACE_TO_HOST), true),
         (insn(alu(AluOpc::Neg, Source::Reg), 1, 0, 0, 0), true),
         (insn(alu(AluOpc::Neg, Source::Imm), 1, 0, 0, 1), true),
         (insn(jmp(JmpOpc::Exit, Source::Imm), 0, 1, 0, 0), true),

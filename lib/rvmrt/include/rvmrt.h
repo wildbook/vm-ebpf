@@ -86,7 +86,7 @@ typedef struct rvm_native {
 //   calls the native function there, with up to 5 arguments in the host C convention, with register arguments also in
 //   xmm registers. Nothing validates the address, so the guest can call any code in the process with any arguments.
 //   The arguments pass as the registers hold them: a pointer into guest memory keeps its region tag unless the
-//   program is loaded with RVM_UNTAGGED or the guest strips the tag (UNTAG in rvm's bpf/rvm_bpf.h). In a program
+//   program is loaded with RVM_UNTAGGED or the guest converts it with HOST() in rvm's bpf/rvm_bpf.h. In a program
 //   with a call of more than five arguments anywhere, every such call passes 12: the five registers, and the seven
 //   stack arguments as the calling function stored them last. The function must never unwind and must leave the
 //   calling program alone, as a native function of rvm_native must, and its time doesn't count against the
