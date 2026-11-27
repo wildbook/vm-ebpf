@@ -13,34 +13,6 @@
 //! A block ends at each slot whose handler may continue anywhere but at the next slot. The handlers that end a block
 //! take a [`Fuel`], which charges a metered run for the block they enter ([`fuel`](crate::fuel)). No other handler
 //! has anything for fuel.
-//!
-//! # Split dispatch
-//!
-//! The handlers of ALU instructions test the parity of the next opcode byte and continue through one of two indirect
-//! jumps, each with its own copy of the handlers in the [`Table`]. It is a choice for the branch predictor of AMD
-//! Zen 3.
-//!
-//! Zen 3 predicts an indirect jump with several targets from a global history in two parts. For each of the last 9
-//! taken branches it keeps bits 3:2 of the address of the branch's last byte. For about 63 conditional branches it
-//! keeps the direction, but it records only branches that have been taken at least once. A chain of handlers that
-//! each end in one indirect jump gives this history little: two address bits per handler, often the same two bits for
-//! different handlers, and no directions, because the checks in the handlers are never taken. Where the target of a
-//! dispatch depends on more than the last nine handlers, as at a `callx` that cycles through several callees, the
-//! predictor can't tell the cases apart. The parity branch goes both ways, so it puts one bit about each opcode that
-//! follows an ALU instruction into the direction history, and that is enough to separate them. Two jumps through one
-//! table would be the same code, which the compiler merges; the second copy keeps them apart.
-//!
-//! Measured on a Ryzen 5 5625U with and without fuel, in three code layouts each: the `callx` loop of the benchmarks
-//! went from 7,500 indirect mispredicts per call to under 6 and ran 29% to 40% faster, a corpus of real programs went
-//! from 80k to 136k mispredicts to 19k to 35k and ran 8% to 20% faster, and a hash function went from up to 2,400 to
-//! under 10 and ran up to 30% faster. Without fuel, most other workloads changed by less than 2%, and none ran more
-//! than about 5% slower in any layout. The cost is one more fused test and branch per ALU dispatch and 2 KB of table.
-//!
-//! Only the ALU handlers split. With every handler split, the direction history covers the last 63 dispatches instead
-//! of the last 63 guest branches, and guest loops whose exit depends on a longer history mispredict more. With the
-//! superinstructions split too, a sieve loop ran 6% to 8% slower.
-//!
-//! Other processors keep other history, so the gain there is unmeasured.
 
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
@@ -48,22 +20,19 @@ use std::mem::MaybeUninit;
 use crate::code::Slots;
 use crate::fuel::{Fuel, Unmetered};
 use crate::handler::{self, handler, jump};
-use crate::opcode::{Class, OpCode};
+use crate::opcode::OpCode;
 use crate::slot::Slot;
 use crate::transfer::Ip;
 use crate::{args, fuse, native, transfer, windows, Context, Host, Interpreter, Memory};
 
 /// Continues at `$ip`, in the block of the slot the handler runs: tail-calls the handler of its instruction. `$ip`
-/// must lie in `0..=len`. A true `$split` makes the tail call one of two, as the module docs describe.
+/// must lie in `0..=len`.
 macro_rules! become_at {
-    ($ctx:expr, $code:expr, $ip:expr, $interp:expr, $table:expr, $split:expr) => {{
+    ($ctx:expr, $code:expr, $ip:expr, $interp:expr, $table:expr) => {{
         let ip = $ip;
         // SAFETY: the caller's (see `Ip`)
         let slot = unsafe { ip.get() };
-        match $split && $crate::dispatch::odd(slot) {
-            true => become $table.odd(slot)($ctx, $code, ip, $interp, $table, $crate::dispatch::SPARE, slot),
-            false => become $table.of(slot)($ctx, $code, ip, $interp, $table, $crate::dispatch::SPARE, slot),
-        }
+        become $table.of(slot)($ctx, $code, ip, $interp, $table, $crate::dispatch::SPARE, slot)
     }};
 }
 
@@ -71,10 +40,7 @@ macro_rules! become_at {
 /// ip of every handler but the guard's does, and must not end its block.
 macro_rules! become_next {
     ($ctx:expr, $code:expr, $ip:expr, $interp:expr, $table:expr) => {
-        become_next!($ctx, $code, $ip, $interp, $table, false)
-    };
-    ($ctx:expr, $code:expr, $ip:expr, $interp:expr, $table:expr, $split:expr) => {
-        become_at!($ctx, $code, $ip.offset(1), $interp, $table, $split)
+        become_at!($ctx, $code, $ip.offset(1), $interp, $table)
     };
 }
 
@@ -89,7 +55,7 @@ macro_rules! become_enter {
             let slot = $crate::slot::Slot::UNREAD;
             become F::step::<M, H>($ctx, $code, ip, $interp, $table, $crate::dispatch::SPARE, slot)
         }
-        become_at!($ctx, $code, ip, $interp, $table, false)
+        become_at!($ctx, $code, ip, $interp, $table)
     }};
 }
 
@@ -129,8 +95,8 @@ pub type Spare = MaybeUninit<u64>;
 
 pub const SPARE: Spare = Spare::uninit();
 
-/// The handler of every opcode byte, and the copy of them that split dispatch continues through.
-pub struct Table<M: Memory, H>(pub [Handler<M, H>; 256], pub [Handler<M, H>; 256]);
+/// The handler of every opcode byte.
+pub struct Table<M: Memory, H>(pub [Handler<M, H>; 256]);
 
 impl<M: Memory, H> Table<M, H> {
     /// The handler of `slot`.
@@ -138,24 +104,6 @@ impl<M: Memory, H> Table<M, H> {
     pub fn of(&self, slot: Slot) -> Handler<M, H> {
         self.0[usize::from(slot.byte())]
     }
-
-    /// The handler of `slot`, from the second copy.
-    #[inline(always)]
-    pub fn odd(&self, slot: Slot) -> Handler<M, H> {
-        self.1[usize::from(slot.byte())]
-    }
-}
-
-/// Whether the handler of opcode byte `op` splits its dispatch.
-pub const fn splits(op: u8) -> bool {
-    matches!(OpCode(op).class(), Class::Alu32 | Class::Alu64)
-}
-
-/// Whether a split dispatch to `slot` takes the second copy of the [`Table`].
-// LLVM takes the branch on even parity; with the branch taken on odd parity, the corpus ran 2% to 6% slower
-#[inline(always)]
-pub fn odd(slot: Slot) -> bool {
-    !slot.byte().count_ones().is_multiple_of(2)
 }
 
 /// The tables of the handlers for the memory `M` and the host `H`.
@@ -202,7 +150,7 @@ pub const fn table<M: Memory, H: Host<M>, F: Fuel>() -> Table<M, H> {
     windows::install::<M, H>(&mut table);
     native::install::<M, H, F>(&mut table);
     args::install::<M, H, F>(&mut table);
-    Table(table, table)
+    Table(table)
 }
 
 /// The handler of opcode `OP`: [`jump`] for the jump classes, whose instructions end a block, and [`handler`] for the

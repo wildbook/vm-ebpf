@@ -2,7 +2,7 @@
 //! for the jump classes, with the host calls it hands on to.
 
 use crate::code::Slots;
-use crate::dispatch::{self, Handler, Spare, Table, SPARE};
+use crate::dispatch::{Handler, Spare, Table, SPARE};
 use crate::fuel::Fuel;
 use crate::host::Callee;
 use crate::opcode::{CALL, CALLX};
@@ -54,7 +54,7 @@ pub extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const OP: u8>(
     }
 
     // `ip` is at `insn` or at the second half of LD_IMM64, which `second_half` found below `len`
-    become_next!(ctx, code, ip, interp, table, dispatch::splits(OP))
+    become_next!(ctx, code, ip, interp, table)
 }
 
 /// The [`Handler`](dispatch::Handler) of opcode `OP` of the jump classes. Every such instruction ends its block.

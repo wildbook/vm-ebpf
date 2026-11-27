@@ -110,7 +110,7 @@ mod metered {
         /// to it. A metered run also starts through it.
         pub const STEPS: Table<M, H> = {
             let step = Metered::step::<M, H> as Handler<M, H>;
-            Table([step; 256], [step; 256])
+            Table([step; 256])
         };
     }
 

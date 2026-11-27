@@ -70,7 +70,7 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
             match const { Super::of(S).branches() } {
                 true => become_enter!(ctx, code, next, interp, table),
                 // the slot after the sequence lies in `0..=len` (see `sequence`)
-                false => become_at!(ctx, code, next, interp, table, false),
+                false => become_at!(ctx, code, next, interp, table),
             }
         }};
     }
