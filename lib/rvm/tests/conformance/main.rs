@@ -9,6 +9,8 @@
 mod asm;
 mod data;
 
+#[cfg(feature = "fuel")]
+use rvm::{ExecError, LimitedCall, VmError};
 use rvm::{Image, Perms, Vm};
 
 #[test]
@@ -37,28 +39,87 @@ fn bpf_conformance_suite() {
     assert!(failures.is_empty(), "bpf_conformance failures:\n{}", failures.join("\n"));
 }
 
-/// Assembles and runs one parsed `.data` file, and checks its outcome.
+/// Assembles and runs one parsed `.data` file unmetered and (with the `fuel` feature) metered, including exact
+/// fuel boundary checks, and verifies every outcome.
 fn run_one(text: &str) -> Result<(), String> {
     let case = data::parse(text)?;
-
     let vm = Vm::new();
     // helper 5 is `unwind` in the classic interpreter test ABI; call_unwind_fail.data and callx.data only check that
     // calling it doesn't abort the program
     vm.register_helper(5, |_: ()| 0u64);
-    let mut program = vm.load_image(Image::from_code(case.code)).map_err(|e| e.to_string())?;
-    let mem = program
-        .memory_mut()
-        .map_bytes(&case.mem, case.mem.len(), Perms::RW)
-        .map_err(|e| e.to_string())?;
-    let outcome = program.call("main", &[mem.base(), case.mem.len() as u64]);
 
-    match (outcome, case.result, case.error) {
-        (Ok(r0), Some(expected), _) if r0 == expected => Ok(()),
-        (Ok(r0), Some(expected), _) => Err(format!("expected r0 = {expected:#x}, got {r0:#x}")),
-        (Ok(r0), None, Some(expected)) => Err(format!("expected error {expected:?}, got r0 = {r0:#x}")),
-        (Ok(_), None, None) => unreachable!("parsed test case has neither a result nor an error"),
-        // No vendored file sets `-- error`; a real one would need to compare `e`'s text.
-        (Err(_), _, Some(_)) => Ok(()),
-        (Err(e), _, None) => Err(e.to_string()),
+    let load = || -> Result<(rvm::Program, u64), String> {
+        let mut program = vm
+            .load_image(Image::from_code(case.code.clone()))
+            .map_err(|e| e.to_string())?;
+        let mem = program
+            .memory_mut()
+            .map_bytes(&case.mem, case.mem.len(), Perms::RW)
+            .map_err(|e| e.to_string())?;
+        Ok((program, mem.base()))
+    };
+
+    let check_outcome = |label: &str, outcome: rvm::Result<u64>| -> Result<(), String> {
+        match (outcome, case.result, case.error.as_deref()) {
+            (Ok(r0), Some(expected), _) if r0 == expected => Ok(()),
+            (Ok(r0), Some(expected), _) => Err(format!("{label}: expected r0 = {expected:#x}, got {r0:#x}")),
+            (Ok(r0), None, Some(expected)) => Err(format!("{label}: expected error {expected:?}, got r0 = {r0:#x}")),
+            (Ok(_), None, None) => unreachable!("parsed test case has neither a result nor an error"),
+            // No vendored file sets `-- error`; a real one would need to compare `e`'s text.
+            (Err(_), _, Some(_)) => Ok(()),
+            (Err(e), _, None) => Err(format!("{label}: {e}")),
+        }
+    };
+
+    // 1. Unmetered run (`Tables::PLAIN`).
+    let (mut program, base) = load()?;
+    let args = [base, case.mem.len() as u64];
+    check_outcome("unmetered", program.call("main", &args))?;
+
+    // 2. Metered run (`Tables::METERED`) and exact fuel boundary check (`Metered::step`).
+    #[cfg(feature = "fuel")]
+    {
+        let (mut program, base) = load()?;
+        let args = [base, case.mem.len() as u64];
+        let main = program.func("main").map_err(|e| e.to_string())?;
+        let LimitedCall { result, instructions } = program.call_func_with_limit(main, &args, 0);
+        check_outcome("metered", result)?;
+
+        if let Some(expected) = case.result {
+            if instructions > 0 {
+                // Exact limit must succeed and consume every unit.
+                let (mut program, base) = load()?;
+                let args = [base, case.mem.len() as u64];
+                let main = program.func("main").map_err(|e| e.to_string())?;
+                let exact = program.call_func_with_limit(main, &args, instructions);
+                match exact.result {
+                    Ok(r0) if r0 == expected && exact.instructions == instructions => {}
+                    other => {
+                        return Err(format!(
+                            "exact fuel ({instructions}): got ({other:?}, used={}), expected Ok({expected:#x})",
+                            exact.instructions
+                        ));
+                    }
+                }
+
+                // One unit short must stop with `InstructionLimit`.
+                let short_limit = instructions - 1;
+                let (mut program, base) = load()?;
+                let args = [base, case.mem.len() as u64];
+                let main = program.func("main").map_err(|e| e.to_string())?;
+                let short = program.call_func_with_limit(main, &args, short_limit);
+                if !matches!(
+                    short.result,
+                    Err(VmError::Exec(ExecError::InstructionLimit { limit })) if limit == short_limit
+                ) {
+                    return Err(format!(
+                        "short fuel ({short_limit}): expected InstructionLimit, got {:?}",
+                        short.result
+                    ));
+                }
+            }
+        }
     }
+
+    Ok(())
 }

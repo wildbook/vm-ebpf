@@ -29,8 +29,14 @@ const ALLOC_CAP: usize = 2 * MEMORY_LIMIT;
 /// Cases per fixture and loader, about a second in a debug build.
 const DEFAULT_ITERS: u64 = 1000;
 
+/// Instruction budget when executing a mutated program that loaded cleanly.
+#[cfg(feature = "fuel")]
+const EXEC_LIMIT: u64 = 10_000;
+
 fn limited_vm() -> rvm::Vm {
     host_vm_with(VmConfig {
+        #[cfg(feature = "fuel")]
+        instruction_limit: EXEC_LIMIT,
         memory_limit: MEMORY_LIMIT,
         ..VmConfig::default()
     })
@@ -100,7 +106,21 @@ fn fixtures() -> Vec<(String, Vec<u8>)> {
 
 fn outcome(loaded: rvm::Result<rvm::Program>) -> Outcome {
     match loaded {
-        Ok(_) => Outcome::Loaded,
+        Ok(program) => {
+            #[cfg(feature = "fuel")]
+            {
+                let mut program = program;
+                if let Some((name, _)) = program.functions().first() {
+                    let name = name.clone();
+                    // Execute under `EXEC_LIMIT` so `Code::new` and the interpreter are fuzzed alongside the loaders.
+                    // Guest faults and instruction limit stops are expected. Panics and over cap allocations fail.
+                    let _ = program.call(&name, &[0; 6]);
+                }
+            }
+            #[cfg(not(feature = "fuel"))]
+            let _ = program;
+            Outcome::Loaded
+        }
         Err(_) => Outcome::Rejected,
     }
 }

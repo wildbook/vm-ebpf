@@ -31,8 +31,8 @@ pub fn host_vm_with(config: VmConfig) -> Vm {
         describe_bits(types);
     });
 
-    vm.register_helper(100, |x: u64| x * 2);
-    vm.register_extern("host_add", |(a, b): (u64, u64)| a + b);
+    vm.register_helper(100, |x: u64| x.wrapping_mul(2));
+    vm.register_extern("host_add", |(a, b): (u64, u64)| a.wrapping_add(b));
     vm.register_extern("host_reenter", |x: u64| x);
     vm.enable_time();
     vm.enable_random();
