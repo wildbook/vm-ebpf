@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::bytes::{MOV32_REG, MOV64_REG};
+use crate::context::FP;
 use crate::dispatch::DispatchTable;
 #[cfg(feature = "fuel")]
 use crate::fuel::Rests;
@@ -14,9 +15,11 @@ use crate::handler::{CALL_HELPER, CALL_KFUNC};
 #[cfg(feature = "ffi")]
 use crate::native::GeneralProto;
 use crate::native::{NativeBind, NativeMode};
-use crate::opcode::{AluOpc, Class, OpCode, Source};
-use crate::slot::Slot;
-use crate::{args, bytes, fuse, native, rewrite, transfer, Host, Instruction, Memory, MAX_NATIVE_ARGS};
+use crate::opcode::{AluOpc, Class, JmpOpc, OpCode, Source, CALL};
+use crate::slot::{Layout, Slot, LAYOUTS};
+use crate::{
+    args, bytes, fuse, native, rewrite, threaded, transfer, windows, Host, Instruction, Memory, MAX_NATIVE_ARGS,
+};
 
 /// One entry of a direct-threaded code stream: the handler pointer and its 8-byte pre-decoded [`Slot`].
 ///
@@ -80,7 +83,7 @@ impl CompiledCache {
                 drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(ptr, total_len)) });
             }
         }
-        let overflow = self.overflow.get_mut().expect("compile cache lock");
+        let overflow = self.overflow.get_mut().unwrap_or_else(|e| e.into_inner());
         for (_, ptr) in overflow.drain(..) {
             // SAFETY: as above.
             drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(ptr, total_len)) });
@@ -312,33 +315,122 @@ impl Code {
     }
 }
 
-/// Compile portable slots into a 16-byte direct-threaded stream, folding `mov dst, src1; alu dst, rhs` into single
-/// 3-operand ALU entries while keeping slot `i + 1` intact for jumps into the middle of a folded pair.
+/// Compile portable slots into a 16-byte direct-threaded stream:
+/// - folds `mov dst, src1; alu dst, rhs` into single 3-operand ALU entries (leaving slot `i + 1` intact for mid-pair
+///   jump targets);
+/// - re-encodes [`Layout::DstSrc`] slots so `dst`, `src`, and `offset` (or pre-scaled jump byte offset) decode from
+///   `RCX` with no extra code-stream loads;
+/// - pre-scales unconditional `ja` and local `call` displacements into byte offsets;
+/// - routes all plain `r10` loads/stores (including 1- and 2-byte) to `windows::stack_access`.
 fn compile_threaded<M: Memory, H: Host<M>>(
     slots: &[Slot],
     len: usize,
     table: &DispatchTable<M, H>,
 ) -> Box<[ThreadedSlot]> {
+    const STRIDE: i64 = size_of::<ThreadedSlot>() as i64;
     let mut out = Vec::with_capacity(slots.len());
-    // Slots inside an active superinstruction must keep their original `Slot` bytes intact because `fuse::handler`
+    // Slots inside an active superinstruction must keep their opcode's threaded layout intact because `fuse::handler`
     // reads `sequence[1..sup.len()]` directly from the threaded stream.
     let mut protected_until = 0usize;
     for i in 0..slots.len() {
         let slot = slots[i];
-        if let Some(sup) = fuse::Super::with_byte(slot.byte()) {
+        let byte = slot.byte();
+        if let Some(sup) = fuse::Super::with_byte(byte) {
             protected_until = protected_until.max(i + sup.len());
-        } else if i >= protected_until && i + 1 < len {
-            if let Some(folded) = fold_alu3(slot, slots[i + 1], table) {
+            out.push(ThreadedSlot {
+                handler: table.handlers[usize::from(byte)] as *const (),
+                slot: encode_threaded_slot(slot, byte),
+            });
+            continue;
+        }
+        if i >= protected_until {
+            if let Some(folded) = threaded::try_fold(slots, i, len, table) {
                 out.push(folded);
                 continue;
             }
+            if i + 1 < len {
+                if let Some(folded) = fold_alu3(slot, slots[i + 1], table) {
+                    out.push(folded);
+                    continue;
+                }
+            }
+            if i < len {
+                if let Some(scaled) = scale_branch_or_call(slot, byte, STRIDE, table) {
+                    out.push(scaled);
+                    continue;
+                }
+            }
         }
+        let handler =
+            stack_access_override::<M, H>(slot, byte).unwrap_or(table.handlers[usize::from(byte)]) as *const ();
         out.push(ThreadedSlot {
-            handler: table.handlers[usize::from(slot.byte())] as *const (),
-            slot,
+            handler,
+            slot: encode_threaded_slot(slot, byte),
         });
     }
     out.into_boxed_slice()
+}
+
+/// Re-encode a portable `slot` into the threaded layout of `byte`.
+#[inline(always)]
+fn encode_threaded_slot(slot: Slot, byte: u8) -> Slot {
+    if LAYOUTS[usize::from(byte)] != Layout::DstSrc {
+        return slot;
+    }
+    let usual = bytes::usual(byte);
+    let extra = if OpCode(usual).is_jump() {
+        (i32::from(slot.offset_raw()) + 1) * (size_of::<ThreadedSlot>() as i32)
+    } else {
+        i32::from(slot.offset_raw())
+    };
+    slot.to_threaded_dst_src(extra)
+}
+
+/// Pre-scale unconditional `ja` (`0x05`/`0x06`) and local `call` into a single byte-offset slot when it fits in `i32`.
+#[inline(always)]
+fn scale_branch_or_call<M: Memory, H: Host<M>>(
+    slot: Slot,
+    byte: u8,
+    stride: i64,
+    table: &DispatchTable<M, H>,
+) -> Option<ThreadedSlot> {
+    let opc = OpCode(byte);
+    if byte == CALL {
+        let off = i64::from(slot.instruction().imm());
+        let byte_off = i32::try_from((off + 1).checked_mul(stride)?).ok()?;
+        return Some(ThreadedSlot {
+            handler: table.local_call_scaled as *const (),
+            slot: Slot::scaled_jump(byte_off),
+        });
+    }
+    if matches!(opc.jmp_opc(), JmpOpc::Ja) && matches!(opc.source(), Source::Imm) {
+        let off = match opc.class() {
+            Class::Jmp64 => i64::from(slot.offset_raw()),
+            Class::Jmp32 => i64::from(slot.imm()),
+            _ => return None,
+        };
+        let byte_off = i32::try_from((off + 1).checked_mul(stride)?).ok()?;
+        return Some(ThreadedSlot {
+            handler: table.ja_scaled as *const (),
+            slot: Slot::scaled_jump(byte_off),
+        });
+    }
+    None
+}
+
+/// Route plain 1- and 2-byte `r10` loads/stores (which don't have dedicated opcode bytes) straight to `stack_access`.
+#[inline(always)]
+fn stack_access_override<M: Memory, H: Host<M>>(slot: Slot, byte: u8) -> Option<crate::dispatch::Handler<M, H>> {
+    if !windows::windowed(byte) {
+        return None;
+    }
+    let base = match OpCode(byte).class() {
+        Class::Ldx => slot.src_reg_decoded(),
+        _ => slot.dst_reg_decoded(),
+    };
+    (usize::from(base.get()) == FP)
+        .then(|| windows::access_handler::<M, H>(byte, true))
+        .flatten()
 }
 
 /// Fold `mov32/64 dst, src1; alu32/64 dst, rhs` into one 3-operand [`ThreadedSlot`].

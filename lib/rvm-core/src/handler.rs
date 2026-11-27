@@ -6,7 +6,7 @@ use crate::dispatch::{Handler, Spare};
 use crate::fuel::{Fuel, RestsPtr};
 use crate::host::Callee;
 use crate::opcode::{CALL, CALLX};
-use crate::slot::{Fields, Shape, Slot};
+use crate::slot::{Fields, Layout, Shape, Slot, LAYOUTS};
 use crate::step::{self, Regs, Step};
 use crate::transfer::{self, Ip};
 use crate::{Context, Host, Interpreter, Memory, Reason};
@@ -141,7 +141,7 @@ pub extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const OP: u8>(
 pub extern "rust-preserve-none" fn jump<M: Memory, H: Host<M>, F: Fuel, const OP: u8>(
     ctx: &mut Context<M>,
     code: Slots,
-    mut ip: Ip,
+    ip: Ip,
     interp: &mut Interpreter<M, H>,
     rests: RestsPtr,
     _: Spare,
@@ -150,8 +150,15 @@ pub extern "rust-preserve-none" fn jump<M: Memory, H: Host<M>, F: Fuel, const OP
     // SAFETY: as in `handler`
     let insn = unsafe { ip.view(slot, const { Shape::of(OP) }) };
     match step::step(&mut ctx.regs, ctx.memory, insn) {
-        Step::Next => {}
-        Step::Jump(offset) => ip = ip.offset(offset),
+        Step::Next => become_enter!(ctx, code, ip.offset(1), interp, rests),
+        Step::Jump(offset) => {
+            if const { matches!(LAYOUTS[OP as usize], Layout::DstSrc) } {
+                let byte_off = slot.imm_i32() as isize;
+                become_enter!(ctx, code, ip.byte_offset(byte_off), interp, rests)
+            } else {
+                become_enter!(ctx, code, ip.offset(offset + 1), interp, rests)
+            }
+        }
         Step::Exit => match interp.pop(&mut ctx.regs) {
             Some(ret_ip) => {
                 if ret_ip.addr() & 1 != 0 {
@@ -160,16 +167,46 @@ pub extern "rust-preserve-none" fn jump<M: Memory, H: Host<M>, F: Fuel, const OP
                 }
                 become_enter!(ctx, code, ret_ip, interp, rests)
             }
-            None => return interp.stop.at(ip, Reason::Exit),
+            None => interp.stop.at(ip, Reason::Exit),
         },
-        Step::Stop(reason) => return interp.stop.at(ip, reason),
+        Step::Stop(reason) => interp.stop.at(ip, reason),
         Step::Call(_) | Step::CallHelper | Step::CallKfunc | Step::CallIndirect | Step::LdImm64 => {
             unreachable!("calls and LD_IMM64 have their own handlers")
         }
     }
+}
 
-    // `ip` is at `insn` or precedes the target of a jump
-    become_enter!(ctx, code, ip.offset(1), interp, rests)
+/// Direct handler for unconditional `ja` whose byte displacement `(offset + 1) * 16` was pre-scaled into `slot`.
+#[inline(never)]
+pub extern "rust-preserve-none" fn ja_scaled<M: Memory, H: Host<M>, F: Fuel>(
+    ctx: &mut Context<M>,
+    code: Slots,
+    ip: Ip,
+    interp: &mut Interpreter<M, H>,
+    rests: RestsPtr,
+    _: Spare,
+    slot: Slot,
+) {
+    let byte_off = slot.imm_i32() as isize;
+    become_enter!(ctx, code, ip.byte_offset(byte_off), interp, rests)
+}
+
+/// Direct handler for local `call` whose byte displacement `(offset + 1) * 16` was pre-scaled into `slot`.
+#[inline(never)]
+pub extern "rust-preserve-none" fn local_call_scaled<M: Memory, H: Host<M>, F: Fuel>(
+    ctx: &mut Context<M>,
+    code: Slots,
+    ip: Ip,
+    interp: &mut Interpreter<M, H>,
+    rests: RestsPtr,
+    _: Spare,
+    slot: Slot,
+) {
+    if !interp.push(&mut ctx.regs, ip.offset(1)) {
+        return interp.stop.at(ip, Reason::StackOverflow);
+    }
+    let byte_off = slot.imm_i32() as isize;
+    become_enter!(ctx, code, ip.byte_offset(byte_off), interp, rests)
 }
 
 /// Direct handler for local `call` (`src_reg == 1`): pushes the caller frame and enters the target without checking

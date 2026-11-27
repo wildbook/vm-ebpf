@@ -14,9 +14,10 @@ use std::mem::MaybeUninit;
 
 use crate::code::Slots;
 use crate::fuel::{Fuel, RestsPtr, Unmetered};
-use crate::handler::{self, alu3_imm, alu3_reg, handler, jump};
+use crate::handler::{self, alu3_imm, alu3_reg, handler, ja_scaled, jump, local_call_scaled};
 use crate::opcode::OpCode;
 use crate::slot::Slot;
+use crate::threaded::{self, FoldTable};
 use crate::transfer::Ip;
 use crate::{args, fuse, native, transfer, windows, Context, Host, Interpreter, Memory};
 
@@ -96,6 +97,9 @@ pub struct Alu3Table<M: Memory, H> {
 pub struct DispatchTable<M: Memory, H> {
     pub handlers: [Handler<M, H>; 256],
     pub alu3: Alu3Table<M, H>,
+    pub folds: FoldTable<M, H>,
+    pub ja_scaled: Handler<M, H>,
+    pub local_call_scaled: Handler<M, H>,
 }
 
 /// The dispatch tables of the handlers for memory `M` and host `H`.
@@ -194,6 +198,9 @@ pub const fn table<M: Memory, H: Host<M>, F: Fuel>() -> DispatchTable<M, H> {
     DispatchTable {
         handlers,
         alu3: alu3_table::<M, H>(),
+        folds: threaded::table::<M, H, F>(),
+        ja_scaled: ja_scaled::<M, H, F>,
+        local_call_scaled: local_call_scaled::<M, H, F>,
     }
 }
 

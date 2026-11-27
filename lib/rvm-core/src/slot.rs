@@ -240,6 +240,121 @@ impl Slot {
         unsafe { Reg::new_unchecked(self.imm[3]) }
     }
 
+    /// The `offset` field of a portable slot.
+    #[inline(always)]
+    pub fn offset_raw(self) -> i16 {
+        self.offset
+    }
+
+    /// Re-encode a portable [`Layout::DstSrc`] slot for the threaded stream: `dst` in byte 0 (`CL`), `src` in byte 1
+    /// (`CH`), and `extra` (`i32::from(offset)` or pre-scaled jump byte offset) in bytes 4..8 (`RCX >> 32`).
+    #[inline(always)]
+    pub fn to_threaded_dst_src(self, extra: i32) -> Self {
+        debug_assert!(LAYOUTS[usize::from(self.byte)] == Layout::DstSrc);
+        Self {
+            byte: self.regs,
+            regs: self.imm[3],
+            offset: 0,
+            imm: extra.to_le_bytes(),
+        }
+    }
+
+    /// Pre-scaled jump or local call slot holding a byte displacement in bytes 4..8 (`RCX >> 32`).
+    #[inline(always)]
+    pub fn scaled_jump(byte_offset: i32) -> Self {
+        Self {
+            byte: 0,
+            regs: 0,
+            offset: 0,
+            imm: byte_offset.to_le_bytes(),
+        }
+    }
+
+    /// Raw 32-bit signed payload in bytes 4..8 (`RCX >> 32`).
+    #[inline(always)]
+    pub fn imm_i32(self) -> i32 {
+        i32::from_le_bytes(self.imm)
+    }
+
+    /// Pack custom pre-decoded threaded operands: `b0` in byte 0 (`CL`), `b1` in byte 1 (`CH`), `off` in bytes 2..4,
+    /// and `imm` in bytes 4..8 (`RCX >> 32`).
+    #[inline(always)]
+    pub fn pack(b0: u8, b1: u8, off: i16, imm: i32) -> Self {
+        Self {
+            byte: b0,
+            regs: b1,
+            offset: off,
+            imm: imm.to_le_bytes(),
+        }
+    }
+
+    /// Pack four byte fields (`b0..=b3`) in bytes 0..4 and `imm` in bytes 4..8 (`RCX >> 32`).
+    #[inline(always)]
+    pub fn pack_bytes(b0: u8, b1: u8, b2: u8, b3: u8, imm: i32) -> Self {
+        Self {
+            byte: b0,
+            regs: b1,
+            offset: i16::from_le_bytes([b2, b3]),
+            imm: imm.to_le_bytes(),
+        }
+    }
+
+    /// Byte 0 (`CL`) as a validated [`Reg`].
+    ///
+    /// # Safety
+    ///
+    /// Byte 0 of `self` must be `< 16`.
+    #[inline(always)]
+    pub unsafe fn reg0(self) -> Reg {
+        // SAFETY: caller guarantees byte 0 < 16.
+        unsafe { Reg::new_unchecked(self.byte) }
+    }
+
+    /// Byte 1 (`CH`) as a validated [`Reg`].
+    ///
+    /// # Safety
+    ///
+    /// Byte 1 of `self` must be `< 16`.
+    #[inline(always)]
+    pub unsafe fn reg1(self) -> Reg {
+        // SAFETY: caller guarantees byte 1 < 16.
+        unsafe { Reg::new_unchecked(self.regs) }
+    }
+
+    /// Byte 2 (low byte of `offset`) as a validated [`Reg`].
+    ///
+    /// # Safety
+    ///
+    /// Byte 2 of `self` must be `< 16`.
+    #[inline(always)]
+    pub unsafe fn reg2(self) -> Reg {
+        // SAFETY: caller guarantees byte 2 < 16.
+        unsafe { Reg::new_unchecked((self.offset as u16) as u8) }
+    }
+
+    /// Byte 3 (high byte of `offset`) as a validated [`Reg`].
+    ///
+    /// # Safety
+    ///
+    /// Byte 3 of `self` must be `< 16`.
+    #[inline(always)]
+    pub unsafe fn reg3(self) -> Reg {
+        // SAFETY: caller guarantees byte 3 < 16.
+        unsafe { Reg::new_unchecked(((self.offset as u16) >> 8) as u8) }
+    }
+
+    /// Byte 2 as a raw `u8`.
+    #[inline(always)]
+    pub fn byte2(self) -> u8 {
+        (self.offset as u16) as u8
+    }
+
+    /// Byte 3 as a raw `u8`.
+    #[inline(always)]
+    pub fn byte3(self) -> u8 {
+        ((self.offset as u16) >> 8) as u8
+    }
+
     /// Pre-decoded 3-operand ALU immediate slot (`dst = src1 op imm`).
     pub fn alu3_imm(dst: Reg, src1: Reg, imm: i32) -> Self {
         Self {
@@ -343,20 +458,22 @@ impl Shape {
 }
 
 /// The fields of a [`Slot`] as the handler of an opcode byte of shape `shape` reads them: from `held`, the slot in a
-/// register, where one instruction extracts them, else from the code (see the module docs).
+/// register, where one instruction extracts them, else from the code (see the module docs). With `THREADED = true`,
+/// [`Layout::DstSrc`] reads `dst` from byte 0 (`CL`), `src` from byte 1 (`CH`), and `offset` from bytes 4..8
+/// (`RCX >> 32`) with no loads from the code stream.
 #[derive(Clone, Copy)]
-pub struct View<'a> {
+pub struct View<'a, const THREADED: bool = false> {
     slot: &'a Slot,
     held: Option<Slot>,
     shape: Shape,
 }
 
-impl<'a> View<'a> {
-    /// `held` is the slot in `slot` if it is in a register. `slot` has offset 0 if `shape` says so.
+impl<'a> View<'a, false> {
+    /// `held` is the portable slot in `slot` if it is in a register. `slot` has offset 0 if `shape` says so.
     ///
     /// # Safety
     ///
-    /// `slot` must have the layout of `shape`: `LAYOUTS[slot.byte()] == shape.layout`.
+    /// `slot` must have the portable layout of `shape`: `LAYOUTS[slot.byte()] == shape.layout`.
     #[inline(always)]
     pub unsafe fn new(slot: &'a Slot, held: Option<Slot>, shape: Shape) -> Self {
         debug_assert_eq!(LAYOUTS[usize::from(slot.byte)], shape.layout);
@@ -364,7 +481,27 @@ impl<'a> View<'a> {
         debug_assert!(!shape.offset_is_zero || slot.offset == 0);
         Self { slot, held, shape }
     }
+}
 
+impl<'a> View<'a, true> {
+    /// `held` is the threaded slot in `slot` if it is in a register.
+    ///
+    /// # Safety
+    ///
+    /// `slot` must have the threaded layout of `shape`.
+    #[inline(always)]
+    pub unsafe fn threaded(slot: &'a Slot, held: Option<Slot>, shape: Shape) -> Self {
+        debug_assert!(held.is_none_or(|held| held == *slot));
+        debug_assert!(match shape.layout {
+            Layout::Raw => true,
+            Layout::Dst => slot.regs < 16,
+            Layout::DstSrc => slot.byte < 16 && slot.regs < 16,
+        });
+        Self { slot, held, shape }
+    }
+}
+
+impl<const THREADED: bool> View<'_, THREADED> {
     #[inline(always)]
     fn layout(self) -> Layout {
         self.shape.layout
@@ -373,9 +510,14 @@ impl<'a> View<'a> {
     /// A register byte of [`Layout::Dst`] or [`Layout::DstSrc`].
     #[inline(always)]
     fn register(self, reg: u8) -> Reg {
-        // SAFETY: the slot holds the register invariant (see the module docs) in its layout, which `View::new`
-        // requires to be the one this view reads
+        // SAFETY: the slot holds the register invariant (see the module docs) in its layout, which `View::new` /
+        // `View::threaded` requires to be the one this view reads
         unsafe { Reg::new_unchecked(reg) }
+    }
+
+    #[inline(always)]
+    fn byte_field(self) -> u8 {
+        self.held.map_or(self.slot.byte, |held| held.byte)
     }
 
     #[inline(always)]
@@ -389,7 +531,7 @@ impl<'a> View<'a> {
     }
 }
 
-impl Fields for View<'_> {
+impl<const THREADED: bool> Fields for View<'_, THREADED> {
     #[inline(always)]
     fn opcode(self) -> OpCode {
         OpCode(self.shape.opcode)
@@ -399,7 +541,9 @@ impl Fields for View<'_> {
     fn dst_reg(self) -> Reg {
         match self.layout() {
             Layout::Raw => Reg::low(self.regs()),
-            Layout::Dst | Layout::DstSrc => self.register(self.regs()),
+            Layout::Dst => self.register(self.regs()),
+            Layout::DstSrc if THREADED => self.register(self.byte_field()),
+            Layout::DstSrc => self.register(self.regs()),
         }
     }
 
@@ -408,17 +552,18 @@ impl Fields for View<'_> {
         match self.layout() {
             Layout::Raw => Reg::low(self.regs() >> 4),
             Layout::Dst => Reg::R0,
+            Layout::DstSrc if THREADED => self.register(self.regs()),
             // a load from the code, as many instructions as a shift of `held`, which the handlers that read `dst_reg`
             // from CH afterwards (LDX) would need to copy first
             Layout::DstSrc => self.register(self.slot.imm[3]),
         }
     }
 
-    // a load from the code; extracting it from `held` takes three instructions
     #[inline(always)]
     fn offset(self) -> i16 {
         match self.shape.offset_is_zero {
             true => 0,
+            false if THREADED && matches!(self.layout(), Layout::DstSrc) => i32::from_le_bytes(self.imm_bytes()) as i16,
             false => self.slot.offset,
         }
     }

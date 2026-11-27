@@ -5,7 +5,7 @@ use crate::code::Slots;
 use crate::context::FP;
 use crate::dispatch::{Spare, SPARE};
 use crate::fuel::{Fuel, RestsPtr};
-use crate::slot::{Fields, Reg, Shape, Slot, View};
+use crate::slot::{Fields, Layout, Reg, Shape, Slot, View, LAYOUTS};
 use crate::step::{self, Regs, Step};
 use crate::transfer::Ip;
 use crate::{windows, Context, Host, Interpreter, Memory};
@@ -32,14 +32,14 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
     // follows the code (see `Ip`)
     let sequence = unsafe { ip.slots(code, len + 1) };
     // SAFETY: `encode` found the opcode of each instruction of the sequence in its first slot, and `compile_threaded`
-    // protects slots inside a superinstruction from 3-op folding, so `sequence[k].slot` has its layout.
+    // encodes each slot in the threaded layout of its opcode without 3-op folding inside a superinstruction.
     let slot_of = |k: usize| {
         macro_rules! view {
             ($($k:literal),*) => {
                 match k {
                     $($k => unsafe {
                         let cached = if $k == 0 { Some(slot) } else { None };
-                        View::new(&sequence[$k].slot, cached, const { Shape::of(Super::of(S).opcode($k)) })
+                        View::threaded(&sequence[$k].slot, cached, const { Shape::of(Super::of(S).opcode($k)) })
                     },)*
                     _ => unreachable!("a slot past `MAX_LEN`"),
                 }
@@ -103,7 +103,14 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
                     Step::Next => {}
                     // only the last instruction branches, after `save_at`; `transfer::bound` leaves a
                     // superinstruction only where its branch target lies in `0..=len` (see `Ip`)
-                    Step::Jump(offset) => become_after!(ip.offset($k + 1 + offset)),
+                    Step::Jump(offset) => {
+                        if const { matches!(LAYOUTS[Super::of(S).opcode($k) as usize], Layout::DstSrc) } {
+                            let byte_off = sequence[$k].slot.imm_i32() as isize;
+                            become_after!(ip.offset($k).byte_offset(byte_off))
+                        } else {
+                            become_after!(ip.offset($k + 1 + offset))
+                        }
+                    }
                     Step::LdImm64 => step::ld_imm64(&mut roles, decoded, sequence[$k + 1].slot.imm()),
                     Step::Stop(reason) => {
                         roles.save(registers, sup.unsaved[$k]);

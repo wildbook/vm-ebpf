@@ -54,13 +54,8 @@ macro_rules! operand {
 // it holds the upper half of the immediate and nothing else. Longer sequences come first, so that they win over their
 // prefixes.
 superinstructions! {
-    // 32-bit rotates: t = x >> k | x << (32 - k) in either shift order, into x
-    0xd8: mov32 t, x; rsh32 t, _; lsh32 x, _; or32 x, t;
-    0x30: mov32 t, x; lsh32 t, _; rsh32 x, _; or32 x, t;
-    // a = b + c, then a load or store through a, or a byte load through a and a branch on the byte
+    // a = b + c, then a byte load through a and a branch on the byte
     0x9e: mov64 a, b; add64 a, c; ldxb a, [a + _]; jeq32 a, _, _;
-    0x08: mov64 a, b; add64 a, c; ldxb _, [a + _];
-    0x20: mov64 a, b; add64 a, c; stb [a + _], _;
     // two moves
     0xf5: mov64 a, b; mov64 _, _;
     // loop counters and mask tests: a += imm or a &= imm, then a branch on a or another ALU op
@@ -74,8 +69,6 @@ superinstructions! {
     0x29: and32 a, _; jne32 a, _, _;
     0x31: add32 a, _; and32 a, _;
     0x86: add64 a, _; add64 _, _;
-    // indexed byte load without a preceding move
-    0x39: add64 a, b; ldxb _, [a + _];
     // the address of an element of a global array
     0xf7: lddw a, _; add64 a, b;
     // spill traffic: a reload and an operation, or a load and a spill, over any registers

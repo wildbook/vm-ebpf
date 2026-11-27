@@ -153,6 +153,13 @@ impl Ip {
         Self(self.0.wrapping_offset(n as isize))
     }
 
+    /// The ip `bytes` bytes on (a multiple of `size_of::<ThreadedSlot>()`), which may lie outside the code.
+    #[inline(always)]
+    pub fn byte_offset(self, bytes: isize) -> Self {
+        debug_assert!(bytes % (size_of::<ThreadedSlot>() as isize) == 0);
+        Self(self.0.cast::<u8>().wrapping_offset(bytes).cast::<ThreadedSlot>())
+    }
+
     /// The pc of the slot in `code`, which it lies in.
     #[inline(always)]
     pub fn pc(self, code: Slots) -> u64 {
@@ -189,17 +196,17 @@ impl Ip {
         unsafe { (*self.0).slot }
     }
 
-    /// The fields of the slot it points to, as the handler of an opcode byte of shape `shape` reads them, which takes
-    /// `held`, that slot in a register.
+    /// The fields of the threaded slot it points to, as the handler of an opcode byte of shape `shape` reads them,
+    /// taking `held`, that slot in a register.
     ///
     /// # Safety
     ///
-    /// As for [`Ip::get`] while the view is in use; `held` must be the slot it points to, and it must have the layout
-    /// of `shape` (see [`View::new`]).
+    /// As for [`Ip::get`] while the view is in use; `held` must be the threaded slot it points to, and it must have
+    /// the threaded layout of `shape` (see [`View::threaded`]).
     #[inline(always)]
-    pub unsafe fn view<'a>(self, held: Slot, shape: Shape) -> View<'a> {
+    pub unsafe fn view<'a>(self, held: Slot, shape: Shape) -> View<'a, true> {
         // SAFETY: the caller's
-        unsafe { View::new(&(*self.0).slot, Some(held), shape) }
+        unsafe { View::threaded(&(*self.0).slot, Some(held), shape) }
     }
 
     /// The `n` threaded slots from this one on, borrowed from `code`.

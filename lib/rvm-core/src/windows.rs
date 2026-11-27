@@ -33,6 +33,7 @@ use crate::{Context, Host, Instruction, Interpreter, Memory};
 /// Each cache that isn't empty holds a window of epoch `epoch`, which [`Windows::take`] ensures. The interpreter calls
 /// [`Windows::revalidate`] whenever code outside the chain of handlers may have changed the memory, and the methods of
 /// [`Memory`] leave its epoch alone, so inside the chain the memory is at `epoch` whenever a cache isn't empty.
+#[repr(C)]
 pub struct Windows {
     /// The window around r10.
     stack: Cache,
@@ -109,6 +110,12 @@ impl Windows {
             false => &self.data,
         }
     }
+
+    /// Run a load or store in the data window for `opc` at `addr`, returning `None` on a miss.
+    #[inline(always)]
+    pub fn run_data(&self, opc: OpCode, kind: usize, addr: u64, value: u64) -> Option<u64> {
+        self.data_for(opc).run(opc, kind, addr, value)
+    }
 }
 
 /// Whether accesses of `size` take the cache of 1 and 2 byte accesses, so that byte streams don't evict the window of
@@ -143,7 +150,7 @@ impl Cache {
     /// Run the load or store `OP` of `insn` at `addr` on the host memory, or return false if it doesn't fit in the
     /// window.
     #[inline(always)]
-    fn access<const OP: u8>(&self, regs: &mut [u64; 16], insn: View, addr: u64) -> bool {
+    fn access<const OP: u8>(&self, regs: &mut [u64; 16], insn: View<'_, true>, addr: u64) -> bool {
         let opc = OpCode(OP);
         let value = match opc.class() {
             Class::Stx => regs.get(insn.src_reg()),
@@ -172,25 +179,46 @@ impl Cache {
         let host = ptr::with_exposed_provenance_mut::<u8>((addr as usize).wrapping_add(self.bias));
         // SAFETY: the access fits in the window at `at`, and the memory is at the window's epoch (see `Windows`), so
         // the host bytes there are the guest bytes and valid for the access
-        unsafe {
-            match (opc.class(), opc.mem_size()) {
-                (Class::Ldx, MemSize::Byte) => return Some(host.read().into()),
-                (Class::Ldx, MemSize::Half) => return Some(u16::from_le(host.cast::<u16>().read_unaligned()).into()),
-                (Class::Ldx, MemSize::Word) => return Some(u32::from_le(host.cast::<u32>().read_unaligned()).into()),
-                (Class::Ldx, MemSize::DWord) => return Some(u64::from_le(host.cast::<u64>().read_unaligned())),
-                (_, MemSize::Byte) => host.write(value as u8),
-                (_, MemSize::Half) => host.cast::<u16>().write_unaligned((value as u16).to_le()),
-                (_, MemSize::Word) => host.cast::<u32>().write_unaligned((value as u32).to_le()),
-                (_, MemSize::DWord) => host.cast::<u64>().write_unaligned(value.to_le()),
+        Some(unsafe { access_raw(host, opc, value) })
+    }
+}
+
+/// Perform the raw host load or store for `opc` at `host`.
+///
+/// # Safety
+///
+/// `host` must be valid for a read or write of `opc.mem_size()` bytes.
+#[inline(always)]
+unsafe fn access_raw(host: *mut u8, opc: OpCode, value: u64) -> u64 {
+    unsafe {
+        match (opc.class(), opc.mem_size()) {
+            (Class::Ldx, MemSize::Byte) => host.read().into(),
+            (Class::Ldx, MemSize::Half) => u16::from_le(host.cast::<u16>().read_unaligned()).into(),
+            (Class::Ldx, MemSize::Word) => u32::from_le(host.cast::<u32>().read_unaligned()).into(),
+            (Class::Ldx, MemSize::DWord) => u64::from_le(host.cast::<u64>().read_unaligned()),
+            (_, MemSize::Byte) => {
+                host.write(value as u8);
+                0
+            }
+            (_, MemSize::Half) => {
+                host.cast::<u16>().write_unaligned((value as u16).to_le());
+                0
+            }
+            (_, MemSize::Word) => {
+                host.cast::<u32>().write_unaligned((value as u32).to_le());
+                0
+            }
+            (_, MemSize::DWord) => {
+                host.cast::<u64>().write_unaligned(value.to_le());
+                0
             }
         }
-        Some(0)
     }
 }
 
 /// The index into [`Cache::fits`] for the access `opc`. 4 and 8 byte accesses sit first so every `stack_access`
 /// handler reaches them within one-byte displacement.
-const fn kind(opc: OpCode) -> usize {
+pub const fn kind(opc: OpCode) -> usize {
     let store = !matches!(opc.class(), Class::Ldx);
     match (opc.mem_size(), store) {
         (MemSize::Word, false) => 0,
@@ -340,7 +368,7 @@ pub extern "rust-preserve-none" fn stack_access<M: Memory, H: Host<M>, const OP:
     _: Spare,
     slot: Slot,
 ) {
-    // SAFETY: a handler's ip lies below `len`, and an r10 access has the layout of its load or store
+    // SAFETY: a handler's ip lies below `len`, and an r10 access has the threaded layout of its load or store
     let insn = unsafe { ip.view(slot, const { Shape::of(OP) }) };
     let addr = step::address(ctx.regs[FP], insn);
     if !interp.windows.stack.access::<OP>(&mut ctx.regs, insn, addr) {
@@ -427,7 +455,7 @@ extern "rust-preserve-none" fn miss<M: Memory, H: Host<M>, const OP: u8, const D
 
 /// The register that holds the base address of the load or store `OP`.
 #[inline(always)]
-fn base_reg<const OP: u8>(insn: View) -> Reg {
+fn base_reg<const OP: u8>(insn: View<'_, true>) -> Reg {
     match OpCode(OP).class() {
         Class::Ldx => insn.src_reg(),
         _ => insn.dst_reg(),

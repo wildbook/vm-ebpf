@@ -136,6 +136,7 @@ mod native;
 mod rewrite;
 mod slot;
 mod step;
+mod threaded;
 #[cfg(feature = "callbacks")]
 mod thunk;
 mod transfer;
