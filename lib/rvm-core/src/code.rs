@@ -130,25 +130,6 @@ impl Code {
         self.len == 0
     }
 
-    /// Make the helper or kfunc `call` in slot `pc` a call of the native function at `index` in
-    /// [`Host::natives`](crate::Host::natives). See [`Code::with_natives`] for the contract.
-    ///
-    /// # Safety
-    ///
-    /// As [`Code::with_natives`].
-    pub unsafe fn bind_native(&mut self, pc: usize, index: u32, args: u8, mode: NativeMode) -> bool {
-        let args = usize::from(args);
-        let Some(slot) = self.slots[..self.len].get_mut(pc) else {
-            return false;
-        };
-        if !matches!(slot.byte(), CALL_HELPER | CALL_KFUNC) || (mode != NativeMode::Raw && args > MAX_NATIVE_ARGS) {
-            return false;
-        }
-        let byte = native::byte(args, mode);
-        *slot = Slot::new(Instruction::new(OpCode(byte), 0, 0, 0, index as i32));
-        true
-    }
-
     /// Make the kfunc `call` in slot `pc` pass the stack arguments of its frame to the host, which then runs it in
     /// [`Host::call_kfunc_stack`](crate::Host::call_kfunc_stack).
     ///

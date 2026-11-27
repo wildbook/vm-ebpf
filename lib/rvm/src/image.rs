@@ -635,18 +635,14 @@ fn resolve_imports(
                 .into());
             }
             (None, Some(p)) if p.needs_general() => {
+                general_mode(name, p, None, true)?;
                 #[cfg(feature = "ffi")]
                 {
-                    p.general_proto(name, None, true)?;
                     (NativeSig::ints(0), NativeKind::General)
                 }
                 #[cfg(not(feature = "ffi"))]
                 {
-                    return Err(LinkError::NativeMismatch {
-                        name: name.clone(),
-                        reason: "this extern needs the `ffi` feature".into(),
-                    }
-                    .into());
+                    unreachable!("general_mode returns Err without `ffi`")
                 }
             }
             (None, Some(p)) => (p.native_sig(name)?, NativeKind::Strip),
@@ -736,42 +732,53 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
     Ok(program)
 }
 
-/// Move each of `addresses` from its link address to the guest address of the same byte in `memory`, where the
-/// regions they point into are mapped.
-fn relocate(addresses: &[Address], insns: &mut [Instruction], memory: &mut VmMemory) -> Result<()> {
+/// Rewrite the 64-bit address stored at `site` (`LD_IMM64` immediate in `insns`, or 8 bytes in `.rodata`/`.data`).
+fn patch_site(
+    site: Site,
+    insns: &mut [Instruction],
+    memory: &mut VmMemory,
+    update: impl FnOnce(u64) -> u64,
+    bad: impl Fn() -> VmError,
+) -> Result<()> {
     // the immediate of an instruction
     const IMM: u64 = 0xFFFF_FFFF << 32;
 
+    match site {
+        Site::Code(at) => {
+            let at = at as usize;
+            let [lo, hi] = insns.get_mut(at..at + 2).ok_or_else(&bad)? else {
+                unreachable!("two instructions")
+            };
+            if lo.byte() != LD_IMM64 {
+                return Err(bad());
+            }
+            let addr = update((lo.0 >> 32) | (hi.0 & IMM));
+            lo.0 = lo.0 & !IMM | addr << 32;
+            hi.0 = hi.0 & !IMM | addr & IMM;
+        }
+        Site::RoData(offset) | Site::Data(offset) => {
+            let in_region = match site {
+                Site::RoData(_) => RODATA_REGION,
+                _ => DATA_REGION,
+            };
+            let at = memory.region_base(in_region) + u64::from(offset);
+            let old = memory.read(at).map_err(|_| bad())?;
+            memory.write(at, update(old)).map_err(|_| bad())?;
+        }
+    }
+    Ok(())
+}
+
+/// Move each of `addresses` from its link address to the guest address of the same byte in `memory`, where the
+/// regions they point into are mapped.
+fn relocate(addresses: &[Address], insns: &mut [Instruction], memory: &mut VmMemory) -> Result<()> {
     for &Address { at, region } in addresses {
         let bad = || invalid(format!("address at {at:?} into region {region}"));
         if region != RODATA_REGION && region != DATA_REGION {
             return Err(bad());
         }
         let base = memory.region_base(region);
-        let guest = |link: u64| base.wrapping_add(link.wrapping_sub(region_tag(region)));
-        match at {
-            Site::Code(at) => {
-                let at = at as usize;
-                let [lo, hi] = insns.get_mut(at..at + 2).ok_or_else(bad)? else {
-                    unreachable!("two instructions")
-                };
-                if lo.byte() != LD_IMM64 {
-                    return Err(bad());
-                }
-                let addr = guest((lo.0 >> 32) | (hi.0 & IMM));
-                lo.0 = lo.0 & !IMM | addr << 32;
-                hi.0 = hi.0 & !IMM | addr & IMM;
-            }
-            Site::RoData(offset) | Site::Data(offset) => {
-                let in_region = match at {
-                    Site::RoData(_) => RODATA_REGION,
-                    _ => DATA_REGION,
-                };
-                let site = memory.region_base(in_region) + u64::from(offset);
-                let addr = guest(memory.read(site).map_err(|_| bad())?);
-                memory.write(site, addr).map_err(|_| bad())?;
-            }
-        }
+        patch_site(at, insns, memory, |link| base.wrapping_add(link.wrapping_sub(region_tag(region))), bad)?;
     }
     Ok(())
 }
@@ -784,8 +791,6 @@ fn patch_tokens(
     insns: &mut [Instruction],
     memory: &mut VmMemory,
 ) -> Result<Box<[Token]>> {
-    const IMM: u64 = 0xFFFF_FFFF << 32;
-
     let mut table: Vec<Token> = Vec::new();
     for &(site, import_idx) in token_sites {
         let bad = || invalid(format!("token at {site:?} for import {import_idx}"));
@@ -803,27 +808,7 @@ fn patch_tokens(
             }
         };
         let addr = region_tag(CODE_REGION) | (token_idx * INSN_SIZE + 1);
-        match site {
-            Site::Code(at) => {
-                let at = at as usize;
-                let [lo, hi] = insns.get_mut(at..at + 2).ok_or_else(bad)? else {
-                    unreachable!("two instructions")
-                };
-                if lo.byte() != LD_IMM64 {
-                    return Err(bad());
-                }
-                lo.0 = lo.0 & !IMM | addr << 32;
-                hi.0 = hi.0 & !IMM | addr & IMM;
-            }
-            Site::RoData(offset) | Site::Data(offset) => {
-                let in_region = match site {
-                    Site::RoData(_) => RODATA_REGION,
-                    _ => DATA_REGION,
-                };
-                let at = memory.region_base(in_region) + u64::from(offset);
-                memory.write(at, addr).map_err(|_| bad())?;
-            }
-        }
+        patch_site(site, insns, memory, |_| addr, bad)?;
     }
     Ok(table.into_boxed_slice())
 }
@@ -945,6 +930,22 @@ fn bind_externs(
     Ok(bound)
 }
 
+fn general_mode(name: &str, proto: &Proto, host_sig: Option<NativeSig>, tagged: bool) -> Result<NativeMode> {
+    #[cfg(feature = "ffi")]
+    {
+        Ok(NativeMode::General(proto.general_proto(name, host_sig, tagged)?))
+    }
+    #[cfg(not(feature = "ffi"))]
+    {
+        let _ = (proto, host_sig, tagged);
+        Err(LinkError::NativeMismatch {
+            name: name.to_string(),
+            reason: "this extern needs the `ffi` feature".into(),
+        }
+        .into())
+    }
+}
+
 fn bind_import(import: &Import, table: &HelperRegistry, tagged: bool) -> Result<BoundImport> {
     match import {
         Import::Helper(id) => {
@@ -965,53 +966,29 @@ fn bind_import(import: &Import, table: &HelperRegistry, tagged: bool) -> Result<
                         };
                         p.check_native_sig(name, host_sig)?;
                         if p.needs_general() || host_sig.is_aware() {
-                            #[cfg(feature = "ffi")]
-                            {
-                                NativeMode::General(p.general_proto(name, Some(host_sig), tagged)?)
-                            }
-                            #[cfg(not(feature = "ffi"))]
-                            {
-                                return Err(LinkError::NativeMismatch {
-                                    name: name.clone(),
-                                    reason: "this extern needs the `ffi` feature".into(),
-                                }
-                                .into());
-                            }
+                            general_mode(name, p, Some(host_sig), tagged)?
+                        } else if tagged && host_sig.has_pointers() {
+                            NativeMode::Checked
                         } else {
-                            match tagged && host_sig.has_pointers() {
-                                true => NativeMode::Checked,
-                                false => NativeMode::Plain,
-                            }
+                            NativeMode::Plain
                         }
                     }
-                    NativeKind::Strip => {
-                        if let Some(p) = proto {
-                            if p.needs_general() {
-                                #[cfg(feature = "ffi")]
-                                {
-                                    return Ok(BoundImport::Native {
-                                        index,
-                                        args: host_sig.args(),
-                                        mode: NativeMode::General(p.general_proto(name, None, tagged)?),
-                                    });
-                                }
-                                #[cfg(not(feature = "ffi"))]
-                                {
-                                    return Err(LinkError::NativeMismatch {
-                                        name: name.clone(),
-                                        reason: "this extern needs the `ffi` feature".into(),
-                                    }
-                                    .into());
-                                }
-                            }
+                    NativeKind::Strip => match proto {
+                        Some(p) if p.needs_general() => general_mode(name, p, None, tagged)?,
+                        Some(p) => {
                             let declared = p.native_sig(name)?;
                             check_strip_sig(name, declared, host_sig)?;
+                            if tagged && host_sig.has_pointers() {
+                                NativeMode::Strip
+                            } else {
+                                NativeMode::Plain
+                            }
                         }
-                        match tagged && host_sig.has_pointers() {
+                        None => match tagged && host_sig.has_pointers() {
                             true => NativeMode::Strip,
                             false => NativeMode::Plain,
-                        }
-                    }
+                        },
+                    },
                     #[cfg(feature = "ffi")]
                     NativeKind::General => {
                         let Some(p) = proto else {

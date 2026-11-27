@@ -92,90 +92,64 @@ macro_rules! define_thunks {
             dispatch = sym rvm_thunk_dispatch,
         );
 
+        #[cfg(all(target_arch = "x86_64", unix))]
+        macro_rules! sysv_thunks_asm {
+            ($prefix:literal, $elf:tt) => {
+                global_asm!(
+                    $(
+                        concat!(
+                            ".balign 16\n",
+                            ".globl ", $prefix, stringify!($sym), "\n",
+                            sysv_thunks_asm!(@type $elf, stringify!($sym)),
+                            $prefix, stringify!($sym), ":\n",
+                            "    mov eax, ", stringify!($idx), "\n",
+                            "    jmp ", $prefix, "rvm_thunk_common\n",
+                            sysv_thunks_asm!(@size $elf, stringify!($sym)),
+                        ),
+                    )*
+                    ".balign 16",
+                    concat!(".globl ", $prefix, "rvm_thunk_common"),
+                    sysv_thunks_asm!(@type $elf, "rvm_thunk_common"),
+                    concat!($prefix, "rvm_thunk_common:"),
+                    "    .cfi_startproc",
+                    // 48 bytes for rdi..r9 + 40 bytes for xmm0..xmm4 = 88 bytes (entry rsp % 16 == 8 -> aligned)
+                    "    sub rsp, 88",
+                    "    .cfi_def_cfa_offset 96",
+                    "    mov [rsp], rdi",
+                    "    mov [rsp + 8], rsi",
+                    "    mov [rsp + 16], rdx",
+                    "    mov [rsp + 24], rcx",
+                    "    mov [rsp + 32], r8",
+                    "    mov [rsp + 40], r9",
+                    "    movq [rsp + 48], xmm0",
+                    "    movq [rsp + 56], xmm1",
+                    "    movq [rsp + 64], xmm2",
+                    "    movq [rsp + 72], xmm3",
+                    "    movq [rsp + 80], xmm4",
+                    "    mov edi, eax",
+                    "    lea rsi, [rsp]",
+                    "    lea rdx, [rsp + 48]",
+                    "    call {dispatch}",
+                    "    movq xmm0, rax",
+                    "    add rsp, 88",
+                    "    .cfi_def_cfa_offset 8",
+                    "    ret",
+                    "    .cfi_endproc",
+                    sysv_thunks_asm!(@size $elf, "rvm_thunk_common"),
+                    dispatch = sym rvm_thunk_dispatch,
+                );
+            };
+            (@type true, $name:expr) => { concat!(".type ", $name, ", @function\n") };
+            (@type false, $name:expr) => { "" };
+            (@size true, $name:expr) => { concat!(".size ", $name, ", .-", $name, "\n") };
+            (@size false, $name:expr) => { "" };
+        }
+
         #[cfg(all(target_arch = "x86_64", unix, not(target_vendor = "apple")))]
-        global_asm!(
-            $(
-                concat!(
-                    ".balign 16\n",
-                    ".globl ", stringify!($sym), "\n",
-                    ".type ", stringify!($sym), ", @function\n",
-                    stringify!($sym), ":\n",
-                    "    mov eax, ", stringify!($idx), "\n",
-                    "    jmp rvm_thunk_common\n",
-                    ".size ", stringify!($sym), ", .-", stringify!($sym), "\n",
-                ),
-            )*
-            ".balign 16",
-            ".globl rvm_thunk_common",
-            ".type rvm_thunk_common, @function",
-            "rvm_thunk_common:",
-            "    .cfi_startproc",
-            // 48 bytes for rdi..r9 + 40 bytes for xmm0..xmm4 = 88 bytes (entry rsp % 16 == 8 -> aligned)
-            "    sub rsp, 88",
-            "    .cfi_def_cfa_offset 96",
-            "    mov [rsp], rdi",
-            "    mov [rsp + 8], rsi",
-            "    mov [rsp + 16], rdx",
-            "    mov [rsp + 24], rcx",
-            "    mov [rsp + 32], r8",
-            "    mov [rsp + 40], r9",
-            "    movq [rsp + 48], xmm0",
-            "    movq [rsp + 56], xmm1",
-            "    movq [rsp + 64], xmm2",
-            "    movq [rsp + 72], xmm3",
-            "    movq [rsp + 80], xmm4",
-            "    mov edi, eax",
-            "    lea rsi, [rsp]",
-            "    lea rdx, [rsp + 48]",
-            "    call {dispatch}",
-            "    movq xmm0, rax",
-            "    add rsp, 88",
-            "    .cfi_def_cfa_offset 8",
-            "    ret",
-            "    .cfi_endproc",
-            ".size rvm_thunk_common, .-rvm_thunk_common",
-            dispatch = sym rvm_thunk_dispatch,
-        );
+        sysv_thunks_asm!("", true);
 
         #[cfg(all(target_arch = "x86_64", target_vendor = "apple"))]
-        global_asm!(
-            $(
-                concat!(
-                    ".balign 16\n",
-                    ".globl _", stringify!($sym), "\n",
-                    "_", stringify!($sym), ":\n",
-                    "    mov eax, ", stringify!($idx), "\n",
-                    "    jmp _rvm_thunk_common\n",
-                ),
-            )*
-            ".balign 16",
-            ".globl _rvm_thunk_common",
-            "_rvm_thunk_common:",
-            "    .cfi_startproc",
-            "    sub rsp, 88",
-            "    .cfi_def_cfa_offset 96",
-            "    mov [rsp], rdi",
-            "    mov [rsp + 8], rsi",
-            "    mov [rsp + 16], rdx",
-            "    mov [rsp + 24], rcx",
-            "    mov [rsp + 32], r8",
-            "    mov [rsp + 40], r9",
-            "    movq [rsp + 48], xmm0",
-            "    movq [rsp + 56], xmm1",
-            "    movq [rsp + 64], xmm2",
-            "    movq [rsp + 72], xmm3",
-            "    movq [rsp + 80], xmm4",
-            "    mov edi, eax",
-            "    lea rsi, [rsp]",
-            "    lea rdx, [rsp + 48]",
-            "    call {dispatch}",
-            "    movq xmm0, rax",
-            "    add rsp, 88",
-            "    .cfi_def_cfa_offset 8",
-            "    ret",
-            "    .cfi_endproc",
-            dispatch = sym rvm_thunk_dispatch,
-        );
+        sysv_thunks_asm!("_", false);
     };
 }
 

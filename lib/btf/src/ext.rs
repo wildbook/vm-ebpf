@@ -12,22 +12,15 @@ const BTF_EXT_HDR_SIZE_WITH_CORE: usize = 32;
 /// The CO-RE relocations and function info records of a `.BTF.ext` section.
 #[derive(Debug, Clone)]
 pub struct BtfExt<'a> {
-    sections: Vec<SectionCoreRelos<'a>>,
-    func_sections: Vec<SectionFuncInfos<'a>>,
+    sections: Vec<ExtSection<'a, CoreRelo>>,
+    func_sections: Vec<ExtSection<'a, FuncInfo>>,
 }
 
-/// The CO-RE relocations of one code section.
+/// Records belonging to one code section in `.BTF.ext`.
 #[derive(Debug, Clone)]
-struct SectionCoreRelos<'a> {
+struct ExtSection<'a, T> {
     section_name: &'a str,
-    relos: Vec<CoreRelo>,
-}
-
-/// The `func_info` records of one code section.
-#[derive(Debug, Clone)]
-struct SectionFuncInfos<'a> {
-    section_name: &'a str,
-    funcs: Vec<FuncInfo>,
+    records: Vec<T>,
 }
 
 /// One `.BTF.ext` `func_info` record: maps a code section byte offset to its `BTF_KIND_FUNC` type ID.
@@ -45,7 +38,12 @@ impl<'a> BtfExt<'a> {
     pub fn parse(data: &'a [u8], strings: &BtfStrings<'a>) -> Result<Self, BtfError> {
         let hdr_len = check_header(data, BTF_EXT_HDR_MIN_SIZE)?;
         let func_data = section(data, hdr_len, word(data, 2), word(data, 3))?;
-        let func_sections = Self::parse_func_infos(func_data, strings)?;
+        let func_sections = parse_ext_sections(func_data, strings, 8, |rec| {
+            Ok(FuncInfo {
+                insn_off: word(rec, 0),
+                type_id: word(rec, 1),
+            })
+        })?;
 
         if hdr_len < BTF_EXT_HDR_SIZE_WITH_CORE || data.len() < BTF_EXT_HDR_SIZE_WITH_CORE {
             return Ok(Self {
@@ -54,7 +52,7 @@ impl<'a> BtfExt<'a> {
             });
         }
         let relo_data = section(data, hdr_len, word(data, 6), word(data, 7))?;
-        let sections = Self::parse_core_relos(relo_data, strings)?;
+        let sections = parse_ext_sections(relo_data, strings, CoreRelo::SIZE, CoreRelo::parse)?;
 
         Ok(Self {
             sections,
@@ -62,95 +60,60 @@ impl<'a> BtfExt<'a> {
         })
     }
 
-    fn parse_func_infos(func_data: &[u8], strings: &BtfStrings<'a>) -> Result<Vec<SectionFuncInfos<'a>>, BtfError> {
-        const MIN_REC: usize = 8;
-        if func_data.len() < 4 {
-            return Ok(Vec::new());
-        }
-        let rec_size = word(func_data, 0);
-        if (rec_size as usize) < MIN_REC {
-            return Err(BtfError::BadRecordSize(rec_size));
-        }
-        let rec_size = rec_size as usize;
-
-        let mut offset = 4;
-        let mut sections = Vec::new();
-        while offset + 8 <= func_data.len() {
-            let sec_name_off = word(&func_data[offset..], 0);
-            let num_info = word(&func_data[offset..], 1);
-            offset += 8;
-
-            let section_name = strings.get_or_empty(sec_name_off);
-            let records = (num_info as usize)
-                .checked_mul(rec_size)
-                .filter(|&len| len <= func_data.len() - offset)
-                .ok_or(BtfError::SectionOverflow)?;
-            let funcs = func_data[offset..][..records]
-                .chunks_exact(rec_size)
-                .map(|rec| FuncInfo {
-                    insn_off: word(rec, 0),
-                    type_id: word(rec, 1),
-                })
-                .collect();
-            offset += records;
-
-            sections.push(SectionFuncInfos { section_name, funcs });
-        }
-        Ok(sections)
-    }
-
     /// The `func_info` records of the code section `section_name`, or `None` if it has none.
     pub fn func_infos_for_section(&self, section_name: &str) -> Option<&[FuncInfo]> {
-        self.func_sections
-            .iter()
-            .find(|s| s.section_name == section_name)
-            .map(|s| s.funcs.as_slice())
-    }
-
-    fn parse_core_relos(relo_data: &[u8], strings: &BtfStrings<'a>) -> Result<Vec<SectionCoreRelos<'a>>, BtfError> {
-        if relo_data.len() < 4 {
-            return Ok(Vec::new());
-        }
-
-        let rec_size = word(relo_data, 0);
-        if (rec_size as usize) < CoreRelo::SIZE {
-            return Err(BtfError::BadRecordSize(rec_size));
-        }
-        let rec_size = rec_size as usize;
-
-        let mut offset = 4;
-        let mut sections = Vec::new();
-
-        while offset + 8 <= relo_data.len() {
-            // section header: sec_name_off, num_info
-            let sec_name_off = word(&relo_data[offset..], 0);
-            let num_info = word(&relo_data[offset..], 1);
-            offset += 8;
-
-            let section_name = strings.get_or_empty(sec_name_off);
-            let records = (num_info as usize)
-                .checked_mul(rec_size)
-                .filter(|&len| len <= relo_data.len() - offset)
-                .ok_or(BtfError::SectionOverflow)?;
-            let relos = relo_data[offset..][..records]
-                .chunks_exact(rec_size)
-                .map(CoreRelo::parse)
-                .collect::<Result<_, _>>()?;
-            offset += records;
-
-            sections.push(SectionCoreRelos { section_name, relos });
-        }
-
-        Ok(sections)
+        find_section(&self.func_sections, section_name)
     }
 
     /// The relocations of the code section `section_name`, or `None` if it has none.
     pub fn relos_for_section(&self, section_name: &str) -> Option<&[CoreRelo]> {
-        self.sections
-            .iter()
-            .find(|s| s.section_name == section_name)
-            .map(|s| s.relos.as_slice())
+        find_section(&self.sections, section_name)
     }
+}
+
+fn find_section<'a, T>(sections: &'a [ExtSection<'_, T>], name: &str) -> Option<&'a [T]> {
+    sections
+        .iter()
+        .find(|s| s.section_name == name)
+        .map(|s| s.records.as_slice())
+}
+
+fn parse_ext_sections<'a, T>(
+    data: &[u8],
+    strings: &BtfStrings<'a>,
+    min_rec: usize,
+    mut parse_rec: impl FnMut(&[u8]) -> Result<T, BtfError>,
+) -> Result<Vec<ExtSection<'a, T>>, BtfError> {
+    if data.len() < 4 {
+        return Ok(Vec::new());
+    }
+    let rec_size = word(data, 0);
+    if (rec_size as usize) < min_rec {
+        return Err(BtfError::BadRecordSize(rec_size));
+    }
+    let rec_size = rec_size as usize;
+
+    let mut offset = 4;
+    let mut sections = Vec::new();
+    while offset + 8 <= data.len() {
+        let sec_name_off = word(&data[offset..], 0);
+        let num_info = word(&data[offset..], 1);
+        offset += 8;
+
+        let section_name = strings.get_or_empty(sec_name_off);
+        let bytes = (num_info as usize)
+            .checked_mul(rec_size)
+            .filter(|&len| len <= data.len() - offset)
+            .ok_or(BtfError::SectionOverflow)?;
+        let records = data[offset..][..bytes]
+            .chunks_exact(rec_size)
+            .map(&mut parse_rec)
+            .collect::<Result<_, _>>()?;
+        offset += bytes;
+
+        sections.push(ExtSection { section_name, records });
+    }
+    Ok(sections)
 }
 
 /// One CO-RE relocation.

@@ -143,7 +143,7 @@ pub unsafe trait Memory {
     }
 
     /// The host address of the `len` bytes at guest address `addr`, which the native function of a checked native
-    /// call ([`Code::bind_native`](crate::Code::bind_native)) gets in place of `addr` and reads, or with `write` reads
+    /// call ([`Code::with_natives`](crate::Code::with_natives)) gets in place of `addr` and reads, or with `write` reads
     /// and writes. Fails with the error of the first of those bytes the guest may not access so.
     ///
     /// When `len` is 0, implementations should return a canonical non-null, aligned dangling address (such as `16`)

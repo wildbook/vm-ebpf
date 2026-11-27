@@ -183,6 +183,26 @@ impl Proto {
             .into());
         }
 
+        let ptr_arg = |i: usize| {
+            if !tagged {
+                GeneralArg::Value
+            } else if let Some(sig) = host_sig {
+                match sig.arg((i + 1) as u8) {
+                    Some(NativeArg::Read(len)) => GeneralArg::Checked {
+                        write: false,
+                        len_arg: len.unwrap_or(0),
+                    },
+                    Some(NativeArg::Write(len)) => GeneralArg::Checked {
+                        write: true,
+                        len_arg: len.unwrap_or(0),
+                    },
+                    _ => GeneralArg::Value,
+                }
+            } else {
+                GeneralArg::Strip
+            }
+        };
+
         let mut args = [GeneralArg::Value; MAX_NATIVE_ARGS];
         for (i, &arg) in self.args.iter().enumerate() {
             args[i] = match arg {
@@ -191,44 +211,8 @@ impl Proto {
                 #[cfg(feature = "callbacks")]
                 ArgKind::Callback => GeneralArg::Callback,
                 #[cfg(not(feature = "callbacks"))]
-                ArgKind::Callback => {
-                    if !tagged {
-                        GeneralArg::Value
-                    } else if let Some(sig) = host_sig {
-                        match sig.arg((i + 1) as u8) {
-                            Some(NativeArg::Read(len)) => GeneralArg::Checked {
-                                write: false,
-                                len_arg: len.unwrap_or(0),
-                            },
-                            Some(NativeArg::Write(len)) => GeneralArg::Checked {
-                                write: true,
-                                len_arg: len.unwrap_or(0),
-                            },
-                            _ => GeneralArg::Value,
-                        }
-                    } else {
-                        GeneralArg::Strip
-                    }
-                }
-                ArgKind::Ptr => {
-                    if !tagged {
-                        GeneralArg::Value
-                    } else if let Some(sig) = host_sig {
-                        match sig.arg((i + 1) as u8) {
-                            Some(NativeArg::Read(len)) => GeneralArg::Checked {
-                                write: false,
-                                len_arg: len.unwrap_or(0),
-                            },
-                            Some(NativeArg::Write(len)) => GeneralArg::Checked {
-                                write: true,
-                                len_arg: len.unwrap_or(0),
-                            },
-                            _ => GeneralArg::Value,
-                        }
-                    } else {
-                        GeneralArg::Strip
-                    }
-                }
+                ArgKind::Callback => ptr_arg(i),
+                ArgKind::Ptr => ptr_arg(i),
                 ArgKind::Copy(3 | 5 | 6 | 7) => GeneralArg::Copy1,
                 ArgKind::Copy(9..=16) => GeneralArg::Copy2,
                 ArgKind::Copy(size) => {

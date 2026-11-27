@@ -252,22 +252,35 @@ impl Drop for EntryArgs<'_> {
 #[cold]
 #[inline(never)]
 fn run_on(
+    reason: Reason<u64>,
+    pc: u64,
+    code: &Code,
+    ctx: &mut Context<VmMemory>,
+    interp: &mut Interpreter<VmMemory, HostCalls>,
+) -> Result<u64> {
+    resume_loop(reason, pc, code, ctx, interp, |r, _| matches!(r, Reason::Exit))
+}
+
+#[cold]
+#[inline(never)]
+fn resume_loop(
     mut reason: Reason<u64>,
     mut pc: u64,
     code: &Code,
     ctx: &mut Context<VmMemory>,
     interp: &mut Interpreter<VmMemory, HostCalls>,
+    is_done: impl Fn(Reason<u64>, u64) -> bool,
 ) -> Result<u64> {
     loop {
+        if is_done(reason, pc) {
+            return Ok(ctx.regs[0]);
+        }
         pc = match interp.host.take_fuel_wanted(reason) {
             Some((slot, stack_token)) => call_with_fuel(slot, stack_token, pc, code, ctx, interp)?,
             None => resume_at(reason, pc, code, interp)?,
         };
         let stop = interp.resume(ctx, code, pc);
         (reason, pc) = (stop.reason, stop.pc);
-        if let Reason::Exit = reason {
-            return Ok(ctx.regs[0]);
-        }
     }
 }
 
@@ -380,23 +393,14 @@ fn call_nested_on(
         interp.abort_nested(ctx, entry_depth);
         return Err(ExecError::InvalidPc { pc }.into());
     }
-    let mut stop = interp.resume(ctx, code, pc);
-    loop {
-        if stop.pc == RETURN_PC && matches!(stop.reason, Reason::BadPc | Reason::OutOfFuel) {
-            return Ok(ctx.regs[0]);
-        }
-        let next = match interp.host.take_fuel_wanted(stop.reason) {
-            Some((slot, stack_token)) => call_with_fuel(slot, stack_token, stop.pc, code, ctx, interp),
-            None => resume_at(stop.reason, stop.pc, code, interp),
-        };
-        match next {
-            Ok(next_pc) => stop = interp.resume(ctx, code, next_pc),
-            Err(err) => {
-                interp.abort_nested(ctx, entry_depth);
-                return Err(err);
-            }
-        }
+    let stop = interp.resume(ctx, code, pc);
+    let result = resume_loop(stop.reason, stop.pc, code, ctx, interp, |r, p| {
+        p == RETURN_PC && matches!(r, Reason::BadPc | Reason::OutOfFuel)
+    });
+    if result.is_err() {
+        interp.abort_nested(ctx, entry_depth);
     }
+    result
 }
 
 /// The error of the call at `pc` that `stop` stopped.

@@ -261,8 +261,7 @@ impl ExternDecls {
             return Ok(Self::default());
         };
         let mut borrows = function_borrows(Some(btf))?;
-        let mut imports = import_tags(btf)?;
-        let calls_back = calls_back_tags(btf);
+        let mut tags = extern_tags(btf)?;
         let mut decls = HashMap::new();
         for (_, ty) in btf.types() {
             let BtfType::Func {
@@ -278,9 +277,12 @@ impl ExternDecls {
                 let msg = format!("extern {name}: a parameter or return type no register holds");
                 return Err(LinkError::InvalidReference(msg).into());
             };
-            if calls_back.contains(*name) {
-                proto.calls_back = true;
-            }
+            let ExternTag {
+                dll,
+                symbol,
+                calls_back,
+            } = tags.remove(*name).unwrap_or_default();
+            proto.calls_back = calls_back;
             if !proto.variadic && proto.reg_count() > MAX_ARGS {
                 return Err(LinkError::TooManyRegisters {
                     name: (*name).to_string(),
@@ -288,7 +290,6 @@ impl ExternDecls {
                 }
                 .into());
             }
-            let ImportTag { dll, symbol } = imports.remove(*name).unwrap_or_default();
             decls.insert((*name).to_string(), ExternDecl { dll, symbol, proto });
         }
         Ok(Self { decls })
@@ -313,14 +314,15 @@ impl ExternDecls {
 }
 
 #[derive(Default)]
-struct ImportTag {
+struct ExternTag {
     dll: Option<String>,
     symbol: Option<String>,
+    calls_back: bool,
 }
 
-/// `import:dll` or `import:dll!symbol` decl tags on extern functions.
-fn import_tags(btf: &Btf<'_>) -> Result<HashMap<String, ImportTag>> {
-    let mut tags = HashMap::new();
+/// `import:dll`, `import:dll!symbol`, and `rvm:calls_back` decl tags on extern functions.
+fn extern_tags(btf: &Btf<'_>) -> Result<HashMap<String, ExternTag>> {
+    let mut tags: HashMap<String, ExternTag> = HashMap::new();
     for (_, ty) in btf.types() {
         let BtfType::DeclTag {
             name: tag,
@@ -328,9 +330,6 @@ fn import_tags(btf: &Btf<'_>) -> Result<HashMap<String, ImportTag>> {
             component_idx: -1,
         } = ty
         else {
-            continue;
-        };
-        let Some(spec) = tag.strip_prefix("import:") else {
             continue;
         };
         let Some(BtfType::Func {
@@ -341,41 +340,25 @@ fn import_tags(btf: &Btf<'_>) -> Result<HashMap<String, ImportTag>> {
         else {
             continue;
         };
-        let (dll, symbol) = match spec.split_once('!') {
-            Some((dll, sym)) if !dll.is_empty() && !sym.is_empty() => (Some(dll.to_string()), Some(sym.to_string())),
-            Some(_) => {
-                return Err(LinkError::InvalidReference(format!("{name}: bad tag {tag}")).into());
-            }
-            None if !spec.is_empty() => (Some(spec.to_string()), None),
-            None => return Err(LinkError::InvalidReference(format!("{name}: empty import tag")).into()),
-        };
-        tags.insert((*name).to_string(), ImportTag { dll, symbol });
-    }
-    Ok(tags)
-}
-
-/// Extern functions carrying `btf_decl_tag("rvm:calls_back")` (`CALLS_BACK`).
-fn calls_back_tags<'a>(btf: &Btf<'a>) -> hashbrown::HashSet<&'a str> {
-    let mut set = hashbrown::HashSet::new();
-    for (_, ty) in btf.types() {
-        let BtfType::DeclTag {
-            name: "rvm:calls_back",
-            type_id,
-            component_idx: -1,
-        } = ty
-        else {
-            continue;
-        };
-        if let Some(BtfType::Func {
-            name,
-            linkage: BTF_FUNC_EXTERN,
-            ..
-        }) = btf.type_by_id(*type_id)
-        {
-            set.insert(*name);
+        if *tag == "rvm:calls_back" {
+            tags.entry((*name).to_string()).or_default().calls_back = true;
+        } else if let Some(spec) = tag.strip_prefix("import:") {
+            let (dll, symbol) = match spec.split_once('!') {
+                Some((dll, sym)) if !dll.is_empty() && !sym.is_empty() => {
+                    (Some(dll.to_string()), Some(sym.to_string()))
+                }
+                Some(_) => {
+                    return Err(LinkError::InvalidReference(format!("{name}: bad tag {tag}")).into());
+                }
+                None if !spec.is_empty() => (Some(spec.to_string()), None),
+                None => return Err(LinkError::InvalidReference(format!("{name}: empty import tag")).into()),
+            };
+            let entry = tags.entry((*name).to_string()).or_default();
+            entry.dll = dll;
+            entry.symbol = symbol;
         }
     }
-    set
+    Ok(tags)
 }
 
 /// Every module's exported symbols by name; two different definitions of one name fail.

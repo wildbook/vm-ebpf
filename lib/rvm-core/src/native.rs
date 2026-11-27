@@ -1,4 +1,4 @@
-//! Calls of native functions: a `call` that [`Code::bind_native`](crate::Code::bind_native) gave the byte of its
+//! Calls of native functions: a `call` that [`Code::with_natives`](crate::Code::with_natives) gave the byte of its
 //! argument count ([`PLAIN`], or [`CHECKED`] where pointer arguments go through
 //! [`Memory::native_ptr`](crate::Memory::native_ptr)), with the index of the function in
 //! [`Host::natives`](crate::Host::natives) in `imm`. Its handler passes r1 to rN in the host C ABI (Windows x64 on
@@ -339,10 +339,8 @@ impl Drop for ActiveGuard {
     }
 }
 
-/// Mark the innermost aware native call on this thread as failed with numeric `code`. Returns `true` if an aware call
-/// was active, or `false` if none was in progress. Calling again during the same call keeps the first failure.
 #[cfg(feature = "ffi")]
-pub fn fail_code(code: u64) -> bool {
+fn record_fail(fail: NativeFail) -> bool {
     let ptr = ACTIVE.get();
     if ptr.is_null() {
         return false;
@@ -350,25 +348,23 @@ pub fn fail_code(code: u64) -> bool {
     // SAFETY: `ptr` points to a live `Active` record on the current thread's call stack, popped by `ActiveGuard`.
     let active = unsafe { &mut *ptr };
     if active.fail.is_none() {
-        active.fail = Some(NativeFail::Code(code));
+        active.fail = Some(fail);
     }
     true
+}
+
+/// Mark the innermost aware native call on this thread as failed with numeric `code`. Returns `true` if an aware call
+/// was active, or `false` if none was in progress. Calling again during the same call keeps the first failure.
+#[cfg(feature = "ffi")]
+pub fn fail_code(code: u64) -> bool {
+    record_fail(NativeFail::Code(code))
 }
 
 /// Mark the innermost aware native call on this thread as failed with `error`. Returns `true` if an aware call was
 /// active, or `false` if none was in progress. Calling again during the same call keeps the first failure.
 #[cfg(feature = "ffi")]
 pub fn fail_error(error: Box<dyn std::error::Error + Send + Sync>) -> bool {
-    let ptr = ACTIVE.get();
-    if ptr.is_null() {
-        return false;
-    }
-    // SAFETY: as in `fail_code`.
-    let active = unsafe { &mut *ptr };
-    if active.fail.is_none() {
-        active.fail = Some(NativeFail::Error(error));
-    }
-    true
+    record_fail(NativeFail::Error(error))
 }
 
 /// Whether the innermost aware native call on this thread can accept a nested guest callback.

@@ -37,11 +37,11 @@ pub trait Host<M: Memory> {
     /// the host function it addresses. For a target that is the address of a native function, `native` runs it.
     fn call_indirect(&mut self, ctx: &mut Context<M>, target: u64, native: NativeCall<'_, M::Error>) -> Option<Callee>;
 
-    /// The native functions that calls bound with [`Code::bind_native`](crate::Code::bind_native) name by index. A
+    /// The native functions that calls bound with [`Code::with_natives`](crate::Code::with_natives) name by index. A
     /// call of an index past the end stops the run with [`Reason::CallKfunc`](crate::Reason::CallKfunc) and that
     /// index. The default has none.
     ///
-    /// The entries must meet the contract of `bind_native` for every call in the code of a run that names them.
+    /// The entries must meet the contract of `with_natives` for every call in the code of a run that names them.
     fn natives(&self) -> &[Native] {
         &[]
     }
