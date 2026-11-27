@@ -117,7 +117,7 @@ impl<'a> MapArg<'a> {
     /// The map with handle `r1` among the calling program's `maps`, if it has one.
     #[inline]
     fn new(maps: &'a mut Maps, r1: u64) -> Option<Self> {
-        let handle = r1 as u32;
+        let handle = u32::try_from(r1).ok()?;
         let def = maps.def(handle)?;
         let (key_size, value_size) = (def.key_size as usize, def.value_size as usize);
         Some(Self {

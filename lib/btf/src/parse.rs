@@ -139,7 +139,8 @@ impl<'a> Btf<'a> {
             BtfType::Struct { name: n, size, members } if *n == name => Some((*size as usize, members)),
             _ => None,
         })?;
-        let byte_offset = |m: &Member<'a>| (m.bitfield_size == 0 && m.bit_offset % 8 == 0).then_some(m.bit_offset / 8);
+        let byte_offset =
+            |m: &Member<'a>| (m.bitfield_size == 0 && m.bit_offset.is_multiple_of(8)).then_some(m.bit_offset / 8);
         let offsets = members.iter().map(|m| Some((m.name, byte_offset(m)? as usize)));
         Some((size, offsets.collect::<Option<_>>()?))
     }
@@ -252,7 +253,11 @@ fn parse_type<'a>(header: &TypeHeader, extra: &'a [u8], strings: &BtfStrings<'a>
             is_64: false,
             variants: records(extra, |c: &[u8; BTF_ENUM_SIZE]| EnumValue {
                 name: strings.get_or_empty(word(c, 0)),
-                value: i64::from(word(c, 1) as i32),
+                value: if kind_flag {
+                    i64::from(word(c, 1) as i32)
+                } else {
+                    i64::from(word(c, 1))
+                },
             }),
         },
         BtfKind::Fwd => BtfType::Fwd {

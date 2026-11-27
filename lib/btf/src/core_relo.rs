@@ -30,6 +30,8 @@ pub enum CoreReloError {
     UnexpectedValue { insn_off: u32, expected: u64, found: u64 },
     /// The relocated offset doesn't fit in the instruction's 16-bit `off` field.
     OffsetTooLarge { insn_off: u32, value: u64 },
+    /// The relocated immediate doesn't fit in the instruction's 32-bit `imm` field.
+    ImmediateTooLarge { insn_off: u32, value: u64 },
     /// A bitfield is too wide to read even with a 64-bit load.
     BitfieldTooWide,
     /// The instruction's opcode isn't one CO-RE relocations know how to patch.
@@ -62,6 +64,9 @@ impl core::fmt::Display for CoreReloError {
             }
             Self::OffsetTooLarge { insn_off, value } => {
                 write!(f, "relocated offset {value} at instruction {insn_off} doesn't fit in 16 bits")
+            }
+            Self::ImmediateTooLarge { insn_off, value } => {
+                write!(f, "relocated immediate {value} at instruction {insn_off} doesn't fit in 32 bits")
             }
             Self::BitfieldTooWide => write!(f, "bitfield can't be read even with a 64-bit load"),
             Self::UnpatchableInstruction(off) => write!(f, "instruction at offset {off} can't be CO-RE patched"),
@@ -1011,9 +1016,6 @@ fn types_match_at(
         let (_, tt) = target
             .resolve_type(targ_id)
             .ok_or(CoreReloError::InvalidTypeId(targ_id))?;
-        if !names_match(lt.name().unwrap_or(""), tt.name().unwrap_or("")) {
-            return Ok(false);
-        }
         let (lk, tk) = (lt.kind(), tt.kind());
 
         match lt {
@@ -1021,6 +1023,9 @@ fn types_match_at(
             BtfType::Fwd {
                 is_union: local_union, ..
             } => {
+                if !names_match(lt.name().unwrap_or(""), tt.name().unwrap_or("")) {
+                    return Ok(false);
+                }
                 let BtfType::Fwd {
                     is_union: targ_union, ..
                 } = tt
@@ -1034,9 +1039,15 @@ fn types_match_at(
                 return Ok(local_union == targ_union);
             }
             BtfType::Enum { .. } => {
+                if !names_match(lt.name().unwrap_or(""), tt.name().unwrap_or("")) {
+                    return Ok(false);
+                }
                 return Ok(is_any_enum(tk) && enums_match(lt, tt));
             }
             BtfType::Struct { .. } | BtfType::Union { .. } => {
+                if !names_match(lt.name().unwrap_or(""), tt.name().unwrap_or("")) {
+                    return Ok(false);
+                }
                 if behind_ptr {
                     if lk == tk {
                         return Ok(true);
@@ -1064,6 +1075,9 @@ fn types_match_at(
                     return Ok(false);
                 };
                 return Ok(size == targ_size && (encoding & BTF_INT_SIGNED) == (targ_encoding & BTF_INT_SIGNED));
+            }
+            BtfType::Float { size, .. } => {
+                return Ok(matches!(tt, BtfType::Float { size: targ_size, .. } if size == targ_size));
             }
             BtfType::Ptr { pointee_type } => {
                 let BtfType::Ptr {

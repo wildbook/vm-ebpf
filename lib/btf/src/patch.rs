@@ -26,7 +26,7 @@ const BPF_LD_IMM64: u8 = 0x18;
 /// Patch the relocated value into an instruction, as libbpf's `bpf_core_patch_insn` does. Returns whether the
 /// instruction was poisoned instead (for the caller's `Unresolved` list).
 pub fn patch_instruction(insns: &mut [[u8; 8]], relo: &CoreRelo, res: &ResolvedRelo) -> Result<bool, CoreReloError> {
-    if relo.insn_off % 8 != 0 {
+    if !relo.insn_off.is_multiple_of(8) {
         return Err(CoreReloError::InstructionOutOfBounds(relo.insn_off));
     }
     let idx = (relo.insn_off / 8) as usize;
@@ -43,7 +43,25 @@ pub fn patch_instruction(insns: &mut [[u8; 8]], relo: &CoreRelo, res: &ResolvedR
             if res.poison {
                 return Ok(poison(&mut insns[idx]));
             }
-            check_orig(relo, res, i64::from(imm(&insn) as i32) as u64)?;
+            let is_alu64 = opcode & CLASS_MASK == ALU64;
+            let raw_imm = imm(&insn);
+            let found = if is_alu64 || (res.orig_val as i64) < 0 {
+                i64::from(raw_imm as i32) as u64
+            } else {
+                u64::from(raw_imm)
+            };
+            check_orig(relo, res, found)?;
+            let fits = if is_alu64 {
+                i64::from(res.new_val as i32) as u64 == res.new_val
+            } else {
+                res.new_val <= u64::from(u32::MAX) || i64::from(res.new_val as i32) as u64 == res.new_val
+            };
+            if !fits {
+                return Err(CoreReloError::ImmediateTooLarge {
+                    insn_off: relo.insn_off,
+                    value: res.new_val,
+                });
+            }
             set_imm(&mut insns[idx], res.new_val as u32);
             Ok(false)
         }

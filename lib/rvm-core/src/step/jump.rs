@@ -16,7 +16,6 @@ pub fn jump<E, R: Regs, const BITS: bool>(regs: &R, insn: impl Fields) -> Step<E
     let jmp_src = opc.source();
 
     let src_reg = insn.src_reg().get();
-    let dst_reg = insn.dst_reg().get();
     let imm = insn.imm();
     let (d, s) = operands::<R, BITS>(regs, insn);
 
@@ -61,10 +60,8 @@ pub fn jump<E, R: Regs, const BITS: bool>(regs: &R, insn: impl Fields) -> Step<E
         JmpOpc::Exit => return Step::Exit,
 
         // `may_goto`: the kernel takes the jump once a loop's budget runs out; rvm never does and bounds loops with
-        // fuel. The kernel verifier rejects JMP32, source X and nonzero `dst_reg`, `src_reg` or `imm`.
-        JmpOpc::Jcond if BITS == BITS_64 && jmp_src == Source::Imm && dst_reg == 0 && src_reg == 0 && imm == 0 => {
-            return Step::Next
-        }
+        // fuel. `rewrite` rejects nonzero `dst_reg`, `src_reg` or `imm`.
+        JmpOpc::Jcond if BITS == BITS_64 && jmp_src == Source::Imm => return Step::Next,
         JmpOpc::Jcond | JmpOpc::UndefF => return Step::INVALID,
     };
 

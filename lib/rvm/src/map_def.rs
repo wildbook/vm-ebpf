@@ -42,6 +42,9 @@ pub fn check_def(def: &MapDef) -> Result<()> {
     if def.kind == MapKind::Array && def.key_size != 4 {
         return bad("array map keys must be 4 bytes");
     }
+    if def.kind == MapKind::Hash && def.key_size == 0 {
+        return bad("hash map key size must not be zero");
+    }
     let entries = u64::from(def.max_entries);
     let values = u64::from(def.value_size).next_multiple_of(CACHE_LINE) * entries;
     if values.max(u64::from(def.key_size) * entries) > MAX_REGION_LEN as u64 {

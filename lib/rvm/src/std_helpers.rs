@@ -76,13 +76,19 @@ pub fn register_random(helpers: &mut HelperRegistry) {
     helpers.put_id(BPF_FUNC_GET_PRANDOM_U32, HostFn::typed(next));
 }
 
+/// Maximum format string length accepted by `bpf_trace_printk`.
+const MAX_PRINTK_FMT: usize = 4096;
+
 /// Register `trace_printk`, passing each formatted line to `sink`.
 ///
 /// Supports the kernel's conversions: `%d %i %u %x %X %p %c %s %%` with `l`/`ll` length modifiers, and up to three
-/// arguments. Returns the formatted length, or -EINVAL if the format string isn't readable. The format string and `%s`
-/// arguments are read with the guest's permissions.
+/// arguments. Returns the formatted length, or -EINVAL if the format string isn't readable or exceeds 4096 bytes. The
+/// format string and `%s` arguments are read with the guest's permissions.
 pub fn register_print(helpers: &mut HelperRegistry, sink: impl Fn(&str) + Send + Sync + 'static) {
     let print = move |ctx: &mut HelperContext| {
+        if ctx.args.r2 > MAX_PRINTK_FMT as u64 {
+            return Ok(-EINVAL as u64);
+        }
         let mem = GuestMemory::new(ctx.memory);
         let Ok(fmt) = mem.read_vec(ctx.args.r1, ctx.args.r2 as usize) else {
             return Ok(-EINVAL as u64);
@@ -152,4 +158,26 @@ fn guest_str(mem: &GuestMemory, addr: u64) -> String {
         .take_while(|&b| b != 0)
         .collect();
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use ebpf_asm::{Assembler, R1, R2};
+
+    use super::*;
+    use crate::{Image, Vm};
+
+    #[test]
+    fn trace_printk_rejects_oversized_fmt() {
+        let vm = Vm::new();
+        vm.enable_print(|_| panic!("sink must not be called for oversized format string"));
+
+        let mut asm = Assembler::new();
+        asm.mov64_imm(R1, 0)
+            .mov64_imm(R2, (MAX_PRINTK_FMT + 1) as i32)
+            .call(BPF_FUNC_TRACE_PRINTK as i32)
+            .exit();
+        let mut prog = vm.load_image(Image::from_code(asm.assemble().unwrap())).unwrap();
+        assert_eq!(prog.call("main", &[]).unwrap(), (-EINVAL) as u64);
+    }
 }

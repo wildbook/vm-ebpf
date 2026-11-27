@@ -155,7 +155,7 @@ pub const fn splits(op: u8) -> bool {
 // LLVM takes the branch on even parity; with the branch taken on odd parity, the corpus ran 2% to 6% slower
 #[inline(always)]
 pub fn odd(slot: Slot) -> bool {
-    slot.byte().count_ones() % 2 != 0
+    !slot.byte().count_ones().is_multiple_of(2)
 }
 
 /// The tables of the handlers for the memory `M` and the host `H`.

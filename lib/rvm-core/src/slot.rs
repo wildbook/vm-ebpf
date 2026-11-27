@@ -143,7 +143,7 @@ const fn layout(byte: u8) -> Layout {
             _ => Layout::Dst,
         },
         Class::Jmp32 | Class::Jmp64 => match opc.jmp_opc() {
-            // `src_reg` of `call` is the kind of call, and `may_goto` checks every field
+            // `src_reg` of `call` is the kind of call; `may_goto` and undefined opcodes read no fields
             JmpOpc::Call if !reg => Layout::Raw,
             JmpOpc::Jcond | JmpOpc::UndefF => Layout::Raw,
             // `ja`, `gotox`, `callx` and `exit` read no `src_reg`

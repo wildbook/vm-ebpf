@@ -538,11 +538,16 @@ impl TypeEntry {
     /// Enums encode as 8-byte `BTF_KIND_ENUM` entries unless a value needs the full 64 bits, in which case the kernel's
     /// `BTF_KIND_ENUM64` format is used instead.
     fn encode_enum(out: &mut Vec<u8>, name: u32, size: u32, is_signed: bool, variants: &[(u32, i64)]) {
-        if variants.iter().all(|&(_, v)| i32::try_from(v).is_ok()) {
+        let fits_32 = if is_signed {
+            variants.iter().all(|&(_, v)| i32::try_from(v).is_ok())
+        } else {
+            variants.iter().all(|&(_, v)| u32::try_from(v).is_ok())
+        };
+        if fits_32 {
             header(out, name, BtfKind::Enum, variants.len() as u16, is_signed, size);
             for &(vname, value) in variants {
                 out.extend_from_slice(&vname.to_le_bytes());
-                out.extend_from_slice(&(value as i32).to_le_bytes());
+                out.extend_from_slice(&(value as u32).to_le_bytes());
             }
         } else {
             header(out, name, BtfKind::Enum64, variants.len() as u16, is_signed, size);

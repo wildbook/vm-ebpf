@@ -496,3 +496,102 @@ fn empty_section_past_data_overflows() {
     let str_past_end = words(&[0x0001_eb9f, 24, 0, 0, 100, 0]);
     assert_eq!(Btf::parse(&str_past_end).unwrap_err(), BtfError::SectionOverflow);
 }
+
+/// Unsigned 32-bit `BTF_KIND_ENUM` values with bit 31 set must zero-extend, and `ALU`/`ALU64` patching must reject
+/// relocated immediates that would silently truncate or flip sign.
+#[test]
+fn unsigned_32bit_enum_and_alu_range_check() {
+    const ALU32_MOV_K: u8 = 0xb4; // BPF_ALU | BPF_MOV | BPF_K
+    const LD_IMM64: u8 = 0x18;
+
+    let mut local = BtfBuilder::new();
+    let e = local.add_enum("flags", 4, false);
+    local.enumerator(e, "HI", 0x8000_0001);
+    let r = relo(&mut local, e, "0", CoreReloKind::EnumvalValue);
+
+    let mut target = BtfBuilder::new();
+    let te = target.add_enum("flags", 4, false);
+    target.enumerator(te, "HI", 0xFFFF_FFFE);
+
+    // Confirm `Btf::parse` decodes unsigned 32-bit `BTF_KIND_ENUM` zero-extended (positive i64).
+    let encoded = target.encode();
+    let parsed = Btf::parse(&encoded).unwrap();
+    let btf::BtfType::Enum {
+        is_64: false,
+        is_signed: false,
+        variants,
+        ..
+    } = parsed.type_by_id(te).unwrap()
+    else {
+        panic!("expected 32-bit unsigned enum");
+    };
+    assert_eq!(variants[0].value, 0xFFFF_FFFE);
+
+    // 32-bit ALU accepts unsigned 32-bit values.
+    let mut insns = [insn(ALU32_MOV_K, 0, 0, 0, 0x8000_0001u32 as i32)];
+    relocate(&local, &target, &r, &mut insns).unwrap();
+    assert_eq!(imm_of(insns[0]) as u32, 0xFFFF_FFFE);
+
+    // 64-bit LD_IMM64 patches all 64 bits with upper half 0 (not sign-extended).
+    let mut insns = [insn(LD_IMM64, 0, 0, 0, 0x8000_0001u32 as i32), insn(0, 0, 0, 0, 0)];
+    relocate(&local, &target, &r, &mut insns).unwrap();
+    assert_eq!(imm_of(insns[0]) as u32, 0xFFFF_FFFE);
+    assert_eq!(imm_of(insns[1]), 0);
+
+    // 64-bit ALU sign-extends imm, so an unsigned value >= 2^31 cannot be encoded without changing its value.
+    let mut small_local = BtfBuilder::new();
+    let se = small_local.add_enum("flags", 4, false);
+    small_local.enumerator(se, "HI", 1);
+    let r_small = relo(&mut small_local, se, "0", CoreReloKind::EnumvalValue);
+    let mut insns = [insn(ALU64_MOV_K, 0, 0, 0, 1)];
+    assert_eq!(
+        relocate(&small_local, &target, &r_small, &mut insns),
+        Err(CoreReloError::ImmediateTooLarge {
+            insn_off: 0,
+            value: 0xFFFF_FFFE
+        })
+    );
+
+    // 64-bit enum value past u32::MAX also fails ALU32 patching.
+    let mut big_target = BtfBuilder::new();
+    let be = big_target.add_enum("flags", 8, false);
+    big_target.enumerator(be, "HI", 1i64 << 33);
+    let mut insns = [insn(ALU32_MOV_K, 0, 0, 0, 1)];
+    assert_eq!(
+        relocate(&small_local, &big_target, &r_small, &mut insns),
+        Err(CoreReloError::ImmediateTooLarge {
+            insn_off: 0,
+            value: 1 << 33
+        })
+    );
+}
+
+/// `TYPE_MATCHES` compares integer fields by size and signedness, not type name, so C `uint64_t` (`unsigned long` on
+/// LP64 BPF) matches Rust `u64` (`unsigned long long`).
+#[test]
+fn type_matches_ignores_int_type_names() {
+    let mut local = BtfBuilder::new();
+    let c_u64 = local.add_int("unsigned long", 8, false);
+    let s = local.add_struct("pkt", 8);
+    local.member(s, "ts", 0, c_u64);
+    let r = relo(&mut local, s, "0", CoreReloKind::TypeMatches);
+
+    let mut target = BtfBuilder::new();
+    let rust_u64 = target.add_int("unsigned long long", 8, false);
+    let ts = target.add_struct("pkt", 8);
+    target.member(ts, "ts", 0, rust_u64);
+
+    let mut insns = [insn(ALU64_MOV_K, 0, 0, 0, 1)];
+    relocate(&local, &target, &r, &mut insns).unwrap();
+    assert_eq!(imm_of(insns[0]), 1);
+
+    // Different signedness still fails to match.
+    let mut signed_target = BtfBuilder::new();
+    let rust_i64 = signed_target.add_int("long long", 8, true);
+    let sts = signed_target.add_struct("pkt", 8);
+    signed_target.member(sts, "ts", 0, rust_i64);
+
+    let mut insns = [insn(ALU64_MOV_K, 0, 0, 0, 1)];
+    relocate(&local, &signed_target, &r, &mut insns).unwrap();
+    assert_eq!(imm_of(insns[0]), 0);
+}

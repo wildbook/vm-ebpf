@@ -585,5 +585,9 @@ mod tests {
         assert_eq!(values, [(0, [0, 0]), (1, [7, 8]), (2, [0, 0])]);
         assert_eq!(array.entries().iter().nth(1).unwrap().0, MapKey::Index(1));
         assert_eq!(array.get_as::<u32, [u64; 2]>(3), Ok(None));
+
+        // hash maps with zero key_size are rejected
+        let zero_key = def("bad_hash", MapKind::Hash, 0, 8);
+        assert!(Maps::new(vec![zero_key], &SharedMaps::default(), &mut MemoryBudget::new(1 << 20)).is_err());
     }
 }

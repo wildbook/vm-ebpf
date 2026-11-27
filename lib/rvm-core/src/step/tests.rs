@@ -209,15 +209,12 @@ fn reserved_encodings() {
 
 #[test]
 fn may_goto() {
-    // the kernel verifier accepts only JMP | JCOND | K with `dst_reg`, `src_reg` and `imm` 0 (`src_reg` 1 is the
-    // newer `unwind_goto`); the jump is never taken
+    // `step` accepts only JMP | JCOND | K and never takes the jump; `rewrite::reserved_fields` rejects nonzero
+    // `dst_reg`, `src_reg` and `imm` when loading code
     let k = OpCode::jmp64(JmpOpc::Jcond, Source::Imm);
     let mut m = Machine::new();
     assert_eq!(m.exec(instr(k, 0, 0, 5, 0)), Step::Next);
     for insn in [
-        instr(k, 1, 0, 5, 0),
-        instr(k, 0, 1, 5, 0),
-        instr(k, 0, 0, 5, 1),
         instr(OpCode::jmp64(JmpOpc::Jcond, Source::Reg), 0, 0, 5, 0),
         instr(OpCode::jmp32(JmpOpc::Jcond, Source::Imm), 0, 0, 5, 0),
     ] {
