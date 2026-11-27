@@ -4,29 +4,43 @@
 //! - An instruction that always runs the same gets its [`canonical`] byte.
 //! - An instruction that would write r10, or that sets a field the kernel verifier reserves, gets [`INVALID`].
 //! - A pseudo LD_IMM64 gets [`MISSING`], and a `mov` from a register with an offset its MOVSX byte.
+//! - An 8-byte load or store through r11 gets the byte of the stack argument it loads or stores ([`args`]), or
+//!   [`INVALID`] if its offset names none. In code with such a store, every `callx` gets [`args::CALLX`].
 //!
 //! Only opcode bytes change. The pass tests each instruction against one entry of [`REWRITES`], and most pass
 //! without a call.
 
-use crate::bytes::{canonical, INVALID, MISSING, MOV32_REG, MOV64_REG, MOVSX32, MOVSX64};
+use crate::bytes::{canonical, INVALID, LDX_DW, MISSING, MOV32_REG, MOV64_REG, MOVSX32, MOVSX64, STX_DW, ST_DW};
 use crate::context::FP;
 use crate::opcode::atomic::{CMPXCHG, FETCH, LOAD_ACQ};
-use crate::opcode::{call, AluOpc, Class, JmpOpc, MemMode, OpCode, Source, CALL, LD_IMM64};
-use crate::Instruction;
+use crate::opcode::{call, AluOpc, Class, JmpOpc, MemMode, OpCode, Source, CALL, CALLX, LD_IMM64};
+use crate::{args, Instruction};
 
 /// Runs the pass on `code`.
 pub fn rewrite(code: &mut [Instruction]) {
+    let mut stores = false;
     for i in 0..code.len() {
         let insn = code[i];
         let rewrite = &REWRITES[usize::from(insn.byte())];
-        // most instructions pass both tests
-        if insn.0 & rewrite.screen != 0 || (rewrite.dst && insn.dst_reg() == R10) {
-            rewrite.apply(code, i);
+        // most instructions pass all three tests
+        if insn.0 & rewrite.screen != 0 || insn.dst_reg() == rewrite.dst || insn.src_reg() == rewrite.src {
+            stores |= rewrite.apply(code, i);
+        }
+    }
+
+    // Nothing says which `callx` passes stack arguments, so each one hands them on.
+    if stores {
+        for insn in code.iter_mut().filter(|insn| insn.byte() == CALLX) {
+            *insn = insn.with_byte(args::CALLX);
         }
     }
 }
 
 const R10: u8 = FP as u8;
+/// The base register of stack arguments.
+const R11: u8 = 11;
+/// No register number, in [`Rewrite::dst`] and [`Rewrite::src`].
+const NO_REG: u8 = 0xff;
 
 /// Whether [`Code::new`](crate::Code::new) leaves the opcode byte `byte` only where `offset` is 0: that of `mov` and
 /// `mov32`, which with an offset run as MOVSX or fail, and those whose `offset` the verifier reserves.
@@ -41,8 +55,11 @@ pub const fn offset_is_zero(byte: u8) -> bool {
 struct Rewrite {
     /// The [`canonical`] byte.
     canonical: Option<u8>,
-    /// The instruction writes `dst_reg`.
-    dst: bool,
+    /// The `dst_reg` that sends an instruction to [`Rewrite::apply`]: r10 in one that writes `dst_reg`, r11 in an
+    /// 8-byte store, whose base register it is. [`NO_REG`] for none.
+    dst: u8,
+    /// The `src_reg` that does: r11 in the 8-byte load, whose base register it is.
+    src: u8,
     /// The byte is an atomic's: [`atomic_writes_r10`] decides whether it writes r10.
     atomic: bool,
     /// The fields that give the instruction `nonzero_byte` where they aren't 0: `src_reg` of LD_IMM64, a pseudo load,
@@ -59,26 +76,41 @@ struct Rewrite {
 }
 
 impl Rewrite {
-    /// Gives the instruction in slot `i` of `code`, whose opcode byte has this rewrite, the opcode byte of the pass.
-    /// The pass has rewritten only the slots before `i`, so slot `i + 1` is as loaded, and the second slot of
-    /// LD_IMM64 keeps its `imm`.
+    /// Gives the instruction in slot `i` of `code`, whose opcode byte has this rewrite, the opcode byte of the pass,
+    /// and returns whether that byte stores a stack argument. The pass has rewritten only the slots before `i`, so
+    /// slot `i + 1` is as loaded, and the second slot of LD_IMM64 keeps its `imm`.
     #[cold]
     #[inline(never)]
-    fn apply(&self, code: &mut [Instruction], i: usize) {
+    fn apply(&self, code: &mut [Instruction], i: usize) -> bool {
         let insn = code[i];
-        let r10 = (self.dst && insn.dst_reg() == R10) || (self.atomic && atomic_writes_r10(insn));
+        let r10 = (self.dst == R10 && insn.dst_reg() == R10) || (self.atomic && atomic_writes_r10(insn));
         let reserved = (insn.0 & field_bits(self.reserved) != 0)
             || (insn.byte() == CALL && call_reserved(insn))
             || (insn.byte() == LD_IMM64 && code.get(i + 1).is_some_and(|second| second.0 as u32 != 0));
-        let byte = match (self.canonical, r10 || reserved) {
-            (Some(byte), _) => byte,
-            (None, true) => INVALID,
-            (None, false) if insn.0 & field_bits(self.nonzero) != 0 => self.nonzero_byte,
+        let byte = match (self.canonical, r10 || reserved, stack_arg(insn)) {
+            (Some(byte), ..) => byte,
+            (None, true, _) => INVALID,
+            (None, false, Some(byte)) => byte,
+            (None, false, None) if insn.0 & field_bits(self.nonzero) != 0 => self.nonzero_byte,
             // an atomic, `call` or LD_IMM64 that needs no rewrite
-            (None, false) => return,
+            (None, false, None) => return false,
         };
         code[i] = insn.with_byte(byte);
+        byte == args::STORE || byte == args::STORE_IMM
     }
+}
+
+/// The byte of the load or store of a stack argument `insn`, if it is an 8-byte load or store through r11:
+/// [`INVALID`] for one whose offset names no stack argument.
+fn stack_arg(insn: Instruction) -> Option<u8> {
+    // a store names the slot at the negated offset, which wraps to a negative one for `i16::MIN`
+    let (byte, base, offset) = match insn.byte() {
+        LDX_DW => (args::LOAD, insn.src_reg(), insn.offset()),
+        STX_DW => (args::STORE, insn.dst_reg(), insn.offset().wrapping_neg()),
+        ST_DW => (args::STORE_IMM, insn.dst_reg(), insn.offset().wrapping_neg()),
+        _ => return None,
+    };
+    (base == R11).then_some(if args::is_slot(offset) { byte } else { INVALID })
 }
 
 /// The fields of an [`Instruction`] but the opcode byte, one bit each in a set of fields.
@@ -107,7 +139,8 @@ const fn field_bits(fields: u8) -> u64 {
 const REWRITES: [Rewrite; 256] = {
     const NONE: Rewrite = Rewrite {
         canonical: None,
-        dst: false,
+        dst: NO_REG,
+        src: NO_REG,
         atomic: false,
         nonzero: 0,
         nonzero_byte: 0,
@@ -130,7 +163,7 @@ const REWRITES: [Rewrite; 256] = {
                     _ => (0, 0),
                 };
                 Rewrite {
-                    dst: true,
+                    dst: R10,
                     nonzero,
                     nonzero_byte,
                     reserved,
@@ -138,23 +171,30 @@ const REWRITES: [Rewrite; 256] = {
                 }
             }
             Class::Ldx => Rewrite {
-                dst: true,
+                dst: R10,
+                src: if byte == LDX_DW { R11 } else { NO_REG },
                 reserved,
                 ..NONE
             },
             Class::Ld if byte == LD_IMM64 => Rewrite {
-                dst: true,
+                dst: R10,
                 nonzero: SRC,
                 nonzero_byte: MISSING,
                 reserved,
                 ..NONE
             },
             Class::Stx => Rewrite {
+                dst: if byte == STX_DW { R11 } else { NO_REG },
                 atomic: matches!(opc.mem_mode(), MemMode::Atomic),
                 reserved,
                 ..NONE
             },
-            Class::Ld | Class::St | Class::Jmp32 | Class::Jmp64 => Rewrite { reserved, ..NONE },
+            Class::St => Rewrite {
+                dst: if byte == ST_DW { R11 } else { NO_REG },
+                reserved,
+                ..NONE
+            },
+            Class::Ld | Class::Jmp32 | Class::Jmp64 => Rewrite { reserved, ..NONE },
         };
         let always = rewrite.canonical.is_some() || rewrite.atomic || byte == CALL || byte == LD_IMM64;
         assert!(!always || byte != 0, "a rewritten byte 0, which `screen` can't catch");

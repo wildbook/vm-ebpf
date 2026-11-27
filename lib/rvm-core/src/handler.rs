@@ -5,7 +5,6 @@ use crate::code::Slots;
 use crate::dispatch::{self, Spare, Table, SPARE};
 use crate::fuel::Fuel;
 use crate::host::Callee;
-use crate::native::NativeCall;
 use crate::opcode::{CALL, CALLX};
 use crate::slot::{Fields, Shape, Slot};
 use crate::step::{self, Regs, Step};
@@ -74,7 +73,7 @@ pub extern "rust-preserve-none" fn jump<M: Memory, H: Host<M>, F: Fuel, const OP
         },
         Step::CallHelper => become host_call::<M, H, F, false>(ctx, code, ip, interp, table, SPARE, slot),
         Step::CallKfunc => become host_call::<M, H, F, true>(ctx, code, ip, interp, table, SPARE, slot),
-        Step::CallIndirect => become indirect_call::<M, H, F>(ctx, code, ip, interp, table, SPARE, slot),
+        Step::CallIndirect => become indirect_call::<M, H, F, false>(ctx, code, ip, interp, table, SPARE, slot),
         Step::Stop(reason) => return interp.stop.at(ip, reason),
         Step::LdImm64 => unreachable!("LD_IMM64 is of the LD class"),
     }
@@ -112,10 +111,12 @@ extern "rust-preserve-none" fn host_call<M: Memory, H: Host<M>, F: Fuel, const K
 }
 
 /// The rest of the handler of `callx`: enters the guest function that [`Host::call_indirect`] names, as a local call
-/// does, or continues with the next instruction after the host function it ran.
+/// does, or continues with the next instruction after the host function it ran. With `STACK`, the handler of a
+/// `callx` in a program that stores stack arguments ([`args::CALLX`](crate::args::CALLX)), where a native function
+/// that the host calls gets those of the frame.
 // Out of line for the reason `host_call` is.
 #[inline(never)]
-extern "rust-preserve-none" fn indirect_call<M: Memory, H: Host<M>, F: Fuel>(
+pub extern "rust-preserve-none" fn indirect_call<M: Memory, H: Host<M>, F: Fuel, const STACK: bool>(
     ctx: &mut Context<M>,
     code: Slots,
     ip: Ip,
@@ -124,12 +125,13 @@ extern "rust-preserve-none" fn indirect_call<M: Memory, H: Host<M>, F: Fuel>(
     _: Spare,
     slot: Slot,
 ) {
-    // SAFETY: as in the handler of `callx`, which continues here
+    // SAFETY: as in the handler of `callx`, which continues here; the slot of a `callx` with stack arguments has the
+    // same layout
     let target = ctx
         .regs
         .get(unsafe { ip.view(slot, const { Shape::of(CALLX) }) }.dst_reg());
-    let native = NativeCall::new(&mut interp.stop, ip);
-    let callee = interp.host.call_indirect(ctx, target, native);
+    let (host, native) = interp.callx(ip, STACK);
+    let callee = host.call_indirect(ctx, target, native);
     interp.windows.revalidate(ctx.memory);
     match callee {
         Some(Callee::Local(pc)) => {

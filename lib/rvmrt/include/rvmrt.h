@@ -25,7 +25,7 @@ typedef enum rvm_status {
     RVM_ERR_LINK = 2,
     // no function with this name
     RVM_ERR_NOT_FOUND = 3,
-    // more than 5 call arguments, a length that can't be mapped, no free region to map, an address that rvm_map
+    // more than 12 call arguments, a length that can't be mapped, no free region to map, an address that rvm_map
     // didn't return, a name that isn't UTF-8, or an invalid rvm_native or rvm_options
     RVM_ERR_ARGUMENT = 4,
     // the call ran more than the runtime's limit of 1,000,000 instructions (rvm's DEFAULT_INSTRUCTION_LIMIT); a
@@ -45,7 +45,8 @@ rvm_status rvm_load(const uint8_t *image, size_t len, rvm_program **program);
 // A native function that images import by name, as an extern (`extern u64 name(...);` in C), and that the
 // interpreter calls directly. It must:
 // - take its `args` arguments, each an integer or pointer of up to 64 bits, in the Windows x64 convention and return
-//   its result in rax;
+//   its result in rax. The guest passes the sixth argument and those after it on its stack, as clang 23 compiles a
+//   call with more than five, and they reach the function like the first five;
 // - never unwind: no C++ exception, SEH unwind or longjmp may leave it;
 // - stay loaded while any program loaded with it may call it, and be safe to run on several threads at once;
 // - leave the program that calls it alone: no rvmrt function may take that program during the call;
@@ -63,13 +64,13 @@ typedef struct rvm_native {
     const char *name;
     size_t name_len;
     const void *func;
-    // number of arguments, 0 to 5
+    // number of arguments, 0 to 12
     uint8_t args;
     // per argument: RVM_ARG_INT, RVM_ARG_READ or RVM_ARG_WRITE
-    uint8_t kind[5];
-    // per pointer argument: 0 to check one byte, or the number (1 to 5) of the integer argument that holds the
+    uint8_t kind[12];
+    // per pointer argument: 0 to check one byte, or the number (1 to 12) of the integer argument that holds the
     // pointer's length in bytes
-    uint8_t len_arg[5];
+    uint8_t len_arg[12];
 } rvm_native;
 
 // What the guest of a program may do beyond the default, in which every memory access is checked against the memory
@@ -84,9 +85,11 @@ typedef struct rvm_native {
 //   calls the native function there, with up to 5 arguments in the Windows x64 convention, the first four also in
 //   xmm0 to xmm3. Nothing validates the address, so the guest can call any code in the process with any arguments.
 //   The arguments pass as the registers hold them: a pointer into guest memory keeps its region tag unless the
-//   program is loaded with RVM_UNTAGGED or the guest strips the tag (UNTAG in rvm's bpf/rvm_bpf.h). The function
-//   must never unwind and must leave the calling program alone, as a native function of rvm_native must, and its
-//   time doesn't count against the instruction limit.
+//   program is loaded with RVM_UNTAGGED or the guest strips the tag (UNTAG in rvm's bpf/rvm_bpf.h). In a program
+//   with a call of more than five arguments anywhere, every such call passes 12: the five registers, and the seven
+//   stack arguments as the calling function stored them last. The function must never unwind and must leave the
+//   calling program alone, as a native function of rvm_native must, and its time doesn't count against the
+//   instruction limit.
 enum { RVM_UNTAGGED = 1, RVM_RAW_POINTERS = 2, RVM_RAW_CALLS = 4 };
 
 typedef struct rvm_options {
@@ -121,8 +124,9 @@ rvm_status rvm_read(const rvm_program *program, uint64_t addr, uint8_t *buf, siz
 // is 0.
 rvm_status rvm_write(rvm_program *program, uint64_t addr, const uint8_t *buf, size_t len);
 
-// Calls the function `name` with args in r1 to r5 and stores its r0 in *ret. name and args may be NULL when their
-// length is 0.
+// Calls the function `name` with up to 12 args and stores its r0 in *ret: the first five go in r1 to r5, the others
+// where a caller passes them on its stack, so the function takes them as clang 23 compiles a function with more
+// than five parameters. name and args may be NULL when their length is 0.
 rvm_status rvm_call(rvm_program *program, const char *name, size_t name_len, const uint64_t *args, size_t nargs,
                     uint64_t *ret);
 

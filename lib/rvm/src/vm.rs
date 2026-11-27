@@ -161,8 +161,9 @@ impl RawCalls {
     /// A `callx` through an address without a region tag, from [`RAW_START`](crate::RAW_START) (64 KiB) up to
     /// [`RAW_END`](crate::RAW_END) (2^47), calls the native function at that address: a function pointer that the
     /// host put in a struct, passed as an argument or returned from a host function. The call passes r1 to r5 in the
-    /// Windows x64 convention, the first four also in xmm0 to xmm3, and puts rax in r0. It works with every
-    /// [`Passthrough`] mode.
+    /// Windows x64 convention, the first four also in xmm0 to xmm3, and puts rax in r0. In a program that passes a
+    /// sixth argument on the stack in any call, it also passes the seven stack arguments of the calling function as
+    /// arguments 6 to 12, as that function stored them last. It works with every [`Passthrough`] mode.
     ///
     /// The addresses of the program's own functions keep their meaning, and so do helper IDs below 64 KiB. A helper
     /// ID from 64 KiB up is reachable through `call <id>` only.
@@ -274,7 +275,8 @@ impl Vm {
     // so linked call sites stay valid.
 
     /// Register a host function that programs call by helper ID (`call <id>`). `func` takes the arguments as a `u64`,
-    /// a tuple of up to five, or `()`. With the `maps` feature, IDs 1 to 3 replace the built-in map helpers.
+    /// a tuple of up to five, or `()`: a call by ID passes r1 to r5 only, and a longer tuple gets 0 in the rest. With
+    /// the `maps` feature, IDs 1 to 3 replace the built-in map helpers.
     ///
     /// # Example
     ///
@@ -305,11 +307,13 @@ impl Vm {
     }
 
     /// Register a host function that programs import by name (`extern u64 name(u64 a, u64 b);` in C). `func` takes
-    /// the arguments as a `u64`, a tuple of up to five, or `()`. A program that imports a name the VM lacks fails to
-    /// link.
+    /// the arguments as a `u64`, a tuple of up to twelve, or `()`. A program that imports a name the VM lacks fails
+    /// to link.
     ///
-    /// Each argument is one register, and linking checks their number against the extern's BTF. A struct of up to 8
-    /// bytes arrives in one register and one of 9 to 16 bytes in two, little endian.
+    /// Each argument is one register, or from the sixth on one 8-byte slot of the caller's stack arguments, and
+    /// linking checks their number against the extern's BTF. A struct of up to 8 bytes arrives in one argument and
+    /// one of 9 to 16 bytes in two, little endian. An argument that C declares narrower than 64 bits has its value
+    /// in the low bits, and the bits above 32 are not defined: cast it to the declared type.
     ///
     /// The result follows clang 23. Up to 8 bytes come back in r0, so `func` returns a struct of that size as an
     /// integer. A struct of 9 to 16 bytes comes back in r0 and r2, so `func` returns `(u64, u64)`, bytes 0 to 7
@@ -358,8 +362,9 @@ impl Vm {
     }
 
     /// Register `func`, a native function that programs import by name as they import a host function
-    /// (`extern u64 name(...);` in C), and that the interpreter calls directly with r1 to r5 in the Windows x64
-    /// convention, its result in r0. `sig` says which arguments are pointers to guest bytes, and how many bytes.
+    /// (`extern u64 name(...);` in C), and that the interpreter calls directly in the Windows x64 convention, its
+    /// result in r0: with r1 to r5, and for a function of 6 to 12 arguments also with the stack arguments of the
+    /// caller. `sig` says which arguments are pointers to guest bytes, and how many bytes.
     ///
     /// Linking checks the extern's BTF against `sig`: the same number of argument registers, integers or enums where
     /// `sig` has integers and pointers where it has pointers, nothing else, and on a pointer that a `BORROW` or
@@ -527,10 +532,11 @@ impl Vm {
     /// Publish `func` from `plugin` as an extern of the same name.
     ///
     /// Programs linked afterwards can import it; programs that already import it pick up the new target at their next
-    /// call. The caller gets r0, so a result of up to 8 bytes: an import that declares a struct of 9 to 16 bytes as
-    /// the result fails to link with [`LinkError::ReturnMismatch`](crate::LinkError::ReturnMismatch).
+    /// call. A call passes up to 12 arguments: those past the fifth reach `func` where the importing program has BTF
+    /// that declares them. The caller gets r0, so a result of up to 8 bytes: an import that declares a struct of 9 to
+    /// 16 bytes as the result fails to link with [`LinkError::ReturnMismatch`](crate::LinkError::ReturnMismatch).
     pub fn export(&self, plugin: &Plugin, func: &str) -> Result<()> {
-        let export = HostFn::raw(plugin.export_fn(func)?);
+        let export = HostFn::raw_stack(plugin.export_fn(func)?);
         self.helpers.update(|h| h.put_name(func.to_string(), export));
         Ok(())
     }

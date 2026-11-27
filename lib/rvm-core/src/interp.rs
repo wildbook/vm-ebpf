@@ -2,10 +2,12 @@
 
 use std::mem::MaybeUninit;
 
+use crate::args::{self, Row, StackArgs};
 use crate::code::Slots;
 use crate::context::FP;
 use crate::dispatch::{Table, SPARE};
 use crate::fuel::Meter;
+use crate::native::NativeCall;
 use crate::transfer::Ip;
 use crate::windows::Windows;
 use crate::{Code, Context, Host, Memory};
@@ -55,8 +57,8 @@ pub enum Reason<E> {
     StackOverflow,
 }
 
-/// Runs code, and keeps what lasts from one run to the next: the frames of the local calls in progress, the
-/// [`Host`], the fuel, and the windows into the memory of `M` that plain loads and stores use.
+/// Runs code, and keeps what lasts from one run to the next: the frames of the local calls in progress, their stack
+/// arguments, the [`Host`], the fuel, and the windows into the memory of `M` that plain loads and stores use.
 ///
 /// [`run`](Self::run) starts a call and [`resume`](Self::resume) continues it after a stop that the caller handled.
 /// Both stay inside the chain of handlers through ALU, memory and jump instructions, local calls and their returns,
@@ -64,7 +66,7 @@ pub enum Reason<E> {
 /// They stop at the instruction that needs the caller: a call that the host declined, a `gotox`, the `exit` of the
 /// entry frame, or a fault.
 // `repr(C)` keeps the scalars ahead of the frames, so every handler reaches all of them but the last fields of the
-// windows with a one-byte displacement.
+// windows with a one-byte displacement, and the stack arguments behind everything a program without them uses.
 #[repr(C)]
 pub struct Interpreter<M: Memory, H> {
     depth: usize,
@@ -79,6 +81,10 @@ pub struct Interpreter<M: Memory, H> {
     frames: [MaybeUninit<Frame>; MAX_CALL_DEPTH],
     /// The limit of the runs and the fuel of the run in progress.
     pub(crate) meter: Meter<M, H>,
+    /// The stack arguments by call depth: the frame at `depth` received those in `args[depth]`, and stores those of
+    /// the calls it makes in `args[depth + 1]`. The entry frame is at depth 0, and `push` keeps `depth` at or below
+    /// [`MAX_CALL_DEPTH`].
+    args: [Row; MAX_CALL_DEPTH + 2],
 }
 
 /// Caller state saved across a local call.
@@ -105,6 +111,7 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
             host,
             frames: [const { MaybeUninit::uninit() }; MAX_CALL_DEPTH],
             meter: Meter::default(),
+            args: [[0; args::MAX_STACK_ARGS + 1]; MAX_CALL_DEPTH + 2],
         }
     }
 
@@ -236,6 +243,44 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
         regs[6..=FP].copy_from_slice(&frame.regs);
         self.depth = depth;
         Some(frame.call_pc)
+    }
+
+    /// The stack arguments that the entry frame of each [`run`](Self::run) receives: argument `5 + k` at index
+    /// `k - 1`. A new interpreter holds 0 in each, and no run changes them.
+    pub fn entry_args(&mut self) -> &mut StackArgs {
+        args::slots_mut(&mut self.args[0])
+    }
+
+    /// The stack arguments of the frame in progress as it stored them last, for the caller of a run that stopped at a
+    /// call of that frame.
+    pub fn stack_args(&self) -> &StackArgs {
+        args::slots(&self.args[self.depth + 1])
+    }
+
+    /// The stack arguments that the frame in progress received.
+    #[inline(always)]
+    pub(crate) fn incoming(&self) -> &Row {
+        &self.args[self.depth]
+    }
+
+    /// The stack arguments of the calls that the frame in progress makes.
+    #[inline(always)]
+    pub(crate) fn outgoing(&mut self) -> &mut Row {
+        &mut self.args[self.depth + 1]
+    }
+
+    /// [`stack_args`](Self::stack_args), with the host that takes them.
+    #[inline(always)]
+    pub(crate) fn stack_args_and_host(&mut self) -> (&StackArgs, &mut H) {
+        (args::slots(&self.args[self.depth + 1]), &mut self.host)
+    }
+
+    /// The host and what it calls a native function with, for the `callx` at `ip`: with the stack arguments of the
+    /// frame in progress if `stack`.
+    #[inline(always)]
+    pub(crate) fn callx(&mut self, ip: Ip, stack: bool) -> (&mut H, NativeCall<'_, M::Error>) {
+        let stack = stack.then(|| args::slots(&self.args[self.depth + 1]));
+        (&mut self.host, NativeCall::new(&mut self.stop, ip, stack))
     }
 }
 

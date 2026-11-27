@@ -2,7 +2,9 @@
 
 use std::fmt;
 
-use rvm_core::{Callee, Code, Context, Host, Interpreter, Native, NativeCall, Reason, METERED};
+use rvm_core::{
+    Callee, Code, Context, Host, Interpreter, Native, NativeCall, Reason, StackArgs, MAX_STACK_ARGS, METERED,
+};
 
 use crate::error::{ExecError, MemoryError, Result, VmError};
 use crate::helper::{CallerFuel, HelperRegistry, HostState, Stop};
@@ -19,8 +21,11 @@ pub const DEFAULT_FRAME_SIZE: u64 = 512;
 /// Helper ID of the call the linker plants for a CO-RE relocation the host can't resolve (`btf::CORE_POISON_HELPER`).
 pub const CORE_POISON_HELPER: u32 = 0xbad2310;
 
-/// Argument registers of a call into a guest function, r1 to r5.
-pub const MAX_ARGS: usize = 5;
+/// Arguments of a call that pass in registers, r1 to r5.
+pub const REG_ARGS: usize = 5;
+
+/// Most arguments of a call: those in registers, and those the caller passes on the stack.
+pub const MAX_ARGS: usize = REG_ARGS + MAX_STACK_ARGS;
 
 /// Runs the functions of one program, with BPF-to-BPF calls on their own stack frames.
 ///
@@ -74,20 +79,21 @@ impl Executor {
         self.interp.limit()
     }
 
-    /// Call the function at `pc` (instruction index) of `code` with `args` in r1-r5 under the instruction limit;
-    /// returns r0. More than 5 arguments fail with [`VmError::TooManyArgs`].
+    /// Call the function at `pc` (instruction index) of `code` under the instruction limit; returns r0. `args` go in
+    /// r1-r5 and, from the sixth on, where a caller that passes them on the stack leaves them. More than 12
+    /// arguments fail with [`VmError::TooManyArgs`].
     #[inline(always)]
     pub fn call(&mut self, code: &Code, memory: &mut VmMemory, pc: u64, args: &[u64]) -> Result<u64> {
-        if args.len() > MAX_ARGS {
-            return Err(VmError::TooManyArgs(args.len()));
+        if args.len() > REG_ARGS {
+            return self.call_with_stack_args(code, memory, pc, args);
         }
 
         // A call starts with fresh registers in the entry frame. Guest code can read and write all 16 registers,
         // r11-r15 included, so each starts at a defined value: r1-r5 hold the arguments and 0 past `args.len()`, r10
         // the stack top, the others 0.
         let mut ctx = Context::new(memory);
-        // at most `MAX_ARGS` stores; `copy_from_slice` calls memcpy
-        for (i, &arg) in args.iter().take(MAX_ARGS).enumerate() {
+        // at most `REG_ARGS` stores; `copy_from_slice` calls memcpy
+        for (i, &arg) in args.iter().take(REG_ARGS).enumerate() {
             ctx.regs[i + 1] = arg;
         }
         ctx.regs[10] = self.stack_top;
@@ -97,6 +103,19 @@ impl Executor {
             return Ok(ctx.regs[0]);
         }
         run_on(stop.reason, stop.pc, code, &mut ctx, &mut self.interp)
+    }
+
+    /// [`call`](Self::call) with more than [`REG_ARGS`] arguments.
+    // Out of line, so that a call with up to five arguments pays one test for the others.
+    #[cold]
+    #[inline(never)]
+    fn call_with_stack_args(&mut self, code: &Code, memory: &mut VmMemory, pc: u64, args: &[u64]) -> Result<u64> {
+        if args.len() > MAX_ARGS {
+            return Err(VmError::TooManyArgs(args.len()));
+        }
+        let (regs, stack) = args.split_at(REG_ARGS);
+        let entry = EntryArgs::new(self, stack);
+        entry.executor.call(code, memory, pc, regs)
     }
 
     /// [`call`](Self::call) that runs at most `*fuel` instructions, the ones it runs in other plugins through their
@@ -177,6 +196,27 @@ impl Drop for Budget<'_> {
     }
 }
 
+/// The executor with stack arguments for the entry frame of one call. It clears them when dropped, also when a host
+/// function panics during the call, so that between calls each is 0: an entry function reads 0 for a stack argument
+/// that a call doesn't pass.
+struct EntryArgs<'a> {
+    executor: &'a mut Executor,
+}
+
+impl<'a> EntryArgs<'a> {
+    /// `executor` with `stack`, at most [`MAX_STACK_ARGS`] values, as the first stack arguments of the entry frame.
+    fn new(executor: &'a mut Executor, stack: &[u64]) -> Self {
+        executor.interp.entry_args()[..stack.len()].copy_from_slice(stack);
+        Self { executor }
+    }
+}
+
+impl Drop for EntryArgs<'_> {
+    fn drop(&mut self) {
+        *self.executor.interp.entry_args() = [0; MAX_STACK_ARGS];
+    }
+}
+
 /// Continue a call after [`Interpreter::run`] stopped at `pc` with `reason`, which is not [`Reason::Exit`], until it
 /// returns or fails.
 // Out of line, so that the call's usual path keeps nothing across `run` that only resuming needs.
@@ -191,7 +231,7 @@ fn run_on(
 ) -> Result<u64> {
     loop {
         pc = match interp.host.take_fuel_wanted(reason) {
-            Some(slot) => call_with_fuel(slot, pc, ctx, interp)?,
+            Some(slot) => call_with_fuel(slot, pc, code, ctx, interp)?,
             None => resume_at(reason, pc, code, interp)?,
         };
         let stop = interp.resume(ctx, code, pc);
@@ -210,14 +250,22 @@ fn run_on(
 fn call_with_fuel(
     slot: u32,
     pc: u64,
+    code: &Code,
     ctx: &mut Context<VmMemory>,
     interp: &mut Interpreter<VmMemory, HostCalls>,
 ) -> Result<u64> {
     let fuel = interp.fuel().expect("only a metered caller asks for its fuel");
+    // the call passes the stack arguments again if it passed them the first time
+    let stack = code.passes_stack_args(pc).then(|| *interp.stack_args());
     let host = &mut interp.host;
     host.state.fuel = CallerFuel::Left(fuel);
     let mut stop = None;
-    let r0 = host.registry.call_slot(slot, ctx, &mut host.state, &mut stop);
+    let r0 = match &stack {
+        Some(stack) => host
+            .registry
+            .call_slot_stack(slot, ctx, &mut host.state, &mut stop, stack),
+        None => host.registry.call_slot(slot, ctx, &mut host.state, &mut stop),
+    };
     let CallerFuel::Left(left) = std::mem::replace(&mut host.state.fuel, CallerFuel::Unknown) else {
         unreachable!("the fuel stays while the function runs")
     };
@@ -315,6 +363,12 @@ impl Host<VmMemory> for HostCalls {
     #[inline]
     fn call_kfunc(&mut self, ctx: &mut Context<VmMemory>, slot: u32) -> Option<u64> {
         self.registry.call_slot(slot, ctx, &mut self.state, &mut self.stop)
+    }
+
+    #[inline]
+    fn call_kfunc_stack(&mut self, ctx: &mut Context<VmMemory>, slot: u32, stack: &StackArgs) -> Option<u64> {
+        self.registry
+            .call_slot_stack(slot, ctx, &mut self.state, &mut self.stop, stack)
     }
 
     // A code address names a guest function, which the interpreter checks against the code. With raw calls, an

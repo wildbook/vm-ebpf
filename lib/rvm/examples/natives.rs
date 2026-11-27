@@ -1,8 +1,9 @@
 //! Gives a plugin native functions, which the interpreter calls directly in the Windows x64 convention:
-//! `bpf/examples/natives.c` mixes integers, upper-cases a buffer on its stack in place and checksums it, and follows a
-//! pointer to a host struct that a native returns. The VM checks each buffer against the guest's memory before the
-//! native gets its host address, and runs with passthrough on so that the guest can read through the returned
-//! pointer. Without passthrough that read faults, which the example checks too.
+//! `bpf/examples/natives.c` mixes integers, upper-cases a buffer on its stack in place and checksums it, calls a
+//! seven-argument native whose checked buffer and length travel on the stack, and follows a pointer to a host struct
+//! that a native returns. The VM checks each buffer against the guest's memory before the native gets its host
+//! address, and runs with passthrough on so that the guest can read through the returned pointer. Without passthrough
+//! that read faults, which the example checks too.
 //!
 //! Run with: cargo run -p rvm --example natives
 
@@ -49,15 +50,34 @@ unsafe extern "win64" fn upper(buf: *mut u8, len: u64) -> u64 {
     0
 }
 
+/// # Safety
+///
+/// `buf` must point to `len` readable bytes, or `len` be 0.
+unsafe extern "win64" fn tagged_checksum(a: u64, b: u64, c: u64, d: u64, e: u64, buf: *const u8, len: u64) -> u64 {
+    let head = a.wrapping_add(b).wrapping_add(c).wrapping_add(d).wrapping_add(e);
+    head.wrapping_add(unsafe { checksum(buf, len) })
+}
+
 extern "win64" fn host_config() -> u64 {
     // `as` exposes the provenance of the pointer the guest reads through
     (&raw const CONFIG) as u64
 }
 
-const NATIVES: [(&str, *const (), NativeSig); 4] = [
+const TAGGED: NativeSig = NativeSig::new(&[
+    NativeArg::Int,
+    NativeArg::Int,
+    NativeArg::Int,
+    NativeArg::Int,
+    NativeArg::Int,
+    NativeArg::Read(Some(7)),
+    NativeArg::Int,
+]);
+
+const NATIVES: [(&str, *const (), NativeSig); 5] = [
     ("mix", mix as *const (), NativeSig::ints(3)),
     ("checksum", checksum as *const (), NativeSig::new(&[NativeArg::Read(Some(2)), NativeArg::Int])),
     ("upper", upper as *const (), NativeSig::new(&[NativeArg::Write(Some(2)), NativeArg::Int])),
+    ("tagged_checksum", tagged_checksum as *const (), TAGGED),
     ("host_config", host_config as *const (), NativeSig::ints(0)),
 ];
 
@@ -74,6 +94,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("shout() = {shouted:#x}");
     // SAFETY: the bytes of a live string
     expect("shout", shouted, unsafe { checksum(b"HELLO, NATIVES".as_ptr(), 14) })?;
+
+    let tagged = program.call("tagged", &[5])?;
+    println!("tagged(5) = {tagged:#x}");
+    // SAFETY: the bytes of a live string
+    expect("tagged", tagged, unsafe { tagged_checksum(5, 6, 7, 8, 9, b"stack args".as_ptr(), 10) })?;
 
     let scaled = program.call("scaled", &[6])?;
     println!("scaled(6) = {scaled} (config version {})", CONFIG.version);

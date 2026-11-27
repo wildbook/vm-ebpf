@@ -1,6 +1,6 @@
 //! What an embedder implements to run the guest's calls of host functions: [`Host`].
 
-use crate::{Context, Memory, Native, NativeCall};
+use crate::{Context, Memory, Native, NativeCall, StackArgs};
 
 /// The host functions that the guest calls. The interpreter runs them from inside a run, so a call that the host
 /// runs costs no stop.
@@ -8,6 +8,9 @@ use crate::{Context, Memory, Native, NativeCall};
 /// Each method gets the arguments in `ctx.regs[1..=5]` and returns the new r0. It returns `None` to decline: the run
 /// then stops at the call with [`Reason::CallHelper`], [`Reason::CallKfunc`] or [`Reason::CallIndirect`], and the
 /// caller of the run decides what the call does. A host that declines records whatever that caller needs.
+///
+/// Arguments 6 to 12 of a call are stack arguments. Only [`call_kfunc_stack`](Self::call_kfunc_stack) gets them, and
+/// the native function that a [`NativeCall`] calls.
 ///
 /// A method may change the memory and its [epoch](Memory::epoch), and every register but r10.
 ///
@@ -22,12 +25,21 @@ pub trait Host<M: Memory> {
     /// defines what the ID names.
     fn call_kfunc(&mut self, ctx: &mut Context<M>, id: u32) -> Option<u64>;
 
+    /// [`call_kfunc`](Self::call_kfunc) from a `call` that [`Code::pass_stack_args`](crate::Code::pass_stack_args)
+    /// marked: `stack` holds the stack arguments as the caller stored them last, argument `5 + k` at index `k - 1`.
+    /// The default drops them.
+    fn call_kfunc_stack(&mut self, ctx: &mut Context<M>, id: u32, stack: &StackArgs) -> Option<u64> {
+        let _ = stack;
+        self.call_kfunc(ctx, id)
+    }
+
     /// Call through `target`, the address in the `dst_reg` of a `callx`: name the guest function it addresses, or run
     /// the host function it addresses. For a target that is the address of a native function, `native` runs it.
     fn call_indirect(&mut self, ctx: &mut Context<M>, target: u64, native: NativeCall<'_, M::Error>) -> Option<Callee>;
 
     /// The native functions that calls bound with [`Code::bind_native`](crate::Code::bind_native) name by index. A
-    /// call of an index past the end stops the run with [`Reason::CallKfunc`](crate::Reason::CallKfunc) and that index. The default has none.
+    /// call of an index past the end stops the run with [`Reason::CallKfunc`](crate::Reason::CallKfunc) and that
+    /// index. The default has none.
     ///
     /// The entries must meet the contract of `bind_native` for every call in the code of a run that names them.
     fn natives(&self) -> &[Native] {

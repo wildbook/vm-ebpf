@@ -7,8 +7,9 @@
 //! Arguments and the result are plain values: a pointer from one plugin means nothing in another's memory, unless the
 //! exported function tags the parameter as a borrow (see [`Borrow`]). Then the caller's buffer is mapped into the
 //! callee at a [`BORROW_FIRST_REGION`] slot for the duration of the call, and the callee gets that address instead.
-//! The result is the callee's r0, which holds up to 8 bytes. A struct of more than 16 bytes comes back through a
-//! pointer into the caller's memory, which the callee can follow only where both plugins are untagged.
+//! A call passes up to 12 arguments: those past the fifth where the importing program declares the function with
+//! them, in its BTF. The result is the callee's r0, which holds up to 8 bytes. A struct of more than 16 bytes comes
+//! back through a pointer into the caller's memory, which the callee can follow only where both plugins are untagged.
 //!
 //! A call into a plugin that is already running, from the host or through a chain of plugin calls, fails with
 //! [`VmError::PluginBusy`] instead of deadlocking. So does [`Plugin::replace`] while the plugin runs.
@@ -19,7 +20,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Weak};
 
 use crate::error::{HostError, Result, VmError};
-use crate::executor::MAX_ARGS;
+use crate::executor::{MAX_ARGS, REG_ARGS};
 use crate::helper::{CallerFuel, HelperContext, Stop};
 use crate::layout::{BORROW_FIRST_REGION, BORROW_REGIONS};
 use crate::memory::{Perms, VmMemory};
@@ -62,7 +63,7 @@ impl Plugin {
         &self.name
     }
 
-    /// Call `func` with arguments in r1-r5.
+    /// Call `func` with arguments as for [`Program::call`].
     pub fn call(&self, func: &str, args: &[u64]) -> Result<u64> {
         self.lock()?.call(func, args).map_err(|e| in_plugin(e, &self.name))
     }
@@ -112,7 +113,9 @@ impl Plugin {
 }
 
 /// Call the export in `slot` of the plugin `name` with the arguments in `ctx`.
-#[inline]
+// Always inline: the two trampolines of the export then each keep the code of their own kind of call, with stack
+// arguments or without.
+#[inline(always)]
 fn call_export(
     program: &Weak<TryLock<Program>>,
     name: &Arc<str>,
@@ -143,20 +146,30 @@ fn call_export(
         .get(&program)
         .ok_or_else(|| failed(not_found(name, slot.func.name())))?;
 
+    // five arguments, or all twelve from a call that passes arguments on the stack
     let a = ctx.args;
-    let args = [a.r1, a.r2, a.r3, a.r4, a.r5];
+    let mut regs = [a.r1, a.r2, a.r3, a.r4, a.r5];
+    let mut all = [0; MAX_ARGS];
+    let args: &mut [u64] = match a.stack {
+        None => &mut regs,
+        Some(stack) => {
+            all[..REG_ARGS].copy_from_slice(&regs);
+            all[REG_ARGS..].copy_from_slice(stack);
+            &mut all
+        }
+    };
     if borrows.is_empty() {
-        return program.call_func_charged(entry, &args, fuel).map_err(failed);
+        return program.call_func_charged(entry, args, fuel).map_err(failed);
     }
     call_with_borrows(&mut program, entry, args, borrows, ctx.memory, fuel).map_err(failed)
 }
 
-/// Call `entry` in `callee` with the `caller`'s buffers that `borrows` names mapped into the callee's borrow regions,
-/// charging the call to `fuel` if the caller is metered.
+/// Call `entry` in `callee` with `args`, and with the `caller`'s buffers that `borrows` names among them mapped into
+/// the callee's borrow regions, charging the call to `fuel` if the caller is metered.
 fn call_with_borrows(
     callee: &mut Program,
     entry: Func,
-    mut args: [u64; MAX_ARGS],
+    args: &mut [u64],
     borrows: Borrows,
     caller: &VmMemory,
     fuel: Option<&mut u64>,
@@ -165,8 +178,12 @@ fn call_with_borrows(
         program: callee,
         borrows,
     };
-    for Borrow { arg, len_arg, writable } in borrows {
-        let (addr, len) = (args[arg as usize], args[len_arg as usize] as usize);
+    for (index, Borrow { arg, len_arg, writable }) in borrows.enumerate() {
+        let (arg, len_arg) = (usize::from(arg), usize::from(len_arg));
+        let (Some(&addr), Some(&len)) = (args.get(arg), args.get(len_arg)) else {
+            return Err(not_passed(arg.max(len_arg), args.len()));
+        };
+        let len = len as usize;
         // the caller must itself be allowed what the callee gets
         let perms = if writable { Perms::RW } else { Perms::R };
         // an empty buffer, such as `(NULL, 0)` from C, maps an empty region whatever the pointer
@@ -174,18 +191,26 @@ fn call_with_borrows(
             0 => NonNull::dangling(),
             _ => caller.host_ptr(addr, len, perms)?,
         };
-        let region = borrow_region(arg);
+        let region = borrow_region(index);
         // the callee sees the caller's bytes at their host address, under the borrow region's tag
         // SAFETY: the caller is blocked in this call, and `callee` unmaps the region before the call returns or
         // unwinds.
-        args[arg as usize] = unsafe { callee.program.memory_any().map_host_any(region, ptr, len, perms) };
+        args[arg] = unsafe { callee.program.memory_any().map_host_any(region, ptr, len, perms) };
     }
-    callee.program.call_func_charged(entry, &args, fuel)
+    callee.program.call_func_charged(entry, args, fuel)
 }
 
-/// The borrow region of the pointer parameter `arg`.
-fn borrow_region(arg: u8) -> usize {
-    BORROW_FIRST_REGION + usize::from(arg)
+/// The error of a call with `passed` arguments to a function that borrows through its argument at position `arg`,
+/// which the call doesn't pass: the importing program has no BTF that declares the arguments past the fifth.
+#[cold]
+fn not_passed(arg: usize, passed: usize) -> VmError {
+    let msg = format!("the function borrows a buffer through argument {}, and the call passes {passed}", arg + 1);
+    VmError::InvalidArgument(msg)
+}
+
+/// The borrow region of the borrowed parameter at `index` among those of its function.
+fn borrow_region(index: usize) -> usize {
+    BORROW_FIRST_REGION + index
 }
 
 /// The callee of a call with borrowed buffers. Unmaps the borrow regions when it goes out of scope, also when a host
@@ -197,9 +222,8 @@ struct UnmapBorrows<'a> {
 
 impl Drop for UnmapBorrows<'_> {
     fn drop(&mut self) {
-        for borrow in self.borrows {
-            let region = borrow_region(borrow.arg);
-            self.program.memory_any().unmap_any(region);
+        for index in 0..self.borrows.count() {
+            self.program.memory_any().unmap_any(borrow_region(index));
         }
     }
 }
@@ -229,19 +253,23 @@ impl ExportSlot {
     }
 }
 
-/// The borrowed parameters of a function, packed for [`ExportSlot`]: one byte per borrow from the low byte up, as
-/// `0x80 | arg | len_arg << 3 | writable << 6`, then zero bytes.
+/// The borrowed parameters of a function, packed for [`ExportSlot`]: 12 bits per borrow from the low bits up, as
+/// `0x800 | arg | len_arg << 4 | writable << 8`, then zero bits.
 #[derive(Clone, Copy)]
 struct Borrows(u64);
 
 impl Borrows {
+    /// The bits of one borrow.
+    const BITS: u32 = 12;
+
     fn new(borrows: &[Borrow]) -> Self {
-        // image loading checks that borrowed parameters are distinct argument registers
+        // image loading checks that a function borrows through at most `BORROW_REGIONS` distinct argument positions,
+        // each below 16
         assert!(borrows.len() <= BORROW_REGIONS);
         let mut packed = 0;
         for b in borrows.iter().rev() {
-            let byte = 0x80 | b.arg | b.len_arg << 3 | u8::from(b.writable) << 6;
-            packed = packed << 8 | u64::from(byte);
+            let bits = 0x800 | u64::from(b.arg) | u64::from(b.len_arg) << 4 | u64::from(b.writable) << 8;
+            packed = packed << Self::BITS | bits;
         }
         Self(packed)
     }
@@ -252,20 +280,22 @@ impl Borrows {
     }
 }
 
+const _: () = assert!(BORROW_REGIONS as u32 * Borrows::BITS <= u64::BITS && MAX_ARGS <= 16);
+
 impl Iterator for Borrows {
     type Item = Borrow;
 
     #[inline]
     fn next(&mut self) -> Option<Borrow> {
-        let b = self.0 as u8;
-        if b == 0 {
+        let bits = self.0 & ((1 << Self::BITS) - 1);
+        if bits == 0 {
             return None;
         }
-        self.0 >>= 8;
+        self.0 >>= Self::BITS;
         Some(Borrow {
-            arg: b & 7,
-            len_arg: b >> 3 & 7,
-            writable: b & 0x40 != 0,
+            arg: (bits & 15) as u8,
+            len_arg: (bits >> 4 & 15) as u8,
+            writable: bits & 0x100 != 0,
         })
     }
 }
@@ -295,7 +325,7 @@ pub struct PluginFunc {
 }
 
 impl PluginFunc {
-    /// Call the function in the plugin's current program; arguments go in r1-r5. Fails with
+    /// Call the function in the plugin's current program, with arguments as for [`Program::call`]. Fails with
     /// [`VmError::FunctionNotFound`] if that program lacks it.
     pub fn call(&self, args: &[u64]) -> Result<u64> {
         self.func.call(&mut *self.plugin.lock()?, &self.plugin.name, args)

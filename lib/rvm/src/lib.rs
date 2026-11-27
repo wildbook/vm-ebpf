@@ -50,9 +50,32 @@
 //! ## Compiler
 //!
 //! Programs come from clang 23.1.6 or newer, as `clang -target bpf -mcpu=v4 -O2 -g -fno-slp-vectorize` writes them,
-//! and rvm follows the calling convention of that clang: five argument registers, a result of up to 8 bytes in r0,
-//! and a result of 9 to 16 bytes in r0 and r2. Loading fails for an object whose debug info names an older clang,
-//! which returns structs another way, and for code that passes arguments on the stack, which rvm does not support.
+//! and rvm follows the calling convention of that clang: five argument registers, up to seven more arguments on the
+//! stack, a result of up to 8 bytes in r0, and a result of 9 to 16 bytes in r0 and r2. Loading fails for an object
+//! whose debug info names an older clang, which returns structs another way, and for code that passes a thirteenth
+//! argument.
+//!
+//! ## Arguments
+//!
+//! A call passes up to 12 arguments, each 64 bits: the first five in r1 to r5 and the others on the stack, as clang
+//! compiles a call with more than five. That holds for every call but one through a helper ID, which passes five:
+//!
+//! | Call | Arguments 6 to 12 |
+//! |---|---|
+//! | between the functions of a program, direct or through a pointer | the callee reads what the caller stored |
+//! | of a host function ([`Vm::register_extern`]) | further elements of the argument tuple |
+//! | of a native function ([`Vm::register_native`]) | on the native stack, pointers checked as [`NativeSig`] says |
+//! | through a pointer to native code ([`RawCalls`]) | on the native stack, in a program with such a call anywhere |
+//! | of another plugin's function ([`Vm::export`]) | where the calling program's BTF declares them |
+//! | from the host ([`Program::call`]) | further elements of `args` |
+//!
+//! A function that reads an argument its caller didn't pass gets 0 from the host, and from a caller in the program
+//! what the last call from the same call depth passed in that position, or 0.
+//!
+//! Clang 23.1 doesn't extend a negative `char` or `short` constant or forwarded narrow parameter past 32 bits when a
+//! caller passes it on the stack, and a callee that clang compiled reads all 64 bits of it. From the sixth argument
+//! on, the functions of a program therefore take `int` or wider types. Host and native functions get such an argument
+//! as a register would hold it, with its value in the low 32 bits.
 //!
 //! ## Components
 //!

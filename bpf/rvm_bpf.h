@@ -39,11 +39,18 @@ typedef signed long long   s64;
  *
  *     extern u64 host_add(u64 a, u64 b);
  *
- * A call passes at most five registers: one per integer, pointer and struct of up to 8 bytes, two per struct of 9 to
- * 16 bytes. rvm does not run calls that need more, which clang passes on the stack, also between a plugin's own
- * functions. A result of up to 8 bytes comes back from every kind of function, where a native function returns a
- * struct only if it is 1, 2, 4 or 8 bytes long. A larger struct comes back from a host function only. rvm fails the
- * load of a plugin with a declaration that its function can't serve.
+ * A call passes up to 12 arguments: one per integer, pointer and struct of up to 8 bytes, two per struct of 9 to 16
+ * bytes. The first five go in registers and clang passes the others on the stack, to every kind of function and
+ * between a plugin's own functions. A call through a helper ID passes five. A result of up to 8 bytes comes back
+ * from every kind of function, where a native function returns a struct only if it is 1, 2, 4 or 8 bytes long. A
+ * larger struct comes back from a host function only. rvm fails the load of a plugin with a declaration that its
+ * function can't serve.
+ *
+ * From the sixth argument on, declare the integer parameters of a plugin's own functions as `int` or wider, not as
+ * `char` or `short`. Clang 23.1 reads such a parameter from the stack as 64 bits, and a caller passing a negative
+ * constant or forwarding a narrow parameter stores it with only its low 32 bits extended, so a negative value
+ * arrives as a large positive one. Host functions and native functions take a narrow argument from the low bits, on
+ * the stack as in a register.
  */
 
 /* The callee uses the caller's buffer in place for one call; parameter `len_arg` holds its size in bytes. */
@@ -99,8 +106,8 @@ static u32 (*bpf_get_prandom_u32)(void) = (void *)7;
 
 /*
  * The pointer `p` without its region tag: the host address of its byte, which native code can follow. A call through
- * a function pointer passes each argument as the register holds it, so a plugin whose pointers carry tags strips
- * the tag of a pointer argument. An untagged plugin needs no UNTAG: its pointers are host addresses.
+ * a function pointer passes each argument as the register or the stack holds it, so a plugin whose pointers carry
+ * tags strips the tag of a pointer argument. An untagged plugin needs no UNTAG: its pointers are host addresses.
  */
 #define UNTAG(p) ((__typeof__(0 ? (p) : (p)))((u64)(p) & 0x03ffffffffffffffULL))
 

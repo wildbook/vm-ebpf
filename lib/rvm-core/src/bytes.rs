@@ -5,14 +5,14 @@
 //! frees the other bytes of such instructions. And it gives some slots one of the freed bytes, which then has a
 //! handler of its own: the first slot of a superinstruction ([`fuse`](crate::fuse)), a load or store through r10
 //! ([`windows`](crate::windows)), a `mov` with an offset ([`MOVSX32`], [`MOVSX64`]), the slots that
-//! [`transfer`](crate::transfer) makes, and native calls ([`native`](crate::native)). [`usual`] gives the opcode that
-//! a slot with such a byte runs as.
+//! [`transfer`](crate::transfer) makes, native calls ([`native`](crate::native)), and the loads, stores and calls of
+//! stack arguments ([`args`](crate::args)). [`usual`] gives the opcode that a slot with such a byte runs as.
 
 use crate::fuse::{Super, SUPERS};
-use crate::native;
-use crate::opcode::{AluEnd, AluOpc, Class, JmpOpc, MemMode, MemSize, OpCode, Source, CALL, LD_IMM64};
+use crate::opcode::{AluEnd, AluOpc, Class, JmpOpc, MemMode, MemSize, OpCode, Source, CALL, CALLX, LD_IMM64};
 use crate::transfer::{FAR, GUARD};
 use crate::windows::STACK_ACCESSES;
+use crate::{args, native};
 
 /// The byte of every LD-class instruction but LD_IMM64, the legacy packet loads among them, which all run as the same
 /// unsupported instruction ([`Reason::Unsupported`](crate::Reason::Unsupported)).
@@ -28,6 +28,11 @@ pub const MOV64_REG: u8 = OpCode::alu64(AluOpc::Mov, Source::Reg).0;
 /// The bytes of `mov32` and `mov` from a register with an offset: MOVSX, or a reserved offset, which fails.
 pub const MOVSX32: u8 = 0xf0;
 pub const MOVSX64: u8 = 0xf8;
+
+/// The 8-byte load and stores, which through r11 load and store stack arguments ([`args`](crate::args)).
+pub const LDX_DW: u8 = OpCode::ldx(MemSize::DWord, MemMode::Mem).0;
+pub const STX_DW: u8 = OpCode::stx(MemSize::DWord, MemMode::Mem).0;
+pub const ST_DW: u8 = OpCode::st(MemSize::DWord, MemMode::Mem).0;
 
 /// The byte [`Code::new`](crate::Code::new) gives an instruction with opcode byte `byte` in its place, if it gives it
 /// another: one that runs the same whatever the other fields hold. No slot holds `byte` afterwards, which frees it for
@@ -74,7 +79,8 @@ const fn always_fails(opc: OpCode) -> bool {
 
 /// The opcode that the instruction in a slot with opcode byte `byte` runs as: for the first slot of a superinstruction
 /// or r10 access, which holds a free byte in its place, the first instruction of the sequence or the load or store, for
-/// a `mov` from a register with an offset, the `mov`, and for a native call, `call`.
+/// a `mov` from a register with an offset, the `mov`, for a native call and a call with stack arguments, `call` or
+/// `callx`, and for the load or store of a stack argument, the 8-byte load or store.
 pub const fn usual(byte: u8) -> u8 {
     const_for!((stack, opcode) in STACK_ACCESSES => {
         if stack == byte {
@@ -91,9 +97,19 @@ pub const fn usual(byte: u8) -> u8 {
             return CALL;
         }
     });
+    const_for!(native in native::STACK => {
+        if native == byte {
+            return CALL;
+        }
+    });
     match (byte, Super::with_byte(byte)) {
         (MOVSX32, _) => MOV32_REG,
         (MOVSX64, _) => MOV64_REG,
+        (args::LOAD, _) => LDX_DW,
+        (args::STORE, _) => STX_DW,
+        (args::STORE_IMM, _) => ST_DW,
+        (args::CALL, _) => CALL,
+        (args::CALLX, _) => CALLX,
         (_, Some(sup)) => sup.opcode(0),
         (_, None) => byte,
     }
@@ -116,4 +132,6 @@ const _: () = {
     claim(&mut used, MOVSX64);
     const_for!(byte in native::PLAIN => claim(&mut used, byte));
     const_for!(byte in native::CHECKED => claim(&mut used, byte));
+    const_for!(byte in native::STACK => claim(&mut used, byte));
+    const_for!(byte in [args::LOAD, args::STORE, args::STORE_IMM, args::CALL, args::CALLX] => claim(&mut used, byte));
 };

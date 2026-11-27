@@ -51,7 +51,7 @@ use crate::handler::{handler, jump};
 use crate::opcode::{Class, OpCode};
 use crate::slot::Slot;
 use crate::transfer::Ip;
-use crate::{fuse, native, transfer, windows, Context, Host, Interpreter, Memory};
+use crate::{args, fuse, native, transfer, windows, Context, Host, Interpreter, Memory};
 
 /// Continues at `$ip`, in the block of the slot the handler runs: tail-calls the handler of its instruction. `$ip`
 /// must lie in `0..=len`. A true `$split` makes the tail call one of two, as the module docs describe.
@@ -200,6 +200,7 @@ pub const fn table<M: Memory, H: Host<M>, F: Fuel>() -> Table<M, H> {
     transfer::install::<M, H, F>(&mut table);
     windows::install::<M, H>(&mut table);
     native::install::<M, H, F>(&mut table);
+    args::install::<M, H, F>(&mut table);
     Table(table, table)
 }
 

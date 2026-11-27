@@ -18,3 +18,7 @@ fuel = ["rvm/fuel"]
 
 [dependencies]
 rvm = { path = "../rvm", default-features = false }
+
+[dev-dependencies]
+# tests/stack_args.rs prepares its image with the linker
+rvm = { path = "../rvm", default-features = false, features = ["link"] }

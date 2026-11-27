@@ -95,8 +95,8 @@
 //! - `context`: [`Context`]
 //! - `dispatch`: how one handler continues with the next, and the tables of handlers
 //! - `handler`: the handlers of the eBPF opcodes
-//! - `fuse::handler`, `windows`, `transfer`, `native`: the handlers of superinstructions, of loads and stores in a
-//!   memory window, of jumps out of the code, and of native calls
+//! - `fuse::handler`, `windows`, `transfer`, `native`, `args`: the handlers of superinstructions, of loads and stores
+//!   in a memory window, of jumps out of the code, of native calls, and of stack arguments
 //! - `fuel`: metered runs
 //!
 //! # Words
@@ -121,6 +121,7 @@ mod macros;
 #[macro_use]
 mod dispatch;
 
+mod args;
 mod bytes;
 mod code;
 mod context;
@@ -140,6 +141,7 @@ mod windows;
 
 pub mod opcode;
 
+pub use args::{StackArgs, MAX_STACK_ARGS};
 pub use code::Code;
 pub use context::Context;
 pub use host::{Callee, Host};

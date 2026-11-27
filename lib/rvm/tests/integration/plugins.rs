@@ -43,7 +43,11 @@ fn instruction_limit_covers_plugin_calls() {
     asm.mov64_imm(R1, SPINS).call(0).sub64_imm(R6, 1).jne_imm(R6, 0, again);
     asm.mov64_imm(R0, 0).exit();
     let mut image = Image::from_code(asm.assemble().unwrap());
-    image.externs.push((2, Import::Name("main".into())));
+    let main = Import::Name {
+        name: "main".into(),
+        stack: false,
+    };
+    image.externs.push((2, main));
     let mut caller = vm.load_image(image).unwrap();
 
     // the third call into the callee runs out of what the first two left
@@ -318,7 +322,11 @@ fn borrowed_buffers() {
         0x95, 0x00, 0, 0, 0, 0, 0, 0, // exit
     ];
     let mut image = Image::from_code(code.to_vec());
-    image.externs.push((2, Import::Name("sum".into())));
+    let sum = Import::Name {
+        name: "sum".into(),
+        stack: false,
+    };
+    image.externs.push((2, sum));
     assert_eq!(vm.load_image(image).unwrap().call("main", &[]).unwrap(), 0);
 }
 

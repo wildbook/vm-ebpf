@@ -1,11 +1,12 @@
 /*
  * Host externs that take or return structs by value, where the BTF parameters differ from the registers: a struct
  * of 9 to 16 bytes takes two argument registers and returns in r0 and r2, and a struct of more than 16 bytes returns
- * through a result pointer in r1. Each call_<name> calls the extern <name>, and for an extern that returns a struct
- * it returns the fields as decimal digits, the first field lowest.
+ * through a result pointer in r1. The sixth register and the ones after it are slots on the stack, and a struct may
+ * take r5 and the first slot. Each call_<name> calls the extern <name>, and for an extern that returns a struct it
+ * returns the fields as decimal digits, the first field lowest.
  *
- * With TOO_MANY defined, the object only takes the address of an extern that needs six registers. BTF declares it,
- * and nothing calls it.
+ * With TOO_MANY defined, the object only takes the address of an extern that needs 13 registers, one more than a
+ * call passes. BTF declares it, and nothing calls it.
  */
 #include "rvm_bpf.h"
 
@@ -26,12 +27,16 @@ extern u64 s12_arg(struct s12 s, u64 x);
 extern u64 s16_arg(struct s16 s, u64 x);
 extern u64 pair_arg(union pair u, u64 x);
 extern u64 two_s16(struct s16 a, struct s16 b, u64 x);
+extern u64 six(struct s16 a, struct s16 b, u64 x, u64 y);
+extern u64 split(u64 a, u64 b, u64 c, u64 d, struct s16 s);
 extern struct s8 s8_ret(u64 x);
 extern struct s12 s12_ret(u64 x);
 extern union pair pair_ret(u64 x);
 extern struct s24 s24_ret(u64 x);
 
 u64 call_scalars(void) { return scalars(1, BLUE, NULL); }
+u64 call_six(void) { return six((struct s16){1, 2}, (struct s16){3, 4}, 5, 6); }
+u64 call_split(void) { return split(1, 2, 3, 4, (struct s16){5, 6}); }
 u64 call_s3_arg(void) { return s3_arg((struct s3){1, 2, 3}, 4); }
 u64 call_s8_arg(void) { return s8_arg((struct s8){1, 2}, 3); }
 u64 call_s12_arg(void) { return s12_arg((struct s12){1, 2, 3}, 4); }
@@ -61,8 +66,8 @@ u64 call_s24_ret(void) {
 
 #else
 
-extern u64 six(struct s16 a, struct s16 b, u64 x, u64 y);
+extern u64 thirteen(struct s16 a, struct s16 b, struct s16 c, struct s16 d, struct s16 e, struct s16 f, u64 x);
 
-u64 address_of_six(void) { return (u64)&six; }
+u64 address_of_thirteen(void) { return (u64)&thirteen; }
 
 #endif

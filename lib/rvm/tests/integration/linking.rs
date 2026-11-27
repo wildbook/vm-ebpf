@@ -112,7 +112,7 @@ const fn returning(returns: Returns, name: &'static str, params: u8, registers: 
     }
 }
 
-const SHAPES: [Shape; 12] = [
+const SHAPES: [Shape; 14] = [
     shape("scalars", 3, 3, &[1, 2, 0]),
     // a 3-byte struct packed into r1
     shape("s3_arg", 2, 2, &[0x03_0201, 4]),
@@ -122,15 +122,22 @@ const SHAPES: [Shape; 12] = [
     shape("s16_arg", 2, 3, &[1, 2, 3]),
     shape("pair_arg", 2, 3, &[1, 2, 3]),
     shape("two_s16", 3, 5, &[1, 2, 3, 4, 5]),
+    // the sixth register is the first slot on the stack
+    shape("six", 4, 6, &[1, 2, 3, 4, 5, 6]),
+    // a 16-byte struct in r5 and that slot
+    shape("split", 5, 6, &[1, 2, 3, 4, 5, 6]),
     returning(Returns::R0, "s8_ret", 1, 1),
     returning(Returns::R0R2, "s12_ret", 1, 1),
     returning(Returns::R0R2, "pair_ret", 1, 1),
     returning(Returns::Pointer, "s24_ret", 1, 2),
     Shape {
-        object: "tests/struct_args_six.o",
-        ..shape("six", 4, 6, &[])
+        object: "tests/struct_args_thirteen.o",
+        ..shape("thirteen", 7, 13, &[])
     },
 ];
+
+/// The registers a call passes: five, and seven slots on the stack.
+const MAX_REGISTERS: u8 = 12;
 
 /// Linking compares the argument registers an extern takes with the host function's arguments, not its BTF
 /// parameters, and the host function gets those registers.
@@ -138,17 +145,17 @@ const SHAPES: [Shape; 12] = [
 fn struct_shapes_count_registers() {
     for shape in &SHAPES {
         let module = Module::from_elf(&object(shape.object)).unwrap();
-        for arity in [shape.params, shape.registers.min(5)] {
+        for arity in [shape.params, shape.registers.min(MAX_REGISTERS)] {
             let vm = Vm::new();
             let seen = Arc::new(Mutex::new(Vec::new()));
             for other in SHAPES.iter().filter(|s| s.object == shape.object) {
-                register_recording(&vm, other, other.registers.min(5), &seen);
+                register_recording(&vm, other, other.registers.min(MAX_REGISTERS), &seen);
             }
             register_recording(&vm, shape, arity, &seen);
             let linked = vm.load_modules(&[&module]);
             let context = format!("{} with {arity} host arguments", shape.name);
 
-            if shape.registers > 5 {
+            if shape.registers > MAX_REGISTERS {
                 let err = linked.err().unwrap();
                 let expected = LinkError::TooManyRegisters {
                     name: shape.name.into(),
@@ -177,6 +184,10 @@ fn struct_shapes_count_registers() {
 /// Register the extern of `shape` with `arity` arguments, which it stores in `seen`. It returns zeros in the
 /// registers the shape's result takes.
 fn register_recording(vm: &Vm, shape: &Shape, arity: u8, seen: &Arc<Mutex<Vec<u64>>>) {
+    type Six = (u64, u64, u64, u64, u64, u64);
+    type Seven = (u64, u64, u64, u64, u64, u64, u64);
+    type Twelve = (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
+
     let seen = seen.clone();
     let record = move |args: &[u64]| *seen.lock().unwrap() = args.to_vec();
     let name = shape.name;
@@ -190,6 +201,11 @@ fn register_recording(vm: &Vm, shape: &Shape, arity: u8, seen: &Arc<Mutex<Vec<u6
         (3, _) => vm.register_extern(name, move |(a, b, c): (u64, u64, u64)| record(&[a, b, c])),
         (4, _) => vm.register_extern(name, move |(a, b, c, d): (u64, u64, u64, u64)| record(&[a, b, c, d])),
         (5, _) => vm.register_extern(name, move |(a, b, c, d, e): (u64, u64, u64, u64, u64)| record(&[a, b, c, d, e])),
+        (6, _) => vm.register_extern(name, move |(a, b, c, d, e, f): Six| record(&[a, b, c, d, e, f])),
+        (7, _) => vm.register_extern(name, move |(a, b, c, d, e, f, g): Seven| record(&[a, b, c, d, e, f, g])),
+        (12, _) => vm.register_extern(name, move |(a, b, c, d, e, f, g, h, i, j, k, l): Twelve| {
+            record(&[a, b, c, d, e, f, g, h, i, j, k, l])
+        }),
         _ => unreachable!("arity {arity}"),
     }
 }

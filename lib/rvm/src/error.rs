@@ -58,7 +58,7 @@ pub enum VmError {
     /// afterwards.
     NoFreeRegion,
 
-    /// A call with more arguments than the 5 that eBPF functions take.
+    /// A call with more arguments than the 12 that a function takes: five in registers and seven on the stack.
     TooManyArgs(usize),
 
     InvalidArgument(String),
@@ -111,7 +111,7 @@ impl fmt::Display for VmError {
             Self::ForeignFunc => write!(f, "function handle belongs to another program; look the function up again"),
             Self::ForeignRegion => write!(f, "region handle belongs to another memory"),
             Self::NoFreeRegion => write!(f, "every host region is taken"),
-            Self::TooManyArgs(count) => write!(f, "{count} arguments, but eBPF functions take at most {MAX_ARGS}"),
+            Self::TooManyArgs(count) => write!(f, "{count} arguments, but a function takes at most {MAX_ARGS}"),
             Self::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
             Self::MemoryLimit(limit) => {
                 write!(f, "program needs more than {limit} bytes of memory; raise VmConfig::memory_limit to allow it")
@@ -195,10 +195,12 @@ pub enum LinkError {
     /// An extern or image disagrees with the native function's signature in what isn't the register count, or the
     /// extern has no BTF to check it against.
     NativeMismatch { name: String, reason: String },
-    /// A host-bound extern needs more argument registers than the five eBPF has.
+    /// A host-bound extern needs more argument registers than the 12 a call passes: five registers, and seven slots
+    /// on the stack that count as registers here.
     TooManyRegisters { name: String, registers: usize },
-    /// The instruction at `pc` passes or takes an argument on the stack, through r11, as clang does from the sixth
-    /// argument register on. `function` is the exported function it lies in, if any.
+    /// The instruction at `pc` is an 8-byte load or store through r11, the base register of stack arguments, with an
+    /// offset that names none of arguments 6 to 12. Clang writes one for a call or a function with more than 12
+    /// arguments. `function` is the exported function it lies in, if any.
     StackArguments { pc: u64, function: Option<String> },
     /// The object's debug info names a clang older than 23 as its compiler, here by version. Such a clang returns
     /// small structs by another convention.
@@ -241,14 +243,15 @@ impl fmt::Display for LinkError {
             }
             Self::NativeMismatch { name, reason } => write!(f, "native {name}: {reason}"),
             Self::TooManyRegisters { name, registers } => {
-                write!(f, "extern {name} takes {registers} argument registers, but eBPF passes at most {MAX_ARGS}")
+                write!(f, "extern {name} takes {registers} argument registers, but a call passes at most {MAX_ARGS}")
             }
             Self::StackArguments { pc, function } => {
                 let place = function.as_ref().map(|name| format!(" in {name}")).unwrap_or_default();
                 write!(
                     f,
-                    "instruction {pc}{place} passes or takes an argument on the stack, through r11, which rvm doesn't \
-                     support: a call has at most {MAX_ARGS} argument registers"
+                    "instruction {pc}{place} passes or takes an argument on the stack that isn't one of arguments 6 \
+                     to {MAX_ARGS}: a call has at most {MAX_ARGS} arguments, and it stores those past the fifth at \
+                     r11 - 8 to r11 - 56, where the callee loads them from r11 + 8 to r11 + 56"
                 )
             }
             #[cfg(feature = "link")]

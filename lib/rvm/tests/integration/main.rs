@@ -18,3 +18,6 @@ mod programs;
 #[cfg(not(miri))]
 mod raw_calls;
 mod regions;
+// natives again
+#[cfg(not(miri))]
+mod stack_args;

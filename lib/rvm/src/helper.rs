@@ -5,39 +5,51 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use hashbrown::HashMap;
-use rvm_core::{Context, Native, NativeSig};
+use rvm_core::{Context, Native, NativeSig, StackArgs};
 
 use crate::error::{HostError, VmError};
+use crate::executor::REG_ARGS;
 #[cfg(feature = "maps")]
 use crate::maps::Maps;
 use crate::memory::{GuestMemory, VmMemory};
 use crate::sync::{lock, Published};
 
-/// Registers r1-r5 at the time of a helper call.
+/// The arguments of a host function call: r1 to r5, and the arguments the call passes on the stack.
 #[derive(Debug, Clone, Copy)]
-pub struct HelperArgs {
+pub struct HelperArgs<'a> {
     pub r1: u64,
     pub r2: u64,
     pub r3: u64,
     pub r4: u64,
     pub r5: u64,
+    /// Arguments 6 to 12 as the caller stored them, argument 6 first, in a call that passes arguments on the stack:
+    /// a `call` of a function that the program imports by name with more than five argument registers. A call
+    /// through a helper ID or a function pointer passes none.
+    pub stack: Option<&'a StackArgs>,
 }
 
-impl HelperArgs {
-    pub fn from_regs(regs: &[u64; 16]) -> Self {
+impl<'a> HelperArgs<'a> {
+    pub fn new(regs: &[u64; 16], stack: Option<&'a StackArgs>) -> Self {
         Self {
             r1: regs[1],
             r2: regs[2],
             r3: regs[3],
             r4: regs[4],
             r5: regs[5],
+            stack,
         }
+    }
+
+    /// Argument `6 + index`, or 0 in a call that passes no arguments on the stack.
+    #[inline(always)]
+    pub fn stack_arg(&self, index: usize) -> u64 {
+        self.stack.map_or(0, |stack| stack[index])
     }
 }
 
-/// What a raw host function sees: the argument registers, the calling program's memory, and its maps and fuel.
+/// What a raw host function sees: the arguments, the calling program's memory, and its maps and fuel.
 pub struct HelperContext<'a> {
-    pub args: HelperArgs,
+    pub args: HelperArgs<'a>,
     pub memory: &'a mut VmMemory,
     pub host: &'a mut HostState,
 }
@@ -65,26 +77,27 @@ pub enum CallerFuel {
     Left(u64),
 }
 
-/// Typed helper arguments, read from r1 onwards.
+/// Typed helper arguments, read from r1 onwards and, past r5, from the stack arguments.
 pub trait FromArgs: Sized {
-    /// Number of argument registers (r1..) this type reads.
+    /// Number of arguments this type reads.
     const ARITY: u8;
 
     /// Extract arguments from the helper args.
     fn from_args(args: &HelperArgs) -> Self;
 }
 
-/// Implements `FromArgs` for a tuple reading `$arity` registers starting at r1.
+/// Implements `FromArgs` for a tuple reading `$arity` arguments: the registers `$reg`, then the stack arguments
+/// `$slot`.
 macro_rules! tuple_args {
-    ($(($($reg:ident),*) $arity:literal);* $(;)?) => {$(
-        impl FromArgs for ($(tuple_args!(@unit $reg),)*) {
+    ($(($($reg:ident),*) ($($slot:literal),*) $arity:literal);* $(;)?) => {$(
+        impl FromArgs for ($(tuple_args!(@unit $reg),)* $(tuple_args!(@unit $slot),)*) {
             const ARITY: u8 = $arity;
             fn from_args(args: &HelperArgs) -> Self {
-                ($(args.$reg,)*)
+                ($(args.$reg,)* $(args.stack_arg($slot),)*)
             }
         }
     )*};
-    (@unit $reg:ident) => { u64 };
+    (@unit $arg:tt) => { u64 };
 }
 
 impl FromArgs for () {
@@ -93,11 +106,18 @@ impl FromArgs for () {
 }
 
 tuple_args! {
-    (r1) 1;
-    (r1, r2) 2;
-    (r1, r2, r3) 3;
-    (r1, r2, r3, r4) 4;
-    (r1, r2, r3, r4, r5) 5;
+    (r1) () 1;
+    (r1, r2) () 2;
+    (r1, r2, r3) () 3;
+    (r1, r2, r3, r4) () 4;
+    (r1, r2, r3, r4, r5) () 5;
+    (r1, r2, r3, r4, r5) (0) 6;
+    (r1, r2, r3, r4, r5) (0, 1) 7;
+    (r1, r2, r3, r4, r5) (0, 1, 2) 8;
+    (r1, r2, r3, r4, r5) (0, 1, 2, 3) 9;
+    (r1, r2, r3, r4, r5) (0, 1, 2, 3, 4) 10;
+    (r1, r2, r3, r4, r5) (0, 1, 2, 3, 4, 5) 11;
+    (r1, r2, r3, r4, r5) (0, 1, 2, 3, 4, 5, 6) 12;
 }
 
 // Single-argument shorthands.
@@ -203,9 +223,21 @@ impl From<HostError> for Stop {
 /// every one of them arrives in a register, and an `Option<u64>`, which returns in two.
 type Trampoline = unsafe fn(*const (), &mut Context<VmMemory>, &mut HostState, &mut Option<Stop>) -> Option<u64>;
 
-/// A host function, called directly through `call` with `data` as its closure.
+/// A [`Trampoline`] for a call that passes arguments on the stack, with those arguments.
+type StackTrampoline =
+    unsafe fn(*const (), &mut Context<VmMemory>, &mut HostState, &mut Option<Stop>, &StackArgs) -> Option<u64>;
+
+/// A host function: how a call reaches it, and how a call that passes arguments on the stack does.
 #[derive(Clone)]
 pub struct HostFn {
+    slot: Slot,
+    // for a function that takes arguments from the stack; the others run through the slot whatever the call passes
+    call_stack: Option<StackTrampoline>,
+}
+
+/// A host function as the extern table keeps it, called directly through `call` with `data` as its closure.
+#[derive(Clone)]
+struct Slot {
     call: Trampoline,
     data: *const (),
     // keeps `data` alive; the call path never touches it
@@ -219,21 +251,32 @@ pub struct HostFn {
     wide: bool,
 }
 
-// SAFETY: `data` points into `_owner`, which is `Send + Sync` and lives as long as the `HostFn`.
-unsafe impl Send for HostFn {}
-unsafe impl Sync for HostFn {}
+// A call indexes the slots of the extern table: by 40 bytes with one `lea` and a scaled address, by 48 with a shift
+// more.
+const _: () = assert!(size_of::<Slot>() == 40);
+
+// SAFETY: `data` points into `_owner`, which is `Send + Sync` and lives as long as the `Slot`.
+unsafe impl Send for Slot {}
+unsafe impl Sync for Slot {}
 
 impl HostFn {
-    /// `func` called through `call`, which must take `data` as a pointer to an `F`.
-    fn with_trampoline<F: Send + Sync + 'static>(func: F, call: Trampoline, arity: Option<u8>, wide: bool) -> Self {
+    /// `func` called through `call` and `call_stack`, which must take `data` as a pointer to an `F`.
+    fn with_trampoline<F: Send + Sync + 'static>(
+        func: F,
+        call: Trampoline,
+        call_stack: Option<StackTrampoline>,
+        arity: Option<u8>,
+        wide: bool,
+    ) -> Self {
         let owner = Arc::new(func);
-        Self {
+        let slot = Slot {
             call,
             data: Arc::as_ptr(&owner).cast(),
             _owner: owner,
             arity,
             wide,
-        }
+        };
+        Self { slot, call_stack }
     }
 
     /// A function that reads its arguments from the registers itself and reaches the caller's memory, maps and fuel.
@@ -242,27 +285,16 @@ impl HostFn {
     where
         F: Fn(&mut HelperContext) -> Result<u64, Stop> + Send + Sync + 'static,
     {
-        /// # Safety
-        ///
-        /// `data` must point to a live `F`.
-        unsafe fn trampoline<F>(
-            data: *const (),
-            ctx: &mut Context<VmMemory>,
-            host: &mut HostState,
-            stop: &mut Option<Stop>,
-        ) -> Option<u64>
-        where
-            F: Fn(&mut HelperContext) -> Result<u64, Stop>,
-        {
-            let mut helper_ctx = HelperContext {
-                args: HelperArgs::from_regs(&ctx.regs),
-                memory: &mut *ctx.memory,
-                host,
-            };
-            finish(unsafe { (*data.cast::<F>())(&mut helper_ctx) }, stop)
-        }
+        Self::with_trampoline(func, raw_call::<F>, None, None, false)
+    }
 
-        Self::with_trampoline(func, trampoline::<F>, None, false)
+    /// [`raw`](Self::raw) for a function that also reads the arguments a call passes on the stack
+    /// ([`HelperArgs::stack`]).
+    pub fn raw_stack<F>(func: F) -> Self
+    where
+        F: Fn(&mut HelperContext) -> Result<u64, Stop> + Send + Sync + 'static,
+    {
+        Self::with_trampoline(func, raw_call::<F>, Some(raw_stack_call::<F>), None, false)
     }
 
     /// A function of the typed arguments.
@@ -272,26 +304,8 @@ impl HostFn {
         A: FromArgs,
         R: IntoReturn,
     {
-        /// # Safety
-        ///
-        /// `data` must point to a live `F`.
-        unsafe fn trampoline<F, A, R>(
-            data: *const (),
-            ctx: &mut Context<VmMemory>,
-            _host: &mut HostState,
-            stop: &mut Option<Stop>,
-        ) -> Option<u64>
-        where
-            F: Fn(A) -> R,
-            A: FromArgs,
-            R: IntoReturn,
-        {
-            let args = A::from_args(&HelperArgs::from_regs(&ctx.regs));
-            let result = unsafe { (*data.cast::<F>())(args) };
-            finish(result.into_return(&mut ctx.regs[2]), stop)
-        }
-
-        Self::with_trampoline(func, trampoline::<F, A, R>, Some(A::ARITY), R::WIDE)
+        let call_stack = takes_stack::<A>().then_some(typed_stack_call::<F, A, R> as StackTrampoline);
+        Self::with_trampoline(func, typed_call::<F, A, R>, call_stack, Some(A::ARITY), R::WIDE)
     }
 
     /// A function of the caller's memory and the typed arguments.
@@ -301,27 +315,153 @@ impl HostFn {
         A: FromArgs,
         R: IntoReturn,
     {
-        /// # Safety
-        ///
-        /// `data` must point to a live `F`.
-        unsafe fn trampoline<F, A, R>(
-            data: *const (),
-            ctx: &mut Context<VmMemory>,
-            _host: &mut HostState,
-            stop: &mut Option<Stop>,
-        ) -> Option<u64>
-        where
-            F: Fn(&mut GuestMemory, A) -> R,
-            A: FromArgs,
-            R: IntoReturn,
-        {
-            let args = A::from_args(&HelperArgs::from_regs(&ctx.regs));
-            let result = unsafe { (*data.cast::<F>())(&mut GuestMemory::new(ctx.memory), args) };
-            finish(result.into_return(&mut ctx.regs[2]), stop)
-        }
-
-        Self::with_trampoline(func, trampoline::<F, A, R>, Some(A::ARITY), R::WIDE)
+        let call_stack = takes_stack::<A>().then_some(memory_stack_call::<F, A, R> as StackTrampoline);
+        Self::with_trampoline(func, memory_call::<F, A, R>, call_stack, Some(A::ARITY), R::WIDE)
     }
+}
+
+/// Whether the typed arguments `A` take any from the stack.
+const fn takes_stack<A: FromArgs>() -> bool {
+    A::ARITY as usize > REG_ARGS
+}
+
+// The trampolines of each kind of host function: the `Trampoline`, the `StackTrampoline`, and the body of both. Each
+// requires `data` to point to a live `F`.
+
+unsafe fn raw_call<F>(
+    data: *const (),
+    ctx: &mut Context<VmMemory>,
+    host: &mut HostState,
+    stop: &mut Option<Stop>,
+) -> Option<u64>
+where
+    F: Fn(&mut HelperContext) -> Result<u64, Stop>,
+{
+    unsafe { run_raw::<F>(data, ctx, host, stop, None) }
+}
+
+unsafe fn raw_stack_call<F>(
+    data: *const (),
+    ctx: &mut Context<VmMemory>,
+    host: &mut HostState,
+    stop: &mut Option<Stop>,
+    stack: &StackArgs,
+) -> Option<u64>
+where
+    F: Fn(&mut HelperContext) -> Result<u64, Stop>,
+{
+    unsafe { run_raw::<F>(data, ctx, host, stop, Some(stack)) }
+}
+
+#[inline(always)]
+unsafe fn run_raw<F>(
+    data: *const (),
+    ctx: &mut Context<VmMemory>,
+    host: &mut HostState,
+    stop: &mut Option<Stop>,
+    stack: Option<&StackArgs>,
+) -> Option<u64>
+where
+    F: Fn(&mut HelperContext) -> Result<u64, Stop>,
+{
+    let mut helper_ctx = HelperContext {
+        args: HelperArgs::new(&ctx.regs, stack),
+        memory: &mut *ctx.memory,
+        host,
+    };
+    finish(unsafe { (*data.cast::<F>())(&mut helper_ctx) }, stop)
+}
+
+unsafe fn typed_call<F, A, R>(
+    data: *const (),
+    ctx: &mut Context<VmMemory>,
+    _host: &mut HostState,
+    stop: &mut Option<Stop>,
+) -> Option<u64>
+where
+    F: Fn(A) -> R,
+    A: FromArgs,
+    R: IntoReturn,
+{
+    unsafe { run_typed::<F, A, R>(data, ctx, stop, None) }
+}
+
+unsafe fn typed_stack_call<F, A, R>(
+    data: *const (),
+    ctx: &mut Context<VmMemory>,
+    _host: &mut HostState,
+    stop: &mut Option<Stop>,
+    stack: &StackArgs,
+) -> Option<u64>
+where
+    F: Fn(A) -> R,
+    A: FromArgs,
+    R: IntoReturn,
+{
+    unsafe { run_typed::<F, A, R>(data, ctx, stop, Some(stack)) }
+}
+
+#[inline(always)]
+unsafe fn run_typed<F, A, R>(
+    data: *const (),
+    ctx: &mut Context<VmMemory>,
+    stop: &mut Option<Stop>,
+    stack: Option<&StackArgs>,
+) -> Option<u64>
+where
+    F: Fn(A) -> R,
+    A: FromArgs,
+    R: IntoReturn,
+{
+    let args = A::from_args(&HelperArgs::new(&ctx.regs, stack));
+    let result = unsafe { (*data.cast::<F>())(args) };
+    finish(result.into_return(&mut ctx.regs[2]), stop)
+}
+
+unsafe fn memory_call<F, A, R>(
+    data: *const (),
+    ctx: &mut Context<VmMemory>,
+    _host: &mut HostState,
+    stop: &mut Option<Stop>,
+) -> Option<u64>
+where
+    F: Fn(&mut GuestMemory, A) -> R,
+    A: FromArgs,
+    R: IntoReturn,
+{
+    unsafe { run_with_memory::<F, A, R>(data, ctx, stop, None) }
+}
+
+unsafe fn memory_stack_call<F, A, R>(
+    data: *const (),
+    ctx: &mut Context<VmMemory>,
+    _host: &mut HostState,
+    stop: &mut Option<Stop>,
+    stack: &StackArgs,
+) -> Option<u64>
+where
+    F: Fn(&mut GuestMemory, A) -> R,
+    A: FromArgs,
+    R: IntoReturn,
+{
+    unsafe { run_with_memory::<F, A, R>(data, ctx, stop, Some(stack)) }
+}
+
+#[inline(always)]
+unsafe fn run_with_memory<F, A, R>(
+    data: *const (),
+    ctx: &mut Context<VmMemory>,
+    stop: &mut Option<Stop>,
+    stack: Option<&StackArgs>,
+) -> Option<u64>
+where
+    F: Fn(&mut GuestMemory, A) -> R,
+    A: FromArgs,
+    R: IntoReturn,
+{
+    let args = A::from_args(&HelperArgs::new(&ctx.regs, stack));
+    let result = unsafe { (*data.cast::<F>())(&mut GuestMemory::new(ctx.memory), args) };
+    finish(result.into_return(&mut ctx.regs[2]), stop)
 }
 
 /// The r0 of a host function call that returned `result`, or `None` once the reason it stops the caller is in `stop`.
@@ -347,7 +487,9 @@ fn finish<E: Into<Stop>>(result: Result<u64, E>, stop: &mut Option<Stop>) -> Opt
 /// with both a native and a host function binds to the native.
 #[derive(Default, Clone)]
 pub struct HelperRegistry {
-    slots: Vec<HostFn>,
+    slots: Vec<Slot>,
+    /// By slot, [`HostFn::call_stack`]: apart from the slots, which keep their size without it.
+    stack_calls: Vec<Option<StackTrampoline>>,
     by_id: Vec<(u32, u32)>, // (helper ID, slot)
     by_name: HashMap<String, u32>,
     natives: Vec<Native>,
@@ -405,11 +547,13 @@ impl HelperRegistry {
     fn put(&mut self, slot: Option<u32>, func: HostFn) -> u32 {
         match slot {
             Some(slot) => {
-                self.slots[slot as usize] = func;
+                self.slots[slot as usize] = func.slot;
+                self.stack_calls[slot as usize] = func.call_stack;
                 slot
             }
             None => {
-                self.slots.push(func);
+                self.slots.push(func.slot);
+                self.stack_calls.push(func.call_stack);
                 (self.slots.len() - 1) as u32
             }
         }
@@ -453,6 +597,32 @@ impl HelperRegistry {
         };
         // SAFETY: `HostFn::with_trampoline` paired `call` with a `data` pointer of the type it expects.
         unsafe { (func.call)(func.data, ctx, host, stop) }
+    }
+
+    /// [`call_slot`](Self::call_slot) from a call that passes `stack` on the stack. A function that takes no stack
+    /// arguments runs as it does there.
+    #[inline]
+    pub fn call_slot_stack(
+        &self,
+        slot: u32,
+        ctx: &mut Context<VmMemory>,
+        host: &mut HostState,
+        stop: &mut Option<Stop>,
+        stack: &StackArgs,
+    ) -> Option<u64> {
+        let (Some(func), Some(call_stack)) = (self.slots.get(slot as usize), self.stack_calls.get(slot as usize))
+        else {
+            *stop = Some(Stop::UnknownSlot(slot));
+            return None;
+        };
+        // SAFETY: `HostFn::with_trampoline` paired `call` and `call_stack` with a `data` pointer of the type they
+        // expect.
+        unsafe {
+            match call_stack {
+                Some(call) => call(func.data, ctx, host, stop, stack),
+                None => (func.call)(func.data, ctx, host, stop),
+            }
+        }
     }
 }
 

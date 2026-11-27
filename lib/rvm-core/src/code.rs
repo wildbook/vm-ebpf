@@ -4,9 +4,9 @@ use std::fmt::{self, Debug, Formatter};
 
 #[cfg(feature = "fuel")]
 use crate::fuel::Rests;
-use crate::opcode::{OpCode, CALL};
+use crate::opcode::{call, OpCode, CALL};
 use crate::slot::Slot;
-use crate::{bytes, fuse, native, rewrite, transfer, Instruction, MAX_NATIVE_ARGS};
+use crate::{args, bytes, fuse, native, rewrite, transfer, Instruction, MAX_NATIVE_ARGS};
 
 /// Bytecode prepared for an [`Interpreter`](crate::Interpreter).
 pub struct Code {
@@ -72,9 +72,10 @@ impl Code {
     }
 
     /// Make the `call` in slot `pc` a call of the native function at `index` in
-    /// [`Host::natives`](crate::Host::natives), which takes the `args` argument registers r1 to rN in the Windows x64
-    /// convention and returns r0. With `checked`, the call first passes each pointer argument of the function's
-    /// [`NativeSig`](crate::NativeSig) through [`Memory::native_ptr`](crate::Memory::native_ptr) and stops with
+    /// [`Host::natives`](crate::Host::natives), which takes `args` arguments in the Windows x64 convention and
+    /// returns r0: r1 to r5, and from the sixth argument on the stack arguments of the frame. With `checked`, the
+    /// call first passes each pointer argument of the function's [`NativeSig`](crate::NativeSig) through
+    /// [`Memory::native_ptr`](crate::Memory::native_ptr) and stops with
     /// [`Reason::MemoryFault`](crate::Reason::MemoryFault) where that fails. A call counts as one instruction, and its
     /// native function runs unmetered.
     ///
@@ -97,6 +98,30 @@ impl Code {
         let byte = native::byte(args, checked && args != 0);
         *slot = Slot::new(Instruction::new(OpCode(byte), 0, 0, 0, index as i32));
         true
+    }
+
+    /// Make the kfunc `call` in slot `pc` pass the stack arguments of its frame to the host, which then runs it in
+    /// [`Host::call_kfunc_stack`](crate::Host::call_kfunc_stack).
+    ///
+    /// Returns false and leaves the code as it is if slot `pc` holds no kfunc `call`.
+    pub fn pass_stack_args(&mut self, pc: usize) -> bool {
+        let Some(slot) = self.slots[..self.len].get_mut(pc) else {
+            return false;
+        };
+        if slot.byte() != CALL {
+            return false;
+        }
+        let insn = slot.instruction();
+        if insn.src_reg() != call::KFUNC {
+            return false;
+        }
+        *slot = Slot::new(insn.with_byte(args::CALL));
+        true
+    }
+
+    /// Whether slot `pc` holds a `call` that [`pass_stack_args`](Self::pass_stack_args) marked.
+    pub fn passes_stack_args(&self, pc: u64) -> bool {
+        self.slots().get(pc).is_some_and(|slot| slot.byte() == args::CALL)
     }
 
     /// Bytes the load or store in slot `pc` accesses, or `None` if the slot holds none, for reporting a

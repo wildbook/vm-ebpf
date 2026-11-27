@@ -34,20 +34,21 @@ pub struct FunctionInfo {
 /// length in bytes. The callee sees the buffer at offset 0 of its own region, and a callee atomic at offset `o` counts
 /// as aligned when the caller's address plus `o` is, since both name the same bytes.
 ///
-/// Both fields are argument registers, not parameter indices: after the result pointer of a returned struct of more
-/// than 16 bytes or a struct parameter of 9 to 16 bytes, a parameter sits in a later register than its index.
+/// Both fields are argument positions, not parameter indices: 0 to 4 for r1 to r5, then 5 to 11 for the arguments on
+/// the stack. After the result pointer of a returned struct of more than 16 bytes or a struct parameter of 9 to 16
+/// bytes, a parameter sits in a later position than its index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Borrow {
-    /// Register of the pointer parameter, 0 for r1.
+    /// Position of the pointer parameter, 0 for r1.
     pub arg: u8,
-    /// Register of the parameter that holds the length.
+    /// Position of the parameter that holds the length.
     pub len_arg: u8,
     /// Whether the callee may write the buffer (`borrow`) or only read it (`borrow_ro`).
     pub writable: bool,
 }
 
 impl Borrow {
-    /// Both parameters are argument registers, and different ones.
+    /// Both parameters are argument positions, and different ones.
     pub(crate) fn in_range(&self) -> bool {
         usize::from(self.arg) < MAX_ARGS && usize::from(self.len_arg) < MAX_ARGS && self.arg != self.len_arg
     }
@@ -89,7 +90,7 @@ impl LimitedCall {
 /// ```ignore
 /// let mut program = vm.load_elf(&elf_bytes)?;
 ///
-/// // Arguments go in r1-r5
+/// // The first five arguments go in r1-r5, up to seven more where a call passes them on the stack
 /// let result = program.call("main", &[])?;
 /// let result = program.call("process", &[ctx_ptr, len])?;
 ///
@@ -178,7 +179,9 @@ impl Program {
         Some(&self.functions.list.get(index)?.1)
     }
 
-    /// Call a function by name; arguments go in r1-r5. Returns r0, which holds a result of up to 8 bytes.
+    /// Call a function by name, with up to 12 arguments: the first five go in r1-r5, the others where a caller that
+    /// passes them on the stack leaves them, so the function takes them as clang compiles a function of more than
+    /// five parameters. An argument that the call leaves out is 0. Returns r0, which holds a result of up to 8 bytes.
     #[inline]
     pub fn call(&mut self, name: &str, args: &[u64]) -> Result<u64> {
         let pc = self.func(name)?.pc;
@@ -208,7 +211,7 @@ impl Program {
         func.program == self.id
     }
 
-    /// Call a function looked up with [`Program::func`]; arguments go in r1-r5.
+    /// Call a function looked up with [`Program::func`], with arguments as for [`Program::call`].
     ///
     /// A handle from another program fails with [`VmError::ForeignFunc`].
     #[inline]

@@ -66,8 +66,8 @@ About the compiler:
 - `-fno-slp-vectorize` avoids a crash of clang 23.1 in BPF instruction selection (`BPF DAG->DAG Pattern Instruction
   Selection`), on a signed vector division that its SLP vectorizer forms from scalar divisions. The BPF target has
   no vector instructions, so the flag loses nothing.
-- Clang 23 compiles calls with more than five arguments, which rvm does not run yet; see
-  [What plugins can use](#what-plugins-can-use).
+- For calls with more than five arguments, declare a plugin function's sixth and later integer parameters as `int` or
+  wider, not `char` or `short`; see [What plugins can use](#what-plugins-can-use).
 
 ### Host functions
 
@@ -88,11 +88,11 @@ vm.register_extern_with_memory("print", |mem, (msg, len): (u64, u64)| {
 });
 ```
 
-A host function takes `()`, one integer, or a tuple of up to five `u64`, and returns `()`, an integer, `bool`, a
-`(u64, u64)` or a `Result` of one of these. The `_with_memory` variants also get the calling plugin's memory. Every
-read and write through it copies, needs the same permissions as the plugin's own loads and stores, and returns a
-`MemoryError` for a pointer the plugin could not use itself. An `Err` from a host function fails the plugin call with
-`HostError::Failed`. To give the plugin an error code instead, return it as an integer.
+A host function takes `()`, one integer, or a tuple of up to twelve `u64` (calls by helper ID pass five), and returns
+`()`, an integer, `bool`, a `(u64, u64)` or a `Result` of one of these. The `_with_memory` variants also get the calling
+plugin's memory. Every read and write through it copies, needs the same permissions as the plugin's own loads and
+stores, and returns a `MemoryError` for a pointer the plugin could not use itself. An `Err` from a host function fails
+the plugin call with `HostError::Failed`. To give the plugin an error code instead, return it as an integer.
 
 A struct or union that the C declaration passes or returns by value travels in registers, as clang 23 lays it out,
 and the host function takes and returns those registers:
@@ -155,17 +155,17 @@ Pointers stored inside plugin memory, such as the fields of a struct the plugin 
 and native code can't follow them; such APIs need `Passthrough::untagged()`. A pointer that a native returns is a
 host address, which the plugin can follow only with passthrough on or untagged.
 
-Registration is unsafe: the native must take exactly the signature's arguments, never unwind (no panic, C++ exception
-or `longjmp`), stay loaded while plugins may call it, be safe on any thread, and treat its integer arguments and the
-bytes behind its pointers as untrusted. Native time doesn't count against the instruction limit, a native can't fail
-the plugin call, and one that calls back into the same plugin gets `VmError::PluginBusy`. Use `register_extern` where
-you need any of those. `rvm_load_with` does the same for the C library.
-[`lib/rvm/examples/natives.rs`](lib/rvm/examples/natives.rs) calls natives on integers and buffers and follows a
-returned pointer.
+Registration is unsafe: the native must take exactly the signature's arguments (up to twelve), never unwind (no panic,
+C++ exception or `longjmp`), stay loaded while plugins may call it, be safe on any thread, and treat its integer
+arguments and the bytes behind its pointers as untrusted. Native time doesn't count against the instruction limit, a
+native can't fail the plugin call, and one that calls back into the same plugin gets `VmError::PluginBusy`. Use
+`register_extern` where you need any of those. `rvm_load_with` does the same for the C library.
+[`lib/rvm/examples/natives.rs`](lib/rvm/examples/natives.rs) calls natives on integers and buffers (including a
+seven-argument call with a checked buffer on the stack) and follows a returned pointer.
 
 ### Passing data
 
-Arguments and return values are up to five `u64` values. For more data, the host maps memory into the plugin and
+A call passes up to twelve `u64` arguments and returns a `u64`. For more data, the host maps memory into the plugin and
 passes its address:
 
 ```rust
@@ -184,9 +184,9 @@ must stay valid while it is mapped. The host reads and writes plugin memory with
 
 A `Plugin` wraps a loaded program so that other plugins can call it. `Vm::export` publishes one of its functions under
 its name, and plugins loaded afterwards declare it as an `extern` like a host function. The call runs in the exporting
-plugin, with its own memory and maps. A pointer parameter tagged with `BORROW(n)` or `BORROW_RO(n)` lends the caller's
-buffer to the callee for that one call, where argument `n` holds the length in bytes. The callee reads and writes the
-caller's bytes in place, without a copy:
+plugin, with its own memory and maps, and passes up to twelve arguments. A pointer parameter tagged with `BORROW(n)` or
+`BORROW_RO(n)` lends the caller's buffer to the callee for that one call, where argument `n` holds the length in bytes,
+whether in a register or on the stack. The callee reads and writes the caller's bytes in place, without a copy:
 
 ```c
 // math.c
@@ -381,11 +381,11 @@ plugin.call("run", &[&raw const API as u64])?;
 ```
 
 A call through a pointer that holds an address without a region tag, from 64 KiB up, then calls the function at that
-address in the Windows x64 convention, with up to five arguments, and the plugin gets what the function leaves in
-rax. The first four arguments also go to xmm0 to xmm3, where a function reads `float` and `double` parameters and a
-variadic function its copies. Pointers to the plugin's own functions and helper IDs below 64 KiB work as before.
-Without the switch, such a call fails with `ExecError::BadCodeAddress`, or with `ExecError::UnknownHelper` if the
-address fits 32 bits.
+address in the Windows x64 convention, with five arguments (or twelve in a program that stores a stack argument
+anywhere), and the plugin gets what the function leaves in rax. The first four arguments also go to xmm0 to xmm3, where
+a function reads `float` and `double` parameters and a variadic function its copies. Pointers to the plugin's own
+functions and helper IDs below 64 KiB work as before. Without the switch, such a call fails with
+`ExecError::BadCodeAddress`, or with `ExecError::UnknownHelper` if the address fits 32 bits.
 
 Nothing declares what such a call passes, so each argument arrives as the register holds it, without a check or a
 conversion. A pointer into plugin memory keeps its region tag, which native code can't follow: load the plugin with
@@ -463,11 +463,11 @@ Built with `cargo build --profile embedded` in `lib/rvmrt`, on x86-64 Windows:
 
 | build | `rvmrt.dll` | added to a C host by `rvmrt.lib` |
 |---|---|---|
-| default | 120,320 bytes, 31 imports from 3 DLLs | 108,032 bytes, 8 imports |
-| without `fuel` | 98,304 bytes, 31 imports from 3 DLLs | 86,016 bytes, 8 imports |
+| default | 127,488 bytes, 24 imports from 3 DLLs | 116,224 bytes, 7 imports |
+| without `fuel` | 102,400 bytes, 24 imports from 3 DLLs | 91,648 bytes, 7 imports |
 
-The 8 imports of the static library are the process heap functions, `memcmp`, `memmove`, `GetCurrentProcess` and
-`TerminateProcess`. The build rebuilds the standard library for size, which needs the `rust-src` component.
+The 7 imports of the static library are the process heap functions, `memcmp`, `memmove` and `memset`. The build
+rebuilds the standard library for size, which needs the `rust-src` component.
 
 ### Instruction limits
 
@@ -541,17 +541,18 @@ rvm implements the eBPF instruction set of [RFC 9669](https://www.rfc-editor.org
 Not supported: the legacy packet loads (`BPF_ABS`, `BPF_IND`), kfunc calls by BTF ID, and map types other than array
 and hash.
 
-The eBPF calling convention applies to plugins too: a call passes at most five argument registers, each an integer, a
-pointer or half of a small struct, and returns up to 16 bytes. eBPF has no floating point instructions, and clang
-rejects code that needs them.
+A call passes up to twelve arguments: the first five in registers and up to seven more on the stack, as clang 23
+compiles a call with more than five, and returns up to 16 bytes. Each argument is an integer, a pointer, or half of a 9
+to 16-byte struct; a thirteenth argument fails the load with `LinkError::StackArguments`, or with
+`LinkError::TooManyRegisters` on a host extern. A call through a helper ID passes five. eBPF has no floating point
+instructions, and clang rejects code that needs them.
 
-Clang 23 compiles a call that needs more than five registers and passes the rest on the stack, through r11, also
-between the functions of one plugin. rvm does not support stack arguments yet: such an object fails to load with
-`LinkError::StackArguments`, or with `LinkError::TooManyRegisters` where the callee is a host function. Pass a pointer
-to a struct instead. Clang 23.1 also miscompiles these calls between BPF functions: with `-mcpu=v3` or `v4`, it
-stores a `char`, `short` or `int` argument past the fifth register without extending it, and the callee reads all
-64 bits. The fix, [llvm/llvm-project#238315](https://github.com/llvm/llvm-project/commit/0fdfbb6f05), is on LLVM's
-main branch and in no 23.x release.
+Clang 23.1 miscompiles `char` and `short` parameters past the fifth argument between a plugin's own functions: a caller
+passing a negative constant or forwarding a narrow parameter stores it with only its low 32 bits extended, and the
+callee reads all 64 bits. Declare a plugin function's sixth and later integer parameters as `int` or wider (`int` and
+`u32` are extended by the callee). Host and native functions read narrow arguments from the low bits. The fix,
+[llvm/llvm-project#238315](https://github.com/llvm/llvm-project/commit/0fdfbb6f05), is on LLVM's main branch and in no
+23.x release.
 
 ## Performance
 
@@ -610,8 +611,8 @@ that declares maps fails to load. `fixed-hash-seed` makes hash maps use a fixed 
 - rvm is an interpreter. Compute-bound plugins run about 15 to 30 times slower than native code; there is no JIT.
 - rvm is developed and measured on x86-64 Windows only.
 - It needs nightly Rust.
-- Plugins are limited by eBPF: five argument registers per call, no floating point, a 512-byte stack frame and 8
-  nested calls.
+- Plugins are limited by eBPF: twelve arguments per call (five in registers and seven on the stack), no floating point,
+  a 512-byte stack frame and 8 nested calls.
 - A plugin runs one call at a time. Calls from several threads into the same plugin fail with
   `VmError::PluginBusy`; load one program per thread to run them in parallel.
 - A struct of 9 to 16 bytes comes back in two registers, which only a host function from `register_extern` returns.
@@ -619,10 +620,10 @@ that declares maps fails to load. `fixed-hash-seed` makes hash maps use a fixed 
 - Native functions use the Windows x64 convention only. They take integers and pointers and return integers,
   pointers and structs of 1, 2, 4 or 8 bytes: no struct parameters, no floats and no variadic functions. They run
   unmetered.
-- A call through a function pointer to native code has no signature. It passes five registers as they are: pointers
-  keep their region tags, a struct by value passes and comes back only if it is 1, 2, 4 or 8 bytes long, there is no
-  sixth argument, and a `float` or `double` result is lost. Nothing validates the target, and Control Flow Guard
-  doesn't check the call.
+- A call through a function pointer to native code has no signature. It passes five registers as they are, plus the
+  seven stack slots in a program that stores any: pointers keep their region tags, a struct by value passes and comes
+  back only if it is 1, 2, 4 or 8 bytes long, and a `float` or `double` result is lost. Nothing validates the target,
+  and Control Flow Guard doesn't check the call.
 - Images are tied to the rvm version that wrote them. Relink them when you update rvm.
 - The C library runs prepared images only, without maps and without host functions other than natives.
 - rvm is not published on crates.io.

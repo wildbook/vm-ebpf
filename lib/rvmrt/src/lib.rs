@@ -47,7 +47,7 @@ pub enum Status {
     Link = 2,
     /// No function with this name.
     NotFound = 3,
-    /// A bad argument: more than 5 call arguments, a length that can't be mapped, no free region to map, an address
+    /// A bad argument: more than 12 call arguments, a length that can't be mapped, no free region to map, an address
     /// that [`rvm_map`] didn't return, a name that isn't UTF-8.
     Argument = 4,
     /// The call ran more instructions than the limit.
@@ -99,7 +99,7 @@ pub struct RvmNative {
     pub name: *const u8,
     pub name_len: usize,
     pub func: *const (),
-    /// Arguments, 0 to 5.
+    /// Arguments, 0 to 12.
     pub args: u8,
     /// Per argument: 0 for an integer, 1 for a pointer the function reads, 2 for one it reads and writes.
     pub kind: [u8; MAX_NATIVE_ARGS],
@@ -283,7 +283,8 @@ pub unsafe extern "C" fn rvm_write(program: *mut RvmProgram, addr: u64, buf: *co
     unsafe { finish(copied.map_err(VmError::Memory), &mut ()) }
 }
 
-/// Calls the function `name` with `args` in r1 to r5 and stores its r0 in `*ret`.
+/// Calls the function `name` with up to 12 `args`, the first five in r1 to r5 and the others as a caller passes them
+/// on the stack, and stores its r0 in `*ret`.
 ///
 /// # Safety
 ///
@@ -330,7 +331,7 @@ pub unsafe extern "C" fn rvm_func(
     Status::Ok
 }
 
-/// Calls the function at `index` with `args` in r1 to r5 and stores its r0 in `*ret`.
+/// Calls the function at `index` with `args` as [`rvm_call`] passes them and stores its r0 in `*ret`.
 ///
 /// # Safety
 ///

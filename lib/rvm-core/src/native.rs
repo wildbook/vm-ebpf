@@ -9,13 +9,20 @@
 //! [`Handler`](crate::dispatch::Handler)). It skips the windows check of other host calls, as a native function has
 //! no way to the memory of the run.
 //!
+//! A function with more than five arguments takes the rest from the stack arguments of the frame
+//! ([`args`](crate::args)). One handler runs every such call ([`STACK`]): it passes all twelve arguments through
+//! `rvm_call_args`, in assembly, and the function ignores those it doesn't take. The Windows x64 convention passes
+//! arguments 5 to 12 on the stack, so a handler per count would differ only in what it copies there.
+//!
 //! A `callx` has no signature. Where its target is the address of a native function,
 //! [`Host::call_indirect`](crate::Host::call_indirect) calls it through a [`NativeCall`], which passes r1 to r5 in
-//! assembly: no Rust function pointer type fits a function whose argument count the caller doesn't know.
+//! assembly: no Rust function pointer type fits a function whose argument count the caller doesn't know. In a
+//! program that stores stack arguments, it passes those too.
 
 use std::arch::global_asm;
 use std::mem::transmute;
 
+use crate::args::{StackArgs, MAX_STACK_ARGS};
 use crate::code::Slots;
 use crate::dispatch::{Handler, Spare, Table};
 use crate::fuel::Fuel;
@@ -24,8 +31,11 @@ use crate::slot::{Fields, Shape, Slot};
 use crate::transfer::Ip;
 use crate::{Context, Host, Interpreter, Memory, Reason};
 
-/// Most arguments a native function takes: the argument registers r1 to r5.
-pub const MAX_ARGS: usize = 5;
+/// The arguments a call passes in registers, r1 to r5.
+const REG_ARGS: usize = 5;
+
+/// Most arguments a native function takes: the argument registers r1 to r5 and the stack arguments.
+pub const MAX_ARGS: usize = REG_ARGS + MAX_STACK_ARGS;
 
 /// A native function as [`Native`] keeps it. A call casts it to `unsafe extern "win64" fn(u64, ...) -> u64` with the
 /// argument count of its [`NativeSig`].
@@ -53,21 +63,24 @@ pub struct Native {
 /// assert_eq!((ADD.args(), FILL.args()), (2, 3));
 /// ```
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct NativeSig(u64);
+pub struct NativeSig(u128);
 
-// The bits of a `NativeSig`, which a checked call reads with constant shifts: the argument count, then for each
-// argument `i + 1` a bit in `POINTERS` and `WRITES`, and 4 bits at `LENS + 4 * i` with 0 for one byte or the number of
-// the integer argument that holds the length, 1 to 5.
+// The bits of a `NativeSig`: the argument count, then for each argument `i + 1` a bit in `POINTERS` and `WRITES`, and
+// 4 bits at `LENS + 4 * i` with 0 for one byte or the number of the integer argument that holds the length, 1 to 12.
+// The fields of arguments 1 to 5 lie in the low 64 bits, which a checked call of up to five arguments reads with
+// constant shifts.
 const POINTERS: u32 = 8;
-const WRITES: u32 = 16;
-const LENS: u32 = 24;
+const WRITES: u32 = 24;
+const LENS: u32 = 40;
+
+const _: () = assert!(LENS + 4 * REG_ARGS as u32 <= u64::BITS && LENS + 4 * MAX_ARGS as u32 <= u128::BITS);
 
 /// One argument of a [`NativeSig`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NativeArg {
-    /// An integer, passed as the guest's register holds it.
+    /// An integer, passed as the guest's register or stack slot holds it.
     Int,
-    /// A pointer to bytes the function reads: one, or as many as the integer argument with this number (1 to 5)
+    /// A pointer to bytes the function reads: one, or as many as the integer argument with this number (1 to 12)
     /// holds.
     Read(Option<u8>),
     /// A pointer to bytes the function reads and writes, as for [`Read`](Self::Read).
@@ -81,8 +94,8 @@ impl NativeSig {
     ///
     /// Panics if `args` exceeds [`MAX_ARGS`].
     pub const fn ints(args: u8) -> Self {
-        assert!(args as usize <= MAX_ARGS, "a native function takes at most 5 arguments");
-        Self(args as u64)
+        assert!(args as usize <= MAX_ARGS, "a native function takes at most 12 arguments");
+        Self(args as u128)
     }
 
     /// The signature of `args`, or `None` for more than [`MAX_ARGS`] arguments or a length argument that isn't an
@@ -91,7 +104,7 @@ impl NativeSig {
         if args.len() > MAX_ARGS {
             return None;
         }
-        let mut bits = args.len() as u64;
+        let mut bits = args.len() as u128;
         let mut i = 0;
         while i < args.len() {
             let (write, len) = match args[i] {
@@ -107,8 +120,8 @@ impl NativeSig {
                 Some(n) if n >= 1 && (n as usize) <= args.len() && matches!(args[n as usize - 1], NativeArg::Int) => n,
                 Some(_) => return None,
             };
-            bits |= 1 << (POINTERS + i as u32) | (write as u64) << (WRITES + i as u32);
-            bits |= (len as u64) << (LENS + 4 * i as u32);
+            bits |= 1 << (POINTERS + i as u32) | (write as u128) << (WRITES + i as u32);
+            bits |= (len as u128) << (LENS + 4 * i as u32);
             i += 1;
         }
         Some(Self(bits))
@@ -122,7 +135,7 @@ impl NativeSig {
     pub const fn new(args: &[NativeArg]) -> Self {
         match Self::try_new(args) {
             Some(sig) => sig,
-            None => panic!("more than 5 arguments, or a length argument that isn't an integer argument"),
+            None => panic!("more than 12 arguments, or a length argument that isn't an integer argument"),
         }
     }
 
@@ -150,17 +163,21 @@ impl NativeSig {
 
     /// Whether any argument is a pointer.
     pub const fn has_pointers(self) -> bool {
-        self.0 >> POINTERS & 0xff != 0
+        self.0 >> POINTERS & ((1 << MAX_ARGS) - 1) != 0
     }
 }
 
 /// The byte of a native call with 0 to 5 arguments that passes them as the registers hold them: bytes of JMP32
 /// instructions that always fail, which [`Code::new`](crate::Code::new) frees.
-pub const PLAIN: [u8; MAX_ARGS + 1] = [0x8e, 0x96, 0xe6, 0xee, 0xf6, 0xfe];
+pub const PLAIN: [u8; REG_ARGS + 1] = [0x8e, 0x96, 0xe6, 0xee, 0xf6, 0xfe];
 
 /// The byte of a native call with 1 to 5 arguments that resolves its pointer arguments first: more bytes of
 /// instructions that always fail.
-pub const CHECKED: [u8; MAX_ARGS] = [0x8c, 0x9d, 0x8f, 0x9b, 0xef];
+pub const CHECKED: [u8; REG_ARGS] = [0x8c, 0x9d, 0x8f, 0x9b, 0xef];
+
+/// The bytes of a native call with 6 to 12 arguments: the one that passes them as the registers and stack slots
+/// hold them, then the one that resolves its pointer arguments first.
+pub const STACK: [u8; 2] = [0x0e, 0xdf];
 
 pub const fn install<M: Memory, H: Host<M>, F: Fuel>(table: &mut [Handler<M, H>; 256]) {
     table[PLAIN[0] as usize] = native_call::<M, H, F, 0, false>;
@@ -174,18 +191,21 @@ pub const fn install<M: Memory, H: Host<M>, F: Fuel>(table: &mut [Handler<M, H>;
     table[CHECKED[2] as usize] = native_call::<M, H, F, 3, true>;
     table[CHECKED[3] as usize] = native_call::<M, H, F, 4, true>;
     table[CHECKED[4] as usize] = native_call::<M, H, F, 5, true>;
+    table[STACK[0] as usize] = stack_call::<M, H, F, false>;
+    table[STACK[1] as usize] = stack_call::<M, H, F, true>;
 }
 
 /// The byte of a native call with `args` arguments, `checked` or not.
 pub const fn byte(args: usize, checked: bool) -> u8 {
-    match checked {
-        true => CHECKED[args - 1],
-        false => PLAIN[args],
+    match (args > REG_ARGS, checked) {
+        (true, _) => STACK[checked as usize],
+        (false, true) => CHECKED[args - 1],
+        (false, false) => PLAIN[args],
     }
 }
 
-/// The handler of a native call with `N` arguments, which with `CHECKED` resolves the pointer arguments of the
-/// function's [`NativeSig`] first.
+/// The handler of a native call with `N` arguments, up to five, which with `CHECKED` resolves the pointer arguments
+/// of the function's [`NativeSig`] first.
 #[inline(never)]
 extern "rust-preserve-none" fn native_call<M: Memory, H: Host<M>, F: Fuel, const N: usize, const CHECKED: bool>(
     ctx: &mut Context<M>,
@@ -204,11 +224,11 @@ extern "rust-preserve-none" fn native_call<M: Memory, H: Host<M>, F: Fuel, const
     };
 
     // the arguments past `N` stay 0, which no call passes
-    let mut a = [0; MAX_ARGS];
+    let mut a = [0; REG_ARGS];
     a[..N].copy_from_slice(&ctx.regs[1..=N]);
     if CHECKED {
         // `N` is a constant, so the loop unrolls and each shift of the signature is one too
-        let bits = sig.0;
+        let bits = sig.0 as u64;
         for (i, arg) in a.iter_mut().enumerate().take(N) {
             if bits >> (POINTERS as usize + i) & 1 == 0 {
                 continue;
@@ -231,6 +251,71 @@ extern "rust-preserve-none" fn native_call<M: Memory, H: Host<M>, F: Fuel, const
     become_enter!(ctx, code, ip.offset(1), interp, table)
 }
 
+/// The handler of a native call with 6 to 12 arguments: r1 to r5 and the stack arguments of the frame. With `CHECKED`
+/// it resolves the pointer arguments of the function's [`NativeSig`] first.
+#[inline(never)]
+extern "rust-preserve-none" fn stack_call<M: Memory, H: Host<M>, F: Fuel, const CHECKED: bool>(
+    ctx: &mut Context<M>,
+    code: Slots,
+    ip: Ip,
+    interp: &mut Interpreter<M, H>,
+    table: &Table<M, H>,
+    _: Spare,
+    slot: Slot,
+) {
+    // SAFETY: a handler's ip lies below `len`, and its slot has the layout of its byte
+    let index = unsafe { ip.view(slot, const { Shape::of(STACK[CHECKED as usize]) }) }.imm() as u32;
+    let (stack, host) = interp.stack_args_and_host();
+    let Some(&Native { func, sig }) = host.natives().get(index as usize) else {
+        core::hint::cold_path();
+        return interp.stop.at(ip, Reason::CallKfunc(index));
+    };
+    let func = func as usize as u64;
+
+    // SAFETY, for both calls: `Code::bind_native` requires each native function a call names to take the arguments of
+    // its signature, and a function leaves alone the arguments past its own
+    ctx.regs[0] = match CHECKED {
+        true => {
+            let mut a = [0; MAX_ARGS];
+            a[..REG_ARGS].copy_from_slice(reg_args(&ctx.regs));
+            a[REG_ARGS..].copy_from_slice(stack);
+            if let Err(error) = resolve_all(&*ctx.memory, sig, &mut a) {
+                return interp.stop.at(ip, Reason::MemoryFault(error));
+            }
+            let (regs, stack) = a.split_at(REG_ARGS);
+            let regs = regs.first_chunk().expect("the first five arguments");
+            let stack = stack.first_chunk().expect("the other seven");
+            unsafe { rvm_call_args(func, regs, stack) }
+        }
+        false => unsafe { rvm_call_args(func, reg_args(&ctx.regs), stack) },
+    };
+
+    become_enter!(ctx, code, ip.offset(1), interp, table)
+}
+
+/// r1 to r5 of `regs`.
+#[inline(always)]
+fn reg_args(regs: &[u64; 16]) -> &[u64; REG_ARGS] {
+    regs[1..].first_chunk().expect("16 registers")
+}
+
+/// Replaces each pointer argument of `sig` among the arguments `a` with the host address of its bytes, as
+/// [`Memory::native_ptr`] resolves it.
+fn resolve_all<M: Memory>(memory: &M, sig: NativeSig, a: &mut [u64; MAX_ARGS]) -> Result<(), M::Error> {
+    for n in 1..=sig.args() {
+        let (len, write) = match sig.arg(n) {
+            Some(NativeArg::Read(len)) => (len, false),
+            Some(NativeArg::Write(len)) => (len, true),
+            Some(NativeArg::Int) | None => continue,
+        };
+        // a length is an integer argument, which this loop leaves as the guest passed it
+        let len = len.map_or(1, |len| a[usize::from(len) - 1]);
+        let arg = &mut a[usize::from(n) - 1];
+        *arg = resolve(memory, *arg, len, write)?;
+    }
+    Ok(())
+}
+
 /// [`Memory::native_ptr`], out of line, so that each pointer argument of a checked handler costs a call rather than
 /// a copy of the check.
 #[inline(never)]
@@ -244,7 +329,7 @@ fn resolve<M: Memory>(memory: &M, addr: u64, len: u64, write: bool) -> Result<u6
 ///
 /// `func` must take `n` integer or pointer arguments in the Windows x64 convention, and never unwind.
 #[inline(always)]
-unsafe fn call(func: NativeFn, n: usize, a: [u64; MAX_ARGS]) -> u64 {
+unsafe fn call(func: NativeFn, n: usize, a: [u64; REG_ARGS]) -> u64 {
     type F1 = unsafe extern "win64" fn(u64) -> u64;
     type F2 = unsafe extern "win64" fn(u64, u64) -> u64;
     type F3 = unsafe extern "win64" fn(u64, u64, u64) -> u64;
@@ -269,16 +354,22 @@ pub struct NativeCall<'a, E> {
     stop: &'a mut StopRecord<E>,
     /// The `callx`.
     ip: Ip,
+    /// The stack arguments of the frame, in a program that stores any.
+    stack: Option<&'a StackArgs>,
 }
 
 impl<'a, E> NativeCall<'a, E> {
-    pub(crate) fn new(stop: &'a mut StopRecord<E>, ip: Ip) -> Self {
-        Self { stop, ip }
+    pub(crate) fn new(stop: &'a mut StopRecord<E>, ip: Ip, stack: Option<&'a StackArgs>) -> Self {
+        Self { stop, ip, stack }
     }
 
     /// Call the function at `func` with r1 to r5 of `regs` in the Windows x64 convention, the first four also in
     /// xmm0 to xmm3, and return its rax. No signature says what the function takes, so nothing is checked or
     /// converted.
+    ///
+    /// In a program that stores a stack argument anywhere, the call also passes the seven stack arguments of the
+    /// frame as arguments 6 to 12, as the frame stored them last: nothing says how many this `callx` passes, and
+    /// the function ignores the rest. In every other program the function gets five arguments.
     ///
     /// It first records the `callx` and `func` as the stop of the run. Nothing reads that record but a debugger,
     /// which finds the guest instruction behind a call that crashed there: the stop that ends the run replaces it.
@@ -286,17 +377,21 @@ impl<'a, E> NativeCall<'a, E> {
     /// # Safety
     ///
     /// `func` must be the address of a function of the Windows x64 convention that is sound to call with whatever
-    /// `regs` hold, and that never unwinds.
+    /// `regs` and the stack arguments hold, and that never unwinds.
     #[inline(always)]
     pub unsafe fn call(self, func: u64, regs: &[u64; 16]) -> u64 {
         self.stop.calling(self.ip, func);
         // SAFETY: the caller's
-        unsafe { rvm_call_regs(func, regs) }
+        match self.stack {
+            None => unsafe { rvm_call_regs(func, regs) },
+            Some(stack) => unsafe { rvm_call_args(func, reg_args(regs), stack) },
+        }
     }
 }
 
 unsafe extern "win64" {
     fn rvm_call_regs(func: u64, regs: &[u64; 16]) -> u64;
+    fn rvm_call_args(func: u64, regs: &[u64; REG_ARGS], stack: &StackArgs) -> u64;
 }
 
 // rvm_call_regs(func, regs): func(regs[1], ..., regs[5]). The first four arguments go to xmm0 to xmm3 as well, where a
@@ -325,6 +420,43 @@ global_asm!(
     "    movq xmm3, r9",
     "    call rax",
     "    add rsp, 40",
+    "    ret",
+    "    .seh_endproc",
+);
+
+// rvm_call_args(func, regs, stack): func(regs[0], ..., regs[4], stack[0], ..., stack[6]), as rvm_call_regs passes
+// its five. It always copies all seven stack arguments, which costs less than a loop over a count and leaves the
+// frame one size for the unwind directives.
+global_asm!(
+    ".globl rvm_call_args",
+    ".def rvm_call_args; .scl 2; .type 32; .endef",
+    ".seh_proc rvm_call_args",
+    "rvm_call_args:",
+    // the callee's home area and its arguments 5 to 12, on an aligned stack
+    "    sub rsp, 104",
+    "    .seh_stackalloc 104",
+    "    .seh_endprologue",
+    "    mov rax, rcx",
+    "    movups xmm0, [r8]",
+    "    movups xmm1, [r8 + 16]",
+    "    movups xmm2, [r8 + 32]",
+    "    mov r10, [r8 + 48]",
+    "    mov r11, [rdx + 32]",
+    "    movups [rsp + 40], xmm0",
+    "    movups [rsp + 56], xmm1",
+    "    movups [rsp + 72], xmm2",
+    "    mov [rsp + 88], r10",
+    "    mov [rsp + 32], r11",
+    "    mov rcx, [rdx]",
+    "    mov r8, [rdx + 16]",
+    "    mov r9, [rdx + 24]",
+    "    mov rdx, [rdx + 8]",
+    "    movq xmm0, rcx",
+    "    movq xmm1, rdx",
+    "    movq xmm2, r8",
+    "    movq xmm3, r9",
+    "    call rax",
+    "    add rsp, 104",
     "    ret",
     "    .seh_endproc",
 );

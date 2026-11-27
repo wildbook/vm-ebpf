@@ -2,9 +2,9 @@
 //!
 //! An [`Image`] is everything linking produces except runtime binding and allocation: the final code with every
 //! relocation, CO-RE adjustment and jump table applied, the initial data, map declarations, exported functions, and the
-//! call sites that bind to host and native functions, natives with the signature they were linked against.
-//! [`crate::Vm::load_image`] binds those call sites in the loading VM, allocates memory and maps, maps the VM's shared
-//! maps and regions, and returns a [`Program`].
+//! call sites that bind to host and native functions: natives with the signature they were linked against, and host
+//! functions with whether the call passes arguments on the stack. [`crate::Vm::load_image`] binds those call sites in
+//! the loading VM, allocates memory and maps, maps the VM's shared maps and regions, and returns a [`Program`].
 //!
 //! # Format
 //!
@@ -17,13 +17,13 @@
 use std::sync::Arc;
 
 use rvm_core::opcode::{call, MemMode, MemSize, OpCode, CALL, LD_IMM64};
-use rvm_core::{Code, Instruction, NativeArg, NativeSig, MAX_CALL_DEPTH, MAX_NATIVE_ARGS};
+use rvm_core::{Code, Instruction, NativeArg, NativeSig, MAX_CALL_DEPTH, MAX_NATIVE_ARGS, MAX_STACK_ARGS};
 
 use crate::error::{LinkError, Result, VmError};
 use crate::helper::{HelperRegistry, SharedHelpers};
 #[cfg(feature = "maps")]
 use crate::layout::MAPS_REGION;
-use crate::layout::{DATA_REGION, RODATA_REGION, STACK_REGION};
+use crate::layout::{BORROW_REGIONS, DATA_REGION, RODATA_REGION, STACK_REGION};
 use crate::map_def::{MapDef, MapKind};
 #[cfg(feature = "maps")]
 use crate::maps::Maps;
@@ -32,7 +32,7 @@ use crate::program::{Borrow, FunctionInfo, Functions, Program};
 use crate::vm::{Shared, VmConfig};
 
 const MAGIC: &[u8; 4] = b"RVMI";
-const FORMAT_VERSION: u32 = 3;
+const FORMAT_VERSION: u32 = 4;
 const RVM_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // tag bytes of the `MapKind`, `Import` and `Site` variants
@@ -78,8 +78,9 @@ pub struct Image {
 /// The host function an extern call binds to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Import {
-    /// A function registered by name, such as a plugin export.
-    Name(String),
+    /// A function registered by name, such as a plugin export. With `stack`, the call passes arguments on the stack,
+    /// which the function gets: the program declares it with more than five argument registers.
+    Name { name: String, stack: bool },
     /// A helper registered by ID.
     Helper(u32),
     /// A native function registered by name, with the signature it had where the image was linked.
@@ -173,9 +174,10 @@ impl Image {
             for (at, import) in &self.externs {
                 w.u32(*at);
                 match import {
-                    Import::Name(name) => {
+                    Import::Name { name, stack } => {
                         w.0.push(IMPORT_NAME);
                         w.str(name);
+                        w.0.push((*stack).into());
                     }
                     Import::Helper(id) => {
                         w.0.push(IMPORT_HELPER);
@@ -301,7 +303,10 @@ impl<'a> Sections<'a> {
         for _ in 0..s.u32()? {
             let at = s.u32()?;
             let import = match s.u8()? {
-                IMPORT_NAME => Import::Name(s.str()?),
+                IMPORT_NAME => Import::Name {
+                    name: s.str()?,
+                    stack: s.u8()? != 0,
+                },
                 IMPORT_HELPER => Import::Helper(s.u32()?),
                 IMPORT_NATIVE => {
                     let name = s.str()?;
@@ -399,7 +404,7 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
     // Bind against one version of the table; the program refreshes from there.
     let snapshot = helpers.snapshot();
     bind_helper_calls(&mut insns, s.code, &snapshot.table);
-    let natives = bind_externs(&mut insns, &s.externs, &snapshot.table)?;
+    let Bound { natives, stack_calls } = bind_externs(&mut insns, &s.externs, &snapshot.table)?;
     let functions = check_functions(s.functions, insns.len() as u64)?;
 
     let mut memory = VmMemory::with_passthrough(config.passthrough);
@@ -431,6 +436,11 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
         // every later table the program refreshes to. `Vm::register_native` vouches for the function.
         if !unsafe { code.bind_native(at as usize, index, sig.args(), checked) } {
             return Err(invalid(format!("native call at instruction {at} is not a valid call")));
+        }
+    }
+    for at in stack_calls {
+        if !code.pass_stack_args(at as usize) {
+            return Err(invalid(format!("extern call at instruction {at} is not a valid call")));
         }
     }
     let program = Program::new(code, memory, stack_top, functions, helpers.clone(), snapshot, config);
@@ -499,22 +509,23 @@ fn check_lengths(s: &Sections<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Fails if `insns` pass or take an argument on the stack as clang does from the sixth argument register on: with an
-/// 8-byte store to `r11 - 8k` or an 8-byte load from `r11 + 8k`. rvm has no stack arguments. To the interpreter r11
-/// is a register like r12 to r15, 0 unless the program sets it, and such an access would fault only when it runs.
+/// Fails if an 8-byte load or store through r11 in `insns` names none of the stack arguments 6 to 12 with its offset,
+/// as the store of a thirteenth argument does. The interpreter fails such an instruction only when it runs. Every
+/// other instruction may name r11, which is a register like r12 to r15 to it.
 fn check_stack_arguments(insns: &[Instruction], functions: &[(String, FunctionInfo)]) -> Result<()> {
     const R11: u8 = 11;
     const LDX_DW: u8 = OpCode::ldx(MemSize::DWord, MemMode::Mem).0;
     const ST_DW: u8 = OpCode::st(MemSize::DWord, MemMode::Mem).0;
     const STX_DW: u8 = OpCode::stx(MemSize::DWord, MemMode::Mem).0;
 
-    let slot = |offset: i16| offset % 8 == 0;
-    let stack_argument = |insn: &Instruction| match insn.byte() {
-        LDX_DW => insn.src_reg() == R11 && insn.offset() > 0 && slot(insn.offset()),
-        ST_DW | STX_DW => insn.dst_reg() == R11 && insn.offset() < 0 && slot(insn.offset()),
+    // the callee loads argument `5 + k` from `r11 + 8k`, and the caller stores it to `r11 - 8k`
+    let slot = |offset: i16| (1..=MAX_STACK_ARGS as i16).any(|k| offset == 8 * k);
+    let no_argument = |insn: &Instruction| match insn.byte() {
+        LDX_DW => insn.src_reg() == R11 && !slot(insn.offset()),
+        ST_DW | STX_DW => insn.dst_reg() == R11 && !slot(insn.offset().wrapping_neg()),
         _ => false,
     };
-    let Some(pc) = insns.iter().position(stack_argument) else {
+    let Some(pc) = insns.iter().position(no_argument) else {
         return Ok(());
     };
 
@@ -536,36 +547,48 @@ fn bind_helper_calls(insns: &mut [Instruction], code: &[u8], table: &HelperRegis
     }
 }
 
+/// The extern calls of an image that [`bind_externs`] leaves to the prepared code, by instruction index.
+struct Bound {
+    /// The calls of native functions, each with the index and the signature of its native.
+    natives: Vec<(u32, u32, NativeSig)>,
+    /// The calls of host functions that pass arguments on the stack.
+    stack_calls: Vec<u32>,
+}
+
 /// Turn each extern call in `insns` into a call to the slot of its import in `table`, but for native imports, which
-/// it checks against `table` and returns as their instruction index, native index and signature.
-fn bind_externs(
-    insns: &mut [Instruction],
-    externs: &[(u32, Import)],
-    table: &HelperRegistry,
-) -> Result<Vec<(u32, u32, NativeSig)>> {
-    let mut natives = Vec::new();
+/// it checks against `table`.
+fn bind_externs(insns: &mut [Instruction], externs: &[(u32, Import)], table: &HelperRegistry) -> Result<Bound> {
+    let mut bound = Bound {
+        natives: Vec::new(),
+        stack_calls: Vec::new(),
+    };
     for (at, import) in externs {
         let insn = insns
             .get_mut(*at as usize)
             .filter(|insn| insn.byte() == CALL)
             .ok_or_else(|| invalid(format!("extern at instruction {at} is not a call")))?;
         let slot = match import {
-            Import::Name(name) => table
-                .slot_of_name(name)
-                .ok_or_else(|| LinkError::UnresolvedSymbol(name.clone()))?,
+            Import::Name { name, stack } => {
+                if *stack {
+                    bound.stack_calls.push(*at);
+                }
+                table
+                    .slot_of_name(name)
+                    .ok_or_else(|| LinkError::UnresolvedSymbol(name.clone()))?
+            }
             Import::Helper(id) => table.slot_of_id(*id).ok_or(LinkError::UnknownHelper(*id))?,
             Import::Native { name, sig } => {
                 let (index, host) = table
                     .native(name)
                     .ok_or_else(|| LinkError::UnresolvedSymbol(name.clone()))?;
                 check_native(name, *sig, host)?;
-                natives.push((*at, index, *sig));
+                bound.natives.push((*at, index, *sig));
                 continue;
             }
         };
         bind_call(insn, slot);
     }
-    Ok(natives)
+    Ok(bound)
 }
 
 /// Fails unless `linked`, the signature an image recorded for the native `name`, is `host`, the loading VM's.
@@ -588,15 +611,16 @@ fn check_native(name: &str, linked: NativeSig, host: NativeSig) -> Result<()> {
 /// The function table of `functions`, in code of `insn_count` instructions.
 fn check_functions(functions: Vec<(String, FunctionInfo)>, insn_count: u64) -> Result<Functions> {
     for (name, info) in &functions {
-        // Each borrow maps its own region, so the pointer parameters must differ. A call rewrites each pointer
-        // parameter as it maps it, so none may also hold a length.
+        // Each borrow maps its own region, of which a program has `BORROW_REGIONS`, so the pointer parameters must
+        // differ. A call rewrites each pointer parameter as it maps it, so none may also hold a length.
         let borrows = &info.borrows;
         let distinct = borrows
             .iter()
             .enumerate()
             .all(|(i, b)| borrows[..i].iter().all(|o| o.arg != b.arg));
         let lengths_apart = borrows.iter().all(|b| borrows.iter().all(|o| o.arg != b.len_arg));
-        if info.pc >= insn_count || !borrows.iter().all(Borrow::in_range) || !distinct || !lengths_apart {
+        let in_range = borrows.len() <= BORROW_REGIONS && borrows.iter().all(Borrow::in_range);
+        if info.pc >= insn_count || !in_range || !distinct || !lengths_apart {
             return Err(invalid(format!("function {name}: entry or borrows out of range")));
         }
     }
