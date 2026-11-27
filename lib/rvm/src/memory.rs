@@ -530,6 +530,28 @@ impl VmMemory {
         Ok(unsafe { src.cast::<V>().read_unaligned() })
     }
 
+    /// Pass `len` guest-readable bytes at `addr` to `f`. Borrows directly from non-shared regions and copies through a
+    /// raw pointer from shared or raw regions so no `&[u8]` aliases concurrent writers.
+    #[cfg(feature = "maps")]
+    #[inline]
+    pub(crate) fn with_guest_bytes<R>(
+        &self,
+        addr: u64,
+        len: usize,
+        need: Perms,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R, MemoryError> {
+        let src = self.host_ptr(addr, len, need)?;
+        let idx = region_of(addr);
+        if idx != 0 && self.shared[idx].is_none() {
+            // SAFETY: `host_ptr` checked `src..src+len`, `idx != 0` is a mapped region, and `shared[idx]` is `None`,
+            // so no concurrent writer aliases it while `&self` is borrowed.
+            Ok(f(unsafe { std::slice::from_raw_parts(src.as_ptr(), len) }))
+        } else {
+            Ok(copy_guest_bytes(src, len, f))
+        }
+    }
+
     /// Write a little-endian scalar at guest address `addr` (host access).
     pub fn write<T: Scalar>(&mut self, addr: u64, value: T) -> Result<(), MemoryError> {
         write_scalar(value, |bytes| self.write_bytes(addr, bytes))
@@ -573,6 +595,29 @@ impl Region {
     /// Guest permissions.
     pub fn perms(&self) -> Perms {
         self.perms
+    }
+}
+
+/// Copy `len` bytes from `src` into local storage before passing them to `f`, so shared or raw memory is never
+/// borrowed as `&[u8]`.
+#[cfg(feature = "maps")]
+#[cold]
+#[inline(never)]
+fn copy_guest_bytes<R>(src: NonNull<u8>, len: usize, f: impl FnOnce(&[u8]) -> R) -> R {
+    const INLINE_LEN: usize = 64;
+    if len <= INLINE_LEN {
+        let mut buf = std::mem::MaybeUninit::<[u64; INLINE_LEN / 8]>::uninit();
+        let dst = buf.as_mut_ptr().cast::<u8>();
+        // SAFETY: caller checked `src..src+len` is readable and `len <= INLINE_LEN`.
+        unsafe {
+            ptr::copy_nonoverlapping(src.as_ptr(), dst, len);
+            f(std::slice::from_raw_parts(dst, len))
+        }
+    } else {
+        let mut buf = vec![0u8; len];
+        // SAFETY: caller checked `src..src+len` is readable.
+        unsafe { ptr::copy_nonoverlapping(src.as_ptr(), buf.as_mut_ptr(), len) };
+        f(&buf)
     }
 }
 
