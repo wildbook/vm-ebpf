@@ -1,6 +1,7 @@
 //! The [`Interpreter`]: what runs a [`Code`] on a [`Context`], and what it keeps from one run to the next.
 
 use std::mem::MaybeUninit;
+use std::ptr;
 
 use crate::args::{self, Row, StackArgs};
 use crate::code::Slots;
@@ -10,6 +11,7 @@ use crate::fuel::{FuelLeft, Meter};
 use crate::native::NativeCall;
 #[cfg(feature = "ffi")]
 use crate::native::NativeFail;
+use crate::slot::Slot;
 use crate::transfer::Ip;
 use crate::windows::Windows;
 use crate::{Code, Context, Host, Memory};
@@ -101,6 +103,8 @@ pub struct Interpreter<M: Memory, H> {
     /// Failure payload from an aware native call that stopped with [`Reason::NativeFailed`].
     #[cfg(feature = "ffi")]
     native_fail: Option<NativeFail>,
+    /// Base slot address of the `Code` that `frames[..depth]` point into, recorded whenever live frames outlive a run.
+    frame_code_first: usize,
 }
 
 /// Caller state saved across a local call.
@@ -110,9 +114,23 @@ pub struct Interpreter<M: Memory, H> {
 struct Frame {
     /// r6-r9 (callee-saved) and r10 (frame pointer).
     regs: [u64; 5],
-    /// The pc of the `call`.
-    call_pc: u64,
+    /// Return slot in `0..=len` of the code, or a tagged odd sentinel for `RETURN_PC` or an out-of-range pc.
+    return_ip: ReturnIp,
 }
+
+/// A saved return [`Ip`] in [`Frame`].
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct ReturnIp(Ip);
+
+// SAFETY: a `ReturnIp` is only dereferenced while `&Code` is borrowed during `run`/`resume`, and `resume` re-derives
+// every live frame pointer from the current `&Code`.
+unsafe impl Send for ReturnIp {}
+unsafe impl Sync for ReturnIp {}
+
+/// Odd sentinel return ip pushed by `begin_nested`; `exit_special` decodes `addr >> 1 == 0` as [`RETURN_PC`].
+#[cfg(feature = "callbacks")]
+const NESTED_RETURN: Ip = Ip(ptr::without_provenance(1));
 
 impl<M: Memory, H: Host<M>> Interpreter<M, H> {
     /// An interpreter that gives each callee of a local call `frame_size` bytes below its caller's r10, and whose
@@ -131,6 +149,7 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
             args: [[0; args::MAX_STACK_ARGS + 1]; MAX_CALL_DEPTH + 2],
             #[cfg(feature = "ffi")]
             native_fail: None,
+            frame_code_first: 0,
         }
     }
 
@@ -159,7 +178,11 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
     /// Continues the call at `pc` of `code`, with the frames and the fuel that the last stop left.
     #[inline]
     pub fn resume(&mut self, ctx: &mut Context<M>, code: &Code, pc: u64) -> Stop<M::Error> {
-        let table = self.meter.resume(&mut self.fuel, code.slots(), pc);
+        let slots = code.slots();
+        if self.depth != 0 {
+            self.rebase_frames(slots);
+        }
+        let table = self.meter.resume(&mut self.fuel, slots, pc);
         self.enter(ctx, code, pc, table, false)
     }
 
@@ -168,7 +191,7 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
     #[cfg(feature = "callbacks")]
     pub fn begin_nested(&mut self, ctx: &mut Context<M>, args: &[u64; 5]) -> Option<usize> {
         let entry_depth = self.depth;
-        if !self.push(&mut ctx.regs, RETURN_PC - 1) {
+        if !self.push(&mut ctx.regs, NESTED_RETURN) {
             return None;
         }
         ctx.regs[1..=5].copy_from_slice(args);
@@ -252,6 +275,9 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
     #[inline(never)]
     fn stopped(&mut self, code: &Code) -> Stop<M::Error> {
         let code = code.slots();
+        if self.depth != 0 {
+            self.frame_code_first = code.first().addr();
+        }
         self.meter
             .settle(&mut self.fuel, code, self.stop.ip(code), &mut self.stop.reason);
         Stop {
@@ -259,6 +285,51 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
             // moved out, as the error of the memory needn't be `Copy`
             reason: std::mem::replace(&mut self.stop.reason, Reason::Exit),
         }
+    }
+
+    /// Record the base address of `code` before an aware native call that may re-enter through `resume`.
+    #[cfg(feature = "callbacks")]
+    #[inline(always)]
+    pub(crate) fn record_frame_code(&mut self, code: Slots) {
+        if self.depth != 0 {
+            self.frame_code_first = code.first().addr();
+        }
+    }
+
+    /// Re-derive live return pointers from `code` so `resume` stays sound across `&mut Code` or a different `Code`.
+    #[cold]
+    #[inline(never)]
+    fn rebase_frames(&mut self, code: Slots) {
+        let new_first = code.first();
+        let new_len = code.len();
+        let old_first = self.frame_code_first;
+        for frame in &mut self.frames[..self.depth] {
+            // SAFETY: `frames[..self.depth]` are initialised.
+            let frame = unsafe { frame.assume_init_mut() };
+            let addr = frame.return_ip.0.addr();
+            if addr & 1 != 0 {
+                continue;
+            }
+            let pc = addr.wrapping_sub(old_first) / size_of::<Slot>();
+            frame.return_ip = if pc <= new_len {
+                ReturnIp(Ip(new_first.wrapping_add(pc)))
+            } else {
+                ReturnIp(Ip(ptr::without_provenance((pc << 1) | 1)))
+            };
+        }
+        self.frame_code_first = new_first.addr();
+    }
+
+    /// Stop at a tagged sentinel return ip (`RETURN_PC` from `begin_nested`, or an out-of-range pc after a code swap).
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn exit_special(&mut self, return_ip: Ip) {
+        let pc = match return_ip.addr() >> 1 {
+            #[cfg(feature = "callbacks")]
+            0 => RETURN_PC,
+            pc => pc as u64,
+        };
+        self.stop.at_pc(pc, Reason::BadPc);
     }
 
     /// The stop of a call that starts or resumes at a `pc` outside the code.
@@ -295,11 +366,11 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
         self.meter.set_left(&mut self.fuel, fuel);
     }
 
-    /// Save the caller's state for the call at `call_pc` and give the callee its stack frame. Returns false, changing
-    /// nothing, on a [`Reason::StackOverflow`].
+    /// Save the caller's state with `return_ip` (the slot after `call`, in `0..=len`, or a tagged odd sentinel) and
+    /// give the callee its stack frame. Returns false, changing nothing, on a [`Reason::StackOverflow`].
     #[inline(always)]
     #[must_use]
-    pub(crate) fn push(&mut self, regs: &mut [u64; 16], call_pc: u64) -> bool {
+    pub(crate) fn push(&mut self, regs: &mut [u64; 16], return_ip: Ip) -> bool {
         let Some(frame) = self.frames.get_mut(self.depth) else {
             return false;
         };
@@ -308,16 +379,16 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
         };
         frame.write(Frame {
             regs: [regs[6], regs[7], regs[8], regs[9], regs[FP]],
-            call_pc,
+            return_ip: ReturnIp(return_ip),
         });
         self.depth += 1;
         regs[FP] = callee_fp;
         true
     }
 
-    /// Restore the caller's state and return the pc of its `call`, or `None` in the entry frame.
+    /// Restore the caller's state and return its saved return ip, or `None` in the entry frame.
     #[inline(always)]
-    pub(crate) fn pop(&mut self, regs: &mut [u64; 16]) -> Option<u64> {
+    pub(crate) fn pop(&mut self, regs: &mut [u64; 16]) -> Option<Ip> {
         // depth 0 wraps and fails the bounds check
         let depth = self.depth.wrapping_sub(1);
         let frame = self.frames.get(depth)?;
@@ -325,7 +396,7 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
         let frame = unsafe { frame.assume_init_ref() };
         regs[6..=FP].copy_from_slice(&frame.regs);
         self.depth = depth;
-        Some(frame.call_pc)
+        Some(frame.return_ip.0)
     }
 
     /// The stack arguments that the entry frame of each [`run`](Self::run) receives: argument `5 + k` at index

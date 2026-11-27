@@ -7,8 +7,8 @@ use std::hash::BuildHasher;
 use std::sync::LazyLock;
 use std::time::Instant;
 
-use crate::helper::{HelperContext, HelperRegistry, HostFn};
-use crate::memory::GuestMemory;
+use crate::helper::{HelperContext, HelperRegistry, HostFn, Stop};
+use crate::memory::{GuestMemory, Perms};
 
 /// Declares the standard helpers: an ID constant for each, [`helper_name`] and, for tests, `STD_HELPERS`.
 macro_rules! std_helpers {
@@ -47,6 +47,97 @@ std_helpers! {
 
 /// `EINVAL`, which helpers return negated when an argument is invalid.
 pub const EINVAL: i64 = 22;
+
+/// Register checked `memset`, `memcpy`, `memmove` and `memcmp` builtins so clang-compiled code does not need
+/// `-fno-builtin`. Each checks guest permissions and returns the original guest destination pointer.
+pub fn register_mem_builtins(helpers: &mut HelperRegistry) {
+    helpers.put_name("memset".into(), HostFn::raw(builtin_memset));
+    helpers.put_name("memcpy".into(), HostFn::raw(builtin_memcpy));
+    helpers.put_name("memmove".into(), HostFn::raw(builtin_memcpy));
+    helpers.put_name("memcmp".into(), HostFn::raw(builtin_memcmp));
+}
+
+fn builtin_memset(ctx: &mut HelperContext) -> Result<u64, Stop> {
+    let (dst, byte, len) = (ctx.args.r1, ctx.args.r2 as u8, ctx.args.r3);
+    if len == 0 {
+        return Ok(dst);
+    }
+    let Ok(len) = usize::try_from(len) else {
+        return Err(Stop::MemoryFault(dst));
+    };
+    let ptr = ctx
+        .memory
+        .host_ptr(dst, len, Perms::W)
+        .map_err(|e| Stop::MemoryFault(e.addr))?;
+    // SAFETY: `host_ptr` checked `dst..dst+len` is writable guest memory.
+    unsafe { ptr.as_ptr().write_bytes(byte, len) };
+    Ok(dst)
+}
+
+/// Handles both `memcpy` and `memmove`; `ptr::copy` stays sound when guest ranges overlap.
+fn builtin_memcpy(ctx: &mut HelperContext) -> Result<u64, Stop> {
+    let (dst, src, len) = (ctx.args.r1, ctx.args.r2, ctx.args.r3);
+    if len == 0 {
+        return Ok(dst);
+    }
+    let Ok(len) = usize::try_from(len) else {
+        return Err(Stop::MemoryFault(dst));
+    };
+    let src_ptr = ctx
+        .memory
+        .host_ptr(src, len, Perms::R)
+        .map_err(|e| Stop::MemoryFault(e.addr))?;
+    let dst_ptr = ctx
+        .memory
+        .host_ptr(dst, len, Perms::W)
+        .map_err(|e| Stop::MemoryFault(e.addr))?;
+    // SAFETY: `host_ptr` checked both ranges; `ptr::copy` allows overlap.
+    unsafe { std::ptr::copy(src_ptr.as_ptr(), dst_ptr.as_ptr(), len) };
+    Ok(dst)
+}
+
+fn builtin_memcmp(ctx: &mut HelperContext) -> Result<u64, Stop> {
+    let (a, b, len) = (ctx.args.r1, ctx.args.r2, ctx.args.r3);
+    if len == 0 {
+        return Ok(0);
+    }
+    let Ok(len) = usize::try_from(len) else {
+        return Err(Stop::MemoryFault(a));
+    };
+    let mut pa = ctx
+        .memory
+        .host_ptr(a, len, Perms::R)
+        .map_err(|e| Stop::MemoryFault(e.addr))?
+        .as_ptr() as *const u8;
+    let mut pb = ctx
+        .memory
+        .host_ptr(b, len, Perms::R)
+        .map_err(|e| Stop::MemoryFault(e.addr))?
+        .as_ptr() as *const u8;
+    let mut rem = len;
+    // Compare 8 bytes at a time through raw pointers so shared or raw memory is never borrowed as `&[u8]`.
+    while rem >= 8 {
+        // SAFETY: `host_ptr` checked `rem <= len` readable bytes from both pointers.
+        let (wa, wb) = unsafe { (pa.cast::<u64>().read_unaligned(), pb.cast::<u64>().read_unaligned()) };
+        if wa != wb {
+            break;
+        }
+        // SAFETY: `rem >= 8`, both stay within the checked range.
+        unsafe {
+            pa = pa.add(8);
+            pb = pb.add(8);
+        }
+        rem -= 8;
+    }
+    for i in 0..rem {
+        // SAFETY: `i < rem`, within the checked range.
+        let (ba, bb) = unsafe { (*pa.add(i), *pb.add(i)) };
+        if ba != bb {
+            return Ok((i32::from(ba) - i32::from(bb)) as i64 as u64);
+        }
+    }
+    Ok(0)
+}
 
 /// Register `ktime_get_ns`: monotonic nanoseconds since the first time any VM in this process registered it.
 pub fn register_time(helpers: &mut HelperRegistry) {
@@ -179,5 +270,48 @@ mod tests {
             .exit();
         let mut prog = vm.load_image(Image::from_code(asm.assemble().unwrap())).unwrap();
         assert_eq!(prog.call("main", &[]).unwrap(), (-EINVAL) as u64);
+    }
+
+    #[test]
+    fn mem_builtins_check_perms_and_keep_tag() {
+        use crate::{ExecError, Import, Perms, VmError};
+
+        let vm = Vm::new();
+        let call_named = |name: &str| {
+            let mut asm = Assembler::new();
+            asm.call(0).exit();
+            let mut img = Image::from_code(asm.assemble().unwrap());
+            img.add_call(0, Import::name(name));
+            vm.load_image(img).unwrap()
+        };
+
+        let mut p_set = call_named("memset");
+        let rw = p_set.memory_mut().map(32, Perms::RW).unwrap().base();
+        let ro = p_set.memory_mut().map_bytes(b"abcdef", 8, Perms::R).unwrap().base();
+        assert_eq!(p_set.call("main", &[rw, 0x5A, 12]).unwrap(), rw);
+        assert_eq!(p_set.call("main", &[0, 0xFF, 0]).unwrap(), 0);
+        assert_eq!(p_set.memory().bytes(rw, 13).unwrap(), &[0x5A; 12].into_iter().chain([0]).collect::<Vec<_>>()[..]);
+        assert!(matches!(p_set.call("main", &[ro, 1, 4]), Err(VmError::Exec(ExecError::MemoryFault { .. }))));
+
+        // Overlapping memcpy stays sound and returns tagged dst
+        let mut p_cpy = call_named("memcpy");
+        let buf = p_cpy.memory_mut().map_bytes(b"abcdefgh", 16, Perms::RW).unwrap().base();
+        assert_eq!(p_cpy.call("main", &[buf + 2, buf, 6]).unwrap(), buf + 2);
+        assert_eq!(p_cpy.memory().bytes(buf, 8).unwrap(), b"ababcdef");
+
+        let mut p_cmp = call_named("memcmp");
+        let a = p_cmp
+            .memory_mut()
+            .map_bytes(b"0123456789ab", 16, Perms::R)
+            .unwrap()
+            .base();
+        let b = p_cmp
+            .memory_mut()
+            .map_bytes(b"0123456789ac", 16, Perms::R)
+            .unwrap()
+            .base();
+        assert_eq!(p_cmp.call("main", &[a, a, 12]).unwrap(), 0);
+        assert!((p_cmp.call("main", &[a, b, 12]).unwrap() as i64) < 0);
+        assert!((p_cmp.call("main", &[b, a, 12]).unwrap() as i64) > 0);
     }
 }

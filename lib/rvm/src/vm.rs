@@ -253,9 +253,9 @@ impl Vm {
         Self::build(VmConfig::default())
     }
 
-    /// A VM with `config`. Its only helpers are the map helpers with the `maps` feature, which touch nothing outside
-    /// the VM. Without the `fuel` feature, a non-zero [`VmConfig::instruction_limit`] fails with
-    /// [`VmError::FuelNotEnabled`].
+    /// A VM with `config`. Its built-in externs are `memset`, `memcpy`, `memmove` and `memcmp` (and the map helpers
+    /// with the `maps` feature), which touch nothing outside the calling program's memory. Without the `fuel` feature,
+    /// a non-zero [`VmConfig::instruction_limit`] fails with [`VmError::FuelNotEnabled`].
     pub fn with_config(config: VmConfig) -> Result<Self> {
         Self::check(&config)?;
         Ok(Self::build(config))
@@ -292,6 +292,7 @@ impl Vm {
         let mut registry = HelperRegistry::default();
         #[cfg(feature = "maps")]
         maps::register_helpers(&mut registry);
+        std_helpers::register_mem_builtins(&mut registry);
         for &(name, func, sig) in natives {
             registry.put_native(name.to_string(), native(name, func, sig)?)?;
         }
@@ -309,12 +310,10 @@ impl Vm {
         Self::with_registry(config, HelperRegistry::default())
     }
 
-    fn with_registry(
-        config: VmConfig,
-        #[cfg_attr(not(feature = "maps"), expect(unused_mut))] mut registry: HelperRegistry,
-    ) -> Self {
+    fn with_registry(config: VmConfig, mut registry: HelperRegistry) -> Self {
         #[cfg(feature = "maps")]
         maps::register_helpers(&mut registry);
+        std_helpers::register_mem_builtins(&mut registry);
         Self {
             helpers: Arc::new(SharedHelpers::new(registry)),
             resolver: Published::default(),

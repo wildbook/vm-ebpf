@@ -201,6 +201,12 @@ impl<'a> Slots<'a> {
         self.code
     }
 
+    /// The number of instruction slots, excluding the guard and moved instructions behind it.
+    #[inline(always)]
+    pub fn len(self) -> usize {
+        self.code.len
+    }
+
     /// All slots.
     #[inline(always)]
     pub fn all(self) -> &'a [Slot] {

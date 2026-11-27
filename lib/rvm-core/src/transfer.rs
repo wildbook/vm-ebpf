@@ -279,7 +279,7 @@ fn run_moved<M: Memory, H: Host<M>>(
         Step::Next => pc,
         Step::Jump(offset) => pc.wrapping_add_signed(offset),
         Step::Call(offset) => {
-            if !interp.push(&mut ctx.regs, pc) {
+            if !interp.push(&mut ctx.regs, ip.offset(1)) {
                 interp.stop.at(ip, Reason::StackOverflow);
                 return None;
             }

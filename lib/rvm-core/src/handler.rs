@@ -80,8 +80,13 @@ pub extern "rust-preserve-none" fn jump<M: Memory, H: Host<M>, F: Fuel, const OP
         Step::Next => {}
         Step::Jump(offset) => ip = ip.offset(offset),
         Step::Exit => match interp.pop(&mut ctx.regs) {
-            // `Interpreter::push` takes any pc, so this one has no proof
-            Some(call_pc) => become_at_pc!(ctx, code, call_pc.wrapping_add(1), interp, table),
+            Some(ret_ip) => {
+                if ret_ip.addr() & 1 != 0 {
+                    core::hint::cold_path();
+                    return interp.exit_special(ret_ip);
+                }
+                become_enter!(ctx, code, ret_ip, interp, table)
+            }
             None => return interp.stop.at(ip, Reason::Exit),
         },
         Step::Stop(reason) => return interp.stop.at(ip, reason),
@@ -108,7 +113,7 @@ extern "rust-preserve-none" fn local_call<M: Memory, H: Host<M>, F: Fuel>(
 ) {
     // SAFETY: `rewrite` leaves `CALL` only for local calls, and `transfer::bound` proves the target lies in `0..=len`
     let offset = unsafe { ip.view(slot, const { Shape::of(CALL) }) }.imm();
-    if !interp.push(&mut ctx.regs, ip.pc(code)) {
+    if !interp.push(&mut ctx.regs, ip.offset(1)) {
         return interp.stop.at(ip, Reason::StackOverflow);
     }
     become_enter!(ctx, code, ip.offset(i64::from(offset) + 1), interp, table)
@@ -172,7 +177,7 @@ pub extern "rust-preserve-none" fn indirect_call<M: Memory, H: Host<M>, F: Fuel,
             if !in_code {
                 return interp.stop.at(ip, Reason::CallIndirect(target));
             }
-            if !interp.push(&mut ctx.regs, ip.pc(code)) {
+            if !interp.push(&mut ctx.regs, ip.offset(1)) {
                 return interp.stop.at(ip, Reason::StackOverflow);
             }
             become_at_pc!(ctx, code, pc, interp, table)

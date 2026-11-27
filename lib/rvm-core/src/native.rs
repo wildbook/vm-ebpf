@@ -724,7 +724,10 @@ extern "rust-preserve-none" fn general_call<M: Memory, H: Host<M>, F: Fuel>(
 
     #[cfg(feature = "callbacks")]
     let program_id = match proto.aware {
-        true => interp.host.callback_program(),
+        true => {
+            interp.record_frame_code(code);
+            interp.host.callback_program()
+        }
         false => 0,
     };
 

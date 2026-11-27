@@ -71,16 +71,25 @@ superinstructions! {
     0x80: mov32 a, b; rsh32 a, _;
     // two moves
     0xf5: mov64 a, b; mov64 _, _;
-    // loop counters: a += imm, then a branch on a or another add
+    // loop counters and mask tests: a += imm or a &= imm, then a branch on a or another ALU op
     0x88: add64 a, _; jlt a, c, _;
+    0x01: add64 a, _; jlt a, _, _;
     0x90: add64 a, _; jne a, _, _;
     0x98: add64 a, _; jgt a, _, _;
+    0x09: add32 a, _; jeq32 a, _, _;
+    0x11: add32 a, _; jne32 a, _, _;
+    0x21: and32 a, _; jeq32 a, _, _;
+    0x29: and32 a, _; jne32 a, _, _;
+    0x31: add32 a, _; and32 a, _;
     0x86: add64 a, _; add64 _, _;
+    // indexed byte load without a preceding move
+    0x39: add64 a, b; ldxb _, [a + _];
     // the address of an element of a global array
     0xf7: lddw a, _; add64 a, b;
     // spill traffic: a reload and an operation, or a load and a spill, over any registers
     0x19: ldxdw a, [fp + _]; mul64 b, c;
     0x1a: ldxw a, [fp + _]; add32 b, c;
+    0x41: ldxw a, [fp + _]; add32 a, _;
     0x1b: ldxw a, [b + _]; stxw [fp + _], c;
 }
 
