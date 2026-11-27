@@ -65,9 +65,9 @@ int main(int argc, char **argv) {
     fclose(file);
 
     rvm_native natives[3] = {
-        {"n6", 2, (const void *)n6, 6, {0}, {0}},
-        {"n12", 3, (const void *)n12, 12, {0}, {0}},
-        {"n_buf", 5, (const void *)n_buf, 8, {0, 0, 0, 0, 0, 0, RVM_ARG_READ, 0}, {0, 0, 0, 0, 0, 0, 8, 0}},
+        {"n6", 2, (const void *)n6, 6, {0}, {0}, 0},
+        {"n12", 3, (const void *)n12, 12, {0}, {0}, 0},
+        {"n_buf", 5, (const void *)n_buf, 8, {0, 0, 0, 0, 0, 0, RVM_ARG_READ, 0}, {0, 0, 0, 0, 0, 0, 8, 0}, 0},
     };
     rvm_options options = {
         .size = sizeof(rvm_options),

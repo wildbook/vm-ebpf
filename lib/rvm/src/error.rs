@@ -337,6 +337,9 @@ pub enum HostError {
         func: String,
         error: Box<VmError>,
     },
+    /// An aware native function failed the call via `rvm_fail` or `rvm::fail_code`.
+    #[cfg(feature = "ffi")]
+    Native { code: u64 },
 }
 
 impl fmt::Display for HostError {
@@ -344,6 +347,8 @@ impl fmt::Display for HostError {
         match self {
             Self::Failed(e) => write!(f, "host function failed: {e}"),
             Self::Plugin { plugin, func, error } => write!(f, "{plugin}::{func}: {error}"),
+            #[cfg(feature = "ffi")]
+            Self::Native { code } => write!(f, "native function failed with code {code}"),
         }
     }
 }

@@ -912,7 +912,7 @@ fn bind_import(import: &Import, table: &HelperRegistry, tagged: bool) -> Result<
                             .into());
                         };
                         p.check_native_sig(name, host_sig)?;
-                        if p.needs_general() {
+                        if p.needs_general() || host_sig.is_aware() {
                             #[cfg(feature = "ffi")]
                             {
                                 NativeMode::General(p.general_proto(name, Some(host_sig), tagged)?)

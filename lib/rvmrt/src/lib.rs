@@ -4,9 +4,11 @@
 //! `rvm::Image::to_bytes`; the runtime has no helpers and no maps, only the native functions the host passes to
 //! [`rvm_load_with`]. With the `fuel` feature it limits each call to `rvm::DEFAULT_INSTRUCTION_LIMIT` instructions.
 
-use std::ffi::c_void;
+use std::ffi::{c_int, c_void};
 use std::slice;
 
+#[cfg(feature = "ffi")]
+use rvm::HostError;
 use rvm::{
     ArgKind, ExecError, Func, NativeArg, NativeImport, NativeSig, Passthrough, Perms, Program, RawCalls, Region,
     Resolved, ReturnKind, Vm, VmConfig, VmError, MAX_NATIVE_ARGS,
@@ -24,6 +26,7 @@ pub struct RvmProgram {
     program: Program,
     funcs: Vec<Func>,
     regions: Vec<Region>,
+    last_failure: u64,
 }
 
 impl RvmProgram {
@@ -34,6 +37,7 @@ impl RvmProgram {
             program,
             funcs,
             regions: Vec::new(),
+            last_failure: 0,
         }
     }
 }
@@ -60,6 +64,8 @@ pub enum Status {
     Helper = 7,
     /// Any other error.
     Other = 8,
+    /// An aware native function failed the call through [`rvm_fail`].
+    Native = 9,
 }
 
 impl Status {
@@ -72,6 +78,8 @@ impl Status {
             VmError::Exec(ExecError::InstructionLimit { .. }) => Self::Limit,
             VmError::Exec(ExecError::UnknownHelper { .. } | ExecError::UnknownExtern { .. }) => Self::Helper,
             VmError::Exec(_) | VmError::Memory(_) => Self::Fault,
+            #[cfg(feature = "ffi")]
+            VmError::Host(HostError::Native { .. }) => Self::Native,
             VmError::Host(_) => Self::Helper,
             _ => Self::Other,
         }
@@ -88,6 +96,9 @@ pub unsafe extern "C" fn rvm_load(image: *const u8, len: usize, program: *mut *m
     unsafe { rvm_load_with(image, len, std::ptr::null(), program) }
 }
 
+/// `RVM_NATIVE_AWARE`: native function may fail the call via [`rvm_fail`].
+const NATIVE_AWARE: u8 = 1;
+
 /// A native function the image imports by name; `rvm_native` in the header.
 #[repr(C)]
 pub struct RvmNative {
@@ -100,6 +111,8 @@ pub struct RvmNative {
     pub kind: [u8; MAX_NATIVE_ARGS],
     /// Per pointer argument: 0 for one byte, or the number of the integer argument that holds its length.
     pub len_arg: [u8; MAX_NATIVE_ARGS],
+    /// `RVM_NATIVE_AWARE` or 0.
+    pub flags: u8,
 }
 
 /// An unresolved extern reported to [`RvmOptions::resolve`]; `rvm_import` in the header.
@@ -272,6 +285,9 @@ fn c_import(imp: &NativeImport<'_>) -> RvmImport {
 
 /// The signature `native` describes, or `None` for an invalid one.
 fn native_sig(native: &RvmNative) -> Option<NativeSig> {
+    if native.flags & !NATIVE_AWARE != 0 {
+        return None;
+    }
     let args = native.kind.get(..usize::from(native.args))?;
     let mut list = [NativeArg::Int; MAX_NATIVE_ARGS];
     for (i, &kind) in args.iter().enumerate() {
@@ -283,7 +299,11 @@ fn native_sig(native: &RvmNative) -> Option<NativeSig> {
             _ => return None,
         };
     }
-    NativeSig::try_new(&list[..args.len()])
+    let sig = NativeSig::try_new(&list[..args.len()])?;
+    Some(match native.flags & NATIVE_AWARE != 0 {
+        true => sig.aware(),
+        false => sig,
+    })
 }
 
 /// Frees a program from [`rvm_load`]; null is ignored.
@@ -406,14 +426,17 @@ pub unsafe extern "C" fn rvm_call(
     if program.is_null() {
         return Status::Argument;
     }
-    let program = unsafe { &mut (*program).program };
+    let prog = unsafe { &mut *program };
     let Some(name) = (unsafe { str_or_none(name, name_len) }) else {
         return Status::Argument;
     };
     let Some(args) = (unsafe { slice_or_empty(args, nargs) }) else {
         return Status::Argument;
     };
-    unsafe { finish(program.call(name, args), ret) }
+    prog.last_failure = 0;
+    let res = prog.program.call(name, args);
+    record_failure(&res, &mut prog.last_failure);
+    unsafe { finish(res, ret) }
 }
 
 /// Stores the index of the function `name` in `*index`, for [`rvm_call_func`].
@@ -461,14 +484,22 @@ pub unsafe extern "C" fn rvm_call_func(
     if program.is_null() {
         return Status::Argument;
     }
-    let RvmProgram { program, funcs, .. } = unsafe { &mut *program };
+    let RvmProgram {
+        program,
+        funcs,
+        last_failure,
+        ..
+    } = unsafe { &mut *program };
     let Some(&func) = funcs.get(index) else {
         return Status::NotFound;
     };
     let Some(args) = (unsafe { slice_or_empty(args, nargs) }) else {
         return Status::Argument;
     };
-    unsafe { finish(program.call_func(func, args), ret) }
+    *last_failure = 0;
+    let res = program.call_func(func, args);
+    record_failure(&res, last_failure);
+    unsafe { finish(res, ret) }
 }
 
 /// The number of functions, or 0 if `program` is null. Indices go from 0 to this count minus 1, in name order.
@@ -509,6 +540,46 @@ pub unsafe extern "C" fn rvm_function_name(
         name_len.write(found.len());
     }
     Status::Ok
+}
+
+/// Marks the innermost aware native call on the current thread as failed with `code`, so the guest call stops with
+/// [`Status::Native`] once the native returns. Returns 1 if an aware call was active, or 0 otherwise.
+///
+/// # Safety
+///
+/// Always safe to call from any thread; does nothing when no aware native call is active.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rvm_fail(#[cfg_attr(not(feature = "ffi"), expect(unused_variables))] code: u64) -> c_int {
+    #[cfg(feature = "ffi")]
+    {
+        c_int::from(rvm::fail_code(code))
+    }
+    #[cfg(not(feature = "ffi"))]
+    {
+        0
+    }
+}
+
+/// Returns the failure code from the last [`Status::Native`] call on `program`, or 0.
+///
+/// # Safety
+///
+/// `program` must be null or a live program from [`rvm_load`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rvm_failure(program: *const RvmProgram) -> u64 {
+    if program.is_null() {
+        return 0;
+    }
+    unsafe { &*program }.last_failure
+}
+
+fn record_failure(result: &rvm::Result<u64>, slot: &mut u64) {
+    #[cfg(feature = "ffi")]
+    if let Err(VmError::Host(HostError::Native { code })) = result {
+        *slot = *code;
+    }
+    #[cfg(not(feature = "ffi"))]
+    let _ = (result, slot);
 }
 
 /// Stores the value of `result` in `*out` when `out` is non-null, or returns the error's status.
@@ -595,6 +666,7 @@ mod tests {
             Status::Fault,
             Status::Helper,
             Status::Other,
+            Status::Native,
         ]
         .map(|status| (c_name(&status), status as i32));
 
@@ -612,6 +684,7 @@ mod tests {
             Status::Fault => "RVM_ERR_FAULT",
             Status::Helper => "RVM_ERR_HELPER",
             Status::Other => "RVM_ERR_OTHER",
+            Status::Native => "RVM_ERR_NATIVE",
         }
     }
 
@@ -780,6 +853,87 @@ mod tests {
             ));
             assert_eq!(ret, 42);
         }
+
+        unsafe { rvm_free(prog) };
+    }
+
+    #[cfg(all(feature = "ffi", not(miri)))]
+    #[test]
+    fn aware_native_fails_with_rvm_fail() {
+        use std::ptr;
+
+        use super::*;
+
+        extern "C" fn maybe_fail(a: u64, b: u64) -> u64 {
+            if a == 99 {
+                assert_eq!(unsafe { rvm_fail(0xbeef) }, 1);
+                return 0;
+            }
+            a + b
+        }
+
+        assert_eq!(unsafe { rvm_fail(1) }, 0);
+        assert_eq!(unsafe { rvm_failure(ptr::null()) }, 0);
+
+        let code = [
+            0x85, 0x00, 0, 0, 0, 0, 0, 0, // call
+            0x95, 0x00, 0, 0, 0, 0, 0, 0, // exit
+        ];
+        let mut image = rvm::Image::from_code(code.to_vec());
+        image.add_call(
+            0,
+            rvm::Import::Name {
+                name: "maybe_fail".into(),
+                dll: None,
+                symbol: None,
+                proto: Some(rvm::Proto {
+                    args: vec![rvm::ArgKind::Int, rvm::ArgKind::Int],
+                    ret: rvm::ReturnKind::Int,
+                    variadic: false,
+                    borrows: Vec::new(),
+                }),
+                stack: false,
+            },
+        );
+        let bytes = image.to_bytes();
+
+        let name = b"maybe_fail";
+        let native = RvmNative {
+            name: name.as_ptr(),
+            name_len: name.len(),
+            func: maybe_fail as *const (),
+            args: 2,
+            kind: [0; MAX_NATIVE_ARGS],
+            len_arg: [0; MAX_NATIVE_ARGS],
+            flags: NATIVE_AWARE,
+        };
+        let options = RvmOptions {
+            size: size_of::<RvmOptions>(),
+            natives: &native,
+            native_count: 1,
+            resolve: None,
+            resolve_user: ptr::null_mut(),
+            flags: 0,
+        };
+        let mut prog: *mut RvmProgram = ptr::null_mut();
+        assert!(matches!(unsafe { rvm_load_with(bytes.as_ptr(), bytes.len(), &options, &mut prog) }, Status::Ok));
+
+        let main = b"main";
+        let mut ret = 0u64;
+        let fail_args = [99u64, 1];
+        assert!(matches!(
+            unsafe { rvm_call(prog, main.as_ptr(), main.len(), fail_args.as_ptr(), 2, &mut ret) },
+            Status::Native
+        ));
+        assert_eq!(unsafe { rvm_failure(prog) }, 0xbeef);
+
+        let ok_args = [20u64, 22];
+        assert!(matches!(
+            unsafe { rvm_call(prog, main.as_ptr(), main.len(), ok_args.as_ptr(), 2, &mut ret) },
+            Status::Ok
+        ));
+        assert_eq!(ret, 42);
+        assert_eq!(unsafe { rvm_failure(prog) }, 0);
 
         unsafe { rvm_free(prog) };
     }

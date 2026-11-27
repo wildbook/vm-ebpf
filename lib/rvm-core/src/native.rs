@@ -20,7 +20,11 @@
 //! program that stores stack arguments, it passes those too.
 
 use std::arch::global_asm;
+#[cfg(feature = "ffi")]
+use std::cell::Cell;
 use std::mem::transmute;
+#[cfg(feature = "ffi")]
+use std::ptr;
 
 use crate::args::{StackArgs, MAX_STACK_ARGS};
 use crate::code::Slots;
@@ -73,6 +77,7 @@ const POINTERS: u32 = 8;
 const WRITES: u32 = 24;
 const LENS: u32 = 40;
 const VARIADIC: u32 = 88;
+const AWARE: u32 = 89;
 
 const _: () = assert!(LENS + 4 * REG_ARGS as u32 <= u64::BITS && LENS + 4 * MAX_ARGS as u32 <= VARIADIC);
 
@@ -165,6 +170,17 @@ impl NativeSig {
         (self.0 >> VARIADIC) & 1 != 0
     }
 
+    /// Mark this native as aware, so it may fail the guest call via `rvm_fail` / `rvm::fail` (or re-enter via
+    /// callbacks). Aware calls run through the `GENERAL` handler (`ffi` feature).
+    pub const fn aware(self) -> Self {
+        Self(self.0 | (1u128 << AWARE))
+    }
+
+    /// Whether this native is marked [`aware`](Self::aware).
+    pub const fn is_aware(self) -> bool {
+        (self.0 >> AWARE) & 1 != 0
+    }
+
     /// The number of arguments.
     pub const fn args(self) -> u8 {
         self.0 as u8
@@ -236,6 +252,94 @@ pub struct GeneralProto {
     pub nargs: u8,
     pub ret: GeneralRet,
     pub variadic: bool,
+    /// Whether this call links an [`Active`] record so the native may fail the call or re-enter.
+    pub aware: bool,
+}
+
+/// Failure recorded by an aware native call through [`fail_code`] or [`fail_error`].
+#[cfg(feature = "ffi")]
+#[derive(Debug)]
+pub enum NativeFail {
+    /// Numeric failure code from C (`rvm_fail`) or Rust (`rvm::fail_code`).
+    Code(u64),
+    /// Host error from Rust (`rvm::fail`).
+    Error(Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// Error from [`call_general`] or [`call_bound`]: either a guest memory fault or a native failure.
+#[derive(Debug)]
+pub enum BoundError<E> {
+    Memory(E),
+    #[cfg(feature = "ffi")]
+    Failed(NativeFail),
+}
+
+/// Stack-allocated record of an aware native call in progress, linked from the thread-local [`ACTIVE`].
+#[cfg(feature = "ffi")]
+pub struct Active {
+    prev: *mut Active,
+    pub fail: Option<NativeFail>,
+}
+
+#[cfg(feature = "ffi")]
+thread_local! {
+    static ACTIVE: Cell<*mut Active> = const { Cell::new(ptr::null_mut()) };
+}
+
+#[cfg(feature = "ffi")]
+struct ActiveGuard {
+    prev: *mut Active,
+}
+
+#[cfg(feature = "ffi")]
+impl ActiveGuard {
+    #[inline]
+    fn push(record: &mut Active) -> Self {
+        let prev = ACTIVE.get();
+        record.prev = prev;
+        ACTIVE.set(record as *mut Active);
+        Self { prev }
+    }
+}
+
+#[cfg(feature = "ffi")]
+impl Drop for ActiveGuard {
+    #[inline]
+    fn drop(&mut self) {
+        ACTIVE.set(self.prev);
+    }
+}
+
+/// Mark the innermost aware native call on this thread as failed with numeric `code`. Returns `true` if an aware call
+/// was active, or `false` if none was in progress. Calling again during the same call keeps the first failure.
+#[cfg(feature = "ffi")]
+pub fn fail_code(code: u64) -> bool {
+    let ptr = ACTIVE.get();
+    if ptr.is_null() {
+        return false;
+    }
+    // SAFETY: `ptr` points to a live `Active` record on the current thread's call stack, popped by `ActiveGuard`.
+    let active = unsafe { &mut *ptr };
+    if active.fail.is_none() {
+        active.fail = Some(NativeFail::Code(code));
+    }
+    true
+}
+
+/// Mark the innermost aware native call on this thread as failed with `error`. Returns `true` if an aware call was
+/// active, or `false` if none was in progress. Calling again during the same call keeps the first failure.
+#[cfg(feature = "ffi")]
+pub fn fail_error(error: Box<dyn std::error::Error + Send + Sync>) -> bool {
+    let ptr = ACTIVE.get();
+    if ptr.is_null() {
+        return false;
+    }
+    // SAFETY: as in `fail_code`.
+    let active = unsafe { &mut *ptr };
+    if active.fail.is_none() {
+        active.fail = Some(NativeFail::Error(error));
+    }
+    true
 }
 
 /// How a bound native call handles pointer arguments and ABI marshalling.
@@ -491,8 +595,13 @@ extern "rust-preserve-none" fn general_call<M: Memory, H: Host<M>, F: Fuel>(
     let proto = code.general(proto_idx);
 
     // SAFETY: `Code::with_natives` guarantees `func` matches `proto`
-    if let Err(error) = unsafe { call_general(func, proto, &mut ctx.regs, Some(stack), &*ctx.memory) } {
-        return interp.stop.at(ip, Reason::MemoryFault(error));
+    match unsafe { call_general(func, proto, &mut ctx.regs, Some(stack), &*ctx.memory) } {
+        Ok(()) => {}
+        Err(BoundError::Memory(error)) => return interp.stop.at(ip, Reason::MemoryFault(error)),
+        Err(BoundError::Failed(fail)) => {
+            interp.set_native_fail(fail);
+            return interp.stop.at(ip, Reason::NativeFailed);
+        }
     }
 
     become_enter!(ctx, code, ip.offset(1), interp, table)
@@ -512,7 +621,7 @@ pub unsafe fn call_general<M: Memory>(
     regs: &mut [u64; 16],
     stack: Option<&StackArgs>,
     memory: &M,
-) -> Result<(), M::Error> {
+) -> Result<(), BoundError<M::Error>> {
     #[repr(C, align(16))]
     struct Scratch([[u64; 2]; MAX_ARGS + 1]);
 
@@ -535,7 +644,7 @@ pub unsafe fn call_general<M: Memory>(
             n_idx = 1;
         }
         GeneralRet::Sret(size) => {
-            native_args[0] = resolve(memory, guest[0], u64::from(size), true)?;
+            native_args[0] = resolve(memory, guest[0], u64::from(size), true).map_err(BoundError::Memory)?;
             g_idx = 1;
             n_idx = 1;
         }
@@ -559,7 +668,7 @@ pub unsafe fn call_general<M: Memory>(
                     0 => 1,
                     n => guest[usize::from(n) - 1],
                 };
-                native_args[n_idx] = resolve(memory, guest[g_idx], len, write)?;
+                native_args[n_idx] = resolve(memory, guest[g_idx], len, write).map_err(BoundError::Memory)?;
                 g_idx += 1;
                 n_idx += 1;
             }
@@ -594,32 +703,45 @@ pub unsafe fn call_general<M: Memory>(
     let regs_arr = regs_slice.first_chunk().expect("first five");
     let stack_arr = stack_slice.first_chunk().expect("other seven");
 
+    let mut active = Active {
+        prev: ptr::null_mut(),
+        fail: None,
+    };
+    let guard = proto.aware.then(|| ActiveGuard::push(&mut active));
+
     // SAFETY: the caller's
-    match proto.ret {
-        GeneralRet::Int => {
-            regs[0] = unsafe { rvm_call_args(func, regs_arr, stack_arr) };
-        }
+    let (ret0, ret2) = match proto.ret {
+        GeneralRet::Int => (unsafe { rvm_call_args(func, regs_arr, stack_arr) }, None),
         GeneralRet::F32 => {
             let v = unsafe { rvm_call_args_f32(func, regs_arr, stack_arr) };
-            regs[0] = u64::from(v.to_bits());
+            (u64::from(v.to_bits()), None)
         }
         GeneralRet::F64 => {
             let v = unsafe { rvm_call_args_f64(func, regs_arr, stack_arr) };
-            regs[0] = v.to_bits();
+            (v.to_bits(), None)
         }
         GeneralRet::SmallAgg => {
             unsafe { rvm_call_args(func, regs_arr, stack_arr) };
-            regs[0] = scratch.0[0][0];
+            (scratch.0[0][0], None)
         }
         GeneralRet::WideAgg => {
             unsafe { rvm_call_args(func, regs_arr, stack_arr) };
-            regs[0] = scratch.0[0][0];
-            regs[2] = scratch.0[0][1];
+            (scratch.0[0][0], Some(scratch.0[0][1]))
         }
         GeneralRet::Sret(_) => {
             unsafe { rvm_call_args(func, regs_arr, stack_arr) };
-            regs[0] = guest[0];
+            (guest[0], None)
         }
+    };
+
+    drop(guard);
+    if let Some(fail) = active.fail.take() {
+        return Err(BoundError::Failed(fail));
+    }
+
+    regs[0] = ret0;
+    if let Some(r2) = ret2 {
+        regs[2] = r2;
     }
     Ok(())
 }
@@ -637,7 +759,7 @@ pub unsafe fn call_bound<M: Memory>(
     regs: &mut [u64; 16],
     stack: Option<&StackArgs>,
     memory: &M,
-) -> Result<(), M::Error> {
+) -> Result<(), BoundError<M::Error>> {
     match mode {
         #[cfg(feature = "ffi")]
         NativeMode::General(ref proto) => return unsafe { call_general(native.func, proto, regs, stack, memory) },
@@ -658,7 +780,7 @@ pub unsafe fn call_bound<M: Memory>(
         a[REG_ARGS..].copy_from_slice(stack);
     }
     match mode {
-        NativeMode::Checked => resolve_all(memory, native.sig, &mut a)?,
+        NativeMode::Checked => resolve_all(memory, native.sig, &mut a).map_err(BoundError::Memory)?,
         NativeMode::Strip => strip_all(memory, native.sig, &mut a),
         NativeMode::Plain => {}
         _ => unreachable!(),

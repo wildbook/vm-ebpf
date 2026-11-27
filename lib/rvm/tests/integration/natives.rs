@@ -767,3 +767,88 @@ fn general_ffi_shapes_and_variadics() {
         assert_eq!(prog.call("test_snprintf", &[12, 34]).unwrap(), expected_hash);
     }
 }
+
+/// Aware natives (`NativeSig::aware()`) can fail the guest call with `rvm::fail` or `rvm::fail_code`, both directly
+/// and through `&extern` tokens; calling outside an active call returns false, and the first failure wins.
+#[cfg(feature = "ffi")]
+#[test]
+fn aware_native_can_fail_call() {
+    use rvm::HostError;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Boom(u64);
+    impl std::fmt::Display for Boom {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "boom {}", self.0)
+        }
+    }
+    impl std::error::Error for Boom {}
+
+    assert!(!rvm::fail_code(1));
+    assert!(!rvm::fail(Boom(0)));
+
+    extern "C" fn checked_add(a: u64, b: u64) -> u64 {
+        match a {
+            100 => {
+                assert!(rvm::fail_code(777));
+                assert!(rvm::fail_code(999)); // second call is ignored; first failure wins
+                0
+            }
+            200 => {
+                assert!(rvm::fail(Boom(b)));
+                0
+            }
+            _ => a + b,
+        }
+    }
+    extern "C" fn unused_sum(_buf: *const u8, _len: u64) -> u64 {
+        0
+    }
+    extern "C" fn unused_stack(_a: u64, _b: u64, _c: u64, _d: u64, _e: u64, _f: u64) -> u64 {
+        0
+    }
+
+    // Direct call via `native_calls.o` (`nat_add`)
+    let vm = vm_with_sigs(VmConfig::default(), NativeSig::ints(2).aware(), SUM);
+    // SAFETY: `checked_add` takes 2 u64s and never unwinds
+    unsafe {
+        vm.register_native("nat_add", checked_add as *const (), NativeSig::ints(2).aware())
+            .unwrap();
+    }
+    let mut prog = vm.load_elf(&object("tests/native_calls.o")).unwrap();
+    assert_eq!(prog.call("add", &[10, 5]).unwrap(), 15);
+    assert!(matches!(prog.call("add", &[100, 5]), Err(VmError::Host(HostError::Native { code: 777 }))));
+    let err = prog.call("add", &[200, 42]).unwrap_err();
+    let VmError::Host(HostError::Failed(inner)) = &err else {
+        panic!("expected HostError::Failed, got {err:?}");
+    };
+    assert_eq!(inner.downcast_ref::<Boom>(), Some(&Boom(42)));
+    // Subsequent non-failing call succeeds cleanly
+    assert_eq!(prog.call("add", &[3, 4]).unwrap(), 7);
+
+    // Token call via `tokens.o` (`tok_nat`)
+    let tok_vm = Vm::new();
+    tok_vm.register_extern("tok_host", |(a, b): (u64, u64)| a + b);
+    // SAFETY: signatures match `tokens.o`
+    unsafe {
+        tok_vm
+            .register_native("tok_nat", checked_add as *const (), NativeSig::ints(2).aware())
+            .unwrap();
+        tok_vm
+            .register_native(
+                "tok_checked",
+                unused_sum as *const (),
+                NativeSig::new(&[NativeArg::Read(Some(2)), NativeArg::Int]),
+            )
+            .unwrap();
+        tok_vm
+            .register_native("tok_stack", unused_stack as *const (), NativeSig::ints(6))
+            .unwrap();
+    }
+    let mut tok_prog = tok_vm.load_elf(&object("tests/tokens.o")).unwrap();
+    assert!(matches!(
+        tok_prog.call("call_code_token", &[1, 100, 9]),
+        Err(VmError::Host(HostError::Native { code: 777 }))
+    ));
+    assert_eq!(tok_prog.call("call_code_token", &[1, 3, 4]).unwrap(), 7);
+}

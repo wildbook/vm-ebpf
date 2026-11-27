@@ -164,7 +164,8 @@ Taking the address of a declared extern (`&host_fn`, in code or in `.rodata`/`.d
 that dispatches through the import's bound target without requiring `RawCalls::on()`. With the `ffi` Cargo feature
 enabled, resolver-bound natives (and variadic natives registered with `NativeSig::variadic`) also support structs of 3,
 5, 6, 7 and 9 to 16 bytes by value, struct returns of any size, `float` and `double` arguments and returns, and
-variadic calls.
+variadic calls. A native registered with `NativeSig::aware()` (or `RVM_NATIVE_AWARE` in `rvmrt`) can fail the guest
+call through `rvm::fail`, `rvm::fail_code` or `rvm_fail`.
 
 Pointers stored inside plugin memory, such as the fields of a struct the plugin fills, keep the plugin's region tag,
 and native code can't follow them. Either load the plugin with `Passthrough::untagged()`, where every pointer is a

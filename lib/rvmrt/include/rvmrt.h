@@ -37,6 +37,8 @@ typedef enum rvm_status {
     // a helper failed
     RVM_ERR_HELPER = 7,
     RVM_ERR_OTHER = 8,
+    // an aware native function failed the call through rvm_fail; call rvm_failure(program) for the code
+    RVM_ERR_NATIVE = 9,
 } rvm_status;
 
 // Loads a prepared image (rvm's Image::to_bytes) and stores the program in *program.
@@ -60,6 +62,7 @@ rvm_status rvm_load(const uint8_t *image, size_t len, rvm_program **program);
 // don't resolve in the guest. RVM_UNTAGGED and RVM_RAW_POINTERS change both. Native time doesn't count against the
 // instruction limit, and a native function can't fail the guest's call.
 enum { RVM_ARG_INT = 0, RVM_ARG_READ = 1, RVM_ARG_WRITE = 2 };
+enum { RVM_NATIVE_AWARE = 1 };
 
 typedef struct rvm_native {
     const char *name;
@@ -72,6 +75,8 @@ typedef struct rvm_native {
     // per pointer argument: 0 to check one byte, or the number (1 to 12) of the integer argument that holds the
     // pointer's length in bytes
     uint8_t len_arg[12];
+    // RVM_NATIVE_AWARE (allows the native to call rvm_fail; needs rvmrt's `ffi` feature), or 0
+    uint8_t flags;
 } rvm_native;
 
 // What the guest of a program may do beyond the default, in which every memory access is checked against the memory
@@ -177,6 +182,13 @@ size_t rvm_function_count(const rvm_program *program);
 // Stores the name of the function at `index` in *name and *name_len; RVM_ERR_NOT_FOUND if index is out of range. The
 // name is UTF-8, not NUL-terminated, and valid until the program is freed.
 rvm_status rvm_function_name(const rvm_program *program, size_t index, const char **name, size_t *name_len);
+
+// Marks the innermost aware native call on the current thread as failed with `code`, so the guest call stops with
+// RVM_ERR_NATIVE once the native returns. Returns 1 if an aware call was active, or 0 otherwise.
+int rvm_fail(uint64_t code);
+
+// Returns the failure code from the last RVM_ERR_NATIVE call on `program`, or 0.
+uint64_t rvm_failure(const rvm_program *program);
 
 #ifdef __cplusplus
 }

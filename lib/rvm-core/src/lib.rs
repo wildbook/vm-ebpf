@@ -149,7 +149,8 @@ pub use instruction::Instruction;
 pub use interp::{Interpreter, Reason, Stop, MAX_CALL_DEPTH, METERED};
 pub use memory::{AtomicOp, Memory, Window};
 pub use native::{
-    call_bound, Native, NativeArg, NativeBind, NativeCall, NativeFn, NativeMode, NativeSig, MAX_ARGS as MAX_NATIVE_ARGS,
+    call_bound, BoundError, Native, NativeArg, NativeBind, NativeCall, NativeFn, NativeMode, NativeSig,
+    MAX_ARGS as MAX_NATIVE_ARGS,
 };
 #[cfg(feature = "ffi")]
-pub use native::{GeneralArg, GeneralProto, GeneralRet};
+pub use native::{fail_code, fail_error, GeneralArg, GeneralProto, GeneralRet, NativeFail};

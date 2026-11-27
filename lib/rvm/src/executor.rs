@@ -3,11 +3,15 @@
 use std::fmt;
 use std::sync::Arc;
 
+#[cfg(feature = "ffi")]
+use rvm_core::NativeFail;
 use rvm_core::{
-    call_bound, Callee, Code, Context, Host, Interpreter, Native, NativeCall, NativeMode, Reason, StackArgs,
-    MAX_STACK_ARGS, METERED,
+    call_bound, BoundError, Callee, Code, Context, Host, Interpreter, Native, NativeCall, NativeMode, Reason,
+    StackArgs, MAX_STACK_ARGS, METERED,
 };
 
+#[cfg(feature = "ffi")]
+use crate::error::HostError;
 use crate::error::{ExecError, MemoryError, Result, VmError};
 use crate::helper::{CallTable, CallerFuel, HelperRegistry, HostState, Stop};
 use crate::image::INSN_SIZE;
@@ -327,7 +331,20 @@ fn resume_at(reason: Reason<u64>, pc: u64, code: &Code, interp: &mut Interpreter
             None => Err(ExecError::BadCodeAddress { pc, target }.into()),
         },
         Reason::JumpIndirect(target) => jump_indirect(target, pc, code),
+        #[cfg(feature = "ffi")]
+        Reason::NativeFailed => {
+            let fail = interp.take_native_fail().expect("NativeFailed without payload");
+            Err(native_fail_error(fail))
+        }
         Reason::Exit => unreachable!("the executor returns at `exit`"),
+    }
+}
+
+#[cfg(feature = "ffi")]
+fn native_fail_error(fail: NativeFail) -> VmError {
+    match fail {
+        NativeFail::Code(code) => HostError::Native { code }.into(),
+        NativeFail::Error(error) => HostError::Failed(error).into(),
     }
 }
 
@@ -342,6 +359,8 @@ fn failure(stop: Stop, pc: u64) -> VmError {
             error: MemoryError { addr, size: 1 },
         }
         .into(),
+        #[cfg(feature = "ffi")]
+        Stop::NativeFailed(fail) => native_fail_error(fail),
         Stop::FuelWanted => unreachable!("`run_on` answers fuel requests"),
     }
 }
@@ -414,8 +433,13 @@ impl HostCalls {
                 // SAFETY: `bind_externs` validated `nat` against the import's prototype for `mode`
                 match unsafe { call_bound(nat, mode, &mut ctx.regs, native.stack(), &*ctx.memory) } {
                     Ok(()) => Some(Callee::Host(ctx.regs[0])),
-                    Err(addr) => {
+                    Err(BoundError::Memory(addr)) => {
                         self.stop = Some(Stop::MemoryFault(addr));
+                        None
+                    }
+                    #[cfg(feature = "ffi")]
+                    Err(BoundError::Failed(fail)) => {
+                        self.stop = Some(Stop::NativeFailed(fail));
                         None
                     }
                 }

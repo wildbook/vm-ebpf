@@ -8,6 +8,8 @@ use crate::context::FP;
 use crate::dispatch::{Table, SPARE};
 use crate::fuel::{FuelLeft, Meter};
 use crate::native::NativeCall;
+#[cfg(feature = "ffi")]
+use crate::native::NativeFail;
 use crate::transfer::Ip;
 use crate::windows::Windows;
 use crate::{Code, Context, Host, Memory};
@@ -55,6 +57,9 @@ pub enum Reason<E> {
     BadPc,
     /// A local call found all [`MAX_CALL_DEPTH`] frames in use, or r10 below the frame size.
     StackOverflow,
+    /// An aware native call failed via [`fail_code`](crate::fail_code) or [`fail_error`](crate::fail_error).
+    #[cfg(feature = "ffi")]
+    NativeFailed,
 }
 
 /// Runs code, and keeps what lasts from one run to the next: the frames of the local calls in progress, their stack
@@ -88,6 +93,9 @@ pub struct Interpreter<M: Memory, H> {
     /// the calls it makes in `args[depth + 1]`. The entry frame is at depth 0, and `push` keeps `depth` at or below
     /// [`MAX_CALL_DEPTH`].
     args: [Row; MAX_CALL_DEPTH + 2],
+    /// Failure payload from an aware native call that stopped with [`Reason::NativeFailed`].
+    #[cfg(feature = "ffi")]
+    native_fail: Option<NativeFail>,
 }
 
 /// Caller state saved across a local call.
@@ -116,7 +124,20 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
             host,
             frames: [const { MaybeUninit::uninit() }; MAX_CALL_DEPTH],
             args: [[0; args::MAX_STACK_ARGS + 1]; MAX_CALL_DEPTH + 2],
+            #[cfg(feature = "ffi")]
+            native_fail: None,
         }
+    }
+
+    #[cfg(feature = "ffi")]
+    pub(crate) fn set_native_fail(&mut self, fail: NativeFail) {
+        self.native_fail = Some(fail);
+    }
+
+    /// Take the failure recorded by an aware native call that stopped with [`Reason::NativeFailed`].
+    #[cfg(feature = "ffi")]
+    pub fn take_native_fail(&mut self) -> Option<NativeFail> {
+        self.native_fail.take()
     }
 
     /// Starts a call at `pc` of `code`, in the entry frame, and runs until an instruction that the caller must

@@ -208,6 +208,7 @@ impl Proto {
             nargs: self.args.len() as u8,
             ret,
             variadic: self.variadic,
+            aware: host_sig.is_some_and(NativeSig::is_aware),
         })
     }
 

@@ -163,3 +163,17 @@ pub use vm::{
     Loader, NativeImport, Passthrough, RawCalls, Resolved, Vm, VmConfig, DEFAULT_INSTRUCTION_LIMIT,
     DEFAULT_MEMORY_LIMIT,
 };
+
+/// Mark the innermost aware native call on the current thread as failed with numeric `code`, which the guest call
+/// reports as `HostError::Native { code }`. Returns `false` if no aware native call is active.
+#[cfg(feature = "ffi")]
+pub fn fail_code(code: u64) -> bool {
+    rvm_core::fail_code(code)
+}
+
+/// Mark the innermost aware native call on the current thread as failed with `error`, which the guest call reports as
+/// `HostError::Failed`. Returns `false` if no aware native call is active.
+#[cfg(feature = "ffi")]
+pub fn fail(error: impl std::error::Error + Send + Sync + 'static) -> bool {
+    rvm_core::fail_error(Box::new(error))
+}

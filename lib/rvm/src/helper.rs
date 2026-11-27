@@ -211,6 +211,9 @@ pub enum Stop {
     UnknownSlot(u32),
     /// A checked native token call faulted on guest address `addr`.
     MemoryFault(u64),
+    /// An aware native token call failed via `rvm_fail` / `rvm::fail`.
+    #[cfg(feature = "ffi")]
+    NativeFailed(rvm_core::NativeFail),
 }
 
 impl From<HostError> for Stop {
