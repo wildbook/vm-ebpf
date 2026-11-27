@@ -2,7 +2,7 @@
 //! for the jump classes, with the host calls it hands on to.
 
 use crate::code::Slots;
-use crate::dispatch::{Handler, Spare, Table, SPARE};
+use crate::dispatch::{Handler, Spare, Table};
 use crate::fuel::Fuel;
 use crate::host::Callee;
 use crate::opcode::{CALL, CALLX};
@@ -73,25 +73,18 @@ pub extern "rust-preserve-none" fn jump<M: Memory, H: Host<M>, F: Fuel, const OP
     match step::step(&mut ctx.regs, ctx.memory, insn) {
         Step::Next => {}
         Step::Jump(offset) => ip = ip.offset(offset),
-        Step::Call(offset) => {
-            if !interp.push(&mut ctx.regs, ip.pc(code)) {
-                return interp.stop.at(ip, Reason::StackOverflow);
-            }
-            ip = ip.offset(offset);
-        }
         Step::Exit => match interp.pop(&mut ctx.regs) {
             // `Interpreter::push` takes any pc, so this one has no proof
             Some(call_pc) => become_at_pc!(ctx, code, call_pc.wrapping_add(1), interp, table),
             None => return interp.stop.at(ip, Reason::Exit),
         },
-        Step::CallHelper => become host_call::<M, H, F, false>(ctx, code, ip, interp, table, SPARE, slot),
-        Step::CallKfunc => become host_call::<M, H, F, true>(ctx, code, ip, interp, table, SPARE, slot),
-        Step::CallIndirect => become indirect_call::<M, H, F, false>(ctx, code, ip, interp, table, SPARE, slot),
         Step::Stop(reason) => return interp.stop.at(ip, reason),
-        Step::LdImm64 => unreachable!("LD_IMM64 is of the LD class"),
+        Step::Call(_) | Step::CallHelper | Step::CallKfunc | Step::CallIndirect | Step::LdImm64 => {
+            unreachable!("calls and LD_IMM64 have their own handlers")
+        }
     }
 
-    // `ip` is at `insn` or precedes the target of a jump or local call
+    // `ip` is at `insn` or precedes the target of a jump
     become_enter!(ctx, code, ip.offset(1), interp, table)
 }
 
