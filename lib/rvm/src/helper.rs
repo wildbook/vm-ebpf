@@ -230,34 +230,37 @@ type StackTrampoline =
 /// A host function: how a call reaches it, and how a call that passes arguments on the stack does.
 #[derive(Clone)]
 pub struct HostFn {
-    slot: Slot,
+    slot: CallSlot,
+    owner: Arc<dyn Send + Sync>,
     // for a function that takes arguments from the stack; the others run through the slot whatever the call passes
     call_stack: Option<StackTrampoline>,
+    #[cfg(feature = "link")]
+    meta: SlotMeta,
 }
 
-/// A host function as the extern table keeps it, called directly through `call` with `data` as its closure.
-#[derive(Clone)]
-struct Slot {
+/// Hot entry in the extern table: called directly through `call` with `data` as its closure. Kept at 16 bytes so four
+/// entries fit in a cache line and indexing is a single shift.
+#[derive(Clone, Copy)]
+struct CallSlot {
     call: Trampoline,
     data: *const (),
-    // keeps `data` alive; the call path never touches it
-    _owner: Arc<dyn Send + Sync>,
-    // argument count, if registered with typed arguments; `None` for raw helpers, which read registers themselves. Only
-    // the linker reads it and `wide`.
-    #[cfg_attr(not(feature = "link"), allow(dead_code))]
-    arity: Option<u8>,
-    // whether the function sets r2 as well as r0: `IntoReturn::WIDE`
-    #[cfg_attr(not(feature = "link"), allow(dead_code))]
-    wide: bool,
 }
 
-// A call indexes the slots of the extern table: by 40 bytes with one `lea` and a scaled address, by 48 with a shift
-// more.
-const _: () = assert!(size_of::<Slot>() == 40);
+const _: () = assert!(size_of::<CallSlot>() == 16);
 
-// SAFETY: `data` points into `_owner`, which is `Send + Sync` and lives as long as the `Slot`.
-unsafe impl Send for Slot {}
-unsafe impl Sync for Slot {}
+// SAFETY: `data` points into the paired `Arc<dyn Send + Sync>` in `HelperRegistry::owners`.
+unsafe impl Send for CallSlot {}
+unsafe impl Sync for CallSlot {}
+
+/// Link-time metadata of a host function slot.
+#[cfg(feature = "link")]
+#[derive(Clone, Copy)]
+struct SlotMeta {
+    // argument count, if registered with typed arguments; `None` for raw helpers, which read registers themselves
+    arity: Option<u8>,
+    // whether the function sets r2 as well as r0: `IntoReturn::WIDE`
+    wide: bool,
+}
 
 impl HostFn {
     /// `func` called through `call` and `call_stack`, which must take `data` as a pointer to an `F`.
@@ -265,18 +268,21 @@ impl HostFn {
         func: F,
         call: Trampoline,
         call_stack: Option<StackTrampoline>,
-        arity: Option<u8>,
-        wide: bool,
+        #[cfg_attr(not(feature = "link"), expect(unused_variables))] arity: Option<u8>,
+        #[cfg_attr(not(feature = "link"), expect(unused_variables))] wide: bool,
     ) -> Self {
         let owner = Arc::new(func);
-        let slot = Slot {
+        let slot = CallSlot {
             call,
             data: Arc::as_ptr(&owner).cast(),
-            _owner: owner,
-            arity,
-            wide,
         };
-        Self { slot, call_stack }
+        Self {
+            slot,
+            owner,
+            call_stack,
+            #[cfg(feature = "link")]
+            meta: SlotMeta { arity, wide },
+        }
     }
 
     /// A function that reads its arguments from the registers itself and reaches the caller's memory, maps and fuel.
@@ -487,9 +493,13 @@ fn finish<E: Into<Stop>>(result: Result<u64, E>, stop: &mut Option<Stop>) -> Opt
 /// with both a native and a host function binds to the native.
 #[derive(Default, Clone)]
 pub struct HelperRegistry {
-    slots: Vec<Slot>,
+    slots: Vec<CallSlot>,
+    // keeps every `CallSlot::data` pointer alive, never touched on the call path
+    owners: Vec<Arc<dyn Send + Sync>>,
     /// By slot, [`HostFn::call_stack`]: apart from the slots, which keep their size without it.
     stack_calls: Vec<Option<StackTrampoline>>,
+    #[cfg(feature = "link")]
+    meta: Vec<SlotMeta>,
     by_id: Vec<(u32, u32)>, // (helper ID, slot)
     by_name: HashMap<String, u32>,
     natives: Vec<Native>,
@@ -537,23 +547,25 @@ impl HelperRegistry {
         Some((index as u32, self.natives[index].sig))
     }
 
-    /// The native functions, by index.
-    #[inline(always)]
-    pub fn natives(&self) -> &[Native] {
-        &self.natives
-    }
-
     /// Replace the function in `slot`, or append a new slot.
     fn put(&mut self, slot: Option<u32>, func: HostFn) -> u32 {
         match slot {
             Some(slot) => {
                 self.slots[slot as usize] = func.slot;
+                self.owners[slot as usize] = func.owner;
                 self.stack_calls[slot as usize] = func.call_stack;
+                #[cfg(feature = "link")]
+                {
+                    self.meta[slot as usize] = func.meta;
+                }
                 slot
             }
             None => {
                 self.slots.push(func.slot);
+                self.owners.push(func.owner);
                 self.stack_calls.push(func.call_stack);
+                #[cfg(feature = "link")]
+                self.meta.push(func.meta);
                 (self.slots.len() - 1) as u32
             }
         }
@@ -562,13 +574,13 @@ impl HelperRegistry {
     /// Argument count of the function in `slot`, if it was registered with typed arguments.
     #[cfg(feature = "link")]
     pub fn arity(&self, slot: u32) -> Option<u8> {
-        self.slots.get(slot as usize)?.arity
+        self.meta.get(slot as usize)?.arity
     }
 
     /// Whether the function in `slot` sets r2 as well as r0.
     #[cfg(feature = "link")]
     pub fn wide(&self, slot: u32) -> bool {
-        self.slots.get(slot as usize).is_some_and(|func| func.wide)
+        self.meta.get(slot as usize).is_some_and(|m| m.wide)
     }
 
     /// Slot of a helper ID.
@@ -581,26 +593,8 @@ impl HelperRegistry {
         self.by_name.get(name).copied()
     }
 
-    /// Call the function in `slot` with the caller's context and host state: the new r0, or `None` once the reason it
-    /// stops the caller is in `stop`.
-    #[inline]
-    pub fn call_slot(
-        &self,
-        slot: u32,
-        ctx: &mut Context<VmMemory>,
-        host: &mut HostState,
-        stop: &mut Option<Stop>,
-    ) -> Option<u64> {
-        let Some(func) = self.slots.get(slot as usize) else {
-            *stop = Some(Stop::UnknownSlot(slot));
-            return None;
-        };
-        // SAFETY: `HostFn::with_trampoline` paired `call` with a `data` pointer of the type it expects.
-        unsafe { (func.call)(func.data, ctx, host, stop) }
-    }
-
-    /// [`call_slot`](Self::call_slot) from a call that passes `stack` on the stack. A function that takes no stack
-    /// arguments runs as it does there.
+    /// Call the function in `slot` from a call that passes `stack` on the stack. A function that takes no stack
+    /// arguments runs as it does without stack arguments.
     #[inline]
     pub fn call_slot_stack(
         &self,
@@ -634,6 +628,85 @@ impl std::fmt::Debug for HelperRegistry {
             .field("names", &self.by_name)
             .field("natives", &self.native_names)
             .finish()
+    }
+}
+
+/// A shared [`HelperRegistry`] handle that caches the raw `slots` and `natives` slice pointers inline so hot calls
+/// avoid chasing the `Arc` pointer while still cloning no table on load or refresh.
+pub struct CallTable {
+    slots_ptr: *const CallSlot,
+    slots_len: usize,
+    natives_ptr: *const Native,
+    natives_len: usize,
+    // keeps the `slots` and `natives` backing buffers alive and immutable
+    registry: Arc<HelperRegistry>,
+}
+
+// SAFETY: `slots_ptr` and `natives_ptr` point into the immutable `Vec` buffers of `registry`, which is `Send + Sync`
+// and lives for the full lifetime of `CallTable`.
+unsafe impl Send for CallTable {}
+unsafe impl Sync for CallTable {}
+
+impl CallTable {
+    pub fn new(registry: Arc<HelperRegistry>) -> Self {
+        let slots = registry.slots.as_slice();
+        let natives = registry.natives.as_slice();
+        Self {
+            slots_ptr: slots.as_ptr(),
+            slots_len: slots.len(),
+            natives_ptr: natives.as_ptr(),
+            natives_len: natives.len(),
+            registry,
+        }
+    }
+
+    pub fn set(&mut self, registry: Arc<HelperRegistry>) {
+        self.slots_ptr = registry.slots.as_ptr();
+        self.slots_len = registry.slots.len();
+        self.natives_ptr = registry.natives.as_ptr();
+        self.natives_len = registry.natives.len();
+        self.registry = registry;
+    }
+
+    #[inline(always)]
+    pub fn registry(&self) -> &HelperRegistry {
+        &self.registry
+    }
+
+    #[inline(always)]
+    pub fn natives(&self) -> &[Native] {
+        // SAFETY: `self.registry` keeps the immutable `Vec<Native>` buffer alive for `&self`.
+        unsafe { std::slice::from_raw_parts(self.natives_ptr, self.natives_len) }
+    }
+
+    #[inline(always)]
+    pub fn call_slot(
+        &self,
+        slot: u32,
+        ctx: &mut Context<VmMemory>,
+        host: &mut HostState,
+        stop: &mut Option<Stop>,
+    ) -> Option<u64> {
+        // SAFETY: `self.registry` keeps the immutable `Vec<CallSlot>` buffer alive for `&self`.
+        let slots = unsafe { std::slice::from_raw_parts(self.slots_ptr, self.slots_len) };
+        let Some(func) = slots.get(slot as usize) else {
+            *stop = Some(Stop::UnknownSlot(slot));
+            return None;
+        };
+        // SAFETY: `HostFn::with_trampoline` paired `call` with a `data` pointer kept alive by `registry.owners`.
+        unsafe { (func.call)(func.data, ctx, host, stop) }
+    }
+
+    #[inline]
+    pub fn call_slot_stack(
+        &self,
+        slot: u32,
+        ctx: &mut Context<VmMemory>,
+        host: &mut HostState,
+        stop: &mut Option<Stop>,
+        stack: &StackArgs,
+    ) -> Option<u64> {
+        self.registry.call_slot_stack(slot, ctx, host, stop, stack)
     }
 }
 

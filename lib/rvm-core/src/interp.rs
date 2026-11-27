@@ -66,8 +66,8 @@ pub enum Reason<E> {
 /// They stop at the instruction that needs the caller: a call that the host declined, a `gotox`, the `exit` of the
 /// entry frame, or a fault.
 // `repr(C)` puts the hot fuel counter at offset 0 (zero displacement in `Fuel::enter`), followed by `depth`,
-// `frame_size`, `stop` and `windows.stack` all within one-byte displacement (0..128), and the cold meter config,
-// `frames` and `args` behind them.
+// `frame_size`, `stop` and `windows.stack` within one byte displacement (0..128), then `meter` and `host` ahead of
+// `frames` and `args`.
 #[repr(C)]
 pub struct Interpreter<M: Memory, H> {
     /// The fuel left in the run in progress (zero-sized without the `fuel` feature).
@@ -77,13 +77,13 @@ pub struct Interpreter<M: Memory, H> {
     frame_size: u64,
     pub(crate) stop: StopRecord<M::Error>,
     pub(crate) windows: Windows,
+    /// The limit of the runs and the table they start through.
+    pub(crate) meter: Meter<M, H>,
     /// The host that runs the guest's calls of host functions.
     pub host: H,
 
     /// `frames[..depth]` are initialised.
     frames: [MaybeUninit<Frame>; MAX_CALL_DEPTH],
-    /// The limit of the runs and the table they start through.
-    pub(crate) meter: Meter<M, H>,
     /// The stack arguments by call depth: the frame at `depth` received those in `args[depth]`, and stores those of
     /// the calls it makes in `args[depth + 1]`. The entry frame is at depth 0, and `push` keeps `depth` at or below
     /// [`MAX_CALL_DEPTH`].
@@ -112,9 +112,9 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
             frame_size,
             stop: StopRecord::NONE,
             windows: Windows::EMPTY,
+            meter: Meter::default(),
             host,
             frames: [const { MaybeUninit::uninit() }; MAX_CALL_DEPTH],
-            meter: Meter::default(),
             args: [[0; args::MAX_STACK_ARGS + 1]; MAX_CALL_DEPTH + 2],
         }
     }

@@ -8,7 +8,7 @@ use rvm_core::{
 };
 
 use crate::error::{ExecError, MemoryError, Result, VmError};
-use crate::helper::{CallerFuel, HelperRegistry, HostState, Stop};
+use crate::helper::{CallTable, CallerFuel, HelperRegistry, HostState, Stop};
 use crate::image::INSN_SIZE;
 use crate::layout::CODE_REGION;
 #[cfg(feature = "maps")]
@@ -45,7 +45,7 @@ impl Executor {
     /// `config`.
     pub fn new(helpers: Arc<HelperRegistry>, stack_top: u64, config: &VmConfig) -> Self {
         let host = HostCalls {
-            registry: helpers,
+            table: CallTable::new(helpers),
             state: HostState::default(),
             stop: None,
             raw_calls: config.raw_calls.is_on(),
@@ -65,7 +65,7 @@ impl Executor {
 
     /// Replace the extern table that helper and kfunc calls use.
     pub fn set_helpers(&mut self, helpers: Arc<HelperRegistry>) {
-        self.interp.host.registry = helpers;
+        self.interp.host.table.set(helpers);
     }
 
     /// The maps passed to helpers through [`HostState::maps`].
@@ -160,7 +160,7 @@ impl Executor {
 impl fmt::Debug for Executor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut s = f.debug_struct("Executor");
-        s.field("helpers", &self.interp.host.registry);
+        s.field("helpers", self.interp.host.table.registry());
         #[cfg(feature = "maps")]
         s.field("maps", &self.interp.host.state.maps);
         s.field("stack_top", &self.stack_top);
@@ -272,8 +272,8 @@ fn call_with_fuel(
     let state = FuelGuard(&mut host.state);
     let mut stop = None;
     let r0 = match &stack {
-        Some(stack) => host.registry.call_slot_stack(slot, ctx, state.0, &mut stop, stack),
-        None => host.registry.call_slot(slot, ctx, state.0, &mut stop),
+        Some(stack) => host.table.call_slot_stack(slot, ctx, state.0, &mut stop, stack),
+        None => host.table.call_slot(slot, ctx, state.0, &mut stop),
     };
     let CallerFuel::Left(left) = state.0.fuel else {
         unreachable!("the fuel stays while the function runs")
@@ -328,7 +328,7 @@ fn failure(stop: Stop, pc: u64) -> VmError {
 
 /// The extern table and the state that helper, kfunc and `callx` calls reach from inside [`Interpreter::run`].
 struct HostCalls {
-    registry: Arc<HelperRegistry>,
+    table: CallTable,
     state: HostState,
     /// Why the host call that stopped the run did, until the executor takes it.
     stop: Option<Stop>,
@@ -346,8 +346,10 @@ impl HostCalls {
         }
         let slot = match reason {
             Reason::CallKfunc(slot) => Some(slot),
-            Reason::CallHelper(id) => self.registry.slot_of_id(id),
-            Reason::CallIndirect(target) => u32::try_from(target).ok().and_then(|id| self.registry.slot_of_id(id)),
+            Reason::CallHelper(id) => self.table.registry().slot_of_id(id),
+            Reason::CallIndirect(target) => u32::try_from(target)
+                .ok()
+                .and_then(|id| self.table.registry().slot_of_id(id)),
             _ => None,
         }?;
         self.stop = None;
@@ -363,7 +365,7 @@ impl Host<VmMemory> for HostCalls {
         if id == CORE_POISON_HELPER {
             return None;
         }
-        let Some(slot) = self.registry.slot_of_id(id) else {
+        let Some(slot) = self.table.registry().slot_of_id(id) else {
             self.stop = Some(Stop::UnknownHelper(id));
             return None;
         };
@@ -372,12 +374,12 @@ impl Host<VmMemory> for HostCalls {
 
     #[inline]
     fn call_kfunc(&mut self, ctx: &mut Context<VmMemory>, slot: u32) -> Option<u64> {
-        self.registry.call_slot(slot, ctx, &mut self.state, &mut self.stop)
+        self.table.call_slot(slot, ctx, &mut self.state, &mut self.stop)
     }
 
     #[inline]
     fn call_kfunc_stack(&mut self, ctx: &mut Context<VmMemory>, slot: u32, stack: &StackArgs) -> Option<u64> {
-        self.registry
+        self.table
             .call_slot_stack(slot, ctx, &mut self.state, &mut self.stop, stack)
     }
 
@@ -410,7 +412,7 @@ impl Host<VmMemory> for HostCalls {
             }
         }
         let id = target as u32;
-        let Some(slot) = self.registry.slot_of_id(id) else {
+        let Some(slot) = self.table.registry().slot_of_id(id) else {
             self.stop = Some(Stop::UnknownHelper(id));
             return None;
         };
@@ -419,7 +421,7 @@ impl Host<VmMemory> for HostCalls {
 
     #[inline(always)]
     fn natives(&self) -> &[Native] {
-        self.registry.natives()
+        self.table.natives()
     }
 }
 
