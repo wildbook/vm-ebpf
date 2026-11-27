@@ -223,6 +223,81 @@ impl Slot {
         let [i0, i1, i2, i3] = self.imm;
         Instruction(u64::from_le_bytes([self.byte, self.regs, off_lo, off_hi, i0, i1, i2, i3]))
     }
+
+    /// The `dst_reg` field of a slot whose layout is [`Layout::Dst`] or [`Layout::DstSrc`].
+    #[inline(always)]
+    pub fn dst_reg_decoded(self) -> Reg {
+        debug_assert!(LAYOUTS[usize::from(self.byte)] != Layout::Raw && self.regs < 16);
+        // SAFETY: `Slot::new` established `self.regs < 16` for non-Raw layouts.
+        unsafe { Reg::new_unchecked(self.regs) }
+    }
+
+    /// The `src_reg` field of a slot whose layout is [`Layout::DstSrc`].
+    #[inline(always)]
+    pub fn src_reg_decoded(self) -> Reg {
+        debug_assert!(LAYOUTS[usize::from(self.byte)] == Layout::DstSrc && self.imm[3] < 16);
+        // SAFETY: `Slot::new` established `self.imm[3] < 16` for `Layout::DstSrc`.
+        unsafe { Reg::new_unchecked(self.imm[3]) }
+    }
+
+    /// Pre-decoded 3-operand ALU immediate slot (`dst = src1 op imm`).
+    pub fn alu3_imm(dst: Reg, src1: Reg, imm: i32) -> Self {
+        Self {
+            byte: src1.get(),
+            regs: dst.get(),
+            offset: 0,
+            imm: imm.to_le_bytes(),
+        }
+    }
+
+    /// Pre-decoded 3-operand ALU register slot (`dst = src1 op src2`).
+    pub fn alu3_reg(dst: Reg, src1: Reg, src2: Reg) -> Self {
+        Self {
+            byte: src1.get(),
+            regs: dst.get(),
+            offset: 0,
+            imm: [0, 0, 0, src2.get()],
+        }
+    }
+
+    /// `src1` of a slot built by [`Self::alu3_imm`] or [`Self::alu3_reg`].
+    ///
+    /// # Safety
+    ///
+    /// `self` must have been constructed by [`Self::alu3_imm`] or [`Self::alu3_reg`].
+    #[inline(always)]
+    pub unsafe fn alu3_src1(self) -> Reg {
+        // SAFETY: `alu3_*` stores a `Reg` (`< 16`) in `byte`.
+        unsafe { Reg::new_unchecked(self.byte) }
+    }
+
+    /// `dst` of a slot built by [`Self::alu3_imm`] or [`Self::alu3_reg`].
+    ///
+    /// # Safety
+    ///
+    /// `self` must have been constructed by [`Self::alu3_imm`] or [`Self::alu3_reg`].
+    #[inline(always)]
+    pub unsafe fn alu3_dst(self) -> Reg {
+        // SAFETY: `alu3_*` stores a `Reg` (`< 16`) in `regs`.
+        unsafe { Reg::new_unchecked(self.regs) }
+    }
+
+    /// `src2` of a slot built by [`Self::alu3_reg`].
+    ///
+    /// # Safety
+    ///
+    /// `self` must have been constructed by [`Self::alu3_reg`].
+    #[inline(always)]
+    pub unsafe fn alu3_src2(self) -> Reg {
+        // SAFETY: `alu3_reg` stores a `Reg` (`< 16`) in `imm[3]`.
+        unsafe { Reg::new_unchecked(self.imm[3]) }
+    }
+
+    /// `imm` of a slot built by [`Self::alu3_imm`].
+    #[inline(always)]
+    pub fn alu3_imm_val(self) -> i32 {
+        i32::from_le_bytes(self.imm)
+    }
 }
 
 /// Shows the fields the layout keeps.

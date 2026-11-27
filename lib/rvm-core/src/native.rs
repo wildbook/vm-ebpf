@@ -28,8 +28,8 @@ use std::ptr;
 
 use crate::args::{StackArgs, MAX_STACK_ARGS};
 use crate::code::Slots;
-use crate::dispatch::{Handler, Spare, Table};
-use crate::fuel::Fuel;
+use crate::dispatch::{Handler, Spare};
+use crate::fuel::{Fuel, RestsPtr};
 use crate::interp::StopRecord;
 use crate::slot::{Fields, Shape, Slot};
 use crate::transfer::Ip;
@@ -540,7 +540,7 @@ extern "rust-preserve-none" fn native_call<M: Memory, H: Host<M>, F: Fuel, const
     code: Slots,
     ip: Ip,
     interp: &mut Interpreter<M, H>,
-    table: &Table<M, H>,
+    rests: RestsPtr,
     _: Spare,
     slot: Slot,
 ) {
@@ -583,7 +583,7 @@ extern "rust-preserve-none" fn native_call<M: Memory, H: Host<M>, F: Fuel, const
     // SAFETY: `Code::with_natives` requires each native function a call names to take `N` arguments
     ctx.regs[0] = unsafe { call(func, N, a) };
 
-    become_enter!(ctx, code, ip.offset(1), interp, table)
+    become_enter!(ctx, code, ip.offset(1), interp, rests)
 }
 
 /// The handler of a native call with 6 to 12 arguments: r1 to r5 and the stack arguments of the frame.
@@ -593,7 +593,7 @@ extern "rust-preserve-none" fn stack_call<M: Memory, H: Host<M>, F: Fuel, const 
     code: Slots,
     ip: Ip,
     interp: &mut Interpreter<M, H>,
-    table: &Table<M, H>,
+    rests: RestsPtr,
     _: Spare,
     slot: Slot,
 ) {
@@ -628,7 +628,7 @@ extern "rust-preserve-none" fn stack_call<M: Memory, H: Host<M>, F: Fuel, const 
         _ => unsafe { rvm_call_args(func, reg_args(&ctx.regs), stack) },
     };
 
-    become_enter!(ctx, code, ip.offset(1), interp, table)
+    become_enter!(ctx, code, ip.offset(1), interp, rests)
 }
 
 /// The handler of [`RAW`]: calls a native function without a prototype, passing r1 to r5 through `rvm_call_regs`.
@@ -638,7 +638,7 @@ extern "rust-preserve-none" fn raw_call<M: Memory, H: Host<M>, F: Fuel>(
     code: Slots,
     ip: Ip,
     interp: &mut Interpreter<M, H>,
-    table: &Table<M, H>,
+    rests: RestsPtr,
     _: Spare,
     slot: Slot,
 ) {
@@ -652,7 +652,7 @@ extern "rust-preserve-none" fn raw_call<M: Memory, H: Host<M>, F: Fuel>(
     // SAFETY: `Code::with_natives` requires the function to be sound to call through `rvm_call_regs`
     ctx.regs[0] = unsafe { rvm_call_regs(func, &ctx.regs) };
 
-    become_enter!(ctx, code, ip.offset(1), interp, table)
+    become_enter!(ctx, code, ip.offset(1), interp, rests)
 }
 
 /// The handler of [`GENERAL`]: marshals structs, float returns, pointers, callbacks, and variadic arguments according
@@ -664,7 +664,7 @@ extern "rust-preserve-none" fn general_call<M: Memory, H: Host<M>, F: Fuel>(
     code: Slots,
     ip: Ip,
     interp: &mut Interpreter<M, H>,
-    table: &Table<M, H>,
+    rests: RestsPtr,
     _: Spare,
     slot: Slot,
 ) {
@@ -771,7 +771,7 @@ extern "rust-preserve-none" fn general_call<M: Memory, H: Host<M>, F: Fuel>(
         ctx.regs[2] = r2;
     }
 
-    become_enter!(ctx, code, ip.offset(1), interp, table)
+    become_enter!(ctx, code, ip.offset(1), interp, rests)
 }
 
 #[cfg(feature = "ffi")]

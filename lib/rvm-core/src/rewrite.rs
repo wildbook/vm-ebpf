@@ -293,7 +293,7 @@ fn reserved_fields() {
     let insn = Instruction::new;
     let (alu, jmp) = (OpCode::alu64, OpCode::jmp64);
     let exit = insn(jmp(JmpOpc::Exit, Source::Imm), 0, 0, 0, 0);
-    let fails = |slots: &[Instruction]| Code::new(slots).slots().get(0).unwrap().byte() == INVALID;
+    let fails = |slots: &[Instruction]| Code::new(slots).raw_slot(0).unwrap().byte() == INVALID;
     for (slot, reserved) in [
         (insn(alu(AluOpc::Add, Source::Imm), 1, 2, 0, 1), true),
         (insn(alu(AluOpc::Add, Source::Reg), 1, 2, 0, 1), true),

@@ -6,9 +6,9 @@
 //! checked fetch would. The interpreter checks the pc a run starts at, the `exit` handler the pc it returns to, the
 //! `callx` handler the pc [`Host::call_indirect`] names, and the caller of the run the targets of `gotox`.
 
-use crate::code::Slots;
-use crate::dispatch::{Handler, Spare, Table};
-use crate::fuel::Fuel;
+use crate::code::{Slots, ThreadedSlot};
+use crate::dispatch::{Handler, Spare};
+use crate::fuel::{Fuel, RestsPtr};
 use crate::fuse::Super;
 use crate::opcode::{call, Class, JmpOpc, OpCode, Source};
 use crate::slot::{Shape, Slot, View};
@@ -130,15 +130,15 @@ const TARGETS: [u8; 256] = {
     })
 };
 
-/// A pointer to the slot of the instruction a handler runs, which handlers carry in place of its pc.
+/// A pointer to the [`ThreadedSlot`] of the instruction a handler runs, which handlers carry in place of its pc.
 ///
-/// Every `Ip` a handler receives points into the slots of the [`Code`](crate::Code) that the run executes: the
-/// interpreter and the checked fetches make one only for a pc they found there, and a handler moves one without a
+/// Every `Ip` a handler receives points into the compiled stream of the [`Code`](crate::Code) that the run executes:
+/// the interpreter and the checked fetches make one only for a pc they found there, and a handler moves one without a
 /// check only from a slot below `len`, to the next slot or to a target that [`bound`] proves lies in `0..=len`. The
 /// slots from `len` on all hold [`GUARD`], whose handler continues nowhere. So a handler reads its own slot, and the
 /// slot it continues at, without a check.
 #[derive(Clone, Copy)]
-pub struct Ip(pub *const Slot);
+pub struct Ip(pub *const ThreadedSlot);
 
 impl Ip {
     /// The ip of `pc` in `code`, which may lie outside its slots.
@@ -164,7 +164,21 @@ impl Ip {
         self.0.addr()
     }
 
-    /// The slot it points to.
+    /// The handler and payload slot at this ip.
+    ///
+    /// # Safety
+    ///
+    /// It must lie in the compiled stream of a [`Code`](crate::Code) built for `<M, H>` that is still borrowed.
+    #[inline(always)]
+    pub unsafe fn fetch<M: Memory, H: Host<M>>(self) -> (Handler<M, H>, Slot) {
+        // SAFETY: the caller's
+        let entry = unsafe { *self.0 };
+        // SAFETY: `compile_threaded` populated `entry.handler` from `DispatchTable<M, H>`.
+        let handler: Handler<M, H> = unsafe { std::mem::transmute(entry.handler) };
+        (handler, entry.slot)
+    }
+
+    /// The [`Slot`] at this ip.
     ///
     /// # Safety
     ///
@@ -172,7 +186,7 @@ impl Ip {
     #[inline(always)]
     pub unsafe fn get(self) -> Slot {
         // SAFETY: the caller's
-        unsafe { *self.0 }
+        unsafe { (*self.0).slot }
     }
 
     /// The fields of the slot it points to, as the handler of an opcode byte of shape `shape` reads them, which takes
@@ -185,16 +199,16 @@ impl Ip {
     #[inline(always)]
     pub unsafe fn view<'a>(self, held: Slot, shape: Shape) -> View<'a> {
         // SAFETY: the caller's
-        unsafe { View::new(&*self.0, Some(held), shape) }
+        unsafe { View::new(&(*self.0).slot, Some(held), shape) }
     }
 
-    /// The `n` slots from this one on, borrowed from `code`.
+    /// The `n` threaded slots from this one on, borrowed from `code`.
     ///
     /// # Safety
     ///
     /// They must lie in `code`.
     #[inline(always)]
-    pub unsafe fn slots<'a>(self, _code: Slots<'a>, n: usize) -> &'a [Slot] {
+    pub unsafe fn slots<'a>(self, _code: Slots<'a>, n: usize) -> &'a [ThreadedSlot] {
         // SAFETY: the caller's
         unsafe { std::slice::from_raw_parts(self.0, n) }
     }
@@ -225,7 +239,7 @@ extern "rust-preserve-none" fn guard<M: Memory, H: Host<M>>(
     _code: Slots,
     ip: Ip,
     interp: &mut Interpreter<M, H>,
-    _table: &Table<M, H>,
+    _rests: RestsPtr,
     _: Spare,
     _slot: Slot,
 ) {
@@ -240,14 +254,14 @@ extern "rust-preserve-none" fn far<M: Memory, H: Host<M>, F: Fuel>(
     code: Slots,
     ip: Ip,
     interp: &mut Interpreter<M, H>,
-    table: &Table<M, H>,
+    rests: RestsPtr,
     _: Spare,
     far: Slot,
 ) {
     let Some(pc) = run_moved(ctx, code, ip, interp, far) else {
         return;
     };
-    become_at_pc!(ctx, code, pc, interp, table)
+    become_at_pc!(ctx, code, pc, interp, rests)
 }
 
 /// Runs the jump or local call that the [`FAR`] slot `far` at `ip` stands for, and returns the pc it continues at.
@@ -265,7 +279,7 @@ fn run_moved<M: Memory, H: Host<M>>(
     let far = far.instruction();
     let byte = far.dst_reg() | far.src_reg() << 4;
     let moved = code
-        .get(u64::from(far.imm() as u32))
+        .raw_slot(u64::from(far.imm() as u32))
         .expect("a moved instruction behind the guard");
     let moved = moved.instruction().with_byte(byte);
 
@@ -377,7 +391,7 @@ mod tests {
             ] {
                 if code[1] == add {
                     // a branch to the guard slot keeps the superinstruction
-                    let fused = Code::new(code).slots().get(1).unwrap().byte() != add.byte();
+                    let fused = Code::new(code).raw_slot(1).unwrap().byte() != add.byte();
                     assert_eq!(fused, (0..=len).contains(&target), "{code:?}");
                 }
                 let stop = match (lands, returns) {
@@ -449,7 +463,7 @@ mod tests {
         let value = (hi as u64) << 32 | 7;
         let upper = Instruction::new(OpCode(0), 0, 0, 0, hi);
         let code = [lddw, upper, add, EXIT];
-        assert_ne!(Code::new(code).slots().get(0).unwrap().byte(), LD_IMM64);
+        assert_ne!(Code::new(code).raw_slot(0).unwrap().byte(), LD_IMM64);
         expect(&code, 0, 10, (Reason::Exit, 3, 6, value + 5));
         if crate::METERED {
             expect(&code, 0, 0, (Reason::OutOfFuel, 0, 0, 0));

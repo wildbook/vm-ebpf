@@ -18,7 +18,8 @@ use std::ptr;
 
 use crate::code::Slots;
 use crate::context::FP;
-use crate::dispatch::{Handler, Spare, Table, SPARE};
+use crate::dispatch::{Handler, Spare, SPARE};
+use crate::fuel::RestsPtr;
 use crate::handler::handler;
 use crate::memory::Window;
 use crate::opcode::{Class, MemMode, MemSize, OpCode};
@@ -335,7 +336,7 @@ pub extern "rust-preserve-none" fn stack_access<M: Memory, H: Host<M>, const OP:
     code: Slots,
     ip: Ip,
     interp: &mut Interpreter<M, H>,
-    table: &Table<M, H>,
+    rests: RestsPtr,
     _: Spare,
     slot: Slot,
 ) {
@@ -343,9 +344,9 @@ pub extern "rust-preserve-none" fn stack_access<M: Memory, H: Host<M>, const OP:
     let insn = unsafe { ip.view(slot, const { Shape::of(OP) }) };
     let addr = step::address(ctx.regs[FP], insn);
     if !interp.windows.stack.access::<OP>(&mut ctx.regs, insn, addr) {
-        become miss::<M, H, OP, false>(ctx, code, ip, interp, table, SPARE, slot)
+        become miss::<M, H, OP, false>(ctx, code, ip, interp, rests, SPARE, slot)
     }
-    become_next!(ctx, code, ip, interp, table)
+    become_next!(ctx, code, ip, interp, rests)
 }
 
 /// The handler of the load or store `OP` through a register other than r10.
@@ -355,7 +356,7 @@ pub extern "rust-preserve-none" fn data_access<M: Memory, H: Host<M>, const OP: 
     code: Slots,
     ip: Ip,
     interp: &mut Interpreter<M, H>,
-    table: &Table<M, H>,
+    rests: RestsPtr,
     _: Spare,
     slot: Slot,
 ) {
@@ -367,13 +368,13 @@ pub extern "rust-preserve-none" fn data_access<M: Memory, H: Host<M>, const OP: 
         .data_for(OpCode(OP))
         .access::<OP>(&mut ctx.regs, insn, addr)
     {
-        become_next!(ctx, code, ip, interp, table)
+        become_next!(ctx, code, ip, interp, rests)
     }
     // a dispatch of its own, so that the hit above keeps its instructions
     if small(OpCode(OP).mem_size()) && interp.windows.spare.access::<OP>(&mut ctx.regs, insn, addr) {
-        become_next!(ctx, code, ip, interp, table)
+        become_next!(ctx, code, ip, interp, rests)
     }
-    become data_miss::<M, H, OP>(ctx, code, ip, interp, table, SPARE, slot)
+    become data_miss::<M, H, OP>(ctx, code, ip, interp, rests, SPARE, slot)
 }
 
 /// Runs a load or store that missed the data window through the window around r10 if it fits there, as one through
@@ -385,7 +386,7 @@ extern "rust-preserve-none" fn data_miss<M: Memory, H: Host<M>, const OP: u8>(
     code: Slots,
     ip: Ip,
     interp: &mut Interpreter<M, H>,
-    table: &Table<M, H>,
+    rests: RestsPtr,
     _: Spare,
     slot: Slot,
 ) {
@@ -393,9 +394,9 @@ extern "rust-preserve-none" fn data_miss<M: Memory, H: Host<M>, const OP: u8>(
     let insn = unsafe { ip.view(slot, const { Shape::of(OP) }) };
     let addr = step::address(ctx.regs.get(base_reg::<OP>(insn)), insn);
     if !interp.windows.stack.access::<OP>(&mut ctx.regs, insn, addr) {
-        become miss::<M, H, OP, true>(ctx, code, ip, interp, table, SPARE, slot)
+        become miss::<M, H, OP, true>(ctx, code, ip, interp, rests, SPARE, slot)
     }
-    become_next!(ctx, code, ip, interp, table)
+    become_next!(ctx, code, ip, interp, rests)
 }
 
 /// Takes the window around the address of the access, or without `DATA` around r10, and runs the access with its
@@ -407,7 +408,7 @@ extern "rust-preserve-none" fn miss<M: Memory, H: Host<M>, const OP: u8, const D
     code: Slots,
     ip: Ip,
     interp: &mut Interpreter<M, H>,
-    table: &Table<M, H>,
+    rests: RestsPtr,
     _: Spare,
     slot: Slot,
 ) {
@@ -421,7 +422,7 @@ extern "rust-preserve-none" fn miss<M: Memory, H: Host<M>, const OP: u8, const D
     interp
         .windows
         .take::<M, DATA>(ctx.memory, around, OpCode(OP).mem_size());
-    become handler::<M, H, OP>(ctx, code, ip, interp, table, SPARE, slot)
+    become handler::<M, H, OP>(ctx, code, ip, interp, rests, SPARE, slot)
 }
 
 /// The register that holds the base address of the load or store `OP`.

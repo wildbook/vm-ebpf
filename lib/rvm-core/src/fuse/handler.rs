@@ -3,8 +3,8 @@
 use super::supers::{Super, MAX_LEN, MAX_ROLES};
 use crate::code::Slots;
 use crate::context::FP;
-use crate::dispatch::{Spare, Table, SPARE};
-use crate::fuel::Fuel;
+use crate::dispatch::{Spare, SPARE};
+use crate::fuel::{Fuel, RestsPtr};
 use crate::slot::{Fields, Reg, Shape, Slot, View};
 use crate::step::{self, Regs, Step};
 use crate::transfer::Ip;
@@ -21,7 +21,7 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
     code: Slots,
     ip: Ip,
     interp: &mut Interpreter<M, H>,
-    table: &Table<M, H>,
+    rests: RestsPtr,
     _: Spare,
     slot: Slot,
 ) {
@@ -31,16 +31,15 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
     // SAFETY: `transfer::bound` leaves a superinstruction only where its sequence lies in the code, and the guard slot
     // follows the code (see `Ip`)
     let sequence = unsafe { ip.slots(code, len + 1) };
-    // SAFETY: `encode` found the opcode of each instruction of the sequence in its first slot, and the bytes
-    // `Code::new` gives such a slot afterwards stand for the same opcode (see `bytes::usual`), so they have its
-    // layout. Each slot's shape is a constant, so that the views fold for the constant `k` every caller passes.
+    // SAFETY: `encode` found the opcode of each instruction of the sequence in its first slot, and `compile_threaded`
+    // protects slots inside a superinstruction from 3-op folding, so `sequence[k].slot` has its layout.
     let slot_of = |k: usize| {
         macro_rules! view {
             ($($k:literal),*) => {
                 match k {
                     $($k => unsafe {
                         let cached = if $k == 0 { Some(slot) } else { None };
-                        View::new(&sequence[$k], cached, const { Shape::of(Super::of(S).opcode($k)) })
+                        View::new(&sequence[$k].slot, cached, const { Shape::of(Super::of(S).opcode($k)) })
                     },)*
                     _ => unreachable!("a slot past `MAX_LEN`"),
                 }
@@ -68,9 +67,9 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
         ($next:expr) => {{
             let next = $next;
             match const { Super::of(S).branches() } {
-                true => become_enter!(ctx, code, next, interp, table),
+                true => become_enter!(ctx, code, next, interp, rests),
                 // the slot after the sequence lies in `0..=len` (see `sequence`)
-                false => become_at!(ctx, code, next, interp, table),
+                false => become_at!(ctx, code, next, interp, rests),
             }
         }};
     }
@@ -86,18 +85,17 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
                 let decoded = sup.decode($k, slot_of($k), ROLE_INDEXES, Some(FREE));
                 let step = match const { windows::windowed(Super::of(S).opcode($k)) } {
                     true if windows::data_step(&interp.windows, &mut roles, decoded) => Step::Next,
-                    // the access missed its window: the sequence continues unfused from it, as a jump into its middle
-                    // would, directly to the fuel-independent window handler of the access alone
+                    // the access missed its window: continue unfused from it, directly to its window handler
                     true => {
                         roles.save(registers, sup.unsaved[$k]);
-                        let miss_slot = if $k == 0 { slot } else { sequence[$k] };
+                        let miss_slot = if $k == 0 { slot } else { sequence[$k].slot };
                         let Some(access) = (const {
                             let sup = Super::of(S);
                             windows::access_handler::<M, H>(sup.opcode($k), sup.is_fp_access($k))
                         }) else {
                             unreachable!("windowed opcode has a window handler")
                         };
-                        become access(ctx, code, at, interp, table, SPARE, miss_slot)
+                        become access(ctx, code, at, interp, rests, SPARE, miss_slot)
                     }
                     false => step::step(&mut roles, ctx.memory, decoded),
                 };
@@ -106,7 +104,7 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
                     // only the last instruction branches, after `save_at`; `transfer::bound` leaves a
                     // superinstruction only where its branch target lies in `0..=len` (see `Ip`)
                     Step::Jump(offset) => become_after!(ip.offset($k + 1 + offset)),
-                    Step::LdImm64 => step::ld_imm64(&mut roles, decoded, sequence[$k + 1].imm()),
+                    Step::LdImm64 => step::ld_imm64(&mut roles, decoded, sequence[$k + 1].slot.imm()),
                     Step::Stop(reason) => {
                         roles.save(registers, sup.unsaved[$k]);
                         return interp.stop.at(at, reason);

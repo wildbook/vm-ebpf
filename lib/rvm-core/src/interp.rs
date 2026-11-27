@@ -4,13 +4,18 @@ use std::mem::MaybeUninit;
 use std::ptr;
 
 use crate::args::{self, Row, StackArgs};
-use crate::code::Slots;
+use crate::code::{Slots, ThreadedSlot};
 use crate::context::FP;
-use crate::dispatch::{Table, SPARE};
+use crate::dispatch::SPARE;
+#[cfg(not(feature = "fuel"))]
+use crate::fuel::RestsPtr;
+#[cfg(feature = "fuel")]
+use crate::fuel::{Fuel, Metered};
 use crate::fuel::{FuelLeft, Meter};
 use crate::native::NativeCall;
 #[cfg(feature = "ffi")]
 use crate::native::NativeFail;
+#[cfg(feature = "fuel")]
 use crate::slot::Slot;
 use crate::transfer::Ip;
 use crate::windows::Windows;
@@ -89,7 +94,7 @@ pub struct Interpreter<M: Memory, H> {
     frame_size: u64,
     pub(crate) stop: StopRecord<M::Error>,
     pub(crate) windows: Windows,
-    /// The limit of the runs and the table they start through.
+    /// The fuel limit configuration and dispatch table.
     pub(crate) meter: Meter<M, H>,
     /// The host that runs the guest's calls of host functions.
     pub host: H,
@@ -171,19 +176,14 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
     #[inline]
     pub fn run(&mut self, ctx: &mut Context<M>, code: &Code, pc: u64) -> Stop<M::Error> {
         self.depth = 0;
-        let table = self.meter.start(&mut self.fuel);
-        self.enter(ctx, code, pc, table, true)
+        self.meter.start(&mut self.fuel);
+        self.enter(ctx, code, pc, true)
     }
 
     /// Continues the call at `pc` of `code`, with the frames and the fuel that the last stop left.
     #[inline]
     pub fn resume(&mut self, ctx: &mut Context<M>, code: &Code, pc: u64) -> Stop<M::Error> {
-        let slots = code.slots();
-        if self.depth != 0 {
-            self.rebase_frames(slots);
-        }
-        let table = self.meter.resume(&mut self.fuel, slots, pc);
-        self.enter(ctx, code, pc, table, false)
+        self.enter(ctx, code, pc, false)
     }
 
     /// Push a nested callback frame returning to [`RETURN_PC`], copy `args` into r1 to r5, and return the previous
@@ -238,23 +238,36 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
         Err(stop)
     }
 
-    /// Runs `code` from `pc` through `table`, for a call that starts there if `fresh` and one that resumes if not.
+    /// Runs `code` from `pc`, for a call that starts there if `fresh` and one that resumes if not.
     #[inline(always)]
-    fn enter(
-        &mut self,
-        ctx: &mut Context<M>,
-        code: &Code,
-        pc: u64,
-        table: &Table<M, H>,
-        fresh: bool,
-    ) -> Stop<M::Error> {
-        let slots = code.slots();
+    fn enter(&mut self, ctx: &mut Context<M>, code: &Code, pc: u64, fresh: bool) -> Stop<M::Error> {
         self.windows.revalidate(ctx.memory);
+        let table = self.meter.table();
+        let slots = code.threaded(table);
+        if !fresh && self.depth != 0 {
+            self.rebase_frames(slots);
+        }
 
-        let Some(slot) = slots.get(pc) else {
+        if pc >= slots.total_len() as u64 {
             return self.outside(pc, fresh);
-        };
-        table.of(slot)(ctx, slots, Ip::at(slots, pc), self, table, SPARE, slot);
+        }
+        let ip = Ip::at(slots, pc);
+
+        #[cfg(feature = "fuel")]
+        let (rests, is_short) = self
+            .meter
+            .enter_block(&mut self.fuel, code.raw_slots(), code.rests(), pc);
+        #[cfg(not(feature = "fuel"))]
+        let (rests, is_short) = (RestsPtr::NULL, false);
+
+        if is_short {
+            #[cfg(feature = "fuel")]
+            Metered::step(ctx, slots, ip, self, rests, SPARE, Slot::UNREAD);
+        } else {
+            // SAFETY: `pc < slots.total_len()`, so `ip` lies in `slots`, built for `<M, H>`.
+            let (next, slot) = unsafe { ip.fetch::<M, H>() };
+            next(ctx, slots, ip, self, rests, SPARE, slot);
+        }
 
         // Test the tag alone first: the handler stored the reason one field at a time, and a single load of the whole
         // reason can't take its bytes from several stores, so it waits for them to reach the cache. Each arm builds
@@ -262,7 +275,7 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
         match self.stop.reason {
             Reason::Exit => Stop {
                 reason: Reason::Exit,
-                pc: self.stop.pc(code.slots()),
+                pc: self.stop.pc(slots),
             },
             _ => self.stopped(code),
         }
@@ -274,14 +287,14 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
     #[cold]
     #[inline(never)]
     fn stopped(&mut self, code: &Code) -> Stop<M::Error> {
-        let code = code.slots();
+        let slots = code.threaded(self.meter.table());
         if self.depth != 0 {
-            self.frame_code_first = code.first().addr();
+            self.frame_code_first = slots.first().addr();
         }
         self.meter
-            .settle(&mut self.fuel, code, self.stop.ip(code), &mut self.stop.reason);
+            .settle(&mut self.fuel, slots, self.stop.ip(slots), &mut self.stop.reason);
         Stop {
-            pc: self.stop.pc(code),
+            pc: self.stop.pc(slots),
             // moved out, as the error of the memory needn't be `Copy`
             reason: std::mem::replace(&mut self.stop.reason, Reason::Exit),
         }
@@ -310,7 +323,7 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
             if addr & 1 != 0 {
                 continue;
             }
-            let pc = addr.wrapping_sub(old_first) / size_of::<Slot>();
+            let pc = addr.wrapping_sub(old_first) / size_of::<ThreadedSlot>();
             frame.return_ip = if pc <= new_len {
                 ReturnIp(Ip(new_first.wrapping_add(pc)))
             } else {
@@ -321,8 +334,8 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
     }
 
     /// Stop at a tagged sentinel return ip (`RETURN_PC` from `begin_nested`, or an out-of-range pc after a code swap).
-    #[cold]
-    #[inline(never)]
+    // Inlined into `jump<EXIT>` so the hot return path calls no function and needs no stack frame.
+    #[inline(always)]
     pub(crate) fn exit_special(&mut self, return_ip: Ip) {
         let pc = match return_ip.addr() >> 1 {
             #[cfg(feature = "callbacks")]

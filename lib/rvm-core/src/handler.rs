@@ -1,9 +1,9 @@
-//! The handlers of the eBPF opcodes: [`handler`] for the instructions that continue with the next one, and [`jump`]
-//! for the jump classes, with the host calls it hands on to.
+//! The handlers of the eBPF opcodes: [`handler`] for the instructions that continue with the next one, [`jump`] for
+//! the jump classes, [`alu3_imm`] / [`alu3_reg`] for folded 3-operand ALU pairs, and the host calls.
 
 use crate::code::Slots;
-use crate::dispatch::{Handler, Spare, Table};
-use crate::fuel::Fuel;
+use crate::dispatch::{Handler, Spare};
+use crate::fuel::{Fuel, RestsPtr};
 use crate::host::Callee;
 use crate::opcode::{CALL, CALLX};
 use crate::slot::{Fields, Shape, Slot};
@@ -30,14 +30,87 @@ pub const fn install<M: Memory, H: Host<M>, F: Fuel>(table: &mut [Handler<M, H>;
     table[TO_GUEST as usize] = addr_space_cast::<M, H, false>;
 }
 
-/// The [`Handler`](dispatch::Handler) of opcode `OP` of the ALU, load and store classes.
+/// Apply one of the nine foldable ALU operations (`0..=8`: add, sub, mul, or, and, xor, lsh, rsh, arsh).
+#[inline(always)]
+fn eval_alu3<const ALU64: bool, const OP: u8>(a: u64, b: u64) -> u64 {
+    let a = if ALU64 { a } else { a as u32 as u64 };
+    let b = if ALU64 { b } else { b as u32 as u64 };
+    let sh = if ALU64 { b & 63 } else { b & 31 };
+    let res = match OP {
+        0 => a.wrapping_add(b),
+        1 => a.wrapping_sub(b),
+        2 => a.wrapping_mul(b),
+        3 => a | b,
+        4 => a & b,
+        5 => a ^ b,
+        6 => a << sh,
+        7 => a >> sh,
+        8 => match ALU64 {
+            true => ((a as i64) >> sh) as u64,
+            false => ((a as i32) >> sh) as u64,
+        },
+        _ => unreachable!(),
+    };
+    if ALU64 {
+        res
+    } else {
+        res as u32 as u64
+    }
+}
+
+/// Folded 3-operand ALU with immediate: `dst = src1 op imm` (replaces `mov dst, src1; op dst, imm`).
+#[inline(never)]
+pub extern "rust-preserve-none" fn alu3_imm<M: Memory, H: Host<M>, const ALU64: bool, const OP: u8>(
+    ctx: &mut Context<M>,
+    code: Slots,
+    ip: Ip,
+    interp: &mut Interpreter<M, H>,
+    rests: RestsPtr,
+    _: Spare,
+    slot: Slot,
+) {
+    // SAFETY: `compile_threaded` built `slot` with `Slot::alu3_imm`.
+    let src1 = unsafe { slot.alu3_src1() };
+    let dst = unsafe { slot.alu3_dst() };
+    let imm = match ALU64 {
+        true => slot.alu3_imm_val() as i64 as u64,
+        false => slot.alu3_imm_val() as u32 as u64,
+    };
+    let res = eval_alu3::<ALU64, OP>(ctx.regs.get(src1), imm);
+    ctx.regs.set(dst, res);
+
+    become_at!(ctx, code, ip.offset(2), interp, rests)
+}
+
+/// Folded 3-operand ALU with register: `dst = src1 op src2` (replaces `mov dst, src1; op dst, src2`).
+#[inline(never)]
+pub extern "rust-preserve-none" fn alu3_reg<M: Memory, H: Host<M>, const ALU64: bool, const OP: u8>(
+    ctx: &mut Context<M>,
+    code: Slots,
+    ip: Ip,
+    interp: &mut Interpreter<M, H>,
+    rests: RestsPtr,
+    _: Spare,
+    slot: Slot,
+) {
+    // SAFETY: `compile_threaded` built `slot` with `Slot::alu3_reg`.
+    let src1 = unsafe { slot.alu3_src1() };
+    let dst = unsafe { slot.alu3_dst() };
+    let src2 = unsafe { slot.alu3_src2() };
+    let res = eval_alu3::<ALU64, OP>(ctx.regs.get(src1), ctx.regs.get(src2));
+    ctx.regs.set(dst, res);
+
+    become_at!(ctx, code, ip.offset(2), interp, rests)
+}
+
+/// The [`Handler`](crate::dispatch::Handler) of opcode `OP` of the ALU, load and store classes.
 #[inline(never)]
 pub extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const OP: u8>(
     ctx: &mut Context<M>,
     code: Slots,
     mut ip: Ip,
     interp: &mut Interpreter<M, H>,
-    table: &Table<M, H>,
+    rests: RestsPtr,
     _: Spare,
     slot: Slot,
 ) {
@@ -60,17 +133,17 @@ pub extern "rust-preserve-none" fn handler<M: Memory, H: Host<M>, const OP: u8>(
     }
 
     // `ip` is at `insn` or at the second half of LD_IMM64, which `second_half` found below `len`
-    become_next!(ctx, code, ip, interp, table)
+    become_next!(ctx, code, ip, interp, rests)
 }
 
-/// The [`Handler`](dispatch::Handler) of opcode `OP` of the jump classes. Every such instruction ends its block.
+/// The [`Handler`](crate::dispatch::Handler) of opcode `OP` of the jump classes. Every such instruction ends its block.
 #[inline(never)]
 pub extern "rust-preserve-none" fn jump<M: Memory, H: Host<M>, F: Fuel, const OP: u8>(
     ctx: &mut Context<M>,
     code: Slots,
     mut ip: Ip,
     interp: &mut Interpreter<M, H>,
-    table: &Table<M, H>,
+    rests: RestsPtr,
     _: Spare,
     slot: Slot,
 ) {
@@ -85,7 +158,7 @@ pub extern "rust-preserve-none" fn jump<M: Memory, H: Host<M>, F: Fuel, const OP
                     core::hint::cold_path();
                     return interp.exit_special(ret_ip);
                 }
-                become_enter!(ctx, code, ret_ip, interp, table)
+                become_enter!(ctx, code, ret_ip, interp, rests)
             }
             None => return interp.stop.at(ip, Reason::Exit),
         },
@@ -96,7 +169,7 @@ pub extern "rust-preserve-none" fn jump<M: Memory, H: Host<M>, F: Fuel, const OP
     }
 
     // `ip` is at `insn` or precedes the target of a jump
-    become_enter!(ctx, code, ip.offset(1), interp, table)
+    become_enter!(ctx, code, ip.offset(1), interp, rests)
 }
 
 /// Direct handler for local `call` (`src_reg == 1`): pushes the caller frame and enters the target without checking
@@ -107,7 +180,7 @@ extern "rust-preserve-none" fn local_call<M: Memory, H: Host<M>, F: Fuel>(
     code: Slots,
     ip: Ip,
     interp: &mut Interpreter<M, H>,
-    table: &Table<M, H>,
+    rests: RestsPtr,
     _: Spare,
     slot: Slot,
 ) {
@@ -116,7 +189,7 @@ extern "rust-preserve-none" fn local_call<M: Memory, H: Host<M>, F: Fuel>(
     if !interp.push(&mut ctx.regs, ip.offset(1)) {
         return interp.stop.at(ip, Reason::StackOverflow);
     }
-    become_enter!(ctx, code, ip.offset(i64::from(offset) + 1), interp, table)
+    become_enter!(ctx, code, ip.offset(i64::from(offset) + 1), interp, rests)
 }
 
 /// The rest of the handler of a helper `call`, or with `KFUNC` a kfunc `call`: runs it on the host and continues with
@@ -128,7 +201,7 @@ extern "rust-preserve-none" fn host_call<M: Memory, H: Host<M>, F: Fuel, const K
     code: Slots,
     ip: Ip,
     interp: &mut Interpreter<M, H>,
-    table: &Table<M, H>,
+    rests: RestsPtr,
     _: Spare,
     slot: Slot,
 ) {
@@ -144,7 +217,7 @@ extern "rust-preserve-none" fn host_call<M: Memory, H: Host<M>, F: Fuel, const K
     interp.windows.revalidate(ctx.memory);
     ctx.regs[0] = r0;
 
-    become_enter!(ctx, code, ip.offset(1), interp, table)
+    become_enter!(ctx, code, ip.offset(1), interp, rests)
 }
 
 /// The rest of the handler of `callx`: enters the guest function that [`Host::call_indirect`] names, as a local call
@@ -158,7 +231,7 @@ pub extern "rust-preserve-none" fn indirect_call<M: Memory, H: Host<M>, F: Fuel,
     code: Slots,
     ip: Ip,
     interp: &mut Interpreter<M, H>,
-    table: &Table<M, H>,
+    rests: RestsPtr,
     _: Spare,
     slot: Slot,
 ) {
@@ -173,18 +246,18 @@ pub extern "rust-preserve-none" fn indirect_call<M: Memory, H: Host<M>, F: Fuel,
     match callee {
         Some(Callee::Local(pc)) => {
             // the slots from `len` on all hold the guard, and no slot below it does
-            let in_code = code.get(pc).is_some_and(|slot| slot.byte() != transfer::GUARD);
+            let in_code = code.raw_slot(pc).is_some_and(|slot| slot.byte() != transfer::GUARD);
             if !in_code {
                 return interp.stop.at(ip, Reason::CallIndirect(target));
             }
             if !interp.push(&mut ctx.regs, ip.offset(1)) {
                 return interp.stop.at(ip, Reason::StackOverflow);
             }
-            become_at_pc!(ctx, code, pc, interp, table)
+            become_at_pc!(ctx, code, pc, interp, rests)
         }
         Some(Callee::Host(r0)) => {
             ctx.regs[0] = r0;
-            become_enter!(ctx, code, ip.offset(1), interp, table)
+            become_enter!(ctx, code, ip.offset(1), interp, rests)
         }
         None => interp.stop.at(ip, Reason::CallIndirect(target)),
     }
@@ -197,7 +270,7 @@ extern "rust-preserve-none" fn addr_space_cast<M: Memory, H: Host<M>, const TO_H
     code: Slots,
     ip: Ip,
     interp: &mut Interpreter<M, H>,
-    table: &Table<M, H>,
+    rests: RestsPtr,
     _: Spare,
     slot: Slot,
 ) {
@@ -210,5 +283,5 @@ extern "rust-preserve-none" fn addr_space_cast<M: Memory, H: Host<M>, const TO_H
     };
     ctx.regs.set(insn.dst_reg(), dst);
 
-    become_next!(ctx, code, ip, interp, table)
+    become_next!(ctx, code, ip, interp, rests)
 }

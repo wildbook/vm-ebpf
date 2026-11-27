@@ -18,9 +18,11 @@
 //! that stores a stack argument ([`CALLX`]).
 
 use crate::code::Slots;
-use crate::dispatch::{Handler, Spare, Table};
-use crate::fuel::Fuel;
+use crate::dispatch::{Handler, Spare};
+use crate::fuel::{Fuel, RestsPtr};
 use crate::handler::indirect_call;
+#[cfg(feature = "fuel")]
+use crate::slot::View;
 use crate::slot::{Fields, Shape, Slot};
 use crate::step::Regs;
 use crate::transfer::Ip;
@@ -81,6 +83,30 @@ pub const fn install<M: Memory, H: Host<M>, F: Fuel>(table: &mut [Handler<M, H>;
     table[CALLX as usize] = indirect_call::<M, H, F, true>;
 }
 
+/// Execute a single stack-argument load or store during cold short-block fuel stepping.
+#[cfg(feature = "fuel")]
+pub fn step_arg<M: Memory, H: Host<M>>(interp: &mut Interpreter<M, H>, regs: &mut [u64; 16], slot: Slot) {
+    match slot.byte() {
+        LOAD => {
+            // SAFETY: `slot` has byte `LOAD`.
+            let insn = unsafe { View::new(&slot, Some(slot), const { Shape::of(LOAD) }) };
+            regs.set(insn.dst_reg(), interp.incoming()[slot_at(insn.offset())]);
+        }
+        STORE => {
+            // SAFETY: `slot` has byte `STORE`.
+            let insn = unsafe { View::new(&slot, Some(slot), const { Shape::of(STORE) }) };
+            let val = regs.get(insn.src_reg());
+            interp.outgoing()[slot_at(insn.offset().wrapping_neg())] = val;
+        }
+        STORE_IMM => {
+            // SAFETY: `slot` has byte `STORE_IMM`.
+            let insn = unsafe { View::new(&slot, Some(slot), const { Shape::of(STORE_IMM) }) };
+            interp.outgoing()[slot_at(insn.offset().wrapping_neg())] = i64::from(insn.imm()) as u64;
+        }
+        _ => unreachable!("not a stack-argument load or store"),
+    }
+}
+
 /// The handler of [`LOAD`].
 #[inline(never)]
 extern "rust-preserve-none" fn load<M: Memory, H: Host<M>>(
@@ -88,7 +114,7 @@ extern "rust-preserve-none" fn load<M: Memory, H: Host<M>>(
     code: Slots,
     ip: Ip,
     interp: &mut Interpreter<M, H>,
-    table: &Table<M, H>,
+    rests: RestsPtr,
     _: Spare,
     slot: Slot,
 ) {
@@ -97,7 +123,7 @@ extern "rust-preserve-none" fn load<M: Memory, H: Host<M>>(
     let value = interp.incoming()[slot_at(insn.offset())];
     ctx.regs.set(insn.dst_reg(), value);
 
-    become_next!(ctx, code, ip, interp, table)
+    become_next!(ctx, code, ip, interp, rests)
 }
 
 /// The handler of [`STORE`], or with `IMM` of [`STORE_IMM`].
@@ -107,7 +133,7 @@ extern "rust-preserve-none" fn store<M: Memory, H: Host<M>, const IMM: bool>(
     code: Slots,
     ip: Ip,
     interp: &mut Interpreter<M, H>,
-    table: &Table<M, H>,
+    rests: RestsPtr,
     _: Spare,
     slot: Slot,
 ) {
@@ -119,7 +145,7 @@ extern "rust-preserve-none" fn store<M: Memory, H: Host<M>, const IMM: bool>(
     };
     interp.outgoing()[slot_at(insn.offset().wrapping_neg())] = value;
 
-    become_next!(ctx, code, ip, interp, table)
+    become_next!(ctx, code, ip, interp, rests)
 }
 
 /// The handler of [`CALL`]: runs the kfunc on the host with the stack arguments of the frame, and continues with
@@ -130,7 +156,7 @@ extern "rust-preserve-none" fn host_call<M: Memory, H: Host<M>, F: Fuel>(
     code: Slots,
     ip: Ip,
     interp: &mut Interpreter<M, H>,
-    table: &Table<M, H>,
+    rests: RestsPtr,
     _: Spare,
     slot: Slot,
 ) {
@@ -143,7 +169,7 @@ extern "rust-preserve-none" fn host_call<M: Memory, H: Host<M>, F: Fuel>(
     interp.windows.revalidate(ctx.memory);
     ctx.regs[0] = r0;
 
-    become_enter!(ctx, code, ip.offset(1), interp, table)
+    become_enter!(ctx, code, ip.offset(1), interp, rests)
 }
 
 #[cfg(test)]
@@ -264,7 +290,7 @@ mod tests {
     #[test]
     fn only_slots_through_r11() {
         let dw = MemSize::DWord;
-        let byte = |insn: Instruction| Code::new([insn, EXIT]).slots().get(0).unwrap().byte();
+        let byte = |insn: Instruction| Code::new([insn, EXIT]).raw_slot(0).unwrap().byte();
 
         for k in 1..=MAX_STACK_ARGS as i16 {
             assert_eq!(byte(ldx(dw, 1, R11, 8 * k)), LOAD);
