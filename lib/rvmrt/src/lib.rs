@@ -890,6 +890,7 @@ mod tests {
                     args: vec![rvm::ArgKind::Int, rvm::ArgKind::Int],
                     ret: rvm::ReturnKind::Int,
                     variadic: false,
+                    calls_back: false,
                     borrows: Vec::new(),
                 }),
                 stack: false,

@@ -15,7 +15,7 @@ use hashbrown::HashMap;
 
 use crate::error::{LinkError, Result, VmError};
 use crate::executor::{CORE_POISON_HELPER, MAX_ARGS, REG_ARGS};
-use crate::image::{set_imm, set_slot_call, Address, Image, Import, Site, INSN_SIZE};
+use crate::image::{set_imm, set_slot_call, Address, CallbackInfo, Image, Import, Site, INSN_SIZE};
 use crate::layout::{BORROW_REGIONS, CODE_REGION, DATA_REGION, RODATA_REGION};
 use crate::map_def::map_defs;
 use crate::memory::{region_tag, split_addr, MemoryBudget, MAX_REGION_LEN};
@@ -129,9 +129,10 @@ pub fn link<'m>(types: &BtfBuilder, modules: &[&'m Module], memory_limit: usize)
     }
 
     // Relocations record maps and named externs; then numeric helper calls.
+    let mut taken_code = Vec::new();
     for ((module, layout), externs) in modules.iter().zip(&layouts).zip(&externs) {
         for reloc in &module.relocations {
-            apply_relocation(externs, module, layout, &global_symbols, reloc, &mut image)?;
+            apply_relocation(externs, module, layout, &global_symbols, reloc, &mut image, &mut taken_code)?;
         }
     }
     mark_helper_calls(&mut image)?;
@@ -139,6 +140,7 @@ pub fn link<'m>(types: &BtfBuilder, modules: &[&'m Module], memory_limit: usize)
 
     image.functions = build_function_table(modules, &layouts, &btfs)?.into_iter().collect();
     image.functions.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    image.callbacks = build_callback_table(modules, &layouts, &btfs, taken_code)?;
     trim_zeros(&mut image.rodata);
     trim_zeros(&mut image.data);
     Ok(image)
@@ -260,6 +262,7 @@ impl ExternDecls {
         };
         let mut borrows = function_borrows(Some(btf))?;
         let mut imports = import_tags(btf)?;
+        let calls_back = calls_back_tags(btf);
         let mut decls = HashMap::new();
         for (_, ty) in btf.types() {
             let BtfType::Func {
@@ -271,10 +274,13 @@ impl ExternDecls {
                 continue;
             };
             let func_borrows = borrows.remove(*name).unwrap_or_default();
-            let Some(proto) = proto::from_btf(btf, *proto_type, func_borrows) else {
+            let Some(mut proto) = proto::from_btf(btf, *proto_type, func_borrows) else {
                 let msg = format!("extern {name}: a parameter or return type no register holds");
                 return Err(LinkError::InvalidReference(msg).into());
             };
+            if calls_back.contains(*name) {
+                proto.calls_back = true;
+            }
             if !proto.variadic && proto.reg_count() > MAX_ARGS {
                 return Err(LinkError::TooManyRegisters {
                     name: (*name).to_string(),
@@ -348,6 +354,30 @@ fn import_tags(btf: &Btf<'_>) -> Result<HashMap<String, ImportTag>> {
     Ok(tags)
 }
 
+/// Extern functions carrying `btf_decl_tag("rvm:calls_back")` (`CALLS_BACK`).
+fn calls_back_tags<'a>(btf: &Btf<'a>) -> hashbrown::HashSet<&'a str> {
+    let mut set = hashbrown::HashSet::new();
+    for (_, ty) in btf.types() {
+        let BtfType::DeclTag {
+            name: "rvm:calls_back",
+            type_id,
+            component_idx: -1,
+        } = ty
+        else {
+            continue;
+        };
+        if let Some(BtfType::Func {
+            name,
+            linkage: BTF_FUNC_EXTERN,
+            ..
+        }) = btf.type_by_id(*type_id)
+        {
+            set.insert(*name);
+        }
+    }
+    set
+}
+
 /// Every module's exported symbols by name; two different definitions of one name fail.
 fn build_symbol_table(modules: &[&Module], layouts: &[ModuleLayout]) -> Result<HashMap<String, Addr>> {
     let mut symbols = HashMap::new();
@@ -376,6 +406,7 @@ fn apply_relocation(
     global_symbols: &HashMap<String, Addr>,
     reloc: &Relocation,
     image: &mut Image,
+    taken_code: &mut Vec<u64>,
 ) -> Result<()> {
     // relocations in sections that aren't loaded (debug info, BTF) don't matter here
     let Some(&patch) = layout.sections.get(&reloc.section_idx) else {
@@ -453,12 +484,20 @@ fn apply_relocation(
     match (reloc.rel_type, patch, sym_addr) {
         (reloc::bpf::BPF_64_64, Addr::Code(at), target) => {
             image.set_ld_imm64(at, target.guest().wrapping_add_signed(reloc.addend))?;
-            if let Addr::Data(target) = target {
-                let at = Site::Code((at / INSN_SIZE) as u32);
-                image.addresses.push(Address {
-                    at,
-                    region: split_addr(target).0,
-                });
+            match target {
+                Addr::Data(target) => {
+                    let at = Site::Code((at / INSN_SIZE) as u32);
+                    image.addresses.push(Address {
+                        at,
+                        region: split_addr(target).0,
+                    });
+                }
+                Addr::Code(base) => {
+                    let dest = base.wrapping_add_signed(reloc.addend);
+                    if dest.is_multiple_of(INSN_SIZE) {
+                        taken_code.push(dest / INSN_SIZE);
+                    }
+                }
             }
         }
         (reloc::bpf::BPF_64_32, Addr::Code(at), Addr::Code(target)) => {
@@ -471,15 +510,23 @@ fn apply_relocation(
             // a data or function pointer stored in global data
             let addr = target.guest().wrapping_add_signed(reloc.addend);
             image.data_mut(at, 8)?.copy_from_slice(&addr.to_le_bytes());
-            if let Addr::Data(target) = target {
-                let at = match split_addr(at) {
-                    (RODATA_REGION, offset) => Site::RoData(offset as u32),
-                    (_, offset) => Site::Data(offset as u32),
-                };
-                image.addresses.push(Address {
-                    at,
-                    region: split_addr(target).0,
-                });
+            match target {
+                Addr::Data(target) => {
+                    let at = match split_addr(at) {
+                        (RODATA_REGION, offset) => Site::RoData(offset as u32),
+                        (_, offset) => Site::Data(offset as u32),
+                    };
+                    image.addresses.push(Address {
+                        at,
+                        region: split_addr(target).0,
+                    });
+                }
+                Addr::Code(base) => {
+                    let dest = base.wrapping_add_signed(reloc.addend);
+                    if dest.is_multiple_of(INSN_SIZE) {
+                        taken_code.push(dest / INSN_SIZE);
+                    }
+                }
             }
         }
         // calls into data, and relocation types a loaded section shouldn't carry
@@ -582,6 +629,92 @@ fn build_function_table(
     }
 
     Ok(functions)
+}
+
+/// Record the BTF prototype and optional export name of every plugin function whose address was taken.
+fn build_callback_table(
+    modules: &[&Module],
+    layouts: &[ModuleLayout],
+    btfs: &[Option<Btf<'_>>],
+    mut taken_code: Vec<u64>,
+) -> Result<Vec<CallbackInfo>> {
+    if taken_code.is_empty() {
+        return Ok(Vec::new());
+    }
+    taken_code.sort_unstable();
+    taken_code.dedup();
+
+    let mut by_pc: HashMap<u64, (Option<String>, Proto)> = HashMap::new();
+    for ((module, layout), btf) in modules.iter().zip(layouts).zip(btfs) {
+        let Some(btf) = btf else {
+            continue;
+        };
+        let export_at = |name: &str, section_idx: usize, offset: u64| -> Option<String> {
+            let exp = module.exports.get(name)?;
+            (exp.is_function && exp.section_idx == section_idx && exp.offset == offset).then(|| name.to_string())
+        };
+
+        if let Some(btf_ext_data) = &module.btf_ext_data {
+            let btf_ext = btf::BtfExt::parse(btf_ext_data, btf.strings())?;
+            for (section_idx, section) in module.sections.iter().enumerate() {
+                let Some(&Addr::Code(sec_at)) = layout.sections.get(&section_idx) else {
+                    continue;
+                };
+                let infos = btf_ext.func_infos_for_section(&section.name).or_else(|| {
+                    btf_ext.func_infos_for_section(section.name.strip_prefix('.').unwrap_or(&section.name))
+                });
+                let Some(infos) = infos else {
+                    continue;
+                };
+                for info in infos {
+                    let Some(BtfType::Func { name, proto_type, .. }) = btf.type_by_id(info.type_id) else {
+                        continue;
+                    };
+                    let offset = u64::from(info.insn_off);
+                    let pc = (sec_at + offset) / INSN_SIZE;
+                    if let Some(proto) = proto::from_btf(btf, *proto_type, Vec::new()) {
+                        by_pc.insert(pc, (export_at(name, section_idx, offset), proto));
+                    }
+                }
+            }
+        }
+
+        // Fallback for objects carrying `.BTF` without `.BTF.ext` func_info records.
+        for sym in &module.symbols {
+            let Some(section_idx) = sym.section_idx else {
+                continue;
+            };
+            let Some(&Addr::Code(sec_at)) = layout.sections.get(&section_idx) else {
+                continue;
+            };
+            if sym.name.is_empty() || !sym.value.is_multiple_of(INSN_SIZE) {
+                continue;
+            }
+            let pc = (sec_at + sym.value) / INSN_SIZE;
+            if by_pc.contains_key(&pc) {
+                continue;
+            }
+            let found = btf.types().find_map(|(_, ty)| match ty {
+                BtfType::Func {
+                    name,
+                    proto_type,
+                    linkage,
+                } if *linkage != BTF_FUNC_EXTERN && *name == sym.name => Some(*proto_type),
+                _ => None,
+            });
+            if let Some(proto) = found.and_then(|pt| proto::from_btf(btf, pt, Vec::new())) {
+                by_pc.insert(pc, (export_at(&sym.name, section_idx, sym.value), proto));
+            }
+        }
+    }
+
+    let mut callbacks = Vec::new();
+    for pc in taken_code {
+        if let Some((name, proto)) = by_pc.remove(&pc) {
+            callbacks.push(CallbackInfo { pc, name, proto });
+        }
+    }
+    Ok(callbacks)
 }
 
 /// `borrow:N` / `borrow_ro:N` decl tags on function parameters, by function name, with each parameter mapped to its

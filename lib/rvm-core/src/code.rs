@@ -213,6 +213,13 @@ impl<'a> Slots<'a> {
         self.first
     }
 
+    /// The code these slots belong to.
+    #[cfg(feature = "callbacks")]
+    #[inline(always)]
+    pub fn code(self) -> &'a Code {
+        self.code
+    }
+
     /// All slots.
     #[inline(always)]
     pub fn all(self) -> &'a [Slot] {

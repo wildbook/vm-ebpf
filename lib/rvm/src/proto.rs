@@ -58,6 +58,8 @@ pub struct Proto {
     pub args: Vec<ArgKind>,
     pub ret: ReturnKind,
     pub variadic: bool,
+    /// Marked with `CALLS_BACK` (`btf_decl_tag("rvm:calls_back")`): may invoke previously registered callbacks.
+    pub calls_back: bool,
     /// `borrow` / `borrow_ro` tags on pointer parameters, indexed by argument register.
     pub borrows: Vec<Borrow>,
 }
@@ -75,6 +77,19 @@ impl Proto {
         matches!(self.ret, ReturnKind::Agg(9..=16))
     }
 
+    /// Whether this prototype requires callback awareness (`CALLS_BACK` or a `Callback` parameter) when the
+    /// `callbacks` feature is enabled.
+    pub fn needs_callbacks(&self) -> bool {
+        #[cfg(feature = "callbacks")]
+        {
+            self.calls_back || self.args.iter().any(|a| matches!(a, ArgKind::Callback))
+        }
+        #[cfg(not(feature = "callbacks"))]
+        {
+            false
+        }
+    }
+
     /// Whether a native call with this prototype needs the `GENERAL` marshalling handler instead of the fast
     /// integer/pointer handlers.
     pub fn needs_general(&self) -> bool {
@@ -84,6 +99,7 @@ impl Proto {
                 .args
                 .iter()
                 .any(|a| matches!(a, ArgKind::Float(_) | ArgKind::Copy(_)))
+            || self.needs_callbacks()
     }
 
     /// Check that this prototype matches a host-registered native signature `sig`.
@@ -170,8 +186,31 @@ impl Proto {
         let mut args = [GeneralArg::Value; MAX_NATIVE_ARGS];
         for (i, &arg) in self.args.iter().enumerate() {
             args[i] = match arg {
-                ArgKind::Int | ArgKind::Float(4 | 8) => GeneralArg::Value,
-                ArgKind::Ptr | ArgKind::Callback => {
+                ArgKind::Int => GeneralArg::Value,
+                ArgKind::Float(4 | 8) => GeneralArg::Float,
+                #[cfg(feature = "callbacks")]
+                ArgKind::Callback => GeneralArg::Callback,
+                #[cfg(not(feature = "callbacks"))]
+                ArgKind::Callback => {
+                    if !tagged {
+                        GeneralArg::Value
+                    } else if let Some(sig) = host_sig {
+                        match sig.arg((i + 1) as u8) {
+                            Some(NativeArg::Read(len)) => GeneralArg::Checked {
+                                write: false,
+                                len_arg: len.unwrap_or(0),
+                            },
+                            Some(NativeArg::Write(len)) => GeneralArg::Checked {
+                                write: true,
+                                len_arg: len.unwrap_or(0),
+                            },
+                            _ => GeneralArg::Value,
+                        }
+                    } else {
+                        GeneralArg::Strip
+                    }
+                }
+                ArgKind::Ptr => {
                     if !tagged {
                         GeneralArg::Value
                     } else if let Some(sig) = host_sig {
@@ -208,7 +247,7 @@ impl Proto {
             nargs: self.args.len() as u8,
             ret,
             variadic: self.variadic,
-            aware: host_sig.is_some_and(NativeSig::is_aware),
+            aware: host_sig.is_some_and(NativeSig::is_aware) || self.needs_callbacks(),
         })
     }
 
@@ -298,6 +337,7 @@ pub fn from_btf(btf: &Btf<'_>, proto_type: u32, borrows: Vec<Borrow>) -> Option<
         args,
         ret,
         variadic,
+        calls_back: false,
         borrows,
     })
 }

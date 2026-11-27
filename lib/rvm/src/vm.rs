@@ -519,6 +519,13 @@ impl Vm {
         self.helpers.update(|h| std_helpers::register_print(h, sink));
     }
 
+    /// Enable the `rvm_callback` and `rvm_callback_free` builtins so plugins can create retained native-callable
+    /// function pointers (which live until freed or until their program is dropped).
+    #[cfg(feature = "callbacks")]
+    pub fn enable_callbacks(&self) {
+        self.helpers.update(crate::callbacks::register_builtins);
+    }
+
     /// Share maps called `name` between every program linked afterwards: they bind to one instance, created by the
     /// first program that declares it, and later declarations must match its layout.
     ///

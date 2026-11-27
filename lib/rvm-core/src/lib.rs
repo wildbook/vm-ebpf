@@ -136,6 +136,8 @@ mod native;
 mod rewrite;
 mod slot;
 mod step;
+#[cfg(feature = "callbacks")]
+mod thunk;
 mod transfer;
 mod windows;
 
@@ -146,11 +148,17 @@ pub use code::Code;
 pub use context::Context;
 pub use host::{Callee, Host};
 pub use instruction::Instruction;
+#[cfg(feature = "callbacks")]
+pub use interp::RETURN_PC;
 pub use interp::{Interpreter, Reason, Stop, MAX_CALL_DEPTH, METERED};
 pub use memory::{AtomicOp, Memory, Window};
+#[cfg(feature = "callbacks")]
+pub use native::{call_active, has_active_callback};
 pub use native::{
     call_bound, BoundError, Native, NativeArg, NativeBind, NativeCall, NativeFn, NativeMode, NativeSig,
     MAX_ARGS as MAX_NATIVE_ARGS,
 };
 #[cfg(feature = "ffi")]
 pub use native::{fail_code, fail_error, GeneralArg, GeneralProto, GeneralRet, NativeFail};
+#[cfg(feature = "callbacks")]
+pub use thunk::{set_thunk_handler, thunk_addr, thunk_index, ThunkHandler, THUNK_COUNT};

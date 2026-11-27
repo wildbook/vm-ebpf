@@ -5,11 +5,15 @@ use std::sync::Arc;
 
 #[cfg(feature = "ffi")]
 use rvm_core::NativeFail;
+#[cfg(feature = "callbacks")]
+use rvm_core::RETURN_PC;
 use rvm_core::{
     call_bound, BoundError, Callee, Code, Context, Host, Interpreter, Native, NativeCall, NativeMode, Reason,
     StackArgs, MAX_STACK_ARGS, METERED,
 };
 
+#[cfg(feature = "callbacks")]
+use crate::callbacks::{release_slot, ProgramCallbacks};
 #[cfg(feature = "ffi")]
 use crate::error::HostError;
 use crate::error::{ExecError, MemoryError, Result, VmError};
@@ -84,6 +88,12 @@ impl Executor {
     /// Set the resolved `&extern` tokens for this program.
     pub fn set_tokens(&mut self, tokens: Box<[Token]>) {
         self.interp.host.tokens = tokens;
+    }
+
+    /// Callback metadata and retained thunk slots for this program.
+    #[cfg(feature = "callbacks")]
+    pub fn callbacks_mut(&mut self) -> &mut ProgramCallbacks {
+        &mut self.interp.host.state.callbacks
     }
 
     /// The maps passed to helpers through [`HostState::maps`].
@@ -344,7 +354,48 @@ fn resume_at(reason: Reason<u64>, pc: u64, code: &Code, interp: &mut Interpreter
 fn native_fail_error(fail: NativeFail) -> VmError {
     match fail {
         NativeFail::Code(code) => HostError::Native { code }.into(),
-        NativeFail::Error(error) => HostError::Failed(error).into(),
+        NativeFail::Error(error) => match error.downcast::<VmError>() {
+            Ok(vm_err) => *vm_err,
+            Err(error) => HostError::Failed(error).into(),
+        },
+    }
+}
+
+/// Run a nested callback inside an active aware native call, driving `run_on` for `gotox` and metered host calls
+/// until the callback exits to [`RETURN_PC`] or fails.
+#[cfg(feature = "callbacks")]
+#[cold]
+#[inline(never)]
+fn call_nested_on(
+    code: &Code,
+    ctx: &mut Context<VmMemory>,
+    interp: &mut Interpreter<VmMemory, HostCalls>,
+    pc: u64,
+    args: &[u64; REG_ARGS],
+) -> Result<u64> {
+    let Some(entry_depth) = interp.begin_nested(ctx, args) else {
+        return Err(ExecError::StackOverflow { pc }.into());
+    };
+    if pc == RETURN_PC {
+        interp.abort_nested(ctx, entry_depth);
+        return Err(ExecError::InvalidPc { pc }.into());
+    }
+    let mut stop = interp.resume(ctx, code, pc);
+    loop {
+        if stop.pc == RETURN_PC && matches!(stop.reason, Reason::BadPc | Reason::OutOfFuel) {
+            return Ok(ctx.regs[0]);
+        }
+        let next = match interp.host.take_fuel_wanted(stop.reason) {
+            Some((slot, stack_token)) => call_with_fuel(slot, stack_token, stop.pc, code, ctx, interp),
+            None => resume_at(stop.reason, stop.pc, code, interp),
+        };
+        match next {
+            Ok(next_pc) => stop = interp.resume(ctx, code, next_pc),
+            Err(err) => {
+                interp.abort_nested(ctx, entry_depth);
+                return Err(err);
+            }
+        }
     }
 }
 
@@ -517,6 +568,66 @@ impl Host<VmMemory> for HostCalls {
     fn natives(&self) -> &[Native] {
         self.table.natives()
     }
+
+    #[cfg(feature = "callbacks")]
+    fn callback_program(&self) -> u64 {
+        self.state.callbacks.program_id
+    }
+
+    #[cfg(feature = "callbacks")]
+    fn prepare_callback(&self, value: u64) -> std::result::Result<(u64, Option<u8>), NativeFail> {
+        if value == 0 {
+            return Ok((0, None));
+        }
+        if let Some(pc) = code_index(value) {
+            return match self.state.callbacks.claim_scoped(pc) {
+                Some(Ok((addr, slot))) => Ok((addr, Some(slot))),
+                Some(Err(err)) => Err(NativeFail::Error(Box::new(err))),
+                None => {
+                    Err(NativeFail::Error(Box::new(VmError::Exec(ExecError::BadCodeAddress { pc: 0, target: value }))))
+                }
+            };
+        }
+        if let Some(token) = self.token_at(value) {
+            return match token {
+                Token::Native { index, .. } => match self.table.natives().get(index as usize) {
+                    Some(nat) => Ok((nat.func as usize as u64, None)),
+                    None => {
+                        Err(NativeFail::Error(Box::new(VmError::Exec(ExecError::UnknownExtern { pc: 0, slot: index }))))
+                    }
+                },
+                Token::Slot { .. } => Err(NativeFail::Error(Box::new(VmError::InvalidArgument(
+                    "cannot pass a host closure or plugin export as a C callback".into(),
+                )))),
+            };
+        }
+        Ok((value, None))
+    }
+
+    #[cfg(feature = "callbacks")]
+    fn release_callback(&self, slot: u8) {
+        release_slot(slot);
+    }
+
+    #[cfg(feature = "callbacks")]
+    fn run_nested(
+        ctx: &mut Context<VmMemory>,
+        interp: &mut Interpreter<VmMemory, Self>,
+        code: &Code,
+        pc: u64,
+        args: &[u64; REG_ARGS],
+        fail: &mut Option<NativeFail>,
+    ) -> u64 {
+        match call_nested_on(code, ctx, interp, pc, args) {
+            Ok(r0) => r0,
+            Err(err) => {
+                if fail.is_none() {
+                    *fail = Some(NativeFail::Error(Box::new(err)));
+                }
+                0
+            }
+        }
+    }
 }
 
 /// The fault at `pc` of the load or store, or of the native call's pointer argument, that failed at `addr`.
@@ -538,7 +649,7 @@ fn jump_indirect(target: u64, pc: u64, code: &Code) -> Result<u64> {
 
 /// Instruction index of the guest code address `addr`, if it is an instruction boundary in the code region. The index
 /// may lie past the end of the code.
-fn code_index(addr: u64) -> Option<u64> {
+pub fn code_index(addr: u64) -> Option<u64> {
     let offset = addr.checked_sub(region_tag(CODE_REGION))?;
     (offset % INSN_SIZE == 0).then_some(offset / INSN_SIZE)
 }

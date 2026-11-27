@@ -17,6 +17,11 @@ use crate::{Code, Context, Host, Memory};
 /// Maximum nesting of local calls below the entry frame.
 pub const MAX_CALL_DEPTH: usize = 8;
 
+/// Sentinel return pc pushed by [`Interpreter::begin_nested`] / [`Interpreter::call_nested`].
+/// Every real code has fewer than 2^31 slots, so `exit` popping `RETURN_PC - 1` stops at `RETURN_PC`.
+#[cfg(feature = "callbacks")]
+pub const RETURN_PC: u64 = u64::MAX;
+
 /// Whether an [`Interpreter`] can meter fuel (`Interpreter::set_limit`), which the `fuel` feature decides.
 pub const METERED: bool = cfg!(feature = "fuel");
 
@@ -156,6 +161,58 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
     pub fn resume(&mut self, ctx: &mut Context<M>, code: &Code, pc: u64) -> Stop<M::Error> {
         let table = self.meter.resume(&mut self.fuel, code.slots(), pc);
         self.enter(ctx, code, pc, table, false)
+    }
+
+    /// Push a nested callback frame returning to [`RETURN_PC`], copy `args` into r1 to r5, and return the previous
+    /// call depth, or `None` on [`Reason::StackOverflow`].
+    #[cfg(feature = "callbacks")]
+    pub fn begin_nested(&mut self, ctx: &mut Context<M>, args: &[u64; 5]) -> Option<usize> {
+        let entry_depth = self.depth;
+        if !self.push(&mut ctx.regs, RETURN_PC - 1) {
+            return None;
+        }
+        ctx.regs[1..=5].copy_from_slice(args);
+        Some(entry_depth)
+    }
+
+    /// Restore call frames and callee-saved registers back to `entry_depth` after a nested callback stops early.
+    #[cfg(feature = "callbacks")]
+    pub fn abort_nested(&mut self, ctx: &mut Context<M>, entry_depth: usize) {
+        while self.depth > entry_depth {
+            self.pop(&mut ctx.regs);
+        }
+    }
+
+    /// Run the guest function at `pc` of `code` inside a run that is already in progress, sharing its registers,
+    /// stack, and fuel. Returns the callee's r0 on normal `exit`, or restores frames to entry depth and returns the
+    /// stop on any fault, fuel exhaustion, or host stop.
+    #[cfg(feature = "callbacks")]
+    pub fn call_nested(
+        &mut self,
+        ctx: &mut Context<M>,
+        code: &Code,
+        pc: u64,
+        args: &[u64; 5],
+    ) -> Result<u64, Stop<M::Error>> {
+        let Some(entry_depth) = self.begin_nested(ctx, args) else {
+            return Err(Stop {
+                reason: Reason::StackOverflow,
+                pc,
+            });
+        };
+        if pc == RETURN_PC {
+            self.abort_nested(ctx, entry_depth);
+            return Err(Stop {
+                reason: Reason::BadPc,
+                pc,
+            });
+        }
+        let stop = self.resume(ctx, code, pc);
+        if stop.pc == RETURN_PC && matches!(stop.reason, Reason::BadPc | Reason::OutOfFuel) {
+            return Ok(ctx.regs[0]);
+        }
+        self.abort_nested(ctx, entry_depth);
+        Err(stop)
     }
 
     /// Runs `code` from `pc` through `table`, for a call that starts there if `fresh` and one that resumes if not.

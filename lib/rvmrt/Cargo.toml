@@ -17,6 +17,8 @@ default = ["fuel"]
 fuel = ["rvm/fuel"]
 # General native FFI marshalling: structs by value/return, float/double returns, variadics.
 ffi = ["rvm/ffi"]
+# Synchronous native-to-guest callbacks.
+callbacks = ["ffi", "rvm/callbacks"]
 
 [dependencies]
 rvm = { path = "../rvm", default-features = false }

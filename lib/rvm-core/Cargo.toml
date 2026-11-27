@@ -15,3 +15,5 @@ default = ["fuel"]
 fuel = []
 # General native call marshalling (structs of 3/5/6/7 and 9..16 bytes, struct returns, float/double returns, variadics).
 ffi = []
+# Native-to-guest callbacks: nested runs (`call_nested`), aware call context, and static thunk pool.
+callbacks = ["ffi"]

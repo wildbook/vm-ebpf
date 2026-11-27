@@ -10,13 +10,19 @@ use std::sync::Arc;
 use hashbrown::HashMap;
 use rvm_core::Code;
 
+#[cfg(feature = "callbacks")]
+use crate::callbacks::ProgramCallbacks;
 use crate::error::{MemoryError, Result, VmError};
 use crate::executor::{fuel_for, Executor, Token, MAX_ARGS};
 use crate::helper::{SharedHelpers, Snapshot};
+#[cfg(feature = "callbacks")]
+use crate::image::CallbackInfo;
 #[cfg(feature = "maps")]
 use crate::maps::{MapRef, Maps};
 use crate::memory::{Perms, Region, Scalar, VmMemory};
 use crate::plugin::not_found;
+#[cfg(feature = "callbacks")]
+use crate::plugin::WeakPlugin;
 use crate::vm::VmConfig;
 
 /// Information about an executable function.
@@ -59,6 +65,13 @@ impl Borrow {
 pub struct Func {
     program: u64,
     pc: u64,
+}
+
+#[cfg(feature = "callbacks")]
+impl Func {
+    pub fn pc(self) -> u64 {
+        self.pc
+    }
 }
 
 /// What a call with an instruction limit of its own returns; see [`Program::call_func_with_limit`].
@@ -140,6 +153,40 @@ impl Program {
     pub(crate) fn with_tokens(mut self, tokens: Box<[Token]>) -> Self {
         self.executor.set_tokens(tokens);
         self
+    }
+
+    /// Attach address-taken function prototypes for callback thunk unmarshalling.
+    #[cfg(feature = "callbacks")]
+    pub(crate) fn with_callbacks(mut self, callbacks: &[CallbackInfo]) -> Self {
+        *self.executor.callbacks_mut() = ProgramCallbacks::new(self.id, callbacks);
+        self
+    }
+
+    #[cfg(feature = "callbacks")]
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    #[cfg(feature = "callbacks")]
+    pub(crate) fn set_plugin(&mut self, plugin: WeakPlugin) {
+        self.executor.callbacks_mut().set_plugin(plugin);
+    }
+
+    #[cfg(feature = "callbacks")]
+    pub(crate) fn transfer_exported_callbacks(&mut self, new_prog: &mut Program) {
+        let mut old = std::mem::take(self.executor.callbacks_mut());
+        old.transfer_exported_to(new_prog);
+        *self.executor.callbacks_mut() = old;
+    }
+
+    #[cfg(feature = "callbacks")]
+    pub(crate) fn push_retained_callback(&mut self, slot: u8, exported: bool) {
+        self.executor.callbacks_mut().push_retained(slot, exported);
+    }
+
+    #[cfg(feature = "callbacks")]
+    pub(crate) fn call_pc_internal(&mut self, pc: u64, args: &[u64]) -> Result<u64> {
+        self.call_pc(pc, args)
     }
 
     /// The program's guest memory.
@@ -493,7 +540,7 @@ struct Entry {
     pc: u64,
 }
 
-static NEXT_PROGRAM_ID: AtomicU64 = AtomicU64::new(0);
+static NEXT_PROGRAM_ID: AtomicU64 = AtomicU64::new(1);
 
 // out of line, so that `Program::func` stays small enough to inline
 #[cold]

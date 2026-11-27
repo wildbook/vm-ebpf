@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 use hashbrown::HashMap;
 use rvm_core::{Context, Native, NativeSig, StackArgs};
 
+#[cfg(feature = "callbacks")]
+use crate::callbacks::ProgramCallbacks;
 use crate::error::{HostError, VmError};
 use crate::executor::REG_ARGS;
 #[cfg(feature = "maps")]
@@ -61,6 +63,9 @@ pub struct HostState {
     pub maps: Maps,
     /// The instructions the calling program has left, for host functions that run guest code on its behalf.
     pub fuel: CallerFuel,
+    /// Callback metadata and retained thunk slots for this program.
+    #[cfg(feature = "callbacks")]
+    pub callbacks: ProgramCallbacks,
 }
 
 /// What a guest call has left of its instruction limit, as the host functions it calls see it.

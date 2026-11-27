@@ -213,8 +213,10 @@ impl NativeSig {
 #[cfg(feature = "ffi")]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GeneralArg {
-    /// Integer, enum, float/double (copied to xmm by the trampoline), or 1/2/4/8-byte struct.
+    /// Integer, enum, or 1/2/4/8-byte struct.
     Value,
+    /// `float` or `double` (passed in xmm registers via `rvm_call_args`).
+    Float,
     /// Pointer whose region tag is stripped via [`Memory::host_address`].
     Strip,
     /// Pointer checked via [`Memory::native_ptr`]; `len_arg` is 0 for 1 byte or 1-based guest argument slot.
@@ -223,6 +225,10 @@ pub enum GeneralArg {
     Copy1,
     /// Struct or union of 9 to 16 bytes: 2 guest registers copied to a 16-byte-aligned scratch slot.
     Copy2,
+    /// Function pointer: guest code address gets a scoped callback thunk, `&extern` token becomes the native's real
+    /// address, null and raw addresses pass unchanged.
+    #[cfg(feature = "callbacks")]
+    Callback,
 }
 
 /// Return value marshalling rule for [`NativeMode::General`].
@@ -274,11 +280,34 @@ pub enum BoundError<E> {
     Failed(NativeFail),
 }
 
+/// Type-erased runner for nested callbacks inside an aware [`GENERAL`] call.
+#[cfg(feature = "callbacks")]
+type NestedRunner = unsafe fn(
+    ctx: *mut (),
+    interp: *mut (),
+    code: *const (),
+    pc: u64,
+    args: &[u64; 5],
+    fail: &mut Option<NativeFail>,
+) -> u64;
+
+/// Re-entry context of an aware [`GENERAL`] call, stored in [`Active`].
+#[cfg(feature = "callbacks")]
+struct ActiveCallback {
+    program_id: u64,
+    ctx: *mut (),
+    interp: *mut (),
+    code: *const (),
+    run: NestedRunner,
+}
+
 /// Stack-allocated record of an aware native call in progress, linked from the thread-local [`ACTIVE`].
 #[cfg(feature = "ffi")]
 pub struct Active {
     prev: *mut Active,
     pub fail: Option<NativeFail>,
+    #[cfg(feature = "callbacks")]
+    callback: Option<ActiveCallback>,
 }
 
 #[cfg(feature = "ffi")]
@@ -340,6 +369,66 @@ pub fn fail_error(error: Box<dyn std::error::Error + Send + Sync>) -> bool {
         active.fail = Some(NativeFail::Error(error));
     }
     true
+}
+
+/// Whether the innermost aware native call on this thread can accept a nested guest callback.
+#[cfg(feature = "callbacks")]
+pub fn has_active_callback() -> bool {
+    let ptr = ACTIVE.get();
+    if ptr.is_null() {
+        return false;
+    }
+    // SAFETY: `ptr` points to a live `Active` record on the current thread's call stack, popped by `ActiveGuard`.
+    unsafe { (*ptr).callback.is_some() }
+}
+
+/// Run the guest function at `pc` inside the innermost aware native call on this thread.
+///
+/// When `program_id` is `Some(id)`, matches only if that call belongs to program `id`. When `None`, matches any
+/// active aware call with callback context.
+///
+/// Returns `None` if no matching aware call is active, `Some(Ok(r0))` on normal return, or `Some(Err(()))` if the
+/// active call had already failed or the callback failed (leaving the error recorded on the active call).
+#[cfg(feature = "callbacks")]
+pub fn call_active(program_id: Option<u64>, pc: u64, args: &[u64; 5]) -> Option<Result<u64, ()>> {
+    let ptr = ACTIVE.get();
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `ptr` points to a live `Active` record on the current thread's call stack, popped by `ActiveGuard`.
+    let active = unsafe { &mut *ptr };
+    let cb = active.callback.as_ref()?;
+    if program_id.is_some_and(|expected| cb.program_id != expected) {
+        return None;
+    }
+    if active.fail.is_some() {
+        return Some(Err(()));
+    }
+    let (ctx, interp, code, run) = (cb.ctx, cb.interp, cb.code, cb.run);
+    // SAFETY: `general_call` does not touch `ctx` or `interp` while the native runs, and `run` reborrows them only
+    // for the duration of this nested call.
+    let r0 = unsafe { run(ctx, interp, code, pc, args, &mut active.fail) };
+    match active.fail.is_some() {
+        true => Some(Err(())),
+        false => Some(Ok(r0)),
+    }
+}
+
+#[cfg(feature = "callbacks")]
+unsafe fn run_nested_erased<M: Memory, H: Host<M>>(
+    ctx: *mut (),
+    interp: *mut (),
+    code: *const (),
+    pc: u64,
+    args: &[u64; 5],
+    fail: &mut Option<NativeFail>,
+) -> u64 {
+    // SAFETY: `general_call` derived `ctx`, `interp`, and `code` from its live references and does not access them
+    // again until after the native returns and drops its `ActiveGuard`.
+    let ctx = unsafe { &mut *ctx.cast::<Context<M>>() };
+    let interp = unsafe { &mut *interp.cast::<Interpreter<M, H>>() };
+    let code = unsafe { &*code.cast::<crate::Code>() };
+    H::run_nested(ctx, interp, code, pc, args, fail)
 }
 
 /// How a bound native call handles pointer arguments and ABI marshalling.
@@ -570,8 +659,8 @@ extern "rust-preserve-none" fn raw_call<M: Memory, H: Host<M>, F: Fuel>(
     become_enter!(ctx, code, ip.offset(1), interp, table)
 }
 
-/// The handler of [`GENERAL`]: marshals structs, float returns, pointers, and variadic arguments according to its
-/// [`GeneralProto`] and calls through `rvm_call_args`.
+/// The handler of [`GENERAL`]: marshals structs, float returns, pointers, callbacks, and variadic arguments according
+/// to its [`GeneralProto`] and invokes the native function.
 #[cfg(feature = "ffi")]
 #[inline(never)]
 extern "rust-preserve-none" fn general_call<M: Memory, H: Host<M>, F: Fuel>(
@@ -587,51 +676,125 @@ extern "rust-preserve-none" fn general_call<M: Memory, H: Host<M>, F: Fuel>(
     let view = unsafe { ip.view(slot, const { Shape::of(GENERAL) }) };
     let index = view.imm() as u32;
     let proto_idx = view.offset() as u16;
-    let (stack, host) = interp.stack_args_and_host();
-    let Some(&Native { func, .. }) = host.natives().get(index as usize) else {
+    // copy stack args by value so no borrow of `interp` stays live across an aware native call
+    let stack = *interp.stack_args();
+    let Some(&Native { func, .. }) = interp.host.natives().get(index as usize) else {
         core::hint::cold_path();
         return interp.stop.at(ip, Reason::CallKfunc(index));
     };
-    let proto = code.general(proto_idx);
+    let proto = *code.general(proto_idx);
 
-    // SAFETY: `Code::with_natives` guarantees `func` matches `proto`
-    match unsafe { call_general(func, proto, &mut ctx.regs, Some(stack), &*ctx.memory) } {
-        Ok(()) => {}
-        Err(BoundError::Memory(error)) => return interp.stop.at(ip, Reason::MemoryFault(error)),
+    let mut scratch = Scratch([[0; 2]; MAX_ARGS + 1]);
+    #[cfg(feature = "callbacks")]
+    let mut scoped = [0u8; MAX_ARGS];
+    #[cfg(feature = "callbacks")]
+    let mut scoped_count = 0usize;
+
+    let (native_args, n_idx, guest0) = match marshal_general(
+        &proto,
+        &ctx.regs,
+        Some(&stack),
+        &*ctx.memory,
+        &mut scratch,
+        #[cfg(feature = "callbacks")]
+        |val| {
+            let (addr, slot) = interp.host.prepare_callback(val)?;
+            if let Some(slot) = slot {
+                if let Some(dst) = scoped.get_mut(scoped_count) {
+                    *dst = slot;
+                    scoped_count += 1;
+                }
+            }
+            Ok(addr)
+        },
+    ) {
+        Ok(v) => v,
+        Err(BoundError::Memory(error)) => {
+            #[cfg(feature = "callbacks")]
+            for &s in scoped.iter().take(scoped_count) {
+                interp.host.release_callback(s);
+            }
+            return interp.stop.at(ip, Reason::MemoryFault(error));
+        }
         Err(BoundError::Failed(fail)) => {
+            #[cfg(feature = "callbacks")]
+            for &s in scoped.iter().take(scoped_count) {
+                interp.host.release_callback(s);
+            }
             interp.set_native_fail(fail);
             return interp.stop.at(ip, Reason::NativeFailed);
         }
+    };
+
+    #[cfg(feature = "callbacks")]
+    let program_id = match proto.aware {
+        true => interp.host.callback_program(),
+        false => 0,
+    };
+
+    let mut active = Active {
+        prev: ptr::null_mut(),
+        fail: None,
+        #[cfg(feature = "callbacks")]
+        callback: proto.aware.then(|| ActiveCallback {
+            program_id,
+            ctx: (ctx as *mut Context<M>).cast(),
+            interp: (interp as *mut Interpreter<M, H>).cast(),
+            code: (code.code() as *const crate::Code).cast(),
+            run: run_nested_erased::<M, H>,
+        }),
+    };
+    let guard = proto.aware.then(|| ActiveGuard::push(&mut active));
+
+    // SAFETY: `Code::with_natives` guarantees `func` matches `proto`; neither `ctx` nor `interp` is touched until
+    // `guard` drops.
+    let (ret0, ret2) = unsafe { invoke_general(func, &proto, &native_args, n_idx, &scratch, guest0) };
+
+    drop(guard);
+
+    #[cfg(feature = "callbacks")]
+    for &s in scoped.iter().take(scoped_count) {
+        interp.host.release_callback(s);
+    }
+
+    #[cfg(feature = "callbacks")]
+    if proto.aware {
+        interp.windows.revalidate(ctx.memory);
+    }
+
+    if let Some(fail) = active.fail.take() {
+        interp.set_native_fail(fail);
+        return interp.stop.at(ip, Reason::NativeFailed);
+    }
+
+    ctx.regs[0] = ret0;
+    if let Some(r2) = ret2 {
+        ctx.regs[2] = r2;
     }
 
     become_enter!(ctx, code, ip.offset(1), interp, table)
 }
 
-/// Marshal guest registers and optional stack arguments according to `proto`, invoke `func`, and write the guest
-/// return register(s).
-///
-/// # Safety
-///
-/// `func` must match the host C ABI described by `proto` and must never unwind.
 #[cfg(feature = "ffi")]
-#[inline(never)]
-pub unsafe fn call_general<M: Memory>(
-    func: NativeFn,
+#[repr(C, align(16))]
+struct Scratch([[u64; 2]; MAX_ARGS + 1]);
+
+#[cfg(feature = "ffi")]
+#[inline]
+fn marshal_general<M: Memory>(
     proto: &GeneralProto,
-    regs: &mut [u64; 16],
+    regs: &[u64; 16],
     stack: Option<&StackArgs>,
     memory: &M,
-) -> Result<(), BoundError<M::Error>> {
-    #[repr(C, align(16))]
-    struct Scratch([[u64; 2]; MAX_ARGS + 1]);
-
+    scratch: &mut Scratch,
+    #[cfg(feature = "callbacks")] mut on_callback: impl FnMut(u64) -> Result<u64, NativeFail>,
+) -> Result<([u64; MAX_ARGS], usize, u64), BoundError<M::Error>> {
     let mut guest = [0u64; MAX_ARGS];
     guest[..REG_ARGS].copy_from_slice(reg_args(regs));
     if let Some(stack) = stack {
         guest[REG_ARGS..].copy_from_slice(stack);
     }
 
-    let mut scratch = Scratch([[0; 2]; MAX_ARGS + 1]);
     let mut scratch_idx = 0usize;
     let mut native_args = [0u64; MAX_ARGS];
     let mut g_idx = 0usize;
@@ -653,7 +816,7 @@ pub unsafe fn call_general<M: Memory>(
 
     for &arg in &proto.args[..usize::from(proto.nargs)] {
         match arg {
-            GeneralArg::Value => {
+            GeneralArg::Value | GeneralArg::Float => {
                 native_args[n_idx] = guest[g_idx];
                 g_idx += 1;
                 n_idx += 1;
@@ -687,6 +850,12 @@ pub unsafe fn call_general<M: Memory>(
                 g_idx += 2;
                 n_idx += 1;
             }
+            #[cfg(feature = "callbacks")]
+            GeneralArg::Callback => {
+                native_args[n_idx] = on_callback(guest[g_idx]).map_err(BoundError::Failed)?;
+                g_idx += 1;
+                n_idx += 1;
+            }
         }
     }
 
@@ -698,41 +867,92 @@ pub unsafe fn call_general<M: Memory>(
         }
     }
 
-    let func = func as usize as u64;
+    Ok((native_args, n_idx, guest[0]))
+}
+
+#[cfg(feature = "ffi")]
+#[inline]
+unsafe fn invoke_general(
+    func: NativeFn,
+    proto: &GeneralProto,
+    native_args: &[u64; MAX_ARGS],
+    n_idx: usize,
+    scratch: &Scratch,
+    guest0: u64,
+) -> (u64, Option<u64>) {
+    let has_float = proto.args[..usize::from(proto.nargs)]
+        .iter()
+        .any(|a| matches!(a, GeneralArg::Float));
     let (regs_slice, stack_slice) = native_args.split_at(REG_ARGS);
-    let regs_arr = regs_slice.first_chunk().expect("first five");
-    let stack_arr = stack_slice.first_chunk().expect("other seven");
+    let regs_arr: &[u64; REG_ARGS] = regs_slice.first_chunk().expect("first five");
+    let stack_arr: &StackArgs = stack_slice.first_chunk().expect("other seven");
+    let func_addr = func as usize as u64;
+
+    // SAFETY: the caller's
+    match proto.ret {
+        GeneralRet::Int if !has_float && !proto.variadic && n_idx <= REG_ARGS => {
+            (unsafe { call(func, n_idx, *regs_arr) }, None)
+        }
+        GeneralRet::Int => (unsafe { rvm_call_args(func_addr, regs_arr, stack_arr) }, None),
+        GeneralRet::F32 => {
+            let v = unsafe { rvm_call_args_f32(func_addr, regs_arr, stack_arr) };
+            (u64::from(v.to_bits()), None)
+        }
+        GeneralRet::F64 => {
+            let v = unsafe { rvm_call_args_f64(func_addr, regs_arr, stack_arr) };
+            (v.to_bits(), None)
+        }
+        GeneralRet::SmallAgg => {
+            unsafe { rvm_call_args(func_addr, regs_arr, stack_arr) };
+            (scratch.0[0][0], None)
+        }
+        GeneralRet::WideAgg => {
+            unsafe { rvm_call_args(func_addr, regs_arr, stack_arr) };
+            (scratch.0[0][0], Some(scratch.0[0][1]))
+        }
+        GeneralRet::Sret(_) => {
+            unsafe { rvm_call_args(func_addr, regs_arr, stack_arr) };
+            (guest0, None)
+        }
+    }
+}
+
+/// Marshal guest registers and optional stack arguments according to `proto`, invoke `func`, and write the guest
+/// return register(s).
+///
+/// # Safety
+///
+/// `func` must match the host C ABI described by `proto` and must never unwind.
+#[cfg(feature = "ffi")]
+#[inline(never)]
+pub unsafe fn call_general<M: Memory>(
+    func: NativeFn,
+    proto: &GeneralProto,
+    regs: &mut [u64; 16],
+    stack: Option<&StackArgs>,
+    memory: &M,
+) -> Result<(), BoundError<M::Error>> {
+    let mut scratch = Scratch([[0; 2]; MAX_ARGS + 1]);
+    let (native_args, n_idx, guest0) = marshal_general(
+        proto,
+        regs,
+        stack,
+        memory,
+        &mut scratch,
+        #[cfg(feature = "callbacks")]
+        Ok,
+    )?;
 
     let mut active = Active {
         prev: ptr::null_mut(),
         fail: None,
+        #[cfg(feature = "callbacks")]
+        callback: None,
     };
     let guard = proto.aware.then(|| ActiveGuard::push(&mut active));
 
     // SAFETY: the caller's
-    let (ret0, ret2) = match proto.ret {
-        GeneralRet::Int => (unsafe { rvm_call_args(func, regs_arr, stack_arr) }, None),
-        GeneralRet::F32 => {
-            let v = unsafe { rvm_call_args_f32(func, regs_arr, stack_arr) };
-            (u64::from(v.to_bits()), None)
-        }
-        GeneralRet::F64 => {
-            let v = unsafe { rvm_call_args_f64(func, regs_arr, stack_arr) };
-            (v.to_bits(), None)
-        }
-        GeneralRet::SmallAgg => {
-            unsafe { rvm_call_args(func, regs_arr, stack_arr) };
-            (scratch.0[0][0], None)
-        }
-        GeneralRet::WideAgg => {
-            unsafe { rvm_call_args(func, regs_arr, stack_arr) };
-            (scratch.0[0][0], Some(scratch.0[0][1]))
-        }
-        GeneralRet::Sret(_) => {
-            unsafe { rvm_call_args(func, regs_arr, stack_arr) };
-            (guest[0], None)
-        }
-    };
+    let (ret0, ret2) = unsafe { invoke_general(func, proto, &native_args, n_idx, &scratch, guest0) };
 
     drop(guard);
     if let Some(fail) = active.fail.take() {

@@ -45,6 +45,51 @@ pub trait Host<M: Memory> {
     fn natives(&self) -> &[Native] {
         &[]
     }
+
+    /// Program identity used to match synchronous callbacks on this thread (`0` if unnamed).
+    #[cfg(feature = "callbacks")]
+    fn callback_program(&self) -> u64 {
+        0
+    }
+
+    /// Resolve a `GeneralArg::Callback` guest argument into a native function pointer for one call. Returns the
+    /// native address and, if a scoped thunk slot was claimed, its index to pass to
+    /// [`release_callback`](Self::release_callback) when the native returns.
+    #[cfg(feature = "callbacks")]
+    fn prepare_callback(&self, value: u64) -> Result<(u64, Option<u8>), crate::NativeFail> {
+        Ok((value, None))
+    }
+
+    /// Release a scoped callback thunk slot claimed by [`prepare_callback`](Self::prepare_callback).
+    #[cfg(feature = "callbacks")]
+    fn release_callback(&self, slot: u8) {
+        let _ = slot;
+    }
+
+    /// Run a nested guest function from an aware native call. The default runs [`Interpreter::call_nested`](crate::Interpreter::call_nested)
+    /// and records any non-return stop as a failure; embedders with a resume loop override this.
+    #[cfg(feature = "callbacks")]
+    fn run_nested(
+        ctx: &mut Context<M>,
+        interp: &mut crate::Interpreter<M, Self>,
+        code: &crate::Code,
+        pc: u64,
+        args: &[u64; 5],
+        fail: &mut Option<crate::NativeFail>,
+    ) -> u64
+    where
+        Self: Sized,
+    {
+        match interp.call_nested(ctx, code, pc, args) {
+            Ok(r0) => r0,
+            Err(stop) => {
+                if fail.is_none() {
+                    *fail = Some(crate::NativeFail::Code(stop.pc));
+                }
+                0
+            }
+        }
+    }
 }
 
 /// What a `callx` calls, as [`Host::call_indirect`] resolves its target.

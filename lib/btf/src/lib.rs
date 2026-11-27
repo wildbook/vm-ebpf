@@ -37,7 +37,7 @@ mod types;
 
 pub use builder::BtfBuilder;
 pub use core_relo::{apply_core_relocations, CoreReloError, Unresolved};
-pub use ext::{BtfExt, CoreRelo, CoreReloKind};
+pub use ext::{BtfExt, CoreRelo, CoreReloKind, FuncInfo};
 pub use parse::{Btf, BtfError};
 pub use patch::CORE_POISON_HELPER;
 pub use raw::{BtfKind, BTF_FUNC_EXTERN, BTF_FUNC_GLOBAL, BTF_FUNC_STATIC, BTF_INT_SIGNED};

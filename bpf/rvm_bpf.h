@@ -60,6 +60,13 @@ typedef signed long long   s64;
 /* Names the DLL (or `"dll!symbol"`) that provides an extern for the host's native resolver. */
 #define IMPORT_FROM(dll)   __attribute__((btf_decl_tag("import:" dll)))
 
+/* Marks an extern native that invokes guest callbacks registered earlier (not passed as an argument of this call). */
+#define CALLS_BACK         __attribute__((btf_decl_tag("rvm:calls_back")))
+
+/* Opt-in callback builtins enabled with Vm::enable_callbacks(). */
+extern void *rvm_callback(void *func);
+extern void rvm_callback_free(void *thunk);
+
 /* Map types and update flags, as in lib/rvm/src/map_def/btf.rs and lib/rvm/src/maps/mod.rs. */
 #define BPF_MAP_TYPE_HASH  1
 #define BPF_MAP_TYPE_ARRAY 2

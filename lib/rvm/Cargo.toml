@@ -30,6 +30,8 @@ fuel = ["rvm-core/fuel"]
 maps = ["dep:bytemuck"]
 # General native FFI marshalling: structs by value/return, float/double returns, variadics.
 ffi = ["rvm-core/ffi"]
+# Native-to-guest callbacks: `rvm::call_guest`, automatic callback thunks, `Vm::enable_callbacks`, and `Plugin::take_callback_error`.
+callbacks = ["ffi", "rvm-core/callbacks"]
 # Guest hash maps use a fixed hash seed, so builds compared in benchmarks probe the same way.
 fixed-hash-seed = []
 

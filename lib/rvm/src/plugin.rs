@@ -47,15 +47,25 @@ use crate::sync::{TryLock, TryLockGuard};
 pub struct Plugin {
     name: Arc<str>,
     program: Arc<TryLock<Program>>,
+    #[cfg(feature = "callbacks")]
+    callback_error: Arc<TryLock<Option<VmError>>>,
 }
 
 impl Plugin {
     /// Wrap `program` as the plugin `name`; errors from calls into it carry the name.
     pub fn new(name: impl Into<Arc<str>>, program: Program) -> Self {
-        Self {
+        let plugin = Self {
             name: name.into(),
             program: Arc::new(TryLock::new(program)),
+            #[cfg(feature = "callbacks")]
+            callback_error: Arc::new(TryLock::new(None)),
+        };
+        #[cfg(feature = "callbacks")]
+        {
+            let weak = plugin.downgrade();
+            plugin.program.try_lock().expect("fresh plugin").set_plugin(weak);
         }
+        plugin
     }
 
     /// The name given to [`Plugin::new`].
@@ -86,10 +96,45 @@ impl Plugin {
 
     /// Swap in a new build of this plugin. Exports keep working; they find their function by name in the new program.
     /// Fails with [`VmError::PluginBusy`] while a call into the plugin runs, on any thread.
-    pub fn replace(&self, program: Program) -> Result<()> {
+    pub fn replace(
+        &self,
+        #[cfg_attr(not(feature = "callbacks"), expect(unused_mut))] mut program: Program,
+    ) -> Result<()> {
+        #[cfg(feature = "callbacks")]
+        program.set_plugin(self.downgrade());
         // drop the replaced program outside the plugin lock
-        let _old = std::mem::replace(&mut *self.lock()?, program);
+        let _old = {
+            let mut slot = self.lock()?;
+            #[cfg(feature = "callbacks")]
+            slot.transfer_exported_callbacks(&mut program);
+            std::mem::replace(&mut *slot, program)
+        };
         Ok(())
+    }
+
+    /// Take the first error recorded by a retained callback that failed outside a synchronous call (for example when
+    /// the plugin was busy on another thread, or when the callback faulted).
+    #[cfg(feature = "callbacks")]
+    pub fn take_callback_error(&self) -> Option<VmError> {
+        loop {
+            if let Some(mut slot) = self.callback_error.try_lock() {
+                return slot.take();
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    #[cfg(feature = "callbacks")]
+    pub(crate) fn set_callback_error(&self, err: VmError) {
+        loop {
+            if let Some(mut slot) = self.callback_error.try_lock() {
+                if slot.is_none() {
+                    *slot = Some(err);
+                }
+                return;
+            }
+            std::hint::spin_loop();
+        }
     }
 
     /// A handle that doesn't keep the plugin alive. Host functions that call back into a plugin should hold this: they
@@ -98,6 +143,8 @@ impl Plugin {
         WeakPlugin {
             name: self.name.clone(),
             program: Arc::downgrade(&self.program),
+            #[cfg(feature = "callbacks")]
+            callback_error: self.callback_error.clone(),
         }
     }
 
@@ -313,6 +360,8 @@ impl Iterator for Borrows {
 pub struct WeakPlugin {
     name: Arc<str>,
     program: Weak<TryLock<Program>>,
+    #[cfg(feature = "callbacks")]
+    callback_error: Arc<TryLock<Option<VmError>>>,
 }
 
 impl WeakPlugin {
@@ -321,6 +370,8 @@ impl WeakPlugin {
         Some(Plugin {
             name: self.name.clone(),
             program: self.program.upgrade()?,
+            #[cfg(feature = "callbacks")]
+            callback_error: self.callback_error.clone(),
         })
     }
 }

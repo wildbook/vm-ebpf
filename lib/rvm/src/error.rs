@@ -58,6 +58,10 @@ pub enum VmError {
     /// afterwards.
     NoFreeRegion,
 
+    /// Every callback thunk slot (64 process-wide) is in use.
+    #[cfg(feature = "callbacks")]
+    NoFreeCallback,
+
     /// A call with more arguments than the 12 that a function takes: five in registers and seven on the stack.
     TooManyArgs(usize),
 
@@ -111,6 +115,8 @@ impl fmt::Display for VmError {
             Self::ForeignFunc => write!(f, "function handle belongs to another program; look the function up again"),
             Self::ForeignRegion => write!(f, "region handle belongs to another memory"),
             Self::NoFreeRegion => write!(f, "every host region is taken"),
+            #[cfg(feature = "callbacks")]
+            Self::NoFreeCallback => write!(f, "every callback thunk slot is in use"),
             Self::TooManyArgs(count) => write!(f, "{count} arguments, but a function takes at most {MAX_ARGS}"),
             Self::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
             Self::MemoryLimit(limit) => {

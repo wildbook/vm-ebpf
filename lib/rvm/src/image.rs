@@ -46,6 +46,8 @@ const IMPORT_NAME: u8 = 0;
 const IMPORT_HELPER: u8 = 1;
 const FLAG_STACK: u8 = 1;
 const FLAG_PROTO: u8 = 2;
+const PROTO_VARIADIC: u8 = 1;
+const PROTO_CALLS_BACK: u8 = 2;
 const RET_VOID: u8 = 0;
 const RET_INT: u8 = 1;
 const RET_PTR: u8 = 2;
@@ -91,6 +93,19 @@ pub struct Image {
     pub addresses: Vec<Address>,
     /// `&extern` references in code and data, as `(site, import index into imports)`.
     pub tokens: Vec<(Site, u32)>,
+    /// Address-taken plugin functions and their BTF prototypes, for callback thunk unmarshalling.
+    pub callbacks: Vec<CallbackInfo>,
+}
+
+/// A plugin function whose address is taken, recorded so callback thunks know its ABI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallbackInfo {
+    /// Instruction index where the function starts.
+    pub pc: u64,
+    /// Export name if globally exported (so retained callbacks follow [`Plugin::replace`](crate::Plugin::replace)).
+    pub name: Option<String>,
+    /// Prototype of the function from BTF.
+    pub proto: Proto,
 }
 
 /// A host, native, or plugin function that an [`Image`] imports.
@@ -280,6 +295,14 @@ impl Image {
                 w.u32(idx);
             }
         });
+        w.section(|w| {
+            w.u32(self.callbacks.len() as u32);
+            for cb in &self.callbacks {
+                w.u64(cb.pc);
+                w.str(cb.name.as_deref().unwrap_or(""));
+                w.proto(&cb.proto);
+            }
+        });
         w.0
     }
 
@@ -298,6 +321,7 @@ impl Image {
             calls: s.calls,
             addresses: s.addresses,
             tokens: s.tokens,
+            callbacks: s.callbacks,
         })
     }
 }
@@ -324,6 +348,7 @@ struct Sections<'a> {
     calls: Vec<(u32, u32)>,
     addresses: Vec<Address>,
     tokens: Vec<(Site, u32)>,
+    callbacks: Vec<CallbackInfo>,
 }
 
 impl<'a> Sections<'a> {
@@ -429,6 +454,17 @@ impl<'a> Sections<'a> {
             tokens.push((site, s.u32()?));
         }
         s.end()?;
+
+        let mut s = r.section()?;
+        let mut callbacks = Vec::new();
+        for _ in 0..s.u32()? {
+            let pc = s.u64()?;
+            let name = s.opt_str()?;
+            let label = name.as_deref().unwrap_or("<callback>");
+            let proto = s.proto(label)?;
+            callbacks.push(CallbackInfo { pc, name, proto });
+        }
+        s.end()?;
         r.end()?;
 
         Ok(Self {
@@ -443,6 +479,7 @@ impl<'a> Sections<'a> {
             calls,
             addresses,
             tokens,
+            callbacks,
         })
     }
 }
@@ -476,6 +513,7 @@ pub fn load(
         calls,
         addresses,
         tokens,
+        callbacks,
     } = image;
     let sections = Sections {
         code: &code,
@@ -489,6 +527,7 @@ pub fn load(
         calls,
         addresses,
         tokens,
+        callbacks,
     };
     load_with_shared_resolver(sections, helpers, resolver, shared, config)
 }
@@ -639,6 +678,11 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
         resolved,
     } = bind_externs(&mut insns, &s.imports, &s.calls, &snapshot.table, tagged)?;
     let functions = check_functions(s.functions, insns.len() as u64)?;
+    for cb in &s.callbacks {
+        if cb.pc >= insns.len() as u64 {
+            return Err(invalid(format!("callback at pc {} out of range", cb.pc)));
+        }
+    }
 
     let mut memory = VmMemory::with_passthrough(config.passthrough);
     let stack_top = memory.map_any(STACK_REGION, stack_len as usize, Perms::RW)? + stack_len;
@@ -679,6 +723,8 @@ fn load_sections(s: Sections<'_>, helpers: &Arc<SharedHelpers>, shared: &Shared,
 
     let program =
         Program::new(code, memory, stack_top, functions, helpers.clone(), snapshot, config).with_tokens(tokens);
+    #[cfg(feature = "callbacks")]
+    let program = program.with_callbacks(&s.callbacks);
     #[cfg(feature = "maps")]
     let program = program.with_maps(maps);
     Ok(program)
@@ -934,6 +980,24 @@ fn bind_import(import: &Import, table: &HelperRegistry, tagged: bool) -> Result<
                     }
                     NativeKind::Strip => {
                         if let Some(p) = proto {
+                            if p.needs_general() {
+                                #[cfg(feature = "ffi")]
+                                {
+                                    return Ok(BoundImport::Native {
+                                        index,
+                                        args: host_sig.args(),
+                                        mode: NativeMode::General(p.general_proto(name, None, tagged)?),
+                                    });
+                                }
+                                #[cfg(not(feature = "ffi"))]
+                                {
+                                    return Err(LinkError::NativeMismatch {
+                                        name: name.clone(),
+                                        reason: "this extern needs the `ffi` feature".into(),
+                                    }
+                                    .into());
+                                }
+                            }
                             let declared = p.native_sig(name)?;
                             check_strip_sig(name, declared, host_sig)?;
                         }
@@ -1134,7 +1198,8 @@ impl Writer {
                 self.u32(size);
             }
         }
-        self.0.push(proto.variadic.into());
+        let flags = (u8::from(proto.variadic) * PROTO_VARIADIC) | (u8::from(proto.calls_back) * PROTO_CALLS_BACK);
+        self.0.push(flags);
         self.0.push(proto.args.len() as u8);
         for &arg in &proto.args {
             match arg {
@@ -1224,7 +1289,12 @@ impl<'a> Reader<'a> {
             RET_AGG => ReturnKind::Agg(self.u32()?),
             kind => return Err(invalid(format!("import {name}: unknown return kind {kind}"))),
         };
-        let variadic = self.u8()? != 0;
+        let flags = self.u8()?;
+        if flags & !(PROTO_VARIADIC | PROTO_CALLS_BACK) != 0 {
+            return Err(invalid(format!("import {name}: unknown proto flags {flags:#x}")));
+        }
+        let variadic = flags & PROTO_VARIADIC != 0;
+        let calls_back = flags & PROTO_CALLS_BACK != 0;
         let count = self.u8()?;
         if usize::from(count) > MAX_NATIVE_ARGS {
             return Err(invalid(format!("import {name}: {count} parameters")));
@@ -1256,6 +1326,7 @@ impl<'a> Reader<'a> {
             args,
             ret,
             variadic,
+            calls_back,
             borrows,
         })
     }

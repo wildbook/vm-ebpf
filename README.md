@@ -167,6 +167,16 @@ enabled, resolver-bound natives (and variadic natives registered with `NativeSig
 variadic calls. A native registered with `NativeSig::aware()` (or `RVM_NATIVE_AWARE` in `rvmrt`) can fail the guest
 call through `rvm::fail`, `rvm::fail_code` or `rvm_fail`.
 
+With the `callbacks` Cargo feature enabled (which implies `ffi`), aware natives can call back into guest functions. A
+Rust native can call a plugin code address directly through `rvm::call_guest(func, &args)`. For foreign C functions
+that take a C function pointer parameter (such as `qsort`), passing a plugin function automatically claims one of 64
+static thunks in `.text` for the duration of the call, unmarshalling C integer, float, double and struct parameters
+into guest registers and returning `r0` in both `rax` and `xmm0`. For callbacks that a native retains past the
+registering call, `Vm::enable_callbacks` enables `rvm_callback` and `rvm_callback_free` from `rvm_bpf.h`, and
+`CALLS_BACK` marks natives that invoke previously registered callbacks synchronously. Exported `Plugin` callbacks
+follow `Plugin::replace` by name, run on idle plugins from any thread, and report busy or faulting invocations through
+`Plugin::take_callback_error`.
+
 Pointers stored inside plugin memory, such as the fields of a struct the plugin fills, keep the plugin's region tag,
 and native code can't follow them. Either load the plugin with `Passthrough::untagged()`, where every pointer is a
 plain host address and nothing is checked, or declare those pointers `__host` and convert with `HOST()` from
@@ -628,6 +638,8 @@ opt-level = 3
 | `link` | the ELF reader, BTF, CO-RE and the linker: `Vm::load_elf`, `Vm::prepare_elf`, `Vm::with_types` | 94 KiB |
 | `fuel` | instruction limits | 18 KiB |
 | `maps` | maps, the map helpers, `Vm::share_map` and `Pod` | 28 KiB |
+| `ffi` | general native ABI marshalling (structs, floats, variadics) and `rvm::fail` / `rvm_fail` | ~14 KiB |
+| `callbacks` | implies `ffi`; nested `rvm::call_guest` runs, 64 static callback thunks in `.text`, `Vm::enable_callbacks` | ~32 KiB |
 
 The size column is what rvm adds to a small Rust host on x86-64 Windows, built with the workspace's `embedded`
 profile (`cargo build --profile embedded`), which also strips symbols and panic locations. Without `maps`, an image
@@ -645,9 +657,9 @@ that declares maps fails to load. `fixed-hash-seed` makes hash maps use a fixed 
   `VmError::PluginBusy`; load one program per thread to run them in parallel.
 - A struct of 9 to 16 bytes comes back in two registers, which only a host function from `register_extern` returns.
   Native functions, the functions that plugins export and calls from the host carry r0.
-- Native functions use the host x86-64 C convention (Windows x64 on Windows, System V AMD64 on Unix). They take
-  integers and pointers and return integers, pointers and structs of 1, 2, 4 or 8 bytes: no struct parameters, no floats
-  and no variadic functions. They run unmetered.
+- Without the `ffi` feature, native functions take integers, pointers and 1, 2, 4 or 8 byte structs and return
+  integers, pointers and 1, 2, 4 or 8 byte structs. Enable `ffi` for other struct sizes, floats and variadics, and
+  `callbacks` for native-to-guest callbacks (64 simultaneous thunk slots process-wide). Native functions run unmetered.
 - A call through a function pointer to native code has no signature. It passes five registers as they are, plus the
   seven stack slots in a program that stores any: pointers keep their region tags, a struct by value passes and comes
   back only if it is 1, 2, 4 or 8 bytes long, and a `float` or `double` result is lost. Nothing validates the target,

@@ -98,6 +98,8 @@
 
 #[cfg(test)]
 mod bpf_sources;
+#[cfg(feature = "callbacks")]
+mod callbacks;
 mod error;
 mod executor;
 mod helper;
@@ -136,7 +138,7 @@ pub use helper::{FromArgs, IntoReturn};
 pub use host_type::__host_field_type;
 #[cfg(feature = "link")]
 pub use host_type::{HostType, HostTypes};
-pub use image::{Image, Import, INSN_SIZE};
+pub use image::{CallbackInfo, Image, Import, INSN_SIZE};
 pub use layout::{
     BORROW_FIRST_REGION, BORROW_REGIONS, CODE_REGION, DATA_REGION, MAPS_REGION, RODATA_REGION,
     SHARED_MAPS_FIRST_REGION, STACK_REGION,
@@ -176,4 +178,31 @@ pub fn fail_code(code: u64) -> bool {
 #[cfg(feature = "ffi")]
 pub fn fail(error: impl std::error::Error + Send + Sync + 'static) -> bool {
     rvm_core::fail_error(Box::new(error))
+}
+
+/// Call a plugin function at guest code address `func` inside the innermost aware native call on the current thread,
+/// sharing its registers, stack, memory, and fuel.
+///
+/// Returns `Some(r0)` on normal return, or `None` if no aware native call with callback context is active on this
+/// thread, if it had already failed, or if the callback failed (in which case the error is recorded so the outer run
+/// stops with it).
+#[cfg(feature = "callbacks")]
+pub fn call_guest(func: u64, args: &[u64]) -> Option<u64> {
+    if !rvm_core::has_active_callback() {
+        return None;
+    }
+    if args.len() > executor::REG_ARGS {
+        rvm_core::fail_error(Box::new(VmError::TooManyArgs(args.len())));
+        return None;
+    }
+    let Some(pc) = executor::code_index(func) else {
+        rvm_core::fail_error(Box::new(VmError::Exec(ExecError::BadCodeAddress { pc: 0, target: func })));
+        return None;
+    };
+    let mut regs = [0u64; executor::REG_ARGS];
+    regs[..args.len()].copy_from_slice(args);
+    match rvm_core::call_active(None, pc, &regs) {
+        Some(Ok(r0)) => Some(r0),
+        _ => None,
+    }
 }
