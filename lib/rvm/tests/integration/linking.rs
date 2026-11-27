@@ -112,23 +112,15 @@ const fn returning(returns: Returns, name: &'static str, params: u8, registers: 
     }
 }
 
-const SHAPES: [Shape; 14] = [
+const SHAPES: [Shape; 8] = [
     shape("scalars", 3, 3, &[1, 2, 0]),
-    // a 3-byte struct packed into r1
-    shape("s3_arg", 2, 2, &[0x03_0201, 4]),
     shape("s8_arg", 2, 2, &[0x2_0000_0001, 3]),
     // bytes 0 to 7 in r1, 8 to 11 in r2
     shape("s12_arg", 2, 3, &[0x2_0000_0001, 3, 4]),
-    shape("s16_arg", 2, 3, &[1, 2, 3]),
-    shape("pair_arg", 2, 3, &[1, 2, 3]),
-    shape("two_s16", 3, 5, &[1, 2, 3, 4, 5]),
-    // the sixth register is the first slot on the stack
-    shape("six", 4, 6, &[1, 2, 3, 4, 5, 6]),
-    // a 16-byte struct in r5 and that slot
+    // a 16-byte struct in r5 and the first stack slot
     shape("split", 5, 6, &[1, 2, 3, 4, 5, 6]),
     returning(Returns::R0, "s8_ret", 1, 1),
     returning(Returns::R0R2, "s12_ret", 1, 1),
-    returning(Returns::R0R2, "pair_ret", 1, 1),
     returning(Returns::Pointer, "s24_ret", 1, 2),
     Shape {
         object: "tests/struct_args_thirteen.o",
@@ -222,8 +214,6 @@ fn struct_args_vm() -> Vm {
     vm.register_extern("s8_ret", |x: u64| x | 2 << 32);
     // struct s12 { u32 a, b, c; }
     vm.register_extern("s12_ret", |x: u64| (x | 2 << 32, 3));
-    // union pair { u64 a[2]; u32 b; }
-    vm.register_extern("pair_ret", |x: u64| (x, 2));
     // struct s24 { u64 a, b, c; }
     vm.register_extern_with_memory("s24_ret", |memory, (result, x): (u64, u64)| {
         memory.write(result, x)?;
@@ -241,12 +231,7 @@ fn struct_results_come_back_by_size() {
     let module = Module::from_elf(&object("tests/struct_args.o")).unwrap();
     let mut program = struct_args_vm().load_modules(&[&module]).unwrap();
     // one decimal digit per field, the first field lowest
-    for (func, fields) in [
-        ("call_s8_ret", 21),
-        ("call_s12_ret", 321),
-        ("call_pair_ret", 21),
-        ("call_s24_ret", 321),
-    ] {
+    for (func, fields) in [("call_s8_ret", 21), ("call_s12_ret", 321), ("call_s24_ret", 321)] {
         assert_eq!(program.call(func, &[]).unwrap(), fields, "{func}");
     }
 

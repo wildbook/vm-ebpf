@@ -36,7 +36,6 @@ struct HostApi {
 
 static API: HostApi = HostApi { zero, one, five, sum };
 
-/// The guest in a VM with helper 100, loaded with `passthrough` and `raw_calls`.
 fn load(passthrough: Passthrough, raw_calls: RawCalls) -> Program {
     let config = VmConfig {
         passthrough,
@@ -48,69 +47,49 @@ fn load(passthrough: Passthrough, raw_calls: RawCalls) -> Program {
     vm.load_elf(&object("tests/raw_calls.o")).unwrap()
 }
 
-/// Raw calls on.
 fn on() -> RawCalls {
     // SAFETY: the tests pass the guest only the functions above, with the arguments they take
     unsafe { RawCalls::on() }
 }
 
-/// An untagged guest reads a table of function pointers in a host struct and calls each, with 0, 1 and 5 integers
-/// and with a pointer into its stack.
+/// Raw calls dispatch vtable entries, callbacks, guest functions, helper IDs below 64 KiB, and `HOST()` pointers.
 #[test]
-fn table_of_function_pointers() {
+fn raw_calls_dispatch() {
     // SAFETY: the guest reads `API` and its own stack
-    let mut program = load(unsafe { Passthrough::untagged() }, on());
-    let api = &raw const API as u64;
-    assert_eq!(program.call("through_table", &[api]).unwrap(), 7 + 11 + 54_321 + 10);
-}
+    let mut untagged = load(unsafe { Passthrough::untagged() }, on());
+    assert_eq!(untagged.call("through_table", &[&raw const API as u64]).unwrap(), 7 + 11 + 54_321 + 10);
 
-/// A function pointer in an argument is called whatever the memory mode, and the other targets of a `callx` keep
-/// their meaning: the guest's own functions, and helper IDs below 64 KiB.
-#[test]
-fn callback_argument() {
-    let mut program = load(Passthrough::OFF, on());
-    assert_eq!(program.call("call_back", &[API.one as usize as u64, 41]).unwrap(), 43);
-    assert_eq!(program.call("call_own", &[21]).unwrap(), 43);
-    assert_eq!(program.call("call_back", &[100, 21]).unwrap(), 43);
+    let mut tagged = load(Passthrough::OFF, on());
+    assert_eq!(tagged.call("call_back", &[API.one as usize as u64, 41]).unwrap(), 43);
+    assert_eq!(tagged.call("call_own", &[21]).unwrap(), 43);
+    assert_eq!(tagged.call("call_back", &[100, 21]).unwrap(), 43);
+    assert_eq!(tagged.call("sum_host", &[API.sum as usize as u64]).unwrap(), 10);
 
-    let err = program.call("call_low", &[1]).unwrap_err();
+    let err = tagged.call("call_low", &[1]).unwrap_err();
     assert!(matches!(err, VmError::Exec(ExecError::UnknownHelper { id: 0x1234, .. })), "{err}");
 }
 
-/// A guest with tagged pointers converts a pointer the native function follows with `HOST()`.
+/// Without raw calls, an untagged target is a helper ID if it fits one and no code address otherwise; `Loader` switches
+/// per program.
 #[test]
-fn host_macro_passes_the_host_address() {
-    let mut program = load(Passthrough::OFF, on());
-    assert_eq!(program.call("sum_host", &[API.sum as usize as u64]).unwrap(), 10);
-}
-
-/// Without raw calls, an untagged target is a helper ID if it fits one and no code address otherwise. `call_high`
-/// also shows that `NATIVE_AT` keeps all 64 bits of its address.
-#[test]
-fn off_is_a_helper_id_or_a_bad_address() {
-    // SAFETY: nothing the guest runs here reads memory
-    for passthrough in [Passthrough::OFF, unsafe { Passthrough::untagged() }] {
-        let mut program = load(passthrough, RawCalls::OFF);
-        for (func, target) in [("call_back", API.one as usize as u64), ("call_high", 0x7ff8_1234_0000)] {
-            let err = program.call(func, &[target, 0]).unwrap_err();
-            assert!(
-                matches!(err, VmError::Exec(ExecError::BadCodeAddress { target: t, .. }) if t == target),
-                "{func}: {err}"
-            );
-        }
-
-        let err = program.call("call_back", &[0x10000, 0]).unwrap_err();
-        assert!(matches!(err, VmError::Exec(ExecError::UnknownHelper { id: 0x10000, .. })), "{err}");
-        assert_eq!(program.call("call_back", &[100, 21]).unwrap(), 43);
+fn raw_calls_off_and_per_program() {
+    let mut off = load(Passthrough::OFF, RawCalls::OFF);
+    for (func, target) in [("call_back", API.one as usize as u64), ("call_high", 0x7ff8_1234_0000)] {
+        let err = off.call(func, &[target, 0]).unwrap_err();
+        assert!(
+            matches!(err, VmError::Exec(ExecError::BadCodeAddress { target: t, .. }) if t == target),
+            "{func}: {err}"
+        );
     }
-}
+    assert!(matches!(
+        off.call("call_back", &[0x10000, 0]),
+        Err(VmError::Exec(ExecError::UnknownHelper { id: 0x10000, .. }))
+    ));
+    assert_eq!(off.call("call_back", &[100, 21]).unwrap(), 43);
 
-/// A loader gives one program raw calls and untagged memory in a VM whose other programs have neither.
-#[test]
-fn switches_per_program() {
     let vm = Vm::new();
     let elf = object("tests/raw_calls.o");
-    // SAFETY: as in `table_of_function_pointers`
+    // SAFETY: as above
     let untagged = unsafe { Passthrough::untagged() };
     let mut trusted = vm
         .loader()
@@ -122,8 +101,9 @@ fn switches_per_program() {
 
     let api = &raw const API as u64;
     assert_eq!(trusted.call("through_table", &[api]).unwrap(), 7 + 11 + 54_321 + 10);
-    let err = checked.call("through_table", &[api]).unwrap_err();
-    assert!(matches!(err, VmError::Exec(ExecError::MemoryFault { .. })), "{err}");
-    let err = checked.call("call_back", &[API.one as usize as u64, 41]).unwrap_err();
-    assert!(matches!(err, VmError::Exec(ExecError::BadCodeAddress { .. })), "{err}");
+    assert!(matches!(checked.call("through_table", &[api]), Err(VmError::Exec(ExecError::MemoryFault { .. }))));
+    assert!(matches!(
+        checked.call("call_back", &[API.one as usize as u64, 41]),
+        Err(VmError::Exec(ExecError::BadCodeAddress { .. }))
+    ));
 }

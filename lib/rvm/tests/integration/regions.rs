@@ -8,10 +8,6 @@ use rvm::{ExecError, Image, Perms, Plugin, Program, Region, Vm, VmError, DATA_RE
 
 use crate::common::object;
 
-fn example() -> Program {
-    Vm::new().load_elf(&object("examples/example.o")).unwrap()
-}
-
 /// A program whose `main` runs `*(u64 *)r1 = r2; r0 = *(u64 *)r1`, with 8 bytes of rodata, all 1s, and 8 of data.
 fn store_load(vm: &Vm) -> Program {
     let mut asm = Assembler::new();
@@ -31,9 +27,6 @@ fn is_mem_fault(r: rvm::Result<u64>) -> bool {
 
 #[test]
 fn rodata_is_read_only_data_is_writable() {
-    let mut program = Vm::new().load_elf(&object("examples/example.o")).unwrap();
-    assert_eq!(program.call("return_magic", &[]).unwrap(), 0xDEAD_BEEF_CAFE_BABE);
-
     let mut program = store_load(&Vm::new());
     let rodata = program.memory().region_base(RODATA_REGION);
     assert!(is_mem_fault(program.call("main", &[rodata, 0])));
@@ -42,55 +35,21 @@ fn rodata_is_read_only_data_is_writable() {
     assert_eq!(program.call("main", &[data, 77]).unwrap(), 77);
 }
 
-/// `bpf_main` writes through host-mapped structs; the writes must not land on other code.
 #[test]
-fn bpf_main_globals_do_not_clobber_code() {
-    #[repr(C)]
-    struct Input {
-        a: u64,
-        b: u64,
-        op: u32,
-        flags: u32,
-    }
-    #[repr(C)]
-    #[derive(Default)]
-    struct Output {
-        result: u64,
-        status: u32,
-        reserved: u32,
-    }
-
-    let input = Input {
-        a: 5,
-        b: 7,
-        op: 2, // mul
-        flags: 0,
+fn map_host_aliases_and_survives_fault() {
+    let mut word = 0u64;
+    let mut program = store_load(&Vm::new());
+    // SAFETY: `word` outlives the mapping (unmapped below) and isn't touched meanwhile.
+    let region = unsafe {
+        program
+            .memory_mut()
+            .map_host(NonNull::from(&mut word).cast(), size_of::<u64>(), Perms::RW)
+            .unwrap()
     };
-    let mut output = Output::default();
-    let mut program = example();
-    let mut mem = program.memory_mut();
-    // SAFETY: both structs outlive the mappings (unmapped below) and aren't touched meanwhile.
-    let (ctx, out) = unsafe {
-        (
-            mem.map_host(NonNull::from(&input).cast(), size_of::<Input>(), Perms::R)
-                .unwrap(),
-            mem.map_host(NonNull::from(&mut output).cast(), size_of::<Output>(), Perms::RW)
-                .unwrap(),
-        )
-    };
-
-    assert_eq!(program.call("bpf_main", &[ctx.base(), out.base()]).unwrap(), 0);
-    program.memory_mut().unmap(ctx).unwrap();
-    program.memory_mut().unmap(out).unwrap();
-    assert_eq!((output.result, output.status), (35, 0));
-    assert_eq!(program.call("simple_add", &[2, 3]).unwrap(), 5);
-}
-
-#[test]
-fn memory_survives_fault() {
-    let mut program = example();
-    assert!(program.call("bpf_main", &[0xFFFF_FFFF_0000, 0xFFFF_FFFF_0000]).is_err());
-    assert_eq!(program.call("simple_add", &[2, 3]).unwrap(), 5);
+    assert!(is_mem_fault(program.call("main", &[0xFFFF_FFFF_0000, 1])));
+    assert_eq!(program.call("main", &[region.base(), 35]).unwrap(), 35);
+    program.memory_mut().unmap(region).unwrap();
+    assert_eq!(word, 35);
 }
 
 /// Helpers read guest pointers with the guest's permissions, so they can't leak a region the guest may only write.

@@ -694,19 +694,17 @@ mod tests {
 
         use super::*;
 
+        let is_arg = |s| matches!(s, Status::Argument);
+        let is_ok = |s| matches!(s, Status::Ok);
+
         // r0 = r1 + 1; exit
         let code = [
-            0xbf, 0x10, 0, 0, 0, 0, 0, 0, // mov64 r0, r1
-            0x07, 0x00, 0, 0, 1, 0, 0, 0, // add64 r0, 1
-            0x95, 0x00, 0, 0, 0, 0, 0, 0, // exit
+            0xbf, 0x10, 0, 0, 0, 0, 0, 0, 0x07, 0x00, 0, 0, 1, 0, 0, 0, 0x95, 0, 0, 0, 0, 0, 0, 0,
         ];
         let bytes = rvm::Image::from_code(code.to_vec()).to_bytes();
 
         let mut prog: *mut RvmProgram = ptr::null_mut();
-        assert!(matches!(unsafe { rvm_load(ptr::null(), 1, &mut prog) }, Status::Argument));
-        assert!(matches!(unsafe { rvm_load(bytes.as_ptr(), bytes.len(), ptr::null_mut()) }, Status::Argument));
-
-        let bad_natives = RvmOptions {
+        let bad_opts = RvmOptions {
             size: size_of::<RvmOptions>(),
             natives: ptr::null(),
             native_count: 1,
@@ -714,76 +712,48 @@ mod tests {
             resolve_user: ptr::null_mut(),
             flags: 0,
         };
-        assert!(matches!(
-            unsafe { rvm_load_with(bytes.as_ptr(), bytes.len(), &bad_natives, &mut prog) },
-            Status::Argument
-        ));
+        unsafe {
+            assert!(is_arg(rvm_load(ptr::null(), 1, &mut prog)));
+            assert!(is_arg(rvm_load(bytes.as_ptr(), bytes.len(), ptr::null_mut())));
+            assert!(is_arg(rvm_load_with(bytes.as_ptr(), bytes.len(), &bad_opts, &mut prog)));
+            assert!(is_ok(rvm_load_with(bytes.as_ptr(), bytes.len(), ptr::null(), &mut prog)));
+            assert!(!prog.is_null());
 
-        // NULL options uses defaults
-        assert!(matches!(unsafe { rvm_load_with(bytes.as_ptr(), bytes.len(), ptr::null(), &mut prog) }, Status::Ok));
-        assert!(!prog.is_null());
+            let (mut addr, mut byte) = (0u64, 0u8);
+            assert!(is_arg(rvm_map(ptr::null_mut(), 16, &mut addr)) && is_arg(rvm_map(prog, 16, ptr::null_mut())));
+            assert!(is_ok(rvm_map(prog, 16, &mut addr)) && is_arg(rvm_unmap(ptr::null_mut(), addr)));
+            assert!(
+                is_arg(rvm_read(ptr::null(), addr, &mut byte, 1)) && is_arg(rvm_read(prog, addr, ptr::null_mut(), 1))
+            );
+            assert!(is_ok(rvm_read(prog, addr, ptr::null_mut(), 0)));
+            assert!(
+                is_arg(rvm_write(ptr::null_mut(), addr, &byte, 1)) && is_arg(rvm_write(prog, addr, ptr::null(), 1))
+            );
+            assert!(is_ok(rvm_write(prog, addr, ptr::null(), 0)) && is_ok(rvm_unmap(prog, addr)));
 
-        // map / unmap / read / write guards
-        let mut addr = 0u64;
-        assert!(matches!(unsafe { rvm_map(ptr::null_mut(), 16, &mut addr) }, Status::Argument));
-        assert!(matches!(unsafe { rvm_map(prog, 16, ptr::null_mut()) }, Status::Argument));
-        assert!(matches!(unsafe { rvm_map(prog, 16, &mut addr) }, Status::Ok));
-        assert!(matches!(unsafe { rvm_unmap(ptr::null_mut(), addr) }, Status::Argument));
+            assert_eq!((rvm_function_count(ptr::null()), rvm_function_count(prog)), (0, 1));
+            let (main, mut idx, mut nptr, mut nlen) = (b"main", 0usize, ptr::null(), 0usize);
+            assert!(is_arg(rvm_func(ptr::null(), main.as_ptr(), 4, &mut idx)));
+            assert!(
+                is_arg(rvm_func(prog, ptr::null(), 1, &mut idx))
+                    && is_arg(rvm_func(prog, main.as_ptr(), 4, ptr::null_mut()))
+            );
+            assert!(is_ok(rvm_func(prog, main.as_ptr(), 4, &mut idx)));
+            assert!(is_arg(rvm_function_name(ptr::null(), idx, &mut nptr, &mut nlen)));
+            assert!(is_arg(rvm_function_name(prog, idx, ptr::null_mut(), &mut nlen)));
+            assert!(is_arg(rvm_function_name(prog, idx, &mut nptr, ptr::null_mut())));
 
-        let mut byte = 0u8;
-        assert!(matches!(unsafe { rvm_read(ptr::null(), addr, &mut byte, 1) }, Status::Argument));
-        assert!(matches!(unsafe { rvm_read(prog, addr, ptr::null_mut(), 1) }, Status::Argument));
-        assert!(matches!(unsafe { rvm_read(prog, addr, ptr::null_mut(), 0) }, Status::Ok));
-
-        assert!(matches!(unsafe { rvm_write(ptr::null_mut(), addr, &byte, 1) }, Status::Argument));
-        assert!(matches!(unsafe { rvm_write(prog, addr, ptr::null(), 1) }, Status::Argument));
-        assert!(matches!(unsafe { rvm_write(prog, addr, ptr::null(), 0) }, Status::Ok));
-        assert!(matches!(unsafe { rvm_unmap(prog, addr) }, Status::Ok));
-
-        // function query guards
-        assert_eq!(unsafe { rvm_function_count(ptr::null()) }, 0);
-        assert_eq!(unsafe { rvm_function_count(prog) }, 1);
-
-        let mut idx = 0usize;
-        let main = b"main";
-        assert!(matches!(unsafe { rvm_func(ptr::null(), main.as_ptr(), main.len(), &mut idx) }, Status::Argument));
-        assert!(matches!(unsafe { rvm_func(prog, ptr::null(), 1, &mut idx) }, Status::Argument));
-        assert!(matches!(unsafe { rvm_func(prog, main.as_ptr(), main.len(), ptr::null_mut()) }, Status::Argument));
-        assert!(matches!(unsafe { rvm_func(prog, main.as_ptr(), main.len(), &mut idx) }, Status::Ok));
-
-        let mut name_ptr = ptr::null();
-        let mut name_len = 0usize;
-        assert!(matches!(
-            unsafe { rvm_function_name(ptr::null(), idx, &mut name_ptr, &mut name_len) },
-            Status::Argument
-        ));
-        assert!(matches!(unsafe { rvm_function_name(prog, idx, ptr::null_mut(), &mut name_len) }, Status::Argument));
-        assert!(matches!(unsafe { rvm_function_name(prog, idx, &mut name_ptr, ptr::null_mut()) }, Status::Argument));
-
-        // call / call_func guards and ret == NULL
-        let arg = 41u64;
-        let mut ret = 0u64;
-        assert!(matches!(
-            unsafe { rvm_call(ptr::null_mut(), main.as_ptr(), main.len(), &arg, 1, &mut ret) },
-            Status::Argument
-        ));
-        assert!(matches!(
-            unsafe { rvm_call(prog, ptr::null(), 1, ptr::null(), 0, ptr::null_mut()) },
-            Status::Argument
-        ));
-        assert!(matches!(
-            unsafe { rvm_call(prog, main.as_ptr(), main.len(), ptr::null(), 1, ptr::null_mut()) },
-            Status::Argument
-        ));
-        assert!(matches!(unsafe { rvm_call(prog, main.as_ptr(), main.len(), &arg, 1, ptr::null_mut()) }, Status::Ok));
-        assert!(matches!(unsafe { rvm_call(prog, main.as_ptr(), main.len(), &arg, 1, &mut ret) }, Status::Ok));
-        assert_eq!(ret, 42);
-
-        assert!(matches!(unsafe { rvm_call_func(ptr::null_mut(), idx, &arg, 1, &mut ret) }, Status::Argument));
-        assert!(matches!(unsafe { rvm_call_func(prog, idx, ptr::null(), 1, ptr::null_mut()) }, Status::Argument));
-        assert!(matches!(unsafe { rvm_call_func(prog, idx, &arg, 1, ptr::null_mut()) }, Status::Ok));
-
-        unsafe { rvm_free(prog) };
+            let (arg, mut ret) = (41u64, 0u64);
+            assert!(is_arg(rvm_call(ptr::null_mut(), main.as_ptr(), 4, &arg, 1, &mut ret)));
+            assert!(is_arg(rvm_call(prog, ptr::null(), 1, ptr::null(), 0, ptr::null_mut())));
+            assert!(is_arg(rvm_call(prog, main.as_ptr(), 4, ptr::null(), 1, ptr::null_mut())));
+            assert!(is_ok(rvm_call(prog, main.as_ptr(), 4, &arg, 1, ptr::null_mut())));
+            assert!(is_ok(rvm_call(prog, main.as_ptr(), 4, &arg, 1, &mut ret)) && ret == 42);
+            assert!(is_arg(rvm_call_func(ptr::null_mut(), idx, &arg, 1, &mut ret)));
+            assert!(is_arg(rvm_call_func(prog, idx, ptr::null(), 1, ptr::null_mut())));
+            assert!(is_ok(rvm_call_func(prog, idx, &arg, 1, ptr::null_mut())));
+            rvm_free(prog);
+        }
     }
 
     #[test]

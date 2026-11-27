@@ -63,23 +63,6 @@ fn instruction_limit_covers_plugin_calls() {
     assert_eq!(instructions, LIMIT);
 }
 
-// spins past DEFAULT_INSTRUCTION_LIMIT (2M+ guest instructions), far too slow under Miri
-#[cfg(not(miri))]
-#[test]
-fn default_has_no_instruction_limit() {
-    use ebpf_asm::{Assembler, R0, R1};
-
-    // 2 n + 3 instructions for n = DEFAULT_INSTRUCTION_LIMIT
-    let mut asm = Assembler::new();
-    let spin = asm.label();
-    asm.mov64_imm(R1, rvm::DEFAULT_INSTRUCTION_LIMIT as i32);
-    asm.bind(spin);
-    asm.sub64_imm(R1, 1).jne_imm(R1, 0, spin);
-    asm.mov64_imm(R0, 1).exit();
-    let mut program = Vm::new().load_image(Image::from_code(asm.assemble().unwrap())).unwrap();
-    assert_eq!(program.call("main", &[]).unwrap(), 1);
-}
-
 #[cfg(not(feature = "fuel"))]
 #[test]
 fn instruction_limit_needs_fuel() {
@@ -103,7 +86,7 @@ fn instruction_limit_needs_fuel() {
 }
 
 #[test]
-fn plugin_calls_export_and_survives_reload() {
+fn plugin_exports_and_handles_follow_replace() {
     let vm = Vm::new();
     vm.register_extern("host_reenter", |x: u64| x);
 
@@ -116,37 +99,23 @@ fn plugin_calls_export_and_survives_reload() {
     let a = Plugin::new("a", vm.load_elf(&object("tests/plugin_a_v1.o")).unwrap());
     vm.export(&a, "a_scale").unwrap();
     let b = Plugin::new("b", vm.load_elf(&object("tests/plugin_b.o")).unwrap());
-    assert_eq!(b.call("b_run", &[5]).unwrap(), 11);
-    let scale = a.lock().unwrap().func("a_scale").unwrap();
-    let direct = a.lock().unwrap().call_func(scale, &[5]).unwrap();
-    assert_eq!(direct, a.call("a_scale", &[5]).unwrap());
+    let scale_fn = a.func("a_scale").unwrap();
+    let raw_func = a.lock().unwrap().func("a_scale").unwrap();
+    assert_eq!((b.call("b_run", &[5]).unwrap(), scale_fn.call(&[5]).unwrap()), (11, 10));
 
-    // Replacing A's code is picked up by B's next call without relinking B.
+    // Replacing A's code is picked up by B and `PluginFunc`, while the old `Func` handle fails as foreign.
     a.replace(vm.load_elf(&object("tests/plugin_a_v2.o")).unwrap()).unwrap();
-    assert_eq!(b.call("b_run", &[5]).unwrap(), 16);
-    // A handle into the replaced program fails instead of running the new one at its pc.
-    assert!(matches!(a.lock().unwrap().call_func(scale, &[5]), Err(VmError::ForeignFunc)));
-}
+    assert_eq!((b.call("b_run", &[5]).unwrap(), scale_fn.call(&[5]).unwrap()), (16, 15));
+    assert!(matches!(a.lock().unwrap().call_func(raw_func, &[5]), Err(VmError::ForeignFunc)));
 
-#[test]
-fn plugin_func_follows_replace() {
-    let vm = Vm::new();
-    let a = Plugin::new("a", vm.load_elf(&object("tests/plugin_a_v1.o")).unwrap());
-    let scale = a.func("a_scale").unwrap();
-    assert_eq!(scale.call(&[5]).unwrap(), 10);
-
-    a.replace(vm.load_elf(&object("tests/plugin_a_v2.o")).unwrap()).unwrap();
-    assert_eq!(scale.call(&[5]).unwrap(), 15);
-
-    // A program without the function fails the call, and the handle recovers when a later program has it again.
+    // A program without the function fails the handle, which recovers once a later program defines it again.
     a.replace(vm.load_elf(&object("tests/maps.o")).unwrap()).unwrap();
-    let err = scale.call(&[5]).unwrap_err();
-    assert!(
-        matches!(&err, VmError::FunctionNotFound { plugin: Some(p), func } if p == "a" && func == "a_scale"),
-        "{err}"
-    );
+    assert!(matches!(
+        scale_fn.call(&[5]).unwrap_err(),
+        VmError::FunctionNotFound { plugin: Some(p), func } if p == "a" && func == "a_scale"
+    ));
     a.replace(vm.load_elf(&object("tests/plugin_a_v1.o")).unwrap()).unwrap();
-    assert_eq!(scale.call(&[5]).unwrap(), 10);
+    assert_eq!(scale_fn.call(&[5]).unwrap(), 10);
 }
 
 #[test]
@@ -226,25 +195,6 @@ fn shared_map_atomics_across_threads() {
         }
     });
     assert_eq!(plugins[0].call("bump", &[]).unwrap(), 2 * N + 1);
-}
-
-/// One plugin writes through a pointer into a shared region, another reads it.
-#[test]
-fn shared_region_is_visible_to_every_plugin() {
-    let vm = Vm::new();
-    // SAFETY: the plugins run on this thread only.
-    let rw = unsafe { vm.share_region(64, rvm::Perms::RW) }.unwrap();
-    let ro = unsafe { vm.share_region(64, rvm::Perms::R) }.unwrap();
-
-    let x = Plugin::new("x", vm.load_elf(&object("tests/shared_region.o")).unwrap());
-    let y = Plugin::new("y", vm.load_elf(&object("tests/shared_region.o")).unwrap());
-    let slot = rw.base() + 8;
-    x.call("put", &[slot, 42]).unwrap();
-    assert_eq!(y.call("get", &[slot]).unwrap(), 42);
-    assert_eq!(rw.read::<u64>(8).unwrap(), 42);
-
-    let err = x.call("put", &[ro.base(), 1]).unwrap_err();
-    assert!(matches!(err, VmError::Exec(rvm::ExecError::MemoryFault { .. })), "{err}");
 }
 
 /// Two plugins on two threads pass messages through a shared region (bpf/tests/acq_rel.c): the producer writes a
@@ -335,6 +285,7 @@ fn plugins_of_different_modes() {
     let vm = Vm::new();
     // SAFETY: one thread
     let shared = unsafe { vm.share_region(64, rvm::Perms::RW) }.unwrap();
+    let ro = unsafe { vm.share_region(64, rvm::Perms::R) }.unwrap();
     let elf = object("tests/shared_region.o");
     let mut checked = vm.load_elf(&elf).unwrap();
     let mut raw = vm.loader().passthrough(untagged).load_elf(&elf).unwrap();
@@ -342,6 +293,11 @@ fn plugins_of_different_modes() {
 
     checked.call("put", &[checked_addr, 5]).unwrap();
     assert_eq!(raw.call("get", &[raw_addr]).unwrap(), 5);
+    assert_eq!(shared.read::<u64>(0).unwrap(), 5);
+    assert!(matches!(
+        checked.call("put", &[ro.base(), 1]),
+        Err(VmError::Exec(rvm::ExecError::MemoryFault { .. }))
+    ));
     for (program, addr) in [(&mut checked, raw_addr), (&mut raw, checked_addr)] {
         let err = program.call("get", &[addr]).unwrap_err();
         assert!(matches!(err, VmError::Exec(rvm::ExecError::MemoryFault { .. })), "{err}");

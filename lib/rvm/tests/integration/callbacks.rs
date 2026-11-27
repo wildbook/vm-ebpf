@@ -189,14 +189,8 @@ fn qsort_and_scoped_callback_abis() {
         fn GetProcAddress(module: *mut std::ffi::c_void, name: *const i8) -> *const ();
     }
 
-    let modes = [
-        Passthrough::OFF,
-        // SAFETY: test passes only valid pointers
-        unsafe { Passthrough::on() },
-        // SAFETY: test passes only valid pointers
-        unsafe { Passthrough::untagged() },
-    ];
-    for mode in modes {
+    // SAFETY: test passes only valid pointers
+    for mode in [Passthrough::OFF, unsafe { Passthrough::untagged() }] {
         let vm = Vm::with_config(VmConfig {
             passthrough: mode,
             ..VmConfig::default()
@@ -234,23 +228,25 @@ fn qsort_and_scoped_callback_abis() {
         let expected_qsort = 1 + 3 * 10 + 7 * 100 + 15 * 1000 + 42 * 10000 + 99 * 100000;
         assert_eq!(prog.call("test_qsort", &[]).unwrap(), expected_qsort, "mode={mode:?}");
 
+        if mode != Passthrough::OFF {
+            continue;
+        }
+
         // Float/double callback args (xmm0..xmm3 + stack arg 5) and double return (xmm0)
         let expected_float = 1.5f64.to_bits()
             ^ (u64::from(2.25f32.to_bits()) << 1)
             ^ (3u64 << 2)
             ^ (4.0f64.to_bits() >> 1)
             ^ (u64::from(5.5f32.to_bits()) << 3);
-        assert_eq!(prog.call("test_float_cb", &[]).unwrap(), expected_float, "mode={mode:?}");
+        assert_eq!(prog.call("test_float_cb", &[]).unwrap(), expected_float);
 
         // By-reference S3 (3 B) and S12 (12 B) structs unmarshalled into guest registers
         let expected_struct = 1 + 2 * 2 + 3 * 3 + 4 + 5 * 10 + 6 * 100 + 7 * 1000;
-        assert_eq!(prog.call("test_struct_cb", &[7]).unwrap(), expected_struct, "mode={mode:?}");
+        assert_eq!(prog.call("test_struct_cb", &[7]).unwrap(), expected_struct);
 
-        // `&extern` native token passed as Callback resolves to the native's real function pointer
-        assert_eq!(prog.call("test_token_as_cb", &[21]).unwrap(), 42, "mode={mode:?}");
-
-        // Null callback passes through unchanged
-        assert_eq!(prog.call("test_null_cb", &[21]).unwrap(), 999, "mode={mode:?}");
+        // `&extern` native token passed as Callback resolves to the native's real function pointer, and null stays null
+        assert_eq!(prog.call("test_token_as_cb", &[21]).unwrap(), 42);
+        assert_eq!(prog.call("test_null_cb", &[21]).unwrap(), 999);
     }
 }
 

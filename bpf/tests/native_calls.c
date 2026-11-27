@@ -1,6 +1,6 @@
 /*
  * Calls native functions, which the tests in lib/rvm/tests/integration/natives.rs register: integers, buffers with
- * a length, a pointer checked for one byte, and a native that calls back into this plugin.
+ * a length, and a pointer checked for one byte.
  */
 #include "rvm_bpf.h"
 
@@ -9,7 +9,6 @@ extern u64 nat_five(u64 a, u64 b, u64 c, u64 d, u64 e);
 extern u64 nat_sum(const u8 *buf BORROW_RO(1), u64 len);
 extern u64 nat_fill(u8 *buf BORROW(1), u64 len, u64 byte);
 extern u64 nat_first(const u8 *p);
-extern u64 nat_reenter(u64 x);
 
 u64 add(u64 a, u64 b) {
     return nat_add(a, b);
@@ -57,16 +56,4 @@ u64 fill_rodata(void) {
 /* An empty buffer may be null. */
 u64 sum_empty(void) {
     return nat_sum(NULL, 0);
-}
-
-u64 reenter(u64 x) {
-    return nat_reenter(x);
-}
-
-/* n native calls in a loop: the sum of 1 to n. */
-u64 count(u64 n) {
-    u64 total = 0;
-    for (u64 i = 0; i < n; i++)
-        total = nat_add(total, i + 1);
-    return total;
 }

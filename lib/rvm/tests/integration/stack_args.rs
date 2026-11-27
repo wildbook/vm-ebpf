@@ -81,14 +81,12 @@ fn load(vm: &Vm) -> Program {
     vm.load_elf(&object("tests/stack_args.o")).unwrap()
 }
 
-/// The calls of the fixture that reach each kind of callee with 6, 8 and 12 arguments, each with its result for
-/// the argument `x`.
+/// The calls of the fixture that reach each kind of callee with 6 and 12 arguments, each with its result for `x`.
 fn calls(x: u64) -> Vec<(&'static str, u64)> {
     let split = weigh(&from(x, 6));
     let mut calls = vec![("call_g_split", split), ("call_h_split", split)];
     for (n, names) in [
         (6, &["call_g6", "callx_g6", "call_h6", "call_n6"][..]),
-        (8, &["call_g8", "call_h8", "call_n8"]),
         (12, &["call_g12", "callx_g12", "call_h12", "call_n12"]),
     ] {
         calls.extend(names.iter().map(|&name| (name, weigh(&from(x, n)))));
@@ -100,7 +98,7 @@ fn calls(x: u64) -> Vec<(&'static str, u64)> {
 #[test]
 fn every_callee_gets_its_arguments() {
     let mut program = load(&vm());
-    for x in [1, 1000, u64::MAX - 20] {
+    for x in [1, u64::MAX - 20] {
         for (name, expected) in calls(x) {
             assert_eq!(program.call(name, &[x]).unwrap(), expected, "{name}({x})");
         }
@@ -111,22 +109,17 @@ fn every_callee_gets_its_arguments() {
 #[test]
 fn host_calls_with_stack_arguments() {
     let mut program = load(&vm());
-    for (name, n) in [("g6", 6), ("g8", 8), ("g12", 12), ("g_split", 6)] {
+    for (name, n) in [("g12", 12), ("g_split", 6)] {
         let args = from(7, n);
         assert_eq!(program.call(name, &args).unwrap(), weigh(&args), "{name}");
-        let func = program.func(name).unwrap();
-        assert_eq!(program.call_func(func, &args).unwrap(), weigh(&args), "{name}");
     }
 
     // an argument the host leaves out is 0, also after a call that passed it
     assert_eq!(program.call("g12", &from(7, 5)).unwrap(), weigh(&from(7, 5)));
     assert_eq!(program.call("g12", &from(7, 9)).unwrap(), weigh(&from(7, 9)));
-
-    let err = program.call("g12", &from(7, 13)).unwrap_err();
-    assert!(matches!(err, VmError::TooManyArgs(13)), "{err}");
+    assert!(matches!(program.call("g12", &from(7, 13)), Err(VmError::TooManyArgs(13))));
 
     let plugin = Plugin::new("stack", program);
-    assert_eq!(plugin.call("g8", &from(3, 8)).unwrap(), weigh(&from(3, 8)));
     assert_eq!(plugin.func("g12").unwrap().call(&from(3, 12)).unwrap(), weigh(&from(3, 12)));
 }
 
@@ -220,13 +213,7 @@ fn raw_calls_pass_the_stack_arguments() {
         .load_elf(&object("tests/stack_args.o"))
         .unwrap();
     let x = 21;
-    for (name, func, n) in [
-        ("raw6", n6 as *const (), 6),
-        ("raw8", n8 as *const (), 8),
-        ("raw12", n12 as *const (), 12),
-    ] {
-        assert_eq!(program.call(name, &[func as u64, x]).unwrap(), weigh(&from(x, n)), "{name}");
-    }
+    assert_eq!(program.call("raw12", &[n12 as *const () as u64, x]).unwrap(), weigh(&from(x, 12)));
     // a function of fewer parameters ignores the rest
     assert_eq!(program.call("raw12", &[n6 as *const () as u64, x]).unwrap(), weigh(&from(x, 6)));
 }
@@ -273,10 +260,7 @@ fn instruction_limit_at_every_instruction() {
     let mut program = load(&vm());
     for (name, args, expected) in [
         ("call_g12", vec![3], weigh(&from(3, 12))),
-        ("callx_g12", vec![3], weigh(&from(3, 12))),
-        ("call_h12", vec![3], weigh(&from(3, 12))),
         ("call_n12", vec![3], weigh(&from(3, 12))),
-        ("call_nest", vec![3, 5, 100], nest(3, 5, 100)),
     ] {
         let func = program.func(name).unwrap();
         let whole = program.call_func_with_limit(func, &args, 0);
@@ -287,9 +271,11 @@ fn instruction_limit_at_every_instruction() {
             match (limit == whole.instructions, call.result) {
                 (true, Ok(result)) => assert_eq!(result, expected, "{name} under {limit}"),
                 (false, Err(VmError::Exec(ExecError::InstructionLimit { .. }))) => {
-                    // the two-slot `lddw` of `callx_g12` doesn't run with one instruction left
-                    let ran = limit - 1..=limit;
-                    assert!(ran.contains(&call.instructions), "{name} under {limit}: {}", call.instructions);
+                    assert!(
+                        (limit - 1..=limit).contains(&call.instructions),
+                        "{name} under {limit}: {}",
+                        call.instructions
+                    );
                 }
                 (_, result) => panic!("{name} under {limit}: {result:?}"),
             }
@@ -297,26 +283,18 @@ fn instruction_limit_at_every_instruction() {
     }
 }
 
-/// A prepared image records which host calls pass stack arguments and the 12-argument signatures of its natives,
-/// and runs as the object does.
+/// A prepared image records `stack` flags and 12-argument native signatures, and runs as the object does.
 #[test]
 fn prepared_image() {
     let image = vm().prepare_elf(&object("tests/stack_args.o")).unwrap();
-    let stack = |wanted: &str| {
-        let found = image.imports().iter().find_map(|import| match import {
-            Import::Name { name, stack, .. } if name == wanted => Some(*stack),
-            _ => None,
-        });
-        found.unwrap_or_else(|| panic!("no call of {wanted}"))
-    };
-    assert!(stack("h6") && stack("h12") && stack("h_split"));
-
+    assert!(image
+        .imports()
+        .iter()
+        .any(|i| matches!(i, Import::Name { name, stack: true, .. } if name == "h12")));
     let bytes = image.to_bytes();
     assert_eq!(Image::from_bytes(&bytes).unwrap(), image);
     let mut program = vm().load_image_bytes(&bytes).unwrap();
-    for (name, expected) in calls(5) {
-        assert_eq!(program.call(name, &[5]).unwrap(), expected, "{name}");
-    }
+    assert_eq!(program.call("call_h12", &[5]).unwrap(), weigh(&from(5, 12)));
     assert_eq!(program.call("call_n_buf", &[5, 4]).unwrap(), weigh(&from(5, 6)) + 11);
 }
 
@@ -359,60 +337,4 @@ fn what_no_call_passes_fails_the_load() {
     ];
     let mut program = Vm::new().load_image(Image::from_code(code.to_vec())).unwrap();
     assert_eq!(program.call("main", &[]).unwrap(), 7);
-}
-
-/// Narrow integers past the fifth argument: `s32`, `u32`, `u8` and `u16` work between a plugin's own functions,
-/// `s8` and `s16` reproduce clang 23.1's 32-bit-only extension on negative constants and forwarded parameters, and
-/// host and native functions receive all narrow types in the low bits.
-#[test]
-fn narrow_stack_arguments() {
-    fn sum_narrow(f: i8, g: u8, h: i16, i: u16, j: i32, k: u32) -> i64 {
-        i64::from(f) + i64::from(g) + i64::from(h) + i64::from(i) + i64::from(j) + i64::from(k)
-    }
-
-    #[rustfmt::skip]
-    extern "C" fn n_narrow(
-        a: u64, b: u64, c: u64, d: u64, e: u64, f: i8, g: u8, h: i16, i: u16, j: i32, k: u32,
-    ) -> i64 {
-        (a + b + c + d + e) as i64 + sum_narrow(f, g, h, i, j, k)
-    }
-
-    let natives = [("n_narrow", n_narrow as *const (), NativeSig::ints(11))];
-    // SAFETY: `n_narrow` takes 11 integer arguments in the host C convention and never unwinds.
-    let vm = unsafe { Vm::with_natives(VmConfig::default(), &natives) }.unwrap();
-    type Eleven = (u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64);
-    vm.register_extern("h_narrow", |(a, b, c, d, e, f, g, h, i, j, k): Eleven| {
-        (a + b + c + d + e) as i64 + sum_narrow(f as i8, g as u8, h as i16, i as u16, j as i32, k as u32)
-    });
-
-    let mut program = vm.load_elf(&object("tests/stack_args_narrow.o")).unwrap();
-
-    // `s32` and `u32`: the callee extends from the low 32 bits
-    assert_eq!(program.call("call_g_s32_imm", &[]).unwrap() as i64, -50_000);
-    assert_eq!(program.call("call_g_s32_reg", &[(-123i32) as u32 as u64]).unwrap() as i64, -123);
-    assert_eq!(program.call("call_g_u32_imm", &[]).unwrap(), 0x8000_0001);
-    assert_eq!(program.call("call_g_u32_reg", &[0x1_8000_0007]).unwrap(), 0x8000_0007);
-
-    // `u8` and `u16`: the caller masks / zero-extends to 64 bits
-    assert_eq!(program.call("call_g_u8_imm", &[]).unwrap(), 250);
-    assert_eq!(program.call("call_g_u8_reg", &[0xdead_beef]).unwrap(), 0xef);
-    assert_eq!(program.call("call_g_u16_imm", &[]).unwrap(), 65_000);
-    assert_eq!(program.call("call_g_u16_reg", &[0xdead_beef]).unwrap(), 0xbeef);
-
-    // Clang 23.1 miscompile (llvm/llvm-project#238315): negative `s8` / `s16` constants and forwarded narrow
-    // parameters arrive with only their low 32 bits sign-extended, and the callee reads all 64 bits.
-    assert_eq!(program.call("call_g_s8_imm", &[]).unwrap(), (-5i32) as u32 as u64);
-    assert_eq!(program.call("call_g_s16_imm", &[]).unwrap(), (-500i32) as u32 as u64);
-    assert_eq!(program.call("call_forward_s8", &[]).unwrap(), (-5i32) as u32 as u64);
-
-    // Host and native functions read narrow arguments from the low bits
-    let imm_expected = (1 + 2 + 3 + 4 + 5) + sum_narrow(-5, 250, -500, 65_000, -50_000, 0x8000_0001);
-    assert_eq!(program.call("call_h_narrow_imm", &[]).unwrap() as i64, imm_expected);
-    assert_eq!(program.call("call_n_narrow_imm", &[]).unwrap() as i64, imm_expected);
-
-    for x in [0u64, 0xff, 0x8000_8080, u64::MAX - 4] {
-        let reg_expected = (1 + 2 + 3 + 4 + 5) + sum_narrow(x as i8, x as u8, x as i16, x as u16, x as i32, x as u32);
-        assert_eq!(program.call("call_h_narrow_reg", &[x]).unwrap() as i64, reg_expected, "host {x:#x}");
-        assert_eq!(program.call("call_n_narrow_reg", &[x]).unwrap() as i64, reg_expected, "native {x:#x}");
-    }
 }

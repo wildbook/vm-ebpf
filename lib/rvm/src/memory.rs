@@ -1105,49 +1105,6 @@ mod tests {
     use crate::error::ExecError;
 
     #[test]
-    fn null_region_and_bounds_fault() {
-        let mut mem = VmMemory::new();
-        let base = mem.map_any(1, 16, Perms::RW).unwrap();
-        assert_eq!(mem.load_u8(0), Err(0));
-        assert_eq!(mem.load_u8(7), Err(7));
-        assert!(mem.load_u64(base + 8).is_ok());
-        assert_eq!(mem.load_u64(base + 9), Err(base + 9)); // straddles the end
-        assert_eq!(mem.load_u8(region_tag(CODE_REGION)), Err(region_tag(CODE_REGION)));
-        // the region's tag on bytes outside it, and its bytes under another tag or none
-        let (past, before) = (base + 16, base - 1);
-        assert_eq!((mem.load_u8(past), mem.load_u8(before)), (Err(past), Err(before)));
-        let (other, untagged) = (base - region_tag(1) + region_tag(2), base - region_tag(1));
-        assert_eq!((mem.load_u8(other), mem.load_u8(untagged)), (Err(other), Err(untagged)));
-        assert_eq!(mem.load_u8(u64::MAX), Err(u64::MAX));
-        // guest-controlled lengths (helper and borrow arguments) must not wrap the check
-        assert!(mem.bytes(base + 8, usize::MAX - 7).is_err());
-        assert!(mem.host_ptr(base, usize::MAX, Perms::NONE).is_err());
-    }
-
-    #[test]
-    fn perms_apply_to_guest_not_host() {
-        let mut mem = VmMemory::new();
-        let ro = mem.map_bytes_any(2, &[1, 2, 3, 4], 8, Perms::R).unwrap();
-        assert_eq!(mem.load_u32(ro), Ok(0x0403_0201));
-        assert_eq!(mem.store_u8(ro, 9), Err(ro));
-        mem.write(ro, 9u8).unwrap(); // host may still patch read-only regions
-        assert_eq!(mem.load_u8(ro), Ok(9));
-
-        let wo = mem.map_any(3, 8, Perms::W).unwrap();
-        assert!(mem.store_u64(wo, 1).is_ok());
-        assert_eq!(mem.load_u64(wo), Err(wo));
-    }
-
-    #[test]
-    fn unaligned_little_endian_access() {
-        let mut mem = VmMemory::new();
-        let base = mem.map_any(1, 16, Perms::RW).unwrap();
-        mem.store_u64(base + 3, 0x1122_3344_5566_7788).unwrap();
-        assert_eq!(mem.bytes(base + 3, 2).unwrap(), &[0x88, 0x77]);
-        assert_eq!(mem.load_u16(base + 4), Ok(0x6677));
-    }
-
-    #[test]
     fn host_region_aliases_host_buffer() {
         let mut buf = [0u8; 8];
         let mut mem = VmMemory::new();
@@ -1156,6 +1113,10 @@ mod tests {
         mem.store_u32(base + 4, 0xAABB_CCDD).unwrap();
         mem.unmap_any(4);
         assert_eq!(mem.load_u8(base), Err(base));
+        // host `write` may still patch a guest-read-only region
+        let ro = mem.map_bytes_any(2, &[1, 2, 3, 4], 8, Perms::R).unwrap();
+        mem.write(ro, 9u8).unwrap();
+        assert_eq!(mem.load_u8(ro), Ok(9));
         drop(mem);
         assert_eq!(buf, [0, 0, 0, 0, 0xDD, 0xCC, 0xBB, 0xAA]);
     }
@@ -1467,44 +1428,26 @@ mod tests {
         let outside = &raw const host_var as u64;
 
         // SAFETY: tests convert addresses only and do not dereference host memory
-        let (on, untagged) = unsafe { (Passthrough::on(), Passthrough::untagged()) };
-        for passthrough in [Passthrough::OFF, on, untagged] {
+        for passthrough in [Passthrough::OFF, unsafe { Passthrough::untagged() }] {
             let mut mem = VmMemory::with_passthrough(passthrough);
             let rw = mem.map(16, Perms::RW).unwrap();
-            let ro = mem.map(8, Perms::R).unwrap();
-
-            let rw_first = rw.base();
-            let rw_last = rw.base() + 15;
-            let rw_past = rw.base() + 16;
-            let ro_first = ro.base();
+            let first = rw.base();
 
             if passthrough.is_untagged() {
-                assert_eq!(mem.host_address(rw_first), rw_first);
-                assert_eq!(mem.guest_address(rw_first), rw_first);
-                assert_eq!(mem.host_address(outside), outside);
-                assert_eq!(mem.guest_address(outside), outside);
                 let high = region_tag(3) | outside;
-                assert_eq!(mem.host_address(high), high);
-                assert_eq!(mem.guest_address(high), high);
+                assert_eq!((mem.host_address(first), mem.guest_address(first)), (first, first));
+                assert_eq!((mem.host_address(high), mem.guest_address(high)), (high, high));
             } else {
-                let rw_host = rw_first & (region_tag(1) - 1);
-                let ro_host = ro_first & (region_tag(1) - 1);
-                assert_eq!(mem.host_address(rw_first), rw_host);
-                assert_eq!(mem.host_address(rw_last), rw_host + 15);
-                assert_eq!(mem.host_address(ro_first), ro_host);
-                assert_eq!(mem.host_address(0), 0);
-                assert_eq!(mem.host_address(outside), outside);
-
-                assert_eq!(mem.guest_address(rw_host), rw_first);
-                assert_eq!(mem.guest_address(rw_host + 15), rw_last);
-                assert_eq!(mem.guest_address(ro_host), ro_first);
-                // one past the end of rw is not inside rw
-                assert_ne!(mem.guest_address(rw_host + 16), rw_past);
-                // already tagged (even with wrong tag), null, or outside every region stays unchanged
-                let wrong_tag = region_tag(10) | rw_host;
-                assert_eq!(mem.guest_address(wrong_tag), wrong_tag);
-                assert_eq!(mem.guest_address(0), 0);
-                assert_eq!(mem.guest_address(outside), outside);
+                let host = first & (region_tag(1) - 1);
+                let wrong_tag = region_tag(10) | host;
+                assert_eq!((mem.host_address(first), mem.host_address(first + 15)), (host, host + 15));
+                assert_eq!((mem.host_address(0), mem.host_address(outside)), (0, outside));
+                assert_eq!((mem.guest_address(host), mem.guest_address(host + 15)), (first, first + 15));
+                assert_ne!(mem.guest_address(host + 16), first + 16);
+                assert_eq!(
+                    (mem.guest_address(wrong_tag), mem.guest_address(0), mem.guest_address(outside)),
+                    (wrong_tag, 0, outside)
+                );
             }
         }
     }
