@@ -46,6 +46,9 @@ pub struct Windows {
 }
 
 /// A [`Window`] as the handlers check it.
+// `repr(C)` keeps `base`, `bias` and the 4/8 byte `fits` entries first so every `stack_access` handler reaches all of
+// them within one-byte displacement of `Interpreter`.
+#[repr(C)]
 struct Cache {
     base: u64,
     /// `window.ptr.expose_provenance().wrapping_sub(base)`, so `addr + bias` gives the host address in parallel with
@@ -67,7 +70,7 @@ impl Windows {
     /// Forget the windows unless `memory` is still at their epoch.
     #[inline(always)]
     pub fn revalidate<M: Memory>(&mut self, memory: &M) {
-        if self.epoch != 0 && memory.epoch() != self.epoch {
+        if memory.epoch() != self.epoch && self.epoch != 0 {
             core::hint::cold_path();
             *self = Self::EMPTY;
         }
@@ -125,14 +128,14 @@ impl Cache {
         self.base = window.base;
         self.bias = window.ptr.expose_provenance().wrapping_sub(window.base as usize);
         self.fits = [
-            fits(window.read_len, 1),
-            fits(window.read_len, 2),
             fits(window.read_len, 4),
             fits(window.read_len, 8),
-            fits(window.write_len, 1),
-            fits(window.write_len, 2),
             fits(window.write_len, 4),
             fits(window.write_len, 8),
+            fits(window.read_len, 1),
+            fits(window.read_len, 2),
+            fits(window.write_len, 1),
+            fits(window.write_len, 2),
         ];
     }
 
@@ -184,16 +187,20 @@ impl Cache {
     }
 }
 
-/// The index into [`Cache::fits`] for the access `opc`.
+/// The index into [`Cache::fits`] for the access `opc`. 4 and 8 byte accesses sit first so every `stack_access`
+/// handler reaches them within one-byte displacement.
 const fn kind(opc: OpCode) -> usize {
     let store = !matches!(opc.class(), Class::Ldx);
-    let size = match opc.mem_size() {
-        MemSize::Byte => 0,
-        MemSize::Half => 1,
-        MemSize::Word => 2,
-        MemSize::DWord => 3,
-    };
-    4 * store as usize + size
+    match (opc.mem_size(), store) {
+        (MemSize::Word, false) => 0,
+        (MemSize::DWord, false) => 1,
+        (MemSize::Word, true) => 2,
+        (MemSize::DWord, true) => 3,
+        (MemSize::Byte, false) => 4,
+        (MemSize::Half, false) => 5,
+        (MemSize::Byte, true) => 6,
+        (MemSize::Half, true) => 7,
+    }
 }
 
 /// Whether the opcode byte `op` is a plain `ldx`, `stx` or `st`, which the windows run.

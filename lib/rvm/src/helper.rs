@@ -606,7 +606,7 @@ impl HelperRegistry {
     ) -> Option<u64> {
         let (Some(func), Some(call_stack)) = (self.slots.get(slot as usize), self.stack_calls.get(slot as usize))
         else {
-            *stop = Some(Stop::UnknownSlot(slot));
+            unknown_slot(stop, slot);
             return None;
         };
         // SAFETY: `HostFn::with_trampoline` paired `call` and `call_stack` with a `data` pointer of the type they
@@ -690,7 +690,7 @@ impl CallTable {
         // SAFETY: `self.registry` keeps the immutable `Vec<CallSlot>` buffer alive for `&self`.
         let slots = unsafe { std::slice::from_raw_parts(self.slots_ptr, self.slots_len) };
         let Some(func) = slots.get(slot as usize) else {
-            *stop = Some(Stop::UnknownSlot(slot));
+            unknown_slot(stop, slot);
             return None;
         };
         // SAFETY: `HostFn::with_trampoline` paired `call` with a `data` pointer kept alive by `registry.owners`.
@@ -708,6 +708,12 @@ impl CallTable {
     ) -> Option<u64> {
         self.registry.call_slot_stack(slot, ctx, host, stop, stack)
     }
+}
+
+#[cold]
+#[inline(never)]
+fn unknown_slot(stop: &mut Option<Stop>, slot: u32) {
+    *stop = Some(Stop::UnknownSlot(slot));
 }
 
 /// The extern table a [`crate::Vm`] shares with the programs it links.

@@ -322,14 +322,22 @@ impl Super {
     }
 
     /// The register of each role, from `slot(k)`, slot `k` of the sequence.
+    // Unrolled over `MAX_ROLES` so `homes[role]` and `slot(k)` fold at `opt-level = "s"` too, instead of copying
+    // `Super` to the stack and emitting a jump table.
     #[inline(always)]
     pub fn registers<F: Fields>(self, slot: impl Fn(usize) -> F) -> [Reg; MAX_ROLES] {
         let mut registers = [Reg::R0; MAX_ROLES];
-        for role in 0..self.roles as usize {
-            let (k, src) = self.homes[role];
-            let slot = slot(k as usize);
-            registers[role] = if src { slot.src_reg() } else { slot.dst_reg() };
+        macro_rules! fetch {
+            ($($role:literal),*) => {$(
+                if $role < self.roles as usize {
+                    let (k, src) = self.homes[$role];
+                    let slot = slot(k as usize);
+                    registers[$role] = if src { slot.src_reg() } else { slot.dst_reg() };
+                }
+            )*};
         }
+        const _: () = assert!(MAX_ROLES == 4);
+        fetch!(0, 1, 2, 3);
         registers
     }
 

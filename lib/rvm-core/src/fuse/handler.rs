@@ -147,23 +147,32 @@ const FP_REG: Reg = Reg::low(FP as u8);
 
 impl Roles<'_> {
     /// Load the roles in the bit set `roles` from their registers `registers`.
+    // Unrolled so constant role masks fold at `opt-level = "s"`.
     #[inline(always)]
     fn load(&mut self, registers: [Reg; MAX_ROLES], roles: u8) {
-        for role in 0..MAX_ROLES {
-            if roles & 1 << role != 0 {
-                self.values[role] = self.regs.get(registers[role]);
-            }
+        macro_rules! step {
+            ($($role:literal),*) => {$(
+                if roles & 1 << $role != 0 {
+                    self.values[$role] = self.regs.get(registers[$role]);
+                }
+            )*};
         }
+        const _: () = assert!(MAX_ROLES == 4);
+        step!(0, 1, 2, 3);
     }
 
     /// Store the roles in the bit set `roles` to their registers `registers`.
     #[inline(always)]
     fn save(&mut self, registers: [Reg; MAX_ROLES], roles: u8) {
-        for role in 0..MAX_ROLES {
-            if roles & 1 << role != 0 {
-                self.regs.set(registers[role], self.values[role]);
-            }
+        macro_rules! step {
+            ($($role:literal),*) => {$(
+                if roles & 1 << $role != 0 {
+                    self.regs.set(registers[$role], self.values[$role]);
+                }
+            )*};
         }
+        const _: () = assert!(MAX_ROLES == 4);
+        step!(0, 1, 2, 3);
     }
 }
 
