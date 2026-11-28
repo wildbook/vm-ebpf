@@ -5,7 +5,7 @@ use crate::code::Slots;
 use crate::dispatch::{Handler, Spare};
 use crate::fuel::{Fuel, RestsPtr};
 use crate::host::Callee;
-use crate::opcode::{Class, JmpOpc, MemMode, MemSize, OpCode, CALL, CALLX};
+use crate::opcode::{Class, JmpOpc, MemMode, MemSize, OpCode, Source, CALL, CALLX};
 use crate::slot::{Fields, Layout, Shape, Slot, View, LAYOUTS};
 use crate::step::{self, Regs, Step, BITS_32, BITS_64};
 use crate::transfer::{self, Ip};
@@ -19,13 +19,16 @@ pub const CALL_KFUNC: u8 = 0x23;
 pub const TO_HOST: u8 = 0x2a;
 /// Dedicated opcode byte for `addr_space_cast` to address space 0 (host to guest address).
 pub const TO_GUEST: u8 = 0x2b;
+/// Opcode byte for `gotox` (`JMP64 | JA | X`).
+const GOTOX: u8 = OpCode::jmp64(JmpOpc::Ja, Source::Reg).0;
 
-/// Install direct handlers for local, helper, kfunc and indirect calls and address-space casts.
+/// Install direct handlers for local, helper, kfunc, indirect calls, `gotox`, and address-space casts.
 pub const fn install<M: Memory, H: Host<M>, F: Fuel>(table: &mut [Handler<M, H>; 256]) {
     table[CALL as usize] = local_call::<M, H, F>;
     table[CALL_HELPER as usize] = host_call::<M, H, F, false>;
     table[CALL_KFUNC as usize] = host_call::<M, H, F, true>;
     table[CALLX as usize] = indirect_call::<M, H, F, false>;
+    table[GOTOX as usize] = indirect_jump::<M, H, F>;
     table[TO_HOST as usize] = addr_space_cast::<M, H, true>;
     table[TO_GUEST as usize] = addr_space_cast::<M, H, false>;
 }
@@ -424,6 +427,30 @@ pub extern "rust-preserve-none" fn indirect_call<M: Memory, H: Host<M>, F: Fuel,
         }
         None => interp.stop.at(ip, Reason::CallIndirect(target)),
     }
+}
+
+/// Direct handler for `gotox` (`JMP64 | JA | X`): resolves the jump table target in loop through
+/// [`Host::jump_indirect`] when the host supports it, or stops with [`Reason::JumpIndirect`].
+#[rustc_align(64)]
+#[inline(never)]
+extern "rust-preserve-none" fn indirect_jump<M: Memory, H: Host<M>, F: Fuel>(
+    ctx: &mut Context<M>,
+    code: Slots,
+    ip: Ip,
+    interp: &mut Interpreter<M, H>,
+    rests: RestsPtr,
+    _: Spare,
+    slot: Slot,
+) {
+    // SAFETY: a handler's ip lies below `len`, and `GOTOX` has `Layout::Dst`.
+    let dst = unsafe { ip.view(slot, const { Shape::of(GOTOX) }) }.dst_reg();
+    let target = ctx.regs.get(dst);
+    if let Some(pc) = interp.host.jump_indirect(target) {
+        if pc < code.len() as u64 {
+            become_enter!(ctx, code, Ip::at(code, pc), interp, rests)
+        }
+    }
+    interp.stop.at(ip, Reason::JumpIndirect(target))
 }
 
 /// The handler of [`TO_HOST`] (`TO_HOST_DIR`) and [`TO_GUEST`]: converts a pointer between address spaces 0 and 1.

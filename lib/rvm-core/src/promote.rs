@@ -1,8 +1,7 @@
 //! Promotion of non-escaping `r10` stack slots to virtual registers.
 //!
-//! Leaf functions that never let `r10` escape into another register or memory and contain no calls or indirect jumps
-//! can keep disjoint 4-byte and 8-byte stack spill slots in `Context::regs` virtual registers (`r16..r47`). The
-//! threaded compiler rewrites those loads and stores into `mov` instructions, which fold into 3-operand ALU handlers
+//! Leaf functions that never let `r10` escape into another register or memory and contain no calls can keep disjoint
+//! 4-byte and 8-byte stack spill slots in `Context::regs` virtual registers (`r16..r47`). The threaded compiler rewrites those loads and stores into `mov` instructions, which fold into 3-operand ALU handlers
 //! with no extra hot handlers. Entry loads the slots from the validated stack window and exit, short-fuel stepping,
 //! or an aliasing data window miss flushes them back to stack memory.
 
@@ -119,8 +118,9 @@ pub fn analyze(slots: &[Slot], len: usize) -> Box<[PromotedRegion]> {
         if opc.is_jump() {
             match opc.jmp_opc() {
                 JmpOpc::Ja if matches!(opc.source(), Source::Reg) => {
-                    // Indirect `gotox` can jump to any pc in the program.
-                    return Box::new([]);
+                    // Indirect `gotox` can jump to any pc in the program, so merge the whole program into one region.
+                    // Any call or `r10` escape anywhere in the program still rejects promotion.
+                    reach[0] = len - 1;
                 }
                 JmpOpc::Ja => {
                     let off = match opc.class() {
@@ -299,6 +299,11 @@ fn analyze_region(slots: &[Slot], start: usize, end: usize) -> Option<PromotedRe
             Class::Jmp32 | Class::Jmp64 => match opc.jmp_opc() {
                 JmpOpc::Exit => {}
                 JmpOpc::Ja if matches!(opc.source(), Source::Imm) => {}
+                JmpOpc::Ja if matches!(opc.source(), Source::Reg) => {
+                    if usize::from(slot.dst_reg_decoded().get()) == FP {
+                        return None;
+                    }
+                }
                 JmpOpc::Call | JmpOpc::Jcond | JmpOpc::UndefF | JmpOpc::Ja => return None,
                 _ => match LAYOUTS[usize::from(usual)] {
                     Layout::Dst => {

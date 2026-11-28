@@ -569,6 +569,11 @@ impl Host<VmMemory> for HostCalls {
     }
 
     #[inline(always)]
+    fn jump_indirect(&self, target: u64) -> Option<u64> {
+        code_index(target)
+    }
+
+    #[inline(always)]
     fn natives(&self) -> &[Native] {
         self.table.natives()
     }

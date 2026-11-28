@@ -37,6 +37,13 @@ pub trait Host<M: Memory> {
     /// the host function it addresses. For a target that is the address of a native function, `native` runs it.
     fn call_indirect(&mut self, ctx: &mut Context<M>, target: u64, native: NativeCall<'_, M::Error>) -> Option<Callee>;
 
+    /// Resolve a `gotox` target address to an instruction pc in the active code, or `None` to stop the run with
+    /// [`Reason::JumpIndirect`](crate::Reason::JumpIndirect).
+    #[inline(always)]
+    fn jump_indirect(&self, _target: u64) -> Option<u64> {
+        None
+    }
+
     /// The native functions that calls bound with [`Code::with_natives`](crate::Code::with_natives) name by index. A
     /// call of an index past the end stops the run with [`Reason::CallKfunc`](crate::Reason::CallKfunc) and that
     /// index. The default has none.

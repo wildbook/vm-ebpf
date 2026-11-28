@@ -54,10 +54,17 @@ const SRC_OP_ADD: u8 = 0;
 const SRC_OP_MUL: u8 = 1;
 const SRC_OP_XOR: u8 = 2;
 
+const CMP_EQ: u8 = 0;
+const CMP_LT: u8 = 1;
+const CMP_SLT: u8 = 2;
+
 /// Handler table for threaded folded sequences.
 pub struct FoldTable<M: Memory, H> {
     pub mov_ja_imm: [Handler<M, H>; 2],
     pub mov_ja_reg: [Handler<M, H>; 2],
+    /// Branchless `jcc_reg +1; mov` handlers indexed by `[bits64]`.
+    pub select_reg_imm: [Handler<M, H>; 2],
+    pub select_reg_reg: [Handler<M, H>; 2],
     pub rot: [[Handler<M, H>; 2]; 2],
     /// Shifted register ALU handlers indexed by `[bits64][lsh][op]` (`op`: 0=xor, 1=or, 2=add).
     pub shift_alu: [[[Handler<M, H>; 3]; 2]; 2],
@@ -90,6 +97,8 @@ pub const fn table<M: Memory, H: Host<M>, F: Fuel>() -> FoldTable<M, H> {
     FoldTable {
         mov_ja_imm: [mov_ja_imm::<M, H, F, false>, mov_ja_imm::<M, H, F, true>],
         mov_ja_reg: [mov_ja_reg::<M, H, F, false>, mov_ja_reg::<M, H, F, true>],
+        select_reg_imm: [select_reg_imm::<M, H, F, false>, select_reg_imm::<M, H, F, true>],
+        select_reg_reg: [select_reg_reg::<M, H, F, false>, select_reg_reg::<M, H, F, true>],
         rot: [
             [rot::<M, H, false, false>, rot::<M, H, false, true>],
             [rot::<M, H, true, false>, rot::<M, H, true, true>],
@@ -275,6 +284,9 @@ pub fn try_fold<M: Memory, H: Host<M>>(
         if let Some(folded) = fold_mov_ja(a, b, i, table, rests) {
             return Some((folded, 0));
         }
+        if let Some(folded) = fold_select(a, b, i, table, rests) {
+            return Some((folded, 2));
+        }
         if let Some(folded) = fold_add_mem(a, b, table) {
             return Some((folded, 2));
         }
@@ -438,6 +450,69 @@ fn fold_mov_ja<M: Memory, H: Host<M>>(
             })
         }
         _ => None,
+    }
+}
+
+fn normalize_reg_cmp(op: JmpOpc) -> Option<(u8, bool, bool)> {
+    // Returns `(kind, invert, swap_operands)` so all 10 register comparisons reduce to `EQ`, `LT`, or `SLT`.
+    match op {
+        JmpOpc::Jeq => Some((CMP_EQ, false, false)),
+        JmpOpc::Jne => Some((CMP_EQ, true, false)),
+        JmpOpc::Jlt => Some((CMP_LT, false, false)),
+        JmpOpc::Jge => Some((CMP_LT, true, false)),
+        JmpOpc::Jgt => Some((CMP_LT, false, true)),
+        JmpOpc::Jle => Some((CMP_LT, true, true)),
+        JmpOpc::Jslt => Some((CMP_SLT, false, false)),
+        JmpOpc::Jsge => Some((CMP_SLT, true, false)),
+        JmpOpc::Jsgt => Some((CMP_SLT, false, true)),
+        JmpOpc::Jsle => Some((CMP_SLT, true, true)),
+        _ => None,
+    }
+}
+
+fn fold_select<M: Memory, H: Host<M>>(
+    s0: Slot,
+    s1: Slot,
+    i: usize,
+    table: &DispatchTable<M, H>,
+    rests: Option<&[u32]>,
+) -> Option<ThreadedSlot> {
+    let opc = OpCode(s0.byte());
+    let bits64 = match opc.class() {
+        Class::Jmp32 => false,
+        Class::Jmp64 => true,
+        _ => return None,
+    };
+    if !matches!(opc.source(), Source::Reg) || s0.offset_raw() != 1 {
+        return None;
+    }
+    let (mov_is_reg, mov64) = match s1.byte() {
+        MOV32_IMM => (false, false),
+        MOV64_IMM => (false, true),
+        MOV32_REG => (true, false),
+        MOV64_REG => (true, true),
+        _ => return None,
+    };
+    let (kind, invert, swap) = normalize_reg_cmp(opc.jmp_opc())?;
+    let (mut a, mut b) = (s0.dst_reg_decoded(), s0.src_reg_decoded());
+    if swap {
+        core::mem::swap(&mut a, &mut b);
+    }
+    let dst = s1.dst_reg_decoded();
+    let fall_rest8 = u8::try_from(rests.map_or(0, |r| r[i + 2])).ok()?;
+    let meta = kind | (u8::from(invert) << 2) | (u8::from(mov64) << 3);
+    if mov_is_reg {
+        let src = s1.src_reg_decoded();
+        let payload = i32::from_le_bytes([meta, fall_rest8, 0, 0]);
+        Some(ThreadedSlot {
+            handler: table.folds.select_reg_reg[usize::from(bits64)] as *const (),
+            slot: Slot::pack_bytes(a.get(), b.get(), dst.get(), src.get(), payload),
+        })
+    } else {
+        Some(ThreadedSlot {
+            handler: table.folds.select_reg_imm[usize::from(bits64)] as *const (),
+            slot: Slot::pack_bytes(a.get(), b.get(), dst.get(), meta, i32::from(fall_rest8)),
+        })
     }
 }
 
@@ -864,6 +939,88 @@ extern "rust-preserve-none" fn mov_ja_reg<M: Memory, H: Host<M>, F: Fuel, const 
     let byte_off = slot.imm_i32() as isize;
     let rest = u64::from(slot.offset_raw() as u16);
     become_enter_rest!(ctx, code, ip.byte_offset(byte_off), interp, rests, rest)
+}
+
+#[inline(always)]
+fn eval_select_cmp<const BITS64: bool>(lhs: u64, rhs: u64, meta: u8) -> bool {
+    let kind = meta & 3;
+    let invert = (meta & 4) != 0;
+    let (eq, lt, slt) = if BITS64 {
+        (lhs == rhs, lhs < rhs, (lhs as i64) < (rhs as i64))
+    } else {
+        let a = lhs as u32;
+        let b = rhs as u32;
+        (a == b, a < b, (a as i32) < (b as i32))
+    };
+    let lt_or_slt = core::hint::select_unpredictable(kind == CMP_LT, lt, slt);
+    let raw = core::hint::select_unpredictable(kind == CMP_EQ, eq, lt_or_slt);
+    raw ^ invert
+}
+
+macro_rules! finish_select {
+    ($ctx:expr, $code:expr, $ip:expr, $interp:expr, $rests:expr, $dst:expr, $rhs:expr, $skip:expr, $fall_rest:expr) => {{
+        let skip = $skip;
+        let cur = $ctx.reg_get($dst);
+        let new_val = core::hint::select_unpredictable(skip, cur, $rhs);
+        let rest = $fall_rest + u64::from(!skip);
+        if !F::enter_rest($interp, rest) {
+            core::hint::cold_path();
+            let stop_ip = $ip.offset(1 + i64::from(skip));
+            become F::step::<M, H>($ctx, $code, stop_ip, $interp, $rests, SPARE, Slot::UNREAD)
+        }
+        $ctx.reg_set($dst, new_val);
+        become_at!($ctx, $code, $ip.offset(2), $interp, $rests)
+    }};
+}
+
+#[rustc_align(64)]
+#[inline(never)]
+extern "rust-preserve-none" fn select_reg_imm<M: Memory, H: Host<M>, F: Fuel, const BITS64: bool>(
+    ctx: &mut Context<M>,
+    code: Slots,
+    ip: Ip,
+    interp: &mut Interpreter<M, H>,
+    rests: RestsPtr,
+    _: Spare,
+    slot: Slot,
+) {
+    // SAFETY: `fold_select` packed `a`, `b`, `dst` into bytes 0..3 and kept `mov_imm` in `ip.offset(1)`.
+    let a = unsafe { slot.reg0() };
+    let b = unsafe { slot.reg1() };
+    let dst = unsafe { slot.reg2() };
+    let meta = slot.byte3();
+    let fall_rest = u64::from(slot.imm_i32() as u32);
+    let skip = eval_select_cmp::<BITS64>(ctx.reg_get(a), ctx.reg_get(b), meta);
+    // SAFETY: `ip.offset(1)` is the intact `mov_imm` slot.
+    let raw_imm = unsafe { ip.offset(1).get() }.imm_i32();
+    let mov_rhs =
+        core::hint::select_unpredictable((meta & 8) != 0, i64::from(raw_imm) as u64, u64::from(raw_imm as u32));
+    finish_select!(ctx, code, ip, interp, rests, dst, mov_rhs, skip, fall_rest)
+}
+
+#[rustc_align(64)]
+#[inline(never)]
+extern "rust-preserve-none" fn select_reg_reg<M: Memory, H: Host<M>, F: Fuel, const BITS64: bool>(
+    ctx: &mut Context<M>,
+    code: Slots,
+    ip: Ip,
+    interp: &mut Interpreter<M, H>,
+    rests: RestsPtr,
+    _: Spare,
+    slot: Slot,
+) {
+    // SAFETY: `fold_select` packed `a`, `b`, `dst`, `src` into bytes 0..4.
+    let a = unsafe { slot.reg0() };
+    let b = unsafe { slot.reg1() };
+    let dst = unsafe { slot.reg2() };
+    let src = unsafe { slot.reg3() };
+    let payload = slot.imm_i32() as u32;
+    let meta = payload as u8;
+    let fall_rest = u64::from((payload >> 8) as u8);
+    let skip = eval_select_cmp::<BITS64>(ctx.reg_get(a), ctx.reg_get(b), meta);
+    let raw = ctx.reg_get(src);
+    let mov_rhs = core::hint::select_unpredictable((meta & 8) != 0, raw, raw as u32 as u64);
+    finish_select!(ctx, code, ip, interp, rests, dst, mov_rhs, skip, fall_rest)
 }
 
 #[rustc_align(64)]
