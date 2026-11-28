@@ -329,7 +329,11 @@ impl Code {
         }
 
         let promote = (key & 1 != 0).then_some(self.promoted.as_ref());
-        let compiled = compile_threaded(&self.slots, self.len, table, promote);
+        #[cfg(feature = "fuel")]
+        let rests = table.metered.then(|| self.rests.slice(&self.slots));
+        #[cfg(not(feature = "fuel"))]
+        let rests: Option<&[u32]> = None;
+        let compiled = compile_threaded(&self.slots, self.len, table, promote, rests);
         let ptr = Box::into_raw(compiled).cast::<ThreadedSlot>();
         for entry in &self.compiled.fast {
             if entry.key.load(Ordering::Relaxed) == 0 {
@@ -362,6 +366,7 @@ fn compile_threaded<M: Memory, H: Host<M>>(
     len: usize,
     table: &DispatchTable<M, H>,
     promote: Option<&[PromotedRegion]>,
+    rests: Option<&[u32]>,
 ) -> Box<[ThreadedSlot]> {
     let rewritten;
     let slots: &[Slot] = match promote {
@@ -387,15 +392,56 @@ fn compile_threaded<M: Memory, H: Host<M>>(
         let slot = slots[i];
         let byte = slot.byte();
         if let Some(sup) = fuse::Super::with_byte(byte) {
-            protected_until = protected_until.max(i + sup.len());
+            let branch_fits = if sup.branches() {
+                let last_pc = i + sup.len() - 1;
+                let last = slots[last_pc];
+                let lb = last.byte();
+                let target_pc = (last_pc as i64 + 1 + i64::from(last.offset_raw())) as usize;
+                let fall_ok = rests.is_none_or(|r| r[last_pc + 1] <= u32::from(u8::MAX));
+                if crate::handler::is_cond_dst_jump(lb) {
+                    fall_ok
+                        && i16::try_from((i32::from(last.offset_raw()) + 1) * (STRIDE as i32)).is_ok()
+                        && rests.is_none_or(|r| r[target_pc] <= u32::from(u8::MAX))
+                } else if LAYOUTS[usize::from(lb)] == Layout::DstSrc {
+                    fall_ok && rests.is_none_or(|r| r[target_pc] <= u32::from(u8::MAX))
+                } else {
+                    fall_ok
+                }
+            } else {
+                true
+            };
+            if branch_fits {
+                protected_until = protected_until.max(i + sup.len());
+                let encoded = if sup.branches() {
+                    let fall_rest = rests.map_or(0, |r| r[i + sup.len()]) as u8;
+                    match LAYOUTS[usize::from(sup.opcode(0))] {
+                        Layout::Dst => slot.with_byte(fall_rest),
+                        Layout::DstSrc => {
+                            slot.to_threaded_dst_src_with_rests(i32::from(slot.offset_raw()), fall_rest, 0)
+                        }
+                        Layout::Raw => encode_threaded_slot(slot, byte),
+                    }
+                } else {
+                    encode_threaded_slot(slot, byte)
+                };
+                out.push(ThreadedSlot {
+                    handler: table.handlers[usize::from(byte)] as *const (),
+                    slot: encoded,
+                });
+                continue;
+            }
+            let first_byte = sup.opcode(0);
+            let unfused = slot.with_byte(first_byte);
+            let handler = stack_access_override::<M, H>(unfused, first_byte)
+                .unwrap_or(table.handlers[usize::from(first_byte)]) as *const ();
             out.push(ThreadedSlot {
-                handler: table.handlers[usize::from(byte)] as *const (),
-                slot: encode_threaded_slot(slot, byte),
+                handler,
+                slot: encode_threaded_slot(unfused, first_byte),
             });
             continue;
         }
         if i >= protected_until {
-            if let Some(folded) = threaded::try_fold(slots, i, len, table) {
+            if let Some(folded) = threaded::try_fold(slots, i, len, table, rests) {
                 out.push(folded);
                 continue;
             }
@@ -406,11 +452,47 @@ fn compile_threaded<M: Memory, H: Host<M>>(
                 }
             }
             if i < len {
-                if let Some(scaled) = scale_branch_or_call(slot, byte, STRIDE, table) {
+                if let Some(scaled) = scale_branch_or_call(slot, byte, i, STRIDE, table, rests) {
                     out.push(scaled);
                     continue;
                 }
             }
+        }
+        if i < len && crate::handler::is_cond_dst_jump(byte) {
+            let target_pc = (i as i64 + 1 + i64::from(slot.offset_raw())) as usize;
+            let taken_rest = rests.map_or(0, |r| r[target_pc]);
+            if let (Ok(byte_off), Ok(taken_rest8)) =
+                (i16::try_from((i32::from(slot.offset_raw()) + 1) * (STRIDE as i32)), u8::try_from(taken_rest))
+            {
+                out.push(ThreadedSlot {
+                    handler: table.handlers[usize::from(byte)] as *const (),
+                    slot: slot.with_offset(byte_off).with_byte(taken_rest8),
+                });
+            } else {
+                out.push(ThreadedSlot {
+                    handler: table.jump_unscaled as *const (),
+                    slot,
+                });
+            }
+            continue;
+        }
+        if i < len && LAYOUTS[usize::from(byte)] == Layout::DstSrc && OpCode(bytes::usual(byte)).is_jump() {
+            let target_pc = (i as i64 + 1 + i64::from(slot.offset_raw())) as usize;
+            let taken_rest = rests.map_or(0, |r| r[target_pc]);
+            let fall_rest = rests.map_or(0, |r| r[i + 1]);
+            if let (Ok(taken_rest8), Ok(fall_rest8)) = (u8::try_from(taken_rest), u8::try_from(fall_rest)) {
+                let byte_off = (i32::from(slot.offset_raw()) + 1) * (STRIDE as i32);
+                out.push(ThreadedSlot {
+                    handler: table.handlers[usize::from(byte)] as *const (),
+                    slot: slot.to_threaded_dst_src_with_rests(byte_off, taken_rest8, fall_rest8),
+                });
+            } else {
+                out.push(ThreadedSlot {
+                    handler: table.jump_unscaled as *const (),
+                    slot,
+                });
+            }
+            continue;
         }
         let handler =
             stack_access_override::<M, H>(slot, byte).unwrap_or(table.handlers[usize::from(byte)]) as *const ();
@@ -442,16 +524,19 @@ fn encode_threaded_slot(slot: Slot, byte: u8) -> Slot {
 fn scale_branch_or_call<M: Memory, H: Host<M>>(
     slot: Slot,
     byte: u8,
+    i: usize,
     stride: i64,
     table: &DispatchTable<M, H>,
+    rests: Option<&[u32]>,
 ) -> Option<ThreadedSlot> {
     let opc = OpCode(byte);
     if byte == CALL {
         let off = i64::from(slot.instruction().imm());
         let byte_off = i32::try_from((off + 1).checked_mul(stride)?).ok()?;
+        let rest = rests.map_or(0, |r| r[(i as i64 + 1 + off) as usize]);
         return Some(ThreadedSlot {
             handler: table.local_call_scaled as *const (),
-            slot: Slot::scaled_jump(byte_off),
+            slot: Slot::scaled_jump(byte_off, rest),
         });
     }
     if matches!(opc.jmp_opc(), JmpOpc::Ja) && matches!(opc.source(), Source::Imm) {
@@ -461,9 +546,10 @@ fn scale_branch_or_call<M: Memory, H: Host<M>>(
             _ => return None,
         };
         let byte_off = i32::try_from((off + 1).checked_mul(stride)?).ok()?;
+        let rest = rests.map_or(0, |r| r[(i as i64 + 1 + off) as usize]);
         return Some(ThreadedSlot {
             handler: table.ja_scaled as *const (),
-            slot: Slot::scaled_jump(byte_off),
+            slot: Slot::scaled_jump(byte_off, rest),
         });
     }
     None

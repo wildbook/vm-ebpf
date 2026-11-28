@@ -344,13 +344,23 @@ impl Super {
     /// The instruction whose first slot is slot `k` of the sequence, from that slot `slot`: the register of each role
     /// from `roles`, and the register operand `_` from `free`, else from `slot`.
     #[inline(always)]
-    pub fn decode(self, k: usize, slot: impl Fields, roles: [Reg; MAX_ROLES], free: Option<Reg>) -> Instruction {
+    pub fn decode(self, k: usize, slot: impl Fields, roles: [Reg; MAX_ROLES], free: Option<Reg>) -> Decoded {
         let part = self.parts[k];
         let dst = part.dst.register(roles, free, slot.dst_reg());
         let src = part.src.register(roles, free, slot.src_reg());
-        let off = if let Field::Any = part.off { slot.offset() } else { 0 };
+        let off = if let Field::Any = part.off {
+            slot.offset_i64()
+        } else {
+            0
+        };
         let imm = if let Field::Any = part.imm { slot.imm() } else { 0 };
-        Instruction::new(OpCode(part.op), dst.get(), src.get(), off, imm)
+        Decoded {
+            op: part.op,
+            dst,
+            src,
+            off,
+            imm,
+        }
     }
 
     /// The first slot of this superinstruction, with opcode byte `byte`, for the sequence at the start of `window`, if
@@ -403,6 +413,53 @@ impl Super {
     #[inline(always)]
     pub const fn branches(self) -> bool {
         self.branches_at(self.len() - 1)
+    }
+}
+
+/// A decoded instruction of a superinstruction sequence, keeping `off` sign-extended as `i64` to avoid re-packing.
+#[derive(Clone, Copy)]
+pub struct Decoded {
+    op: u8,
+    dst: Reg,
+    src: Reg,
+    off: i64,
+    imm: i32,
+}
+
+impl Fields for Decoded {
+    #[inline(always)]
+    fn opcode(self) -> OpCode {
+        OpCode(self.op)
+    }
+
+    #[inline(always)]
+    fn dst_reg(self) -> Reg {
+        self.dst
+    }
+
+    #[inline(always)]
+    fn src_reg(self) -> Reg {
+        self.src
+    }
+
+    #[inline(always)]
+    fn offset(self) -> i16 {
+        self.off as i16
+    }
+
+    #[inline(always)]
+    fn offset_i64(self) -> i64 {
+        self.off
+    }
+
+    #[inline(always)]
+    fn imm(self) -> i32 {
+        self.imm
+    }
+
+    #[inline(always)]
+    fn instruction(self) -> Instruction {
+        Instruction::new(OpCode(self.op), self.dst.get(), self.src.get(), self.off as i16, self.imm)
     }
 }
 

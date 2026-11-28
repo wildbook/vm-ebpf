@@ -14,7 +14,7 @@ use std::mem::MaybeUninit;
 
 use crate::code::Slots;
 use crate::fuel::{Fuel, RestsPtr, Unmetered};
-use crate::handler::{self, alu3_imm, alu3_reg, handler, ja_scaled, jump, local_call_scaled};
+use crate::handler::{self, alu3_imm, alu3_reg, handler, ja_scaled, jump, jump_unscaled, local_call_scaled};
 use crate::opcode::OpCode;
 use crate::slot::Slot;
 use crate::threaded::{self, FoldTable};
@@ -47,6 +47,19 @@ macro_rules! become_enter {
     ($ctx:expr, $code:expr, $ip:expr, $interp:expr, $rests:expr) => {{
         let ip = $ip;
         if !F::enter($interp, $code, ip, $rests) {
+            core::hint::cold_path();
+            let slot = $crate::slot::Slot::UNREAD;
+            become F::step::<M, H>($ctx, $code, ip, $interp, $rests, $crate::dispatch::SPARE, slot)
+        }
+        become_at!($ctx, $code, ip, $interp, $rests)
+    }};
+}
+
+/// Enters the block at `$ip` by charging a pre-decoded block length `$rest` directly instead of reading `$rests`.
+macro_rules! become_enter_rest {
+    ($ctx:expr, $code:expr, $ip:expr, $interp:expr, $rests:expr, $rest:expr) => {{
+        let ip = $ip;
+        if !F::enter_rest($interp, $rest) {
             core::hint::cold_path();
             let slot = $crate::slot::Slot::UNREAD;
             become F::step::<M, H>($ctx, $code, ip, $interp, $rests, $crate::dispatch::SPARE, slot)
@@ -100,6 +113,9 @@ pub struct DispatchTable<M: Memory, H> {
     pub folds: FoldTable<M, H>,
     pub ja_scaled: Handler<M, H>,
     pub local_call_scaled: Handler<M, H>,
+    pub jump_unscaled: Handler<M, H>,
+    #[cfg(feature = "fuel")]
+    pub metered: bool,
 }
 
 /// The dispatch tables of the handlers for memory `M` and host `H`.
@@ -201,6 +217,9 @@ pub const fn table<M: Memory, H: Host<M>, F: Fuel>() -> DispatchTable<M, H> {
         folds: threaded::table::<M, H, F>(),
         ja_scaled: ja_scaled::<M, H, F>,
         local_call_scaled: local_call_scaled::<M, H, F>,
+        jump_unscaled: jump_unscaled::<M, H, F>,
+        #[cfg(feature = "fuel")]
+        metered: F::IS_METERED,
     }
 }
 

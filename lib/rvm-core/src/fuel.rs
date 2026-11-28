@@ -41,9 +41,16 @@ impl RestsPtr {
 
 /// What a handler that ends a block does for fuel where it continues.
 pub trait Fuel {
+    /// Whether runs using this fuel type charge per-block fuel.
+    #[cfg(feature = "fuel")]
+    const IS_METERED: bool;
+
     /// Enters the block of `ip` in `code` there: charges it to the fuel of `interp`. False if the fuel can't pay for
     /// the block; [`step`](Self::step) then runs the block one instruction at a time until fuel runs out.
     fn enter<M: Memory, H>(interp: &mut Interpreter<M, H>, code: Slots, ip: Ip, rests: RestsPtr) -> bool;
+
+    /// Charges a pre-decoded block length `rest` directly to `interp` without reading the `rests` array.
+    fn enter_rest<M: Memory, H>(interp: &mut Interpreter<M, H>, rest: u64) -> bool;
 
     /// A [`Handler`](crate::dispatch::Handler) that steps unfused instructions from `ip` in a block entered with too
     /// little fuel for it, stopping where fuel runs out or an instruction stops.
@@ -62,8 +69,16 @@ pub trait Fuel {
 pub struct Unmetered;
 
 impl Fuel for Unmetered {
+    #[cfg(feature = "fuel")]
+    const IS_METERED: bool = false;
+
     #[inline(always)]
     fn enter<M: Memory, H>(_: &mut Interpreter<M, H>, _: Slots, _: Ip, _: RestsPtr) -> bool {
+        true
+    }
+
+    #[inline(always)]
+    fn enter_rest<M: Memory, H>(_: &mut Interpreter<M, H>, _: u64) -> bool {
         true
     }
 
@@ -114,11 +129,19 @@ mod metered {
     pub struct Metered;
 
     impl Fuel for Metered {
+        const IS_METERED: bool = true;
+
         #[inline(always)]
         fn enter<M: Memory, H>(interp: &mut Interpreter<M, H>, code: Slots, ip: Ip, rests: RestsPtr) -> bool {
             let pc = ip.pc(code) as usize;
             // SAFETY: `ip` lies in `code`, and `rests` points to `code.total_len()` entries initialised before entry.
             let rest = u64::from(unsafe { *rests.0.add(pc) });
+            interp.fuel.0 = interp.fuel.0.wrapping_sub(rest);
+            !short(interp.fuel.0)
+        }
+
+        #[inline(always)]
+        fn enter_rest<M: Memory, H>(interp: &mut Interpreter<M, H>, rest: u64) -> bool {
             interp.fuel.0 = interp.fuel.0.wrapping_sub(rest);
             !short(interp.fuel.0)
         }
@@ -362,6 +385,13 @@ mod metered {
                 return RestsPtr(ptr);
             }
             RestsPtr(self.compute(raw))
+        }
+
+        /// Slice of per-slot `rest` counts for `raw`, computing it if needed.
+        pub fn slice(&self, raw: &[Slot]) -> &[u32] {
+            let ptr = self.ptr(raw).0;
+            // SAFETY: `compute` allocates `raw.len()` entries and lives until `Rests` is dropped.
+            unsafe { std::slice::from_raw_parts(ptr, raw.len()) }
         }
 
         /// The `rest` of the slot at `ip` of `code`, whose rests these are.

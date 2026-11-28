@@ -5,8 +5,8 @@ use crate::code::Slots;
 use crate::dispatch::{Handler, Spare};
 use crate::fuel::{Fuel, RestsPtr};
 use crate::host::Callee;
-use crate::opcode::{Class, MemMode, MemSize, OpCode, CALL, CALLX};
-use crate::slot::{Fields, Layout, Shape, Slot, LAYOUTS};
+use crate::opcode::{Class, JmpOpc, MemMode, MemSize, OpCode, CALL, CALLX};
+use crate::slot::{Fields, Layout, Shape, Slot, View, LAYOUTS};
 use crate::step::{self, Regs, Step, BITS_32, BITS_64};
 use crate::transfer::{self, Ip};
 use crate::{Context, Host, Interpreter, Memory, Reason};
@@ -204,6 +204,14 @@ extern "rust-preserve-none" fn ldx_memsx_bail<M: Memory, H: Host<M>, const OP: u
     become handler::<M, H, OP>(ctx, unpromoted, new_ip, interp, rests, crate::dispatch::SPARE, new_slot)
 }
 
+/// Whether `byte` is a `Layout::Dst` conditional jump whose threaded slot holds a pre-scaled `i16` byte offset.
+pub const fn is_cond_dst_jump(byte: u8) -> bool {
+    let opc = OpCode(crate::bytes::usual(byte));
+    opc.is_jump()
+        && matches!(LAYOUTS[byte as usize], Layout::Dst)
+        && !matches!(opc.jmp_opc(), JmpOpc::Ja | JmpOpc::Call | JmpOpc::Exit | JmpOpc::Jcond | JmpOpc::UndefF)
+}
+
 /// The [`Handler`](crate::dispatch::Handler) of opcode `OP` of the jump classes. Every such instruction ends its block.
 #[rustc_align(64)]
 #[inline(never)]
@@ -224,11 +232,23 @@ pub extern "rust-preserve-none" fn jump<M: Memory, H: Host<M>, F: Fuel, const OP
         _ => unreachable!("only the jump classes use `jump`"),
     };
     match step {
-        Step::Next => become_enter!(ctx, code, ip.offset(1), interp, rests),
+        Step::Next => {
+            if const { matches!(LAYOUTS[OP as usize], Layout::DstSrc) } {
+                let fall_rest = u64::from(slot.byte3());
+                become_enter_rest!(ctx, code, ip.offset(1), interp, rests, fall_rest)
+            } else {
+                become_enter!(ctx, code, ip.offset(1), interp, rests)
+            }
+        }
         Step::Jump(offset) => {
             if const { matches!(LAYOUTS[OP as usize], Layout::DstSrc) } {
                 let byte_off = slot.imm_i32() as isize;
-                become_enter!(ctx, code, ip.byte_offset(byte_off), interp, rests)
+                let taken_rest = u64::from(slot.byte2());
+                become_enter_rest!(ctx, code, ip.byte_offset(byte_off), interp, rests, taken_rest)
+            } else if const { is_cond_dst_jump(OP) } {
+                let byte_off = slot.offset_raw() as isize;
+                let taken_rest = u64::from(slot.byte());
+                become_enter_rest!(ctx, code, ip.byte_offset(byte_off), interp, rests, taken_rest)
             } else {
                 become_enter!(ctx, code, ip.offset(offset + 1), interp, rests)
             }
@@ -250,6 +270,34 @@ pub extern "rust-preserve-none" fn jump<M: Memory, H: Host<M>, F: Fuel, const OP
     }
 }
 
+/// Cold fallback for a conditional jump whose byte offset or metered block length exceeds the inline slot fields.
+#[cold]
+#[inline(never)]
+pub extern "rust-preserve-none" fn jump_unscaled<M: Memory, H: Host<M>, F: Fuel>(
+    ctx: &mut Context<M>,
+    code: Slots,
+    ip: Ip,
+    interp: &mut Interpreter<M, H>,
+    rests: RestsPtr,
+    _: Spare,
+    slot: Slot,
+) {
+    let byte = slot.byte();
+    // SAFETY: `compile_threaded` leaves `slot` in its portable layout for `jump_unscaled`.
+    let insn = unsafe { View::new(&slot, Some(slot), Shape::of(byte)) };
+    let step: Step<M::Error> = match OpCode(byte).class() {
+        Class::Jmp32 => step::jump::<M::Error, _, BITS_32>(&ctx.regs_view(), insn),
+        Class::Jmp64 => step::jump::<M::Error, _, BITS_64>(&ctx.regs_view(), insn),
+        _ => unreachable!("only conditional jumps use `jump_unscaled`"),
+    };
+    match step {
+        Step::Next => become_enter!(ctx, code, ip.offset(1), interp, rests),
+        Step::Jump(offset) => become_enter!(ctx, code, ip.offset(offset + 1), interp, rests),
+        Step::Stop(reason) => interp.stop.at(ip, reason),
+        _ => unreachable!("only conditional jumps use `jump_unscaled`"),
+    }
+}
+
 /// Direct handler for unconditional `ja` whose byte displacement `(offset + 1) * 16` was pre-scaled into `slot`.
 #[rustc_align(64)]
 #[inline(never)]
@@ -263,7 +311,8 @@ pub extern "rust-preserve-none" fn ja_scaled<M: Memory, H: Host<M>, F: Fuel>(
     slot: Slot,
 ) {
     let byte_off = slot.imm_i32() as isize;
-    become_enter!(ctx, code, ip.byte_offset(byte_off), interp, rests)
+    let rest = u64::from(slot.low_u32());
+    become_enter_rest!(ctx, code, ip.byte_offset(byte_off), interp, rests, rest)
 }
 
 /// Direct handler for local `call` whose byte displacement `(offset + 1) * 16` was pre-scaled into `slot`.
@@ -282,7 +331,8 @@ pub extern "rust-preserve-none" fn local_call_scaled<M: Memory, H: Host<M>, F: F
         return interp.stop.at(ip, Reason::StackOverflow);
     }
     let byte_off = slot.imm_i32() as isize;
-    become_enter!(ctx, code, ip.byte_offset(byte_off), interp, rests)
+    let rest = u64::from(slot.low_u32());
+    become_enter_rest!(ctx, code, ip.byte_offset(byte_off), interp, rests, rest)
 }
 
 /// Direct handler for local `call` (`src_reg == 1`): pushes the caller frame and enters the target without checking

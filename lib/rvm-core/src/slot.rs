@@ -231,6 +231,13 @@ impl Slot {
         self
     }
 
+    /// Copy `self` with `offset` replaced by `offset`.
+    #[inline(always)]
+    pub fn with_offset(mut self, offset: i16) -> Self {
+        self.offset = offset;
+        self
+    }
+
     /// Portable `mov64`/`mov32 dst, src` slot accepting architectural or virtual registers.
     #[inline(always)]
     pub fn mov_reg(bits64: bool, dst: Reg, src: Reg) -> Self {
@@ -299,24 +306,44 @@ impl Slot {
     /// (`CH`), and `extra` (`i32::from(offset)` or pre-scaled jump byte offset) in bytes 4..8 (`RCX >> 32`).
     #[inline(always)]
     pub fn to_threaded_dst_src(self, extra: i32) -> Self {
+        self.to_threaded_dst_src_with_rests(extra, 0, 0)
+    }
+
+    /// Re-encode a portable [`Layout::DstSrc`] conditional jump with `taken_rest` in byte 2 and `fall_rest` in byte 3.
+    #[inline(always)]
+    pub fn to_threaded_dst_src_with_rests(self, extra: i32, taken_rest: u8, fall_rest: u8) -> Self {
         debug_assert!(LAYOUTS[usize::from(self.byte)] == Layout::DstSrc);
         Self {
             byte: self.regs,
             regs: self.imm[3],
-            offset: 0,
+            offset: i16::from_le_bytes([taken_rest, fall_rest]),
             imm: extra.to_le_bytes(),
         }
     }
 
-    /// Pre-scaled jump or local call slot holding a byte displacement in bytes 4..8 (`RCX >> 32`).
+    /// Pre-scaled jump or local call slot holding `rest` in bytes 0..4 and `byte_offset` in bytes 4..8 (`RCX >> 32`).
     #[inline(always)]
-    pub fn scaled_jump(byte_offset: i32) -> Self {
+    pub fn scaled_jump(byte_offset: i32, rest: u32) -> Self {
+        let [b0, b1, b2, b3] = rest.to_le_bytes();
         Self {
-            byte: 0,
-            regs: 0,
-            offset: 0,
+            byte: b0,
+            regs: b1,
+            offset: i16::from_le_bytes([b2, b3]),
             imm: byte_offset.to_le_bytes(),
         }
+    }
+
+    /// Low 32 bits of the slot (bytes 0..4, `ECX`).
+    #[inline(always)]
+    pub fn low_u32(self) -> u32 {
+        let [o0, o1] = self.offset.to_le_bytes();
+        u32::from_le_bytes([self.byte, self.regs, o0, o1])
+    }
+
+    /// Byte 1 (`CH`) as a raw `u8`.
+    #[inline(always)]
+    pub fn byte1(self) -> u8 {
+        self.regs
     }
 
     /// Raw 32-bit signed payload in bytes 4..8 (`RCX >> 32`).

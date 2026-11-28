@@ -79,6 +79,7 @@ pub fn try_fold<M: Memory, H: Host<M>>(
     i: usize,
     len: usize,
     table: &DispatchTable<M, H>,
+    rests: Option<&[u32]>,
 ) -> Option<ThreadedSlot> {
     if i + 3 < len {
         if let Some(folded) = fold_rot(slots[i], slots[i + 1], slots[i + 2], slots[i + 3], table) {
@@ -93,7 +94,7 @@ pub fn try_fold<M: Memory, H: Host<M>>(
     if i + 1 < len {
         let a = slots[i];
         let b = slots[i + 1];
-        if let Some(folded) = fold_mov_ja(a, b, table) {
+        if let Some(folded) = fold_mov_ja(a, b, i, table, rests) {
             return Some(folded);
         }
         if let Some(folded) = fold_add_mem(a, b, table) {
@@ -196,7 +197,13 @@ fn fold_mov_add_mem<M: Memory, H: Host<M>>(
     }
 }
 
-fn fold_mov_ja<M: Memory, H: Host<M>>(s0: Slot, s1: Slot, table: &DispatchTable<M, H>) -> Option<ThreadedSlot> {
+fn fold_mov_ja<M: Memory, H: Host<M>>(
+    s0: Slot,
+    s1: Slot,
+    i: usize,
+    table: &DispatchTable<M, H>,
+    rests: Option<&[u32]>,
+) -> Option<ThreadedSlot> {
     let ja_opc = OpCode(s1.byte());
     if !matches!(ja_opc.jmp_opc(), JmpOpc::Ja) || !matches!(ja_opc.source(), Source::Imm) {
         return None;
@@ -207,24 +214,28 @@ fn fold_mov_ja<M: Memory, H: Host<M>>(s0: Slot, s1: Slot, table: &DispatchTable<
         _ => return None,
     };
     let byte_off = (ja_off + 2).checked_mul(size_of::<ThreadedSlot>() as i64)?;
+    let target_pc = (i as i64 + 2 + ja_off) as usize;
+    let rest = rests.map_or(0, |r| r[target_pc]);
     match s0.byte() {
         MOV32_IMM | MOV64_IMM => {
             let bits64 = s0.byte() == MOV64_IMM;
             let off16 = i16::try_from(byte_off).ok()?;
+            let rest8 = u8::try_from(rest).ok()?;
             let dst = s0.dst_reg_decoded();
             Some(ThreadedSlot {
                 handler: table.folds.mov_ja_imm[usize::from(bits64)] as *const (),
-                slot: Slot::pack(dst.get(), 0, off16, s0.imm()),
+                slot: Slot::pack(dst.get(), rest8, off16, s0.imm()),
             })
         }
         MOV32_REG | MOV64_REG => {
             let bits64 = s0.byte() == MOV64_REG;
             let off32 = i32::try_from(byte_off).ok()?;
+            let rest16 = u16::try_from(rest).ok()?;
             let dst = s0.dst_reg_decoded();
             let src = s0.src_reg_decoded();
             Some(ThreadedSlot {
                 handler: table.folds.mov_ja_reg[usize::from(bits64)] as *const (),
-                slot: Slot::pack(dst.get(), src.get(), 0, off32),
+                slot: Slot::pack(dst.get(), src.get(), rest16 as i16, off32),
             })
         }
         _ => None,
@@ -297,7 +308,8 @@ extern "rust-preserve-none" fn mov_ja_imm<M: Memory, H: Host<M>, F: Fuel, const 
     };
     ctx.reg_set(dst, val);
     let byte_off = slot.offset_raw() as isize;
-    become_enter!(ctx, code, ip.byte_offset(byte_off), interp, rests)
+    let rest = u64::from(slot.byte1());
+    become_enter_rest!(ctx, code, ip.byte_offset(byte_off), interp, rests, rest)
 }
 
 #[rustc_align(64)]
@@ -318,7 +330,8 @@ extern "rust-preserve-none" fn mov_ja_reg<M: Memory, H: Host<M>, F: Fuel, const 
     let val = if BITS64 { raw } else { raw as u32 as u64 };
     ctx.reg_set(dst, val);
     let byte_off = slot.imm_i32() as isize;
-    become_enter!(ctx, code, ip.byte_offset(byte_off), interp, rests)
+    let rest = u64::from(slot.offset_raw() as u16);
+    become_enter_rest!(ctx, code, ip.byte_offset(byte_off), interp, rests, rest)
 }
 
 #[rustc_align(64)]

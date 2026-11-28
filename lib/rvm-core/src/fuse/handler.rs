@@ -107,7 +107,12 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
                     Step::Jump(offset) => {
                         if const { matches!(LAYOUTS[Super::of(S).opcode($k) as usize], Layout::DstSrc) } {
                             let byte_off = sequence[$k].slot.imm_i32() as isize;
-                            become_after!(ip.offset($k).byte_offset(byte_off))
+                            let taken_rest = u64::from(sequence[$k].slot.byte2());
+                            become_enter_rest!(ctx, code, ip.offset($k).byte_offset(byte_off), interp, rests, taken_rest)
+                        } else if const { crate::handler::is_cond_dst_jump(Super::of(S).opcode($k)) } {
+                            let byte_off = sequence[$k].slot.offset_raw() as isize;
+                            let taken_rest = u64::from(sequence[$k].slot.byte());
+                            become_enter_rest!(ctx, code, ip.offset($k).byte_offset(byte_off), interp, rests, taken_rest)
                         } else {
                             become_after!(ip.offset($k + 1 + offset))
                         }
@@ -128,7 +133,15 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
     if sup.save_at as usize == len {
         roles.save(registers, sup.writes);
     }
-    become_after!(ip.offset(len as i64))
+    if const { Super::of(S).branches() } {
+        let fall_rest = match const { LAYOUTS[Super::of(S).opcode(0) as usize] } {
+            Layout::Dst => u64::from(slot.byte()),
+            Layout::DstSrc => u64::from(slot.byte2()),
+            Layout::Raw => unreachable!("no branching superinstruction starts with Layout::Raw"),
+        };
+        become_enter_rest!(ctx, code, ip.offset(len as i64), interp, rests, fall_rest)
+    }
+    become_at!(ctx, code, ip.offset(len as i64), interp, rests)
 }
 
 /// The registers of a superinstruction's sequence as [`fused`] runs it: its instructions name role `r` as register
