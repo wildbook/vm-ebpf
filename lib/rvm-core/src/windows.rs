@@ -27,7 +27,7 @@ use crate::promote::PROMOTE_FRAME;
 use crate::slot::{Fields, Reg, Shape, Slot, View};
 use crate::step::{self, Regs};
 use crate::transfer::Ip;
-use crate::{Context, Host, Instruction, Interpreter, Memory};
+use crate::{Context, Host, Instruction, Interpreter, Memory, Reason};
 
 /// The windows that [`stack_access`] and [`data_access`] check addresses against, kept in the [`Interpreter`].
 ///
@@ -561,6 +561,71 @@ extern "rust-preserve-none" fn miss<M: Memory, H: Host<M>, const OP: u8, const D
             .take::<M, DATA>(ctx.memory, around, OpCode(OP).mem_size());
     }
     become handler::<M, H, OP>(ctx, code, ip, interp, rests, SPARE, slot)
+}
+
+/// Cold fallback for a fused byte load at `ip` that missed the primary small data window.
+///
+/// Completes the byte load through `spare`, `stack`, or `ctx.memory`, writes `dst`, and continues at the intact slot
+/// `ip.offset(1)`.
+#[cold]
+#[inline(never)]
+pub extern "rust-preserve-none" fn byte_load_miss<M: Memory, H: Host<M>>(
+    ctx: &mut Context<M>,
+    code: Slots,
+    ip: Ip,
+    interp: &mut Interpreter<M, H>,
+    rests: RestsPtr,
+    _: Spare,
+    slot: Slot,
+) {
+    const LDX_B: u8 = OpCode::ldx(MemSize::Byte, MemMode::Mem).0;
+    // SAFETY: caller packed `dst` in byte 0, `base` in byte 1, and signed `off` in byte 3.
+    let dst = unsafe { slot.reg0() };
+    let base = unsafe { slot.reg1() };
+    let off = i64::from(slot.byte3() as i8);
+    let addr = ctx.regs.get(base).wrapping_add_signed(off);
+    let (mut code, mut ip) = (code, ip);
+
+    if let Some(loaded) = interp
+        .windows
+        .spare
+        .run(OpCode(LDX_B), const { kind(OpCode(LDX_B)) }, addr, 0)
+    {
+        ctx.regs.set(dst, loaded);
+        become_next!(ctx, code, ip, interp, rests)
+    }
+
+    if interp.promo_overlaps(addr, 1) {
+        (code, ip) = interp.bail_promoted(ctx, code, ip);
+    }
+    if let Some(loaded) = interp
+        .windows
+        .stack
+        .run(OpCode(LDX_B), const { kind(OpCode(LDX_B)) }, addr, 0)
+    {
+        ctx.regs.set(dst, loaded);
+        become_next!(ctx, code, ip, interp, rests)
+    }
+
+    if interp.is_promoted() {
+        let (lo, hi) = interp.promo_range();
+        let need_bail =
+            range_overlaps(addr, 1, lo, hi) || interp.windows.take_checked(ctx.memory, addr, MemSize::Byte, lo, hi);
+        if need_bail {
+            (code, ip) = interp.bail_promoted(ctx, code, ip);
+            interp.windows.take::<M, true>(ctx.memory, addr, MemSize::Byte);
+        }
+    } else {
+        interp.windows.take::<M, true>(ctx.memory, addr, MemSize::Byte);
+    }
+
+    match ctx.memory.load_u8(addr) {
+        Ok(byte) => {
+            ctx.regs.set(dst, u64::from(byte));
+            become_next!(ctx, code, ip, interp, rests)
+        }
+        Err(err) => interp.stop.at(ip, Reason::MemoryFault(err)),
+    }
 }
 
 /// The register that holds the base address of the load or store `OP`.

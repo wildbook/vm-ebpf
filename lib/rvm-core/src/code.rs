@@ -391,6 +391,13 @@ fn compile_threaded<M: Memory, H: Host<M>>(
     for i in 0..slots.len() {
         let slot = slots[i];
         let byte = slot.byte();
+        if i >= protected_until && byte == 0xf7 {
+            if let Some(folded) = threaded::try_fold_0xf7(slots, i, len, table) {
+                protected_until = protected_until.max(i + 4);
+                out.push(folded);
+                continue;
+            }
+        }
         if let Some(sup) = fuse::Super::with_byte(byte) {
             let branch_fits = if sup.branches() {
                 let last_pc = i + sup.len() - 1;
@@ -441,7 +448,8 @@ fn compile_threaded<M: Memory, H: Host<M>>(
             continue;
         }
         if i >= protected_until {
-            if let Some(folded) = threaded::try_fold(slots, i, len, table, rests) {
+            if let Some((folded, protect_len)) = threaded::try_fold(slots, i, len, table, rests) {
+                protected_until = protected_until.max(i + protect_len);
                 out.push(folded);
                 continue;
             }
