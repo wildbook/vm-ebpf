@@ -4,20 +4,14 @@ use std::mem::MaybeUninit;
 use std::ptr;
 
 use crate::args::{self, Row, StackArgs};
-use crate::code::{Slots, ThreadedSlot};
+use crate::code::Slots;
 use crate::context::FP;
 use crate::dispatch::SPARE;
-#[cfg(not(feature = "fuel"))]
-use crate::fuel::RestsPtr;
-#[cfg(feature = "fuel")]
-use crate::fuel::{Fuel, Metered};
-use crate::fuel::{FuelLeft, Meter};
+use crate::fuel::{FuelLeft, Meter, RestsPtr};
 use crate::native::NativeCall;
 #[cfg(feature = "ffi")]
 use crate::native::NativeFail;
 use crate::promote::{PromotedRegion, PROMOTE_FRAME};
-#[cfg(feature = "fuel")]
-use crate::slot::Slot;
 use crate::transfer::Ip;
 use crate::windows::{range_overlaps, Windows};
 use crate::{Code, Context, Host, Memory};
@@ -109,8 +103,8 @@ pub struct Interpreter<M: Memory, H> {
     /// Failure payload from an aware native call that stopped with [`Reason::NativeFailed`].
     #[cfg(feature = "ffi")]
     native_fail: Option<NativeFail>,
-    /// Base slot address of the `Code` that `frames[..depth]` point into, recorded whenever live frames outlive a run.
-    frame_code_first: usize,
+    /// Return BPF pcs of live frames `0..depth`, recorded whenever frames outlive a run or cross a callback.
+    frame_return_pcs: [u64; MAX_CALL_DEPTH],
     /// Active stack-slot promotion state during a promoted leaf run (null region when inactive).
     active_promo: ActivePromo,
 }
@@ -121,7 +115,6 @@ struct ActivePromo {
     region: *const PromotedRegion,
     fp_host: usize,
     fp: u64,
-    bailed: bool,
 }
 
 impl ActivePromo {
@@ -129,7 +122,6 @@ impl ActivePromo {
         region: ptr::null(),
         fp_host: 0,
         fp: 0,
-        bailed: false,
     };
 }
 
@@ -192,9 +184,24 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
             args: [[0; args::MAX_STACK_ARGS + 1]; MAX_CALL_DEPTH + 2],
             #[cfg(feature = "ffi")]
             native_fail: None,
-            frame_code_first: 0,
+            frame_return_pcs: [0; MAX_CALL_DEPTH],
             active_promo: ActivePromo::NONE,
         }
+    }
+
+    /// Switch dispatch mid-run from `old_code` to the 1:1 uncompacted stream, rebasing any live call frames so both
+    /// `exit` and `stopped_with` see pointers into the active stream.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn switch_to_uncompacted<'a>(&mut self, old_code: Slots<'a>) -> (Slots<'a>, RestsPtr) {
+        let uncompacted = old_code.code().threaded_uncompacted(self.meter.table());
+        if self.depth != 0 {
+            self.record_frame_pcs(old_code);
+            let ok = self.rebase_frames(uncompacted);
+            debug_assert!(ok, "1:1 uncompacted stream contains every pc");
+        }
+        self.stop.bailed = true;
+        (uncompacted, uncompacted.rests_ptr())
     }
 
     /// Whether a promoted leaf region currently holds stack slots in `Context::regs` virtual registers.
@@ -234,15 +241,15 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
         unsafe { (*region).flush(ctx, fp_host) };
     }
 
-    /// Flush active promoted virtual registers and switch dispatch to the unpromoted stream at the same `pc`.
+    /// Flush active promoted virtual registers and switch dispatch to the 1:1 uncompacted stream at the same `pc`.
     #[cold]
     #[inline(never)]
-    pub(crate) fn bail_promoted<'a>(&mut self, ctx: &Context<M>, code: Slots<'a>, ip: Ip) -> (Slots<'a>, Ip) {
+    pub(crate) fn bail_promoted<'a>(&mut self, ctx: &Context<M>, code: Slots<'a>, ip: Ip) -> (Slots<'a>, Ip, RestsPtr) {
         self.flush_promoted(ctx);
-        self.active_promo.bailed = true;
+        self.stop.bailed = true;
         let pc = ip.pc(code);
-        let unpromoted = code.code().threaded(self.meter.table());
-        (unpromoted, Ip::at(unpromoted, pc))
+        let uncompacted = code.code().threaded_uncompacted(self.meter.table());
+        (uncompacted, Ip::at(uncompacted, pc), uncompacted.rests_ptr())
     }
 
     #[cfg(feature = "ffi")]
@@ -317,7 +324,10 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
                 pc,
             });
         }
+        let prev_bailed = self.stop.bailed;
+        self.stop.bailed = false;
         let stop = self.resume(ctx, code, pc);
+        self.stop.bailed = prev_bailed;
         if stop.pc == RETURN_PC && matches!(stop.reason, Reason::BadPc | Reason::OutOfFuel) {
             return Ok(ctx.regs[0]);
         }
@@ -341,34 +351,94 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
     fn enter_unpromoted(&mut self, ctx: &mut Context<M>, code: &Code, pc: u64, fresh: bool) -> Stop<M::Error> {
         let table = self.meter.table();
         let slots = code.threaded(table);
+        if !fresh && self.depth != 0 && !self.rebase_frames(slots) {
+            return self.enter_uncompacted(ctx, code, pc, fresh);
+        }
+
+        if pc >= slots.total_len() as u64 {
+            return self.outside(pc, fresh);
+        }
+        let ip = if pc == 0 {
+            slots.first_ip()
+        } else {
+            let Some(ip) = slots.ip_at(pc) else {
+                return self.enter_uncompacted(ctx, code, pc, fresh);
+            };
+            ip
+        };
+
+        #[cfg(feature = "fuel")]
+        let (rests, is_short) = if self.meter.is_metered() {
+            let short = self
+                .meter
+                .enter_block(&mut self.fuel, code.raw_slots(), code.rests(), pc);
+            (slots.rests_ptr(), short)
+        } else {
+            (RestsPtr::NULL, false)
+        };
+        #[cfg(not(feature = "fuel"))]
+        let (rests, is_short) = (RestsPtr::NULL, false);
+
+        if is_short {
+            #[cfg(feature = "fuel")]
+            crate::fuel::step_from_pc(ctx, slots, pc, self);
+        } else {
+            // SAFETY: `ip` came from `slots.ip_at(pc)` and lies in `slots`, built for `<M, H>`.
+            let (next, slot) = unsafe { ip.fetch::<M, H>() };
+            next(ctx, slots, ip, self, rests, SPARE, slot);
+        }
+        let stop_slots = if self.stop.bailed {
+            core::hint::cold_path();
+            self.stop.bailed = false;
+            code.threaded_uncompacted(table)
+        } else {
+            slots
+        };
+
+        // Test the tag alone first: the handler stored the reason one field at a time, and a single load of the whole
+        // reason can't take its bytes from several stores, so it waits for them to reach the cache. Each arm builds
+        // its own `Stop`, so that a caller that only tests for `Exit` runs no more of this function than the test.
+        match self.stop.reason {
+            Reason::Exit => Stop {
+                reason: Reason::Exit,
+                pc: self.stop.pc(stop_slots),
+            },
+            _ => self.stopped_with(stop_slots),
+        }
+    }
+
+    /// Cold fallback for entry or resume at a mid-block `pc` that was folded or eliminated in the compacted stream.
+    #[cold]
+    #[inline(never)]
+    fn enter_uncompacted(&mut self, ctx: &mut Context<M>, code: &Code, pc: u64, fresh: bool) -> Stop<M::Error> {
+        let table = self.meter.table();
+        let slots = code.threaded_uncompacted(table);
         if !fresh && self.depth != 0 {
             self.rebase_frames(slots);
         }
-
         if pc >= slots.total_len() as u64 {
             return self.outside(pc, fresh);
         }
         let ip = Ip::at(slots, pc);
 
         #[cfg(feature = "fuel")]
-        let (rests, is_short) = self
+        let is_short = self
             .meter
             .enter_block(&mut self.fuel, code.raw_slots(), code.rests(), pc);
         #[cfg(not(feature = "fuel"))]
-        let (rests, is_short) = (RestsPtr::NULL, false);
+        let is_short = false;
+        let rests = slots.rests_ptr();
 
         if is_short {
             #[cfg(feature = "fuel")]
-            Metered::step(ctx, slots, ip, self, rests, SPARE, Slot::UNREAD);
+            crate::fuel::step_from_pc(ctx, slots, pc, self);
         } else {
-            // SAFETY: `pc < slots.total_len()`, so `ip` lies in `slots`, built for `<M, H>`.
+            // SAFETY: `pc < slots.total_len()` and `slots` is 1:1.
             let (next, slot) = unsafe { ip.fetch::<M, H>() };
             next(ctx, slots, ip, self, rests, SPARE, slot);
         }
+        self.stop.bailed = false;
 
-        // Test the tag alone first: the handler stored the reason one field at a time, and a single load of the whole
-        // reason can't take its bytes from several stores, so it waits for them to reach the cache. Each arm builds
-        // its own `Stop`, so that a caller that only tests for `Exit` runs no more of this function than the test.
         match self.stop.reason {
             Reason::Exit => Stop {
                 reason: Reason::Exit,
@@ -397,25 +467,34 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
             return self.enter_unpromoted(ctx, code, pc, false);
         }
 
+        let table = self.meter.table();
+        let slots = code.threaded_promoted(table);
+        let ip = if pc == 0 {
+            slots.first_ip()
+        } else {
+            let Some(ip) = slots.ip_at(pc) else {
+                return self.enter_uncompacted(ctx, code, pc, false);
+            };
+            ip
+        };
+
         #[cfg(feature = "fuel")]
-        let (rests, is_short) = self
-            .meter
-            .enter_block(&mut self.fuel, code.raw_slots(), code.rests(), pc);
+        let rests = if self.meter.is_metered() {
+            if self
+                .meter
+                .enter_block(&mut self.fuel, code.raw_slots(), code.rests(), pc)
+            {
+                crate::fuel::step_from_pc(ctx, slots, pc, self);
+                return self.stopped_with(slots);
+            }
+            slots.rests_ptr()
+        } else {
+            RestsPtr::NULL
+        };
         #[cfg(not(feature = "fuel"))]
         let rests = RestsPtr::NULL;
 
-        let table = self.meter.table();
-        #[cfg(feature = "fuel")]
-        if is_short {
-            let slots = code.threaded(table);
-            let ip = Ip::at(slots, pc);
-            Metered::step(ctx, slots, ip, self, rests, SPARE, Slot::UNREAD);
-            return self.stopped_with(slots);
-        }
-
         self.windows.clear_overlapping(fp.wrapping_sub(PROMOTE_FRAME), fp);
-        let slots = code.threaded_promoted(table);
-        let ip = Ip::at(slots, pc);
 
         // SAFETY: `fp_host != 0` proves `[fp - PROMOTE_FRAME .. fp)` lies in the RW stack window.
         unsafe { region.load(ctx, fp_host) };
@@ -424,21 +503,25 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
             region: ptr::from_ref(region),
             fp_host,
             fp,
-            bailed: false,
         };
 
-        // SAFETY: `pc < region.end <= code.len()`, so `ip` lies in `slots`, built for `<M, H>`.
+        // SAFETY: `ip` came from `slots.ip_at(pc)` and lies in `slots`, built for `<M, H>`.
         let (next, slot) = unsafe { ip.fetch::<M, H>() };
         next(ctx, slots, ip, self, rests, SPARE, slot);
 
-        let bailed = self.active_promo.bailed;
         if !self.active_promo.region.is_null() {
             // SAFETY: `region.load` initialized the virtual slots and `fp_host` stayed valid (no calls in region).
             unsafe { region.flush(ctx, fp_host) };
         }
         self.active_promo = prev;
 
-        let stop_slots = if bailed { code.threaded(table) } else { slots };
+        let stop_slots = if self.stop.bailed {
+            core::hint::cold_path();
+            self.stop.bailed = false;
+            code.threaded_uncompacted(table)
+        } else {
+            slots
+        };
         match self.stop.reason {
             Reason::Exit => Stop {
                 reason: Reason::Exit,
@@ -453,10 +536,12 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
     #[inline(never)]
     fn stopped_with(&mut self, slots: Slots<'_>) -> Stop<M::Error> {
         if self.depth != 0 {
-            self.frame_code_first = slots.first().addr();
+            self.record_frame_pcs(slots);
         }
+        let stop_pc = self.stop.in_code_pc(slots);
+        let settled = self.stop.settled;
         self.meter
-            .settle(&mut self.fuel, slots, self.stop.ip(slots), &mut self.stop.reason);
+            .settle(&mut self.fuel, slots, stop_pc, settled, &mut self.stop.reason);
         Stop {
             pc: self.stop.pc(slots),
             // moved out, as the error of the memory needn't be `Copy`
@@ -464,37 +549,51 @@ impl<M: Memory, H: Host<M>> Interpreter<M, H> {
         }
     }
 
-    /// Record the base address of `code` before an aware native call that may re-enter through `resume`.
+    /// Record the BPF return pcs of live frames before an aware native call that may re-enter through `resume`.
     #[cfg(feature = "callbacks")]
     #[inline(always)]
     pub(crate) fn record_frame_code(&mut self, code: Slots) {
         if self.depth != 0 {
-            self.frame_code_first = code.first().addr();
+            self.record_frame_pcs(code);
+        }
+    }
+
+    /// Snapshot the BPF return pc of every live non-sentinel frame while `slots` is still live.
+    #[cold]
+    #[inline(never)]
+    fn record_frame_pcs(&mut self, slots: Slots) {
+        for i in 0..self.depth {
+            // SAFETY: `frames` entries in `0..self.depth` are initialised.
+            let addr = unsafe { self.frames.return_ip[i].assume_init() }.0.addr();
+            if addr & 1 == 0 {
+                self.frame_return_pcs[i] = slots.pc_at(addr);
+            }
         }
     }
 
     /// Re-derive live return pointers from `code` so `resume` stays sound across `&mut Code` or a different `Code`.
+    /// Returns `false` if any live frame returns to a mid-block pc that `code` compacted away.
     #[cold]
     #[inline(never)]
-    fn rebase_frames(&mut self, code: Slots) {
-        let new_first = code.first();
-        let new_len = code.len();
-        let old_first = self.frame_code_first;
-        for slot in &mut self.frames.return_ip[..self.depth] {
+    fn rebase_frames(&mut self, code: Slots) -> bool {
+        let new_len = code.len() as u64;
+        for i in 0..self.depth {
             // SAFETY: `frames` entries in `0..self.depth` are initialised.
-            let return_ip = unsafe { slot.assume_init_mut() };
-            let addr = return_ip.0.addr();
-            if addr & 1 != 0 {
+            let return_ip = unsafe { self.frames.return_ip[i].assume_init_mut() };
+            if return_ip.0.addr() & 1 != 0 {
                 continue;
             }
-            let pc = addr.wrapping_sub(old_first) / size_of::<ThreadedSlot>();
-            *return_ip = if pc <= new_len {
-                ReturnIp(Ip(new_first.wrapping_add(pc)))
+            let pc = self.frame_return_pcs[i];
+            if pc <= new_len {
+                let Some(ip) = code.ip_at(pc) else {
+                    return false;
+                };
+                *return_ip = ReturnIp(ip);
             } else {
-                ReturnIp(Ip(ptr::without_provenance((pc << 1) | 1)))
-            };
+                *return_ip = ReturnIp(Ip(ptr::without_provenance(((pc as usize) << 1) | 1)));
+            }
         }
-        self.frame_code_first = new_first.addr();
+        true
     }
 
     /// Stop at a tagged sentinel return ip (`RETURN_PC` from `begin_nested`, or an out-of-range pc after a code swap).
@@ -634,6 +733,10 @@ pub struct StopRecord<E> {
     /// [`Reason::Exit`] where no chain has stopped since the interpreter took the last one, unless a `callx` called a
     /// native function since.
     reason: Reason<E>,
+    /// True when `fuel::step_from_pc` already settled exact remaining fuel.
+    settled: bool,
+    /// True when dispatch switched mid-run to the 1:1 uncompacted stream.
+    bailed: bool,
 }
 
 impl<E> StopRecord<E> {
@@ -641,27 +744,37 @@ impl<E> StopRecord<E> {
         slot: 0,
         pc: 0,
         reason: Reason::Exit,
+        settled: false,
+        bailed: false,
     };
 
     /// Stop at `ip`, the ip of the handler.
     #[inline(always)]
     pub fn at(&mut self, ip: Ip, reason: Reason<E>) {
         core::hint::cold_path();
-        (self.slot, self.reason) = (ip.addr(), reason);
+        (self.slot, self.reason, self.settled) = (ip.addr(), reason, false);
     }
 
     /// Record the `callx` at `ip` that is about to call the native function at `target`. Only a debugger reads the
     /// record, to find the guest instruction behind a call that crashed: the handler that ends the chain replaces it.
     #[inline(always)]
     pub fn calling(&mut self, ip: Ip, target: u64) {
-        (self.slot, self.reason) = (ip.addr(), Reason::CallIndirect(target));
+        (self.slot, self.reason, self.settled) = (ip.addr(), Reason::CallIndirect(target), false);
     }
 
     /// Stop at `pc`, which may lie outside the code.
     #[inline(always)]
     pub fn at_pc(&mut self, pc: u64, reason: Reason<E>) {
         core::hint::cold_path();
-        (self.slot, self.pc, self.reason) = (0, pc, reason);
+        (self.slot, self.pc, self.reason, self.settled) = (0, pc, reason, false);
+    }
+
+    /// Stop at `pc` with exact remaining fuel already settled by the cold short-fuel stepper.
+    #[cfg(feature = "fuel")]
+    #[inline(always)]
+    pub fn at_pc_settled(&mut self, pc: u64, reason: Reason<E>) {
+        core::hint::cold_path();
+        (self.slot, self.pc, self.reason, self.settled) = (0, pc, reason, true);
     }
 
     /// The pc it stopped at, in the slots `code` of the code it ran.
@@ -673,8 +786,8 @@ impl<E> StopRecord<E> {
         }
     }
 
-    /// The ip it stopped at in `code`, unless it stopped at a pc.
-    fn ip(&self, code: Slots) -> Option<Ip> {
-        (self.slot != 0).then(|| Ip::at(code, code.pc_at(self.slot)))
+    /// The in-code BPF pc it stopped at, or `None` if it stopped outside the code via `at_pc`.
+    fn in_code_pc(&self, code: Slots) -> Option<u64> {
+        (self.slot != 0).then(|| code.pc_at(self.slot))
     }
 }

@@ -2,7 +2,7 @@
 
 use super::supers::{Super, MAX_LEN, MAX_ROLES};
 use crate::code::Slots;
-use crate::context::FP;
+use crate::context::{RegView, FP};
 use crate::dispatch::{Spare, SPARE};
 use crate::fuel::{Fuel, RestsPtr};
 use crate::slot::{Fields, Layout, Reg, Shape, Slot, View, LAYOUTS};
@@ -52,9 +52,10 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
 
     let registers = sup.registers(slot_of);
     let free = sup.free_at.map_or(Reg::R0, |k| slot_of(usize::from(k)).dst_reg());
+    let (regs, memory) = ctx.split_mut();
     let mut roles = Roles {
         values: [0; MAX_ROLES],
-        regs: &mut ctx.regs,
+        regs,
         free,
         registers,
         direct: sup.direct,
@@ -98,7 +99,7 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
                         };
                         become access(ctx, code, at, interp, rests, SPARE, miss_slot)
                     }
-                    false => step::step(&mut roles, ctx.memory, decoded),
+                    false => step::step(&mut roles, memory, decoded),
                 };
                 match step {
                     Step::Next => {}
@@ -114,7 +115,8 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
                             let taken_rest = u64::from(sequence[$k].slot.byte());
                             become_enter_rest!(ctx, code, ip.offset($k).byte_offset(byte_off), interp, rests, taken_rest)
                         } else {
-                            become_after!(ip.offset($k + 1 + offset))
+                            let target_pc = (ip.pc(code) as i64 + $k + 1 + offset) as u64;
+                            become_after!(Ip::at(code, target_pc))
                         }
                     }
                     Step::LdImm64 => step::ld_imm64(&mut roles, decoded, sequence[$k + 1].slot.imm()),
@@ -149,7 +151,7 @@ pub extern "rust-preserve-none" fn fused<M: Memory, H: Host<M>, F: Fuel, const S
 /// is register `free` in `regs`, and `fp` as r10.
 struct Roles<'a> {
     values: [u64; MAX_ROLES],
-    regs: &'a mut [u64; 16],
+    regs: RegView<'a>,
     free: Reg,
     registers: [Reg; MAX_ROLES],
     direct: bool,

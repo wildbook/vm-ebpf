@@ -63,6 +63,18 @@ pub trait Fuel {
         spare: Spare,
         slot: Slot,
     );
+
+    /// Like [`step`](Self::step), starting at `ip.pc(code) + 1 + slot.byte()` for folded select handlers whose
+    /// skipped instruction may not occupy a slot in the compacted stream.
+    extern "rust-preserve-none" fn step_delta<M: Memory, H: Host<M>>(
+        ctx: &mut Context<M>,
+        code: Slots,
+        ip: Ip,
+        interp: &mut Interpreter<M, H>,
+        rests: RestsPtr,
+        spare: Spare,
+        slot: Slot,
+    );
 }
 
 /// No fuel: the handlers of a run without a limit.
@@ -93,10 +105,22 @@ impl Fuel for Unmetered {
     ) {
         unreachable!("no block is short of fuel")
     }
+
+    extern "rust-preserve-none" fn step_delta<M: Memory, H: Host<M>>(
+        _: &mut Context<M>,
+        _: Slots,
+        _: Ip,
+        _: &mut Interpreter<M, H>,
+        _: RestsPtr,
+        _: Spare,
+        _: Slot,
+    ) {
+        unreachable!("no block is short of fuel")
+    }
 }
 
 #[cfg(feature = "fuel")]
-pub use metered::{FuelLeft, Meter, Metered, Rests};
+pub use metered::{step_from_pc, FuelLeft, Meter, Rests};
 #[cfg(not(feature = "fuel"))]
 pub use unmetered::{FuelLeft, Meter};
 
@@ -133,9 +157,9 @@ mod metered {
 
         #[inline(always)]
         fn enter<M: Memory, H>(interp: &mut Interpreter<M, H>, code: Slots, ip: Ip, rests: RestsPtr) -> bool {
-            let pc = ip.pc(code) as usize;
-            // SAFETY: `ip` lies in `code`, and `rests` points to `code.total_len()` entries initialised before entry.
-            let rest = u64::from(unsafe { *rests.0.add(pc) });
+            let idx = code.slot_idx(ip.addr());
+            // SAFETY: `ip` lies in `code`, and `rests` points to `idx_rests` with one entry per compacted slot.
+            let rest = u64::from(unsafe { *rests.0.add(idx) });
             interp.fuel.0 = interp.fuel.0.wrapping_sub(rest);
             !short(interp.fuel.0)
         }
@@ -157,83 +181,106 @@ mod metered {
             code: Slots,
             ip: Ip,
             interp: &mut Interpreter<M, H>,
-            rests: RestsPtr,
+            _rests: RestsPtr,
             _: Spare,
             _: Slot,
         ) {
-            if interp.is_promoted() {
-                interp.flush_promoted(ctx);
-            }
-            let mut pc = ip.pc(code);
-            // SAFETY: `ip` lies in `code`, and `rests` points to `code.total_len()` entries.
-            let mut fuel = interp
-                .fuel
-                .0
-                .wrapping_add(u64::from(unsafe { *rests.0.add(pc as usize) }));
-            loop {
-                let raw = code.raw_slot(pc).expect("short-block pc lies in code");
-                let alone = ALONE[usize::from(raw.byte())];
-                let units = match alone {
-                    LD_IMM64 => 2,
-                    _ => 1,
-                };
-                if fuel < units {
-                    // LD_IMM64 with one unit left keeps it
-                    interp.fuel.0 = fuel;
-                    return interp.stop.at(Ip::at(code, pc), Reason::OutOfFuel);
-                }
+            step_from_pc(ctx, code, ip.pc(code), interp);
+        }
 
-                let stop_reason = match alone {
-                    TO_HOST => {
-                        // SAFETY: `raw` has byte `TO_HOST`, whose layout matches `Shape::of(TO_HOST)`.
-                        let insn = unsafe { View::new(&raw, Some(raw), const { Shape::of(TO_HOST) }) };
-                        let dst = ctx.memory.host_address(ctx.regs.get(insn.src_reg()));
-                        ctx.regs.set(insn.dst_reg(), dst);
-                        None
-                    }
-                    TO_GUEST => {
-                        // SAFETY: `raw` has byte `TO_GUEST`, whose layout matches `Shape::of(TO_GUEST)`.
-                        let insn = unsafe { View::new(&raw, Some(raw), const { Shape::of(TO_GUEST) }) };
-                        let dst = ctx.memory.guest_address(ctx.regs.get(insn.src_reg()));
-                        ctx.regs.set(insn.dst_reg(), dst);
-                        None
-                    }
-                    args::LOAD | args::STORE | args::STORE_IMM => {
-                        args::step_arg(interp, &mut ctx.regs, raw);
-                        None
-                    }
-                    _ => {
-                        // SAFETY: `alone` has the same layout as `raw.byte()` (see `bytes::usual`).
-                        let insn = unsafe { View::new(&raw, Some(raw), Shape::of(alone)) };
-                        match step::step(&mut ctx.regs, ctx.memory, insn) {
-                            Step::Next => None,
-                            Step::LdImm64 => {
-                                let second = code.raw_slot(pc + 1).expect("slot after LD_IMM64 lies in code");
-                                let Some(upper) = transfer::second_half(second) else {
-                                    // SAFETY: `pc` lies in `code`.
-                                    let r = u64::from(unsafe { *rests.0.add(pc as usize) });
-                                    interp.fuel.0 = fuel.wrapping_sub(r);
-                                    return interp.stop.at(Ip::at(code, pc), Reason::BadPc);
-                                };
-                                step::ld_imm64(&mut ctx.regs, insn, upper);
-                                fuel -= 2;
-                                pc += 2;
-                                continue;
-                            }
-                            Step::Stop(reason) => Some(reason),
-                            _ => unreachable!("short block stops before any block-ending instruction"),
-                        }
-                    }
-                };
-                if let Some(reason) = stop_reason {
-                    // SAFETY: `pc` lies in `code`.
-                    let r = u64::from(unsafe { *rests.0.add(pc as usize) });
-                    interp.fuel.0 = fuel.wrapping_sub(r);
-                    return interp.stop.at(Ip::at(code, pc), reason);
-                }
-                fuel -= 1;
-                pc += 1;
+        #[cold]
+        #[inline(never)]
+        extern "rust-preserve-none" fn step_delta<M: Memory, H: Host<M>>(
+            ctx: &mut Context<M>,
+            code: Slots,
+            ip: Ip,
+            interp: &mut Interpreter<M, H>,
+            _rests: RestsPtr,
+            _: Spare,
+            slot: Slot,
+        ) {
+            let pc = ip.pc(code) + 1 + u64::from(slot.byte());
+            step_from_pc(ctx, code, pc, interp);
+        }
+    }
+
+    /// Cold single-slot stepper from original BPF `start_pc` when a block has insufficient fuel.
+    #[cold]
+    #[inline(never)]
+    pub fn step_from_pc<M: Memory, H: Host<M>>(
+        ctx: &mut Context<M>,
+        code: Slots,
+        start_pc: u64,
+        interp: &mut Interpreter<M, H>,
+    ) {
+        if interp.is_promoted() {
+            interp.flush_promoted(ctx);
+        }
+        let mut pc = start_pc;
+        let raw_rests = code.rests().slice(code.raw_slots());
+        let mut fuel = interp.fuel.0.wrapping_add(u64::from(raw_rests[pc as usize]));
+        loop {
+            let raw = code.raw_slot(pc).expect("short-block pc lies in code");
+            let alone = ALONE[usize::from(raw.byte())];
+            let units = match alone {
+                LD_IMM64 => 2,
+                _ => 1,
+            };
+            if fuel < units {
+                // LD_IMM64 with one unit left keeps it
+                interp.fuel.0 = fuel;
+                return interp.stop.at_pc_settled(pc, Reason::OutOfFuel);
             }
+
+            let stop_reason = match alone {
+                TO_HOST => {
+                    // SAFETY: `raw` has byte `TO_HOST`, whose layout matches `Shape::of(TO_HOST)`.
+                    let insn = unsafe { View::new(&raw, Some(raw), const { Shape::of(TO_HOST) }) };
+                    let dst = ctx.memory.host_address(ctx.regs.get(insn.src_reg()));
+                    ctx.regs.set(insn.dst_reg(), dst);
+                    None
+                }
+                TO_GUEST => {
+                    // SAFETY: `raw` has byte `TO_GUEST`, whose layout matches `Shape::of(TO_GUEST)`.
+                    let insn = unsafe { View::new(&raw, Some(raw), const { Shape::of(TO_GUEST) }) };
+                    let dst = ctx.memory.guest_address(ctx.regs.get(insn.src_reg()));
+                    ctx.regs.set(insn.dst_reg(), dst);
+                    None
+                }
+                args::LOAD | args::STORE | args::STORE_IMM => {
+                    args::step_arg(interp, &mut ctx.regs, raw);
+                    None
+                }
+                _ => {
+                    // SAFETY: `alone` has the same layout as `raw.byte()` (see `bytes::usual`).
+                    let insn = unsafe { View::new(&raw, Some(raw), Shape::of(alone)) };
+                    match step::step(&mut ctx.regs, ctx.memory, insn) {
+                        Step::Next => None,
+                        Step::LdImm64 => {
+                            let second = code.raw_slot(pc + 1).expect("slot after LD_IMM64 lies in code");
+                            let Some(upper) = transfer::second_half(second) else {
+                                interp.fuel.0 = fuel;
+                                return interp.stop.at_pc_settled(pc, Reason::BadPc);
+                            };
+                            step::ld_imm64(&mut ctx.regs, insn, upper);
+                            fuel -= 2;
+                            pc += 2;
+                            continue;
+                        }
+                        Step::Stop(reason) => Some(reason),
+                        _ => unreachable!("short block stops before any block-ending instruction"),
+                    }
+                }
+            };
+            if let Some(reason) = stop_reason {
+                interp.fuel.0 = match reason {
+                    Reason::BadPc => fuel,
+                    _ => fuel - 1,
+                };
+                return interp.stop.at_pc_settled(pc, reason);
+            }
+            fuel -= 1;
+            pc += 1;
         }
     }
 
@@ -303,17 +350,23 @@ mod metered {
             left.0 = self.limit;
         }
 
-        /// Charge the block at `pc` before entering handlers; returns `(rests_ptr, short)`.
+        /// Whether runs using this meter are metered.
         #[inline(always)]
-        pub fn enter_block(&self, left: &mut FuelLeft, raw: &[Slot], rests: &Rests, pc: u64) -> (RestsPtr, bool) {
+        pub fn is_metered(&self) -> bool {
+            self.metered
+        }
+
+        /// Charge the block at `pc` before entering handlers; returns true if fuel is short.
+        #[inline(always)]
+        pub fn enter_block(&self, left: &mut FuelLeft, raw: &[Slot], rests: &Rests, pc: u64) -> bool {
             if !self.metered {
-                return (RestsPtr::NULL, false);
+                return false;
             }
             let ptr = rests.ptr(raw);
             // SAFETY: caller checked `pc < raw.len()`, and `ptr` points to `raw.len()` entries.
             let rest = u64::from(unsafe { *ptr.0.add(pc as usize) });
             left.0 = left.0.wrapping_sub(rest);
-            (ptr, short(left.0))
+            short(left.0)
         }
 
         /// Why a call can't start, if `fresh`, or resume at a pc outside the code. A fresh call has the fuel of the
@@ -344,20 +397,27 @@ mod metered {
         }
 
         /// Turns the fuel that the handlers of a metered run of `code` kept into what charging per slot leaves
-        /// where the run stopped with `reason`: at `ip`, or with `None` at a pc outside the code.
-        pub fn settle<E>(&self, left: &mut FuelLeft, code: Slots, ip: Option<Ip>, reason: &mut Reason<E>) {
-            if !self.metered {
+        /// where the run stopped with `reason`: at `pc` if in code, or with `None` at a pc outside the code.
+        pub fn settle<E>(
+            &self,
+            left: &mut FuelLeft,
+            code: Slots,
+            stop_pc: Option<u64>,
+            settled: bool,
+            reason: &mut Reason<E>,
+        ) {
+            if !self.metered || settled {
                 return;
             }
-            let Some(ip) = ip else {
+            let Some(pc) = stop_pc else {
                 // the handler that continued there ended its block, so the fuel is charged up to it
                 if left.0 == 0 {
                     *reason = Reason::OutOfFuel;
                 }
                 return;
             };
-            // SAFETY: a handler stops at its own ip, which lies in the slots of its code (see `Ip`)
-            let before = left.0.wrapping_add(unsafe { code.rests().of(code, ip) });
+            let rest = u64::from(code.rests().slice(code.raw_slots())[pc as usize]);
+            let before = left.0.wrapping_add(rest);
             left.0 = match reason {
                 // `Metered::step` left the fuel before the slot
                 Reason::OutOfFuel => left.0,
@@ -392,17 +452,6 @@ mod metered {
             let ptr = self.ptr(raw).0;
             // SAFETY: `compute` allocates `raw.len()` entries and lives until `Rests` is dropped.
             unsafe { std::slice::from_raw_parts(ptr, raw.len()) }
-        }
-
-        /// The `rest` of the slot at `ip` of `code`, whose rests these are.
-        ///
-        /// # Safety
-        ///
-        /// `ip` must lie in the slots of `code`.
-        pub unsafe fn of(&self, code: Slots, ip: Ip) -> u64 {
-            let ptr = self.ptr(code.raw_slots());
-            // SAFETY: the caller's, and `ptr` has `code.total_len()` entries.
-            u64::from(unsafe { *ptr.0.add(ip.pc(code) as usize) })
         }
 
         /// Computes and publishes the `rest` array for `slots`.
@@ -502,7 +551,7 @@ mod unmetered {
 
         pub fn set_left(&self, _: &mut FuelLeft, _: u64) {}
 
-        pub fn settle<E>(&self, _: &mut FuelLeft, _: Slots, _: Option<Ip>, _: &mut Reason<E>) {}
+        pub fn settle<E>(&self, _: &mut FuelLeft, _: Slots, _: Option<u64>, _: bool, _: &mut Reason<E>) {}
     }
 }
 

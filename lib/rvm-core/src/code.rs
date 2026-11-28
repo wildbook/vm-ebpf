@@ -1,31 +1,29 @@
 //! Prepared code: [`Code`], the passes of [`Code::new`] that turn instructions into portable slots, and lazy
-//! compilation into 16-byte direct-threaded [`ThreadedSlot`] streams with 3-operand ALU folding.
+//! compilation into compacted 16-byte direct-threaded [`ThreadedSlot`] streams.
 
 use std::fmt::{self, Debug, Formatter};
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use crate::bytes::{MOV32_REG, MOV64_REG};
-use crate::context::FP;
 use crate::dispatch::DispatchTable;
 #[cfg(feature = "fuel")]
 use crate::fuel::Rests;
+use crate::fuel::RestsPtr;
 use crate::handler::{CALL_HELPER, CALL_KFUNC};
 #[cfg(feature = "ffi")]
 use crate::native::GeneralProto;
 use crate::native::{NativeBind, NativeMode};
-use crate::opcode::{AluOpc, Class, JmpOpc, OpCode, Source, CALL};
+use crate::opcode::OpCode;
 use crate::promote::{self, PromotedRegion};
-use crate::slot::{Layout, Slot, LAYOUTS};
-use crate::{
-    args, bytes, fuse, native, rewrite, threaded, transfer, windows, Host, Instruction, Memory, MAX_NATIVE_ARGS,
-};
+use crate::slot::Slot;
+use crate::transfer::Ip;
+use crate::{args, bytes, compile, fuse, native, rewrite, transfer, Host, Instruction, Memory, MAX_NATIVE_ARGS};
 
 /// One entry of a direct-threaded code stream: the handler pointer and its 8-byte pre-decoded [`Slot`].
 ///
-/// Kept at 16 bytes (`align(16)`) so `Ip::offset(n)` scales by 16, `pc_at` is a right shift by 4, and loading `slot`
-/// into `RCX` runs in parallel with the memory-indirect tail jump through `handler`.
+/// Kept at 16 bytes (`align(16)`) so `Ip::offset(n)` scales by 16, `slot_idx` is a right shift by 4, and loading
+/// `slot` into `RCX` runs in parallel with the memory-indirect tail jump through `handler`.
 #[derive(Clone, Copy)]
 #[repr(C, align(16))]
 pub struct ThreadedSlot {
@@ -35,8 +33,87 @@ pub struct ThreadedSlot {
 
 const _: () = assert!(size_of::<ThreadedSlot>() == 16);
 
-/// Fast lock-free cache slots for compiled threaded streams, keyed by static dispatch table address.
+/// Sentinel in [`StreamMaps::pc_to_idx`] for an original BPF pc that was folded or eliminated mid-block.
+pub const NO_SLOT: u32 = u32::MAX;
+
+/// Cold side tables mapping between compacted threaded slot indices and original BPF pcs.
+pub struct StreamMaps {
+    /// Original BPF pc (`0..total_len`) to compacted slot index, or [`NO_SLOT`] if compacted away mid-block.
+    pub pc_to_idx: Box<[u32]>,
+    /// Compacted slot index (`0..slot_count`) to original BPF pc.
+    pub idx_to_pc: Box<[u32]>,
+    /// Per-compacted-slot block length for metered runs (empty when unmetered).
+    #[cfg(feature = "fuel")]
+    pub idx_rests: Box<[u32]>,
+}
+
+/// Owned compiled direct-threaded stream and its cold PC/fuel mapping tables.
+///
+/// `base[0].handler` stores `maps` and `base[0].slot` stores `maps.idx_to_pc.as_ptr()` while `base[1..len]` holds the
+/// executable [`ThreadedSlot`] stream. Stored as raw pointers from `Box::into_raw` so moving `CompiledStream` inside
+/// [`CompiledCache`] never retags the allocations.
+pub struct CompiledStream {
+    base: *mut ThreadedSlot,
+    len: usize,
+    maps: *mut StreamMaps,
+}
+
+// SAFETY: compiled streams and their maps are immutable once published and owned exclusively by `Code` until dropped.
+unsafe impl Send for CompiledStream {}
+unsafe impl Sync for CompiledStream {}
+
+const _: () = assert!(size_of::<(*const StreamMaps, *const u32)>() == size_of::<ThreadedSlot>());
+
+impl CompiledStream {
+    pub fn new(slots: Vec<ThreadedSlot>, maps: StreamMaps) -> Self {
+        let is_identity = maps.idx_to_pc.iter().enumerate().all(|(i, &pc)| pc as usize == i);
+        let maps = Box::into_raw(Box::new(maps));
+        // SAFETY: `maps` is live and will not be moved again until `Drop`.
+        let idx_to_pc_ptr = if is_identity {
+            ptr::null()
+        } else {
+            unsafe { (*maps).idx_to_pc.as_ptr() }
+        };
+        let mut buf = Vec::with_capacity(1 + slots.len());
+        buf.push(ThreadedSlot {
+            handler: ptr::null(),
+            slot: Slot::UNREAD,
+        });
+        buf.extend(slots);
+        let len = buf.len();
+        let base = Box::into_raw(buf.into_boxed_slice()).cast::<ThreadedSlot>();
+        // SAFETY: `base[0]` is 16-byte aligned and 16 bytes wide, matching `(*const StreamMaps, *const u32)`.
+        unsafe {
+            base.cast::<(*const StreamMaps, *const u32)>()
+                .write((maps, idx_to_pc_ptr));
+        }
+        Self { base, len, maps }
+    }
+
+    /// Pointer to `base[1]`, the first executable [`ThreadedSlot`], keeping provenance over `base[0]`.
+    #[inline(always)]
+    pub fn first(&self) -> *const ThreadedSlot {
+        // SAFETY: `new` always inserts the header at `base[0]`, so `base.add(1)` is in bounds.
+        unsafe { self.base.add(1) }
+    }
+}
+
+impl Drop for CompiledStream {
+    fn drop(&mut self) {
+        // SAFETY: `new` produced `base` from `Box::into_raw` with length `self.len`, and `maps` from `Box::into_raw`.
+        unsafe {
+            drop(Box::from_raw(ptr::slice_from_raw_parts_mut(self.base, self.len)));
+            drop(Box::from_raw(self.maps));
+        }
+    }
+}
+
+/// Fast lock-free cache slots for compiled threaded streams, keyed by dispatch table address and mode bits.
 const CACHE_SLOTS: usize = 4;
+
+/// Mode tag bits ORed into the aligned `&DispatchTable` key.
+const KEY_PROMOTED: usize = 1;
+const KEY_UNCOMPACTED: usize = 2;
 
 struct CacheEntry {
     key: AtomicUsize,
@@ -52,11 +129,17 @@ impl CacheEntry {
     }
 }
 
-/// Lock-free cache of compiled [`ThreadedSlot`] streams for one [`Code`], keyed by `&DispatchTable` address.
+#[derive(Default)]
+struct CacheOverflow {
+    entries: Vec<(usize, *const ThreadedSlot)>,
+    owned: Vec<CompiledStream>,
+}
+
+/// Lock-free cache of compiled [`CompiledStream`]s for one [`Code`], keyed by `&DispatchTable` address and mode bits.
 struct CompiledCache {
     fast: [CacheEntry; CACHE_SLOTS],
-    /// Serialises first-time compilation and holds any entries past [`CACHE_SLOTS`].
-    overflow: Mutex<Vec<(usize, *mut ThreadedSlot)>>,
+    /// Serialises first-time compilation, owns every [`CompiledStream`], and holds keys past [`CACHE_SLOTS`].
+    overflow: Mutex<CacheOverflow>,
 }
 
 // SAFETY: compiled streams are immutable once published and owned exclusively by `Code` until dropped.
@@ -67,28 +150,20 @@ impl Default for CompiledCache {
     fn default() -> Self {
         Self {
             fast: std::array::from_fn(|_| CacheEntry::empty()),
-            overflow: Mutex::new(Vec::new()),
+            overflow: Mutex::new(CacheOverflow::default()),
         }
     }
 }
 
 impl CompiledCache {
-    /// Free all compiled streams, each of length `total_len`.
-    fn clear(&mut self, total_len: usize) {
+    fn clear(&mut self) {
         for entry in &mut self.fast {
-            let ptr = *entry.ptr.get_mut();
             *entry.key.get_mut() = 0;
             *entry.ptr.get_mut() = ptr::null_mut();
-            if !ptr.is_null() {
-                // SAFETY: `ptr` came from `Box::into_raw` on a slice of length `total_len`.
-                drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(ptr, total_len)) });
-            }
         }
         let overflow = self.overflow.get_mut().unwrap_or_else(|e| e.into_inner());
-        for (_, ptr) in overflow.drain(..) {
-            // SAFETY: as above.
-            drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(ptr, total_len)) });
-        }
+        overflow.entries.clear();
+        overflow.owned.clear();
     }
 }
 
@@ -97,7 +172,7 @@ pub struct Code {
     /// Portable slots, then the guard and moved instructions [`transfer::bound`] appends.
     slots: Box<[Slot]>,
     len: usize,
-    /// Lazily compiled 16-byte direct-threaded streams per dispatch table (`PLAIN`, `METERED`, `FLAT_*`).
+    /// Lazily compiled 16-byte direct-threaded streams per dispatch table and mode.
     compiled: CompiledCache,
     /// Non-escaping leaf functions eligible for stack-slot promotion to virtual registers.
     promoted: Box<[PromotedRegion]>,
@@ -105,12 +180,6 @@ pub struct Code {
     general: Box<[GeneralProto]>,
     #[cfg(feature = "fuel")]
     rests: Rests,
-}
-
-impl Drop for Code {
-    fn drop(&mut self) {
-        self.compiled.clear(self.slots.len());
-    }
 }
 
 impl Code {
@@ -236,7 +305,7 @@ impl Code {
         }
         let insn = slot.instruction();
         *slot = Slot::new(insn.with_byte(args::CALL));
-        self.compiled.clear(self.slots.len());
+        self.compiled.clear();
         true
     }
 
@@ -285,16 +354,23 @@ impl Code {
         None
     }
 
-    /// The direct-threaded [`Slots`] for `table`, compiling and caching them on first use.
+    /// The compacted direct-threaded [`Slots`] for `table`, compiling and caching them on first use.
     #[inline(always)]
     pub(crate) fn threaded<M: Memory, H: Host<M>>(&self, table: &DispatchTable<M, H>) -> Slots<'_> {
         self.threaded_by_key(ptr::from_ref(table).addr(), table)
     }
 
-    /// The direct-threaded [`Slots`] for `table` with stack-slot promotion applied to [`Self::promoted`].
+    /// The compacted direct-threaded [`Slots`] for `table` with stack-slot promotion applied to [`Self::promoted`].
     #[inline(always)]
     pub(crate) fn threaded_promoted<M: Memory, H: Host<M>>(&self, table: &DispatchTable<M, H>) -> Slots<'_> {
-        self.threaded_by_key(ptr::from_ref(table).addr() | 1, table)
+        self.threaded_by_key(ptr::from_ref(table).addr() | KEY_PROMOTED, table)
+    }
+
+    /// The 1:1 uncompacted fallback [`Slots`] for `table`, used on promoted bailout or mid-block indirect entry.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn threaded_uncompacted<M: Memory, H: Host<M>>(&self, table: &DispatchTable<M, H>) -> Slots<'_> {
+        self.threaded_by_key(ptr::from_ref(table).addr() | KEY_UNCOMPACTED, table)
     }
 
     #[inline(always)]
@@ -324,26 +400,33 @@ impl Code {
                 return entry.ptr.load(Ordering::Relaxed);
             }
         }
-        if let Some(&(_, ptr)) = overflow.iter().find(|&&(k, _)| k == key) {
+        if let Some(&(_, ptr)) = overflow.entries.iter().find(|&&(k, _)| k == key) {
             return ptr;
         }
 
-        let promote = (key & 1 != 0).then_some(self.promoted.as_ref());
         #[cfg(feature = "fuel")]
         let rests = table.metered.then(|| self.rests.slice(&self.slots));
         #[cfg(not(feature = "fuel"))]
         let rests: Option<&[u32]> = None;
-        let compiled = compile_threaded(&self.slots, self.len, table, promote, rests);
-        let ptr = Box::into_raw(compiled).cast::<ThreadedSlot>();
+
+        let stream = if key & KEY_UNCOMPACTED != 0 {
+            compile::compile_uncompacted(&self.slots, self.len, table, rests)
+        } else {
+            let promote = (key & KEY_PROMOTED != 0).then_some(self.promoted.as_ref());
+            compile::compile_compacted(&self.slots, self.len, table, promote, rests)
+        };
+        let first = stream.first();
+        overflow.owned.push(stream);
+
         for entry in &self.compiled.fast {
             if entry.key.load(Ordering::Relaxed) == 0 {
-                entry.ptr.store(ptr, Ordering::Relaxed);
+                entry.ptr.store(first.cast_mut(), Ordering::Relaxed);
                 entry.key.store(key, Ordering::Release);
-                return ptr;
+                return first;
             }
         }
-        overflow.push((key, ptr));
-        ptr
+        overflow.entries.push((key, first));
+        first
     }
 
     /// The `rest` of each slot, which metered runs read.
@@ -352,286 +435,6 @@ impl Code {
     pub(crate) fn rests(&self) -> &Rests {
         &self.rests
     }
-}
-
-/// Compile portable slots into a 16-byte direct-threaded stream:
-/// - folds `mov dst, src1; alu dst, rhs` into single 3-operand ALU entries (leaving slot `i + 1` intact for mid-pair
-///   jump targets);
-/// - re-encodes [`Layout::DstSrc`] slots so `dst`, `src`, and `offset` (or pre-scaled jump byte offset) decode from
-///   `RCX` with no extra code-stream loads;
-/// - pre-scales unconditional `ja` and local `call` displacements into byte offsets;
-/// - routes all plain `r10` loads/stores (including 1- and 2-byte) to `windows::stack_access`.
-fn compile_threaded<M: Memory, H: Host<M>>(
-    raw_slots: &[Slot],
-    len: usize,
-    table: &DispatchTable<M, H>,
-    promote: Option<&[PromotedRegion]>,
-    rests: Option<&[u32]>,
-) -> Box<[ThreadedSlot]> {
-    let rewritten;
-    let slots: &[Slot] = match promote {
-        Some(regions) if !regions.is_empty() => {
-            let mut buf = raw_slots.to_vec();
-            for region in regions {
-                let start = region.start as usize;
-                let end = region.end as usize;
-                let patched = promote::rewrite_region(raw_slots, region);
-                buf[start..end].copy_from_slice(&patched);
-            }
-            rewritten = buf;
-            &rewritten
-        }
-        _ => raw_slots,
-    };
-    const STRIDE: i64 = size_of::<ThreadedSlot>() as i64;
-    let mut out = Vec::with_capacity(slots.len());
-    // Slots inside an active superinstruction must keep their opcode's threaded layout intact because `fuse::handler`
-    // reads `sequence[1..sup.len()]` directly from the threaded stream.
-    let mut protected_until = 0usize;
-    for i in 0..slots.len() {
-        let slot = slots[i];
-        let byte = slot.byte();
-        if i >= protected_until && byte == 0xf7 {
-            if let Some(folded) = threaded::try_fold_0xf7(slots, i, len, table) {
-                protected_until = protected_until.max(i + 4);
-                out.push(folded);
-                continue;
-            }
-        }
-        if let Some(sup) = fuse::Super::with_byte(byte) {
-            let branch_fits = if sup.branches() {
-                let last_pc = i + sup.len() - 1;
-                let last = slots[last_pc];
-                let lb = last.byte();
-                let target_pc = (last_pc as i64 + 1 + i64::from(last.offset_raw())) as usize;
-                let fall_ok = rests.is_none_or(|r| r[last_pc + 1] <= u32::from(u8::MAX));
-                if crate::handler::is_cond_dst_jump(lb) {
-                    fall_ok
-                        && i16::try_from((i32::from(last.offset_raw()) + 1) * (STRIDE as i32)).is_ok()
-                        && rests.is_none_or(|r| r[target_pc] <= u32::from(u8::MAX))
-                } else if LAYOUTS[usize::from(lb)] == Layout::DstSrc {
-                    fall_ok && rests.is_none_or(|r| r[target_pc] <= u32::from(u8::MAX))
-                } else {
-                    fall_ok
-                }
-            } else {
-                true
-            };
-            if branch_fits {
-                protected_until = protected_until.max(i + sup.len());
-                let encoded = if sup.branches() {
-                    let fall_rest = rests.map_or(0, |r| r[i + sup.len()]) as u8;
-                    match LAYOUTS[usize::from(sup.opcode(0))] {
-                        Layout::Dst => slot.with_byte(fall_rest),
-                        Layout::DstSrc => {
-                            slot.to_threaded_dst_src_with_rests(i32::from(slot.offset_raw()), fall_rest, 0)
-                        }
-                        Layout::Raw => encode_threaded_slot(slot, byte),
-                    }
-                } else {
-                    encode_threaded_slot(slot, byte)
-                };
-                out.push(ThreadedSlot {
-                    handler: table.handlers[usize::from(byte)] as *const (),
-                    slot: encoded,
-                });
-                continue;
-            }
-            let first_byte = sup.opcode(0);
-            let unfused = slot.with_byte(first_byte);
-            let handler = stack_access_override::<M, H>(unfused, first_byte)
-                .unwrap_or(table.handlers[usize::from(first_byte)]) as *const ();
-            out.push(ThreadedSlot {
-                handler,
-                slot: encode_threaded_slot(unfused, first_byte),
-            });
-            continue;
-        }
-        if i >= protected_until {
-            if let Some((folded, protect_len)) = threaded::try_fold(slots, i, len, table, rests) {
-                protected_until = protected_until.max(i + protect_len);
-                out.push(folded);
-                continue;
-            }
-            if i + 1 < len {
-                if let Some(folded) = fold_alu3(slot, slots[i + 1], table) {
-                    out.push(folded);
-                    continue;
-                }
-            }
-            if i < len {
-                if let Some(scaled) = scale_branch_or_call(slot, byte, i, STRIDE, table, rests) {
-                    out.push(scaled);
-                    continue;
-                }
-            }
-        }
-        if i < len && crate::handler::is_cond_dst_jump(byte) {
-            let target_pc = (i as i64 + 1 + i64::from(slot.offset_raw())) as usize;
-            let taken_rest = rests.map_or(0, |r| r[target_pc]);
-            if let (Ok(byte_off), Ok(taken_rest8)) =
-                (i16::try_from((i32::from(slot.offset_raw()) + 1) * (STRIDE as i32)), u8::try_from(taken_rest))
-            {
-                out.push(ThreadedSlot {
-                    handler: table.handlers[usize::from(byte)] as *const (),
-                    slot: slot.with_offset(byte_off).with_byte(taken_rest8),
-                });
-            } else {
-                out.push(ThreadedSlot {
-                    handler: table.jump_unscaled as *const (),
-                    slot,
-                });
-            }
-            continue;
-        }
-        if i < len && LAYOUTS[usize::from(byte)] == Layout::DstSrc && OpCode(bytes::usual(byte)).is_jump() {
-            let target_pc = (i as i64 + 1 + i64::from(slot.offset_raw())) as usize;
-            let taken_rest = rests.map_or(0, |r| r[target_pc]);
-            let fall_rest = rests.map_or(0, |r| r[i + 1]);
-            if let (Ok(taken_rest8), Ok(fall_rest8)) = (u8::try_from(taken_rest), u8::try_from(fall_rest)) {
-                let byte_off = (i32::from(slot.offset_raw()) + 1) * (STRIDE as i32);
-                out.push(ThreadedSlot {
-                    handler: table.handlers[usize::from(byte)] as *const (),
-                    slot: slot.to_threaded_dst_src_with_rests(byte_off, taken_rest8, fall_rest8),
-                });
-            } else {
-                out.push(ThreadedSlot {
-                    handler: table.jump_unscaled as *const (),
-                    slot,
-                });
-            }
-            continue;
-        }
-        let handler =
-            stack_access_override::<M, H>(slot, byte).unwrap_or(table.handlers[usize::from(byte)]) as *const ();
-        out.push(ThreadedSlot {
-            handler,
-            slot: encode_threaded_slot(slot, byte),
-        });
-    }
-    out.into_boxed_slice()
-}
-
-/// Re-encode a portable `slot` into the threaded layout of `byte`.
-#[inline(always)]
-fn encode_threaded_slot(slot: Slot, byte: u8) -> Slot {
-    if LAYOUTS[usize::from(byte)] != Layout::DstSrc {
-        return slot;
-    }
-    let usual = bytes::usual(byte);
-    let extra = if OpCode(usual).is_jump() {
-        (i32::from(slot.offset_raw()) + 1) * (size_of::<ThreadedSlot>() as i32)
-    } else {
-        i32::from(slot.offset_raw())
-    };
-    slot.to_threaded_dst_src(extra)
-}
-
-/// Pre-scale unconditional `ja` (`0x05`/`0x06`) and local `call` into a single byte-offset slot when it fits in `i32`.
-#[inline(always)]
-fn scale_branch_or_call<M: Memory, H: Host<M>>(
-    slot: Slot,
-    byte: u8,
-    i: usize,
-    stride: i64,
-    table: &DispatchTable<M, H>,
-    rests: Option<&[u32]>,
-) -> Option<ThreadedSlot> {
-    let opc = OpCode(byte);
-    if byte == CALL {
-        let off = i64::from(slot.instruction().imm());
-        let byte_off = i32::try_from((off + 1).checked_mul(stride)?).ok()?;
-        let rest = rests.map_or(0, |r| r[(i as i64 + 1 + off) as usize]);
-        return Some(ThreadedSlot {
-            handler: table.local_call_scaled as *const (),
-            slot: Slot::scaled_jump(byte_off, rest),
-        });
-    }
-    if matches!(opc.jmp_opc(), JmpOpc::Ja) && matches!(opc.source(), Source::Imm) {
-        let off = match opc.class() {
-            Class::Jmp64 => i64::from(slot.offset_raw()),
-            Class::Jmp32 => i64::from(slot.imm()),
-            _ => return None,
-        };
-        let byte_off = i32::try_from((off + 1).checked_mul(stride)?).ok()?;
-        let rest = rests.map_or(0, |r| r[(i as i64 + 1 + off) as usize]);
-        return Some(ThreadedSlot {
-            handler: table.ja_scaled as *const (),
-            slot: Slot::scaled_jump(byte_off, rest),
-        });
-    }
-    None
-}
-
-/// Route plain 1- and 2-byte `r10` loads/stores (which don't have dedicated opcode bytes) straight to `stack_access`.
-#[inline(always)]
-fn stack_access_override<M: Memory, H: Host<M>>(slot: Slot, byte: u8) -> Option<crate::dispatch::Handler<M, H>> {
-    if !windows::windowed(byte) {
-        return None;
-    }
-    let base = match OpCode(byte).class() {
-        Class::Ldx => slot.src_reg_decoded(),
-        _ => slot.dst_reg_decoded(),
-    };
-    (usize::from(base.get()) == FP)
-        .then(|| windows::access_handler::<M, H>(byte, true))
-        .flatten()
-}
-
-/// Fold `mov32/64 dst, src1; alu32/64 dst, rhs` into one 3-operand [`ThreadedSlot`].
-#[inline(always)]
-fn fold_alu3<M: Memory, H: Host<M>>(first: Slot, second: Slot, table: &DispatchTable<M, H>) -> Option<ThreadedSlot> {
-    let mov64 = match first.byte() {
-        MOV64_REG => true,
-        MOV32_REG => false,
-        _ => return None,
-    };
-    let op_byte = second.byte();
-    let opc = OpCode(op_byte);
-    let alu64 = match opc.class() {
-        Class::Alu64 => {
-            if !mov64 {
-                return None;
-            }
-            true
-        }
-        Class::Alu32 => false,
-        _ => return None,
-    };
-    let op_idx = match opc.alu_opc() {
-        AluOpc::Add => 0,
-        AluOpc::Sub => 1,
-        AluOpc::Mul => 2,
-        AluOpc::Or => 3,
-        AluOpc::And => 4,
-        AluOpc::Xor => 5,
-        AluOpc::Lsh => 6,
-        AluOpc::Rsh => 7,
-        AluOpc::Arsh => 8,
-        _ => return None,
-    };
-
-    let dst = first.dst_reg_decoded();
-    if second.dst_reg_decoded() != dst {
-        return None;
-    }
-    let src1 = first.src_reg_decoded();
-
-    let (handler, slot) = match opc.source() {
-        Source::Imm => {
-            let h = table.alu3.imm[usize::from(alu64)][op_idx];
-            (h as *const (), Slot::alu3_imm(dst, src1, second.imm()))
-        }
-        Source::Reg => {
-            let mut src2 = second.src_reg_decoded();
-            if src2 == dst {
-                src2 = src1;
-            }
-            let h = table.alu3.reg[usize::from(alu64)][op_idx];
-            (h as *const (), Slot::alu3_reg(dst, src1, src2))
-        }
-    };
-    Some(ThreadedSlot { handler, slot })
 }
 
 impl Debug for Code {
@@ -647,16 +450,23 @@ impl Debug for Code {
 /// the code, for handlers that check a pc or read metadata. They take two registers.
 #[derive(Clone, Copy)]
 pub struct Slots<'a> {
-    /// Base pointer of the active compiled [`ThreadedSlot`] stream.
+    /// Base pointer of the active compiled [`ThreadedSlot`] stream (`buf[1]`, with `&StreamMaps` in `buf[0].handler`).
     first: *const ThreadedSlot,
     code: &'a Code,
 }
 
 impl<'a> Slots<'a> {
-    /// The pointer to the first threaded slot, valid while the code is borrowed.
+    /// Pointer to the first executable [`ThreadedSlot`] (`pc == 0`).
     #[inline(always)]
-    pub fn first(self) -> *const ThreadedSlot {
-        self.first
+    pub fn first_ip(self) -> Ip {
+        Ip(self.first)
+    }
+
+    /// The cold mapping tables for the active compiled stream.
+    #[inline(always)]
+    fn maps(self) -> &'a StreamMaps {
+        // SAFETY: `self.first` points to `base[1]` of a live `CompiledStream` whose `base[0]` holds `(maps, idx_to_pc)`.
+        unsafe { &*(*self.first.sub(1).cast::<(*const StreamMaps, *const u32)>()).0 }
     }
 
     /// The code these slots belong to.
@@ -671,7 +481,7 @@ impl<'a> Slots<'a> {
         self.code.len
     }
 
-    /// Total number of slots including the guard and moved instructions behind it.
+    /// Total number of portable slots including the guard and moved instructions behind it.
     #[inline(always)]
     pub fn total_len(self) -> usize {
         self.code.slots.len()
@@ -690,10 +500,57 @@ impl<'a> Slots<'a> {
         &self.code.slots
     }
 
-    /// The pc of the threaded slot at address `addr`, which lies in this stream.
+    /// Compacted slot index for an address `addr` lying in this stream.
+    #[inline(always)]
+    pub fn slot_idx(self, addr: usize) -> usize {
+        (addr - self.first.addr()) / size_of::<ThreadedSlot>()
+    }
+
+    /// Original BPF pc of the threaded slot at address `addr`, which lies in this stream.
     #[inline(always)]
     pub fn pc_at(self, addr: usize) -> u64 {
-        ((addr - self.first.addr()) / size_of::<ThreadedSlot>()) as u64
+        let idx = self.slot_idx(addr);
+        // SAFETY: `base[0]` holds `(maps, idx_to_pc_ptr)`, null when `idx_to_pc` is the identity mapping.
+        let ptr = unsafe { (*self.first.sub(1).cast::<(*const StreamMaps, *const u32)>()).1 };
+        if ptr.is_null() {
+            idx as u64
+        } else {
+            // SAFETY: `idx < idx_to_pc.len()` for any slot address in this stream.
+            u64::from(unsafe { *ptr.add(idx) })
+        }
+    }
+
+    /// Resolve an original BPF `pc` (`< total_len`) to its [`Ip`] in this stream, or `None` if compacted away.
+    #[inline(always)]
+    pub fn ip_at(self, pc: u64) -> Option<Ip> {
+        let idx = *self.maps().pc_to_idx.get(pc as usize)?;
+        (idx != NO_SLOT).then(|| Ip(self.first.wrapping_add(idx as usize)))
+    }
+
+    /// Resolve an original BPF `pc` known to be a valid slot boundary in this stream.
+    #[inline(always)]
+    pub fn ip_at_unchecked(self, pc: u64) -> Ip {
+        let idx = self.maps().pc_to_idx[pc as usize];
+        debug_assert_ne!(idx, NO_SLOT, "expected block leader or uncompacted pc {pc}");
+        Ip(self.first.wrapping_add(idx as usize))
+    }
+
+    /// Pointer to the per-compacted-slot `rest` array for metered runs, or [`RestsPtr::NULL`] when unmetered.
+    #[inline(always)]
+    pub fn rests_ptr(self) -> RestsPtr {
+        #[cfg(feature = "fuel")]
+        {
+            let rests = &self.maps().idx_rests;
+            if rests.is_empty() {
+                RestsPtr::NULL
+            } else {
+                RestsPtr(rests.as_ptr())
+            }
+        }
+        #[cfg(not(feature = "fuel"))]
+        {
+            RestsPtr::NULL
+        }
     }
 
     /// The [`GeneralProto`] at `index` recorded by [`Code::with_natives`].
@@ -704,7 +561,7 @@ impl<'a> Slots<'a> {
         unsafe { self.code.general.get_unchecked(usize::from(index)) }
     }
 
-    /// The `rest` of each slot, which metered runs read.
+    /// The `rest` of each portable slot, which metered runs read on cold paths.
     #[cfg(feature = "fuel")]
     #[inline(always)]
     pub fn rests(self) -> &'a Rests {

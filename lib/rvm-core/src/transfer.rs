@@ -141,10 +141,10 @@ const TARGETS: [u8; 256] = {
 pub struct Ip(pub *const ThreadedSlot);
 
 impl Ip {
-    /// The ip of `pc` in `code`, which may lie outside its slots.
+    /// The ip of `pc` in `code`, where `pc` is known to be a valid slot boundary in `code`.
     #[inline(always)]
     pub fn at(code: Slots, pc: u64) -> Self {
-        Self(code.first().wrapping_add(pc as usize))
+        code.ip_at_unchecked(pc)
     }
 
     /// The ip `n` slots on, which may lie outside the code.

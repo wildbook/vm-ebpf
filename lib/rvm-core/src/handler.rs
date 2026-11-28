@@ -83,7 +83,7 @@ pub extern "rust-preserve-none" fn alu3_imm<M: Memory, H: Host<M>, const ALU64: 
     let res = eval_alu3::<ALU64, OP>(ctx.reg_get(src1), imm);
     ctx.reg_set(dst, res);
 
-    become_at!(ctx, code, ip.offset(2), interp, rests)
+    become_next!(ctx, code, ip, interp, rests)
 }
 
 /// Folded 3-operand ALU with register: `dst = src1 op src2` (replaces `mov dst, src1; op dst, src2`).
@@ -105,7 +105,7 @@ pub extern "rust-preserve-none" fn alu3_reg<M: Memory, H: Host<M>, const ALU64: 
     let res = eval_alu3::<ALU64, OP>(ctx.reg_get(src1), ctx.reg_get(src2));
     ctx.reg_set(dst, res);
 
-    become_at!(ctx, code, ip.offset(2), interp, rests)
+    become_next!(ctx, code, ip, interp, rests)
 }
 
 /// The [`Handler`](crate::dispatch::Handler) of opcode `OP` of the ALU, load and store classes.
@@ -197,14 +197,14 @@ extern "rust-preserve-none" fn ldx_memsx_bail<M: Memory, H: Host<M>, const OP: u
     code: Slots,
     ip: Ip,
     interp: &mut Interpreter<M, H>,
-    rests: RestsPtr,
+    _rests: RestsPtr,
     _: Spare,
     _slot: Slot,
 ) {
-    let (unpromoted, new_ip) = interp.bail_promoted(ctx, code, ip);
-    // SAFETY: `new_ip` points at the same in-bounds pc in the unpromoted stream.
+    let (unpromoted, new_ip, new_rests) = interp.bail_promoted(ctx, code, ip);
+    // SAFETY: `new_ip` points at the same in-bounds pc in the uncompacted stream.
     let new_slot = unsafe { new_ip.get() };
-    become handler::<M, H, OP>(ctx, unpromoted, new_ip, interp, rests, crate::dispatch::SPARE, new_slot)
+    become handler::<M, H, OP>(ctx, unpromoted, new_ip, interp, new_rests, crate::dispatch::SPARE, new_slot)
 }
 
 /// Whether `byte` is a `Layout::Dst` conditional jump whose threaded slot holds a pre-scaled `i16` byte offset.
@@ -253,7 +253,8 @@ pub extern "rust-preserve-none" fn jump<M: Memory, H: Host<M>, F: Fuel, const OP
                 let taken_rest = u64::from(slot.byte());
                 become_enter_rest!(ctx, code, ip.byte_offset(byte_off), interp, rests, taken_rest)
             } else {
-                become_enter!(ctx, code, ip.offset(offset + 1), interp, rests)
+                let target_pc = (ip.pc(code) as i64 + 1 + offset) as u64;
+                become_enter!(ctx, code, Ip::at(code, target_pc), interp, rests)
             }
         }
         Step::Exit => match interp.pop(&mut ctx.regs) {
@@ -295,7 +296,10 @@ pub extern "rust-preserve-none" fn jump_unscaled<M: Memory, H: Host<M>, F: Fuel>
     };
     match step {
         Step::Next => become_enter!(ctx, code, ip.offset(1), interp, rests),
-        Step::Jump(offset) => become_enter!(ctx, code, ip.offset(offset + 1), interp, rests),
+        Step::Jump(offset) => {
+            let target_pc = (ip.pc(code) as i64 + 1 + offset) as u64;
+            become_enter!(ctx, code, Ip::at(code, target_pc), interp, rests)
+        }
         Step::Stop(reason) => interp.stop.at(ip, reason),
         _ => unreachable!("only conditional jumps use `jump_unscaled`"),
     }
@@ -355,7 +359,8 @@ extern "rust-preserve-none" fn local_call<M: Memory, H: Host<M>, F: Fuel>(
     if !interp.push(&mut ctx.regs, ip.offset(1)) {
         return interp.stop.at(ip, Reason::StackOverflow);
     }
-    become_enter!(ctx, code, ip.offset(i64::from(offset) + 1), interp, rests)
+    let target_pc = (ip.pc(code) as i64 + 1 + i64::from(offset)) as u64;
+    become_enter!(ctx, code, Ip::at(code, target_pc), interp, rests)
 }
 
 /// The rest of the handler of a helper `call`, or with `KFUNC` a kfunc `call`: runs it on the host and continues with
@@ -444,13 +449,41 @@ extern "rust-preserve-none" fn indirect_jump<M: Memory, H: Host<M>, F: Fuel>(
 ) {
     // SAFETY: a handler's ip lies below `len`, and `GOTOX` has `Layout::Dst`.
     let dst = unsafe { ip.view(slot, const { Shape::of(GOTOX) }) }.dst_reg();
-    let target = ctx.regs.get(dst);
+    let target = ctx.reg_get(dst);
     if let Some(pc) = interp.host.jump_indirect(target) {
         if pc < code.len() as u64 {
-            become_enter!(ctx, code, Ip::at(code, pc), interp, rests)
+            if let Some(target_ip) = code.ip_at(pc) {
+                become_enter!(ctx, code, target_ip, interp, rests)
+            }
+            become indirect_jump_uncompacted::<M, H, F>(ctx, code, ip, interp, rests, crate::dispatch::SPARE, slot)
         }
     }
     interp.stop.at(ip, Reason::JumpIndirect(target))
+}
+
+#[cold]
+#[inline(never)]
+extern "rust-preserve-none" fn indirect_jump_uncompacted<M: Memory, H: Host<M>, F: Fuel>(
+    ctx: &mut Context<M>,
+    code: Slots,
+    ip: Ip,
+    interp: &mut Interpreter<M, H>,
+    _rests: RestsPtr,
+    _: Spare,
+    slot: Slot,
+) {
+    // SAFETY: same as `indirect_jump`, which jumps here when `pc` was compacted away mid-block.
+    let dst = unsafe { ip.view(slot, const { Shape::of(GOTOX) }) }.dst_reg();
+    let target = ctx.reg_get(dst);
+    let pc = interp
+        .host
+        .jump_indirect(target)
+        .expect("indirect_jump already resolved target");
+    if interp.is_promoted() {
+        interp.flush_promoted(ctx);
+    }
+    let (uncompacted, new_rests) = interp.switch_to_uncompacted(code);
+    become_enter!(ctx, uncompacted, Ip::at(uncompacted, pc), interp, new_rests)
 }
 
 /// The handler of [`TO_HOST`] (`TO_HOST_DIR`) and [`TO_GUEST`]: converts a pointer between address spaces 0 and 1.

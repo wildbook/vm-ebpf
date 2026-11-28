@@ -124,6 +124,7 @@ mod dispatch;
 mod args;
 mod bytes;
 mod code;
+mod compile;
 mod context;
 mod fuel;
 mod fuse;

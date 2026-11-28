@@ -442,7 +442,8 @@ pub extern "rust-preserve-none" fn stack_access<M: Memory, H: Host<M>, const OP:
     // SAFETY: a handler's ip lies below `len`, and an r10 access has the threaded layout of its load or store
     let insn = unsafe { ip.view(slot, const { Shape::of(OP) }) };
     let addr = step::address(ctx.regs[FP], insn);
-    if !interp.windows.stack.access::<OP>(&mut ctx.regs, insn, addr) {
+    let mut regs = ctx.regs_view_mut();
+    if !interp.windows.stack.access::<OP>(&mut regs, insn, addr) {
         become miss::<M, H, OP, false>(ctx, code, ip, interp, rests, SPARE, slot)
     }
     become_next!(ctx, code, ip, interp, rests)
@@ -462,17 +463,14 @@ pub extern "rust-preserve-none" fn data_access<M: Memory, H: Host<M>, const OP: 
 ) {
     // SAFETY: as in `handler`
     let insn = unsafe { ip.view(slot, const { Shape::of(OP) }) };
-    let addr = step::address(ctx.regs.get(base_reg::<OP>(insn)), insn);
-    if interp
-        .windows
-        .data_for(OpCode(OP))
-        .access::<OP>(&mut ctx.regs, insn, addr)
-    {
+    let addr = step::address(ctx.reg_get(base_reg::<OP>(insn)), insn);
+    let mut regs = ctx.regs_view_mut();
+    if interp.windows.data_for(OpCode(OP)).access::<OP>(&mut regs, insn, addr) {
         become_next!(ctx, code, ip, interp, rests)
     }
     // Keep the primary window hit straight-line by placing the spare check after its dispatch.
     core::hint::cold_path();
-    if small(OpCode(OP).mem_size()) && interp.windows.spare.access::<OP>(&mut ctx.regs, insn, addr) {
+    if small(OpCode(OP).mem_size()) && interp.windows.spare.access::<OP>(&mut regs, insn, addr) {
         become_next!(ctx, code, ip, interp, rests)
     }
     become data_miss::<M, H, OP>(ctx, code, ip, interp, rests, SPARE, slot)
@@ -505,14 +503,15 @@ extern "rust-preserve-none" fn data_miss<M: Memory, H: Host<M>, const OP: u8>(
 ) {
     // SAFETY: as in `data_access`, which continues here
     let insn = unsafe { ip.view(slot, const { Shape::of(OP) }) };
-    let addr = step::address(ctx.regs.get(base_reg::<OP>(insn)), insn);
+    let addr = step::address(ctx.reg_get(base_reg::<OP>(insn)), insn);
     if interp.promo_overlaps(addr, const { OpCode(OP).mem_size().bytes() as u64 }) {
-        let (unpromoted, new_ip) = interp.bail_promoted(ctx, code, ip);
-        // SAFETY: `new_ip` points at the same in-bounds pc in the unpromoted stream.
+        let (unpromoted, new_ip, new_rests) = interp.bail_promoted(ctx, code, ip);
+        // SAFETY: `new_ip` points at the same in-bounds pc in the uncompacted stream.
         let new_slot = unsafe { new_ip.get() };
-        become handler::<M, H, OP>(ctx, unpromoted, new_ip, interp, rests, SPARE, new_slot)
+        become handler::<M, H, OP>(ctx, unpromoted, new_ip, interp, new_rests, SPARE, new_slot)
     }
-    if !interp.windows.stack.access::<OP>(&mut ctx.regs, insn, addr) {
+    let mut regs = ctx.regs_view_mut();
+    if !interp.windows.stack.access::<OP>(&mut regs, insn, addr) {
         become miss::<M, H, OP, true>(ctx, code, ip, interp, rests, SPARE, slot)
     }
     become_next!(ctx, code, ip, interp, rests)
@@ -534,11 +533,11 @@ extern "rust-preserve-none" fn miss<M: Memory, H: Host<M>, const OP: u8, const D
     // SAFETY: as in `stack_access` and `data_access`, which continue here
     let insn = unsafe { ip.view(slot, const { Shape::of(OP) }) };
     let around = match DATA {
-        true => step::address(ctx.regs.get(base_reg::<OP>(insn)), insn),
+        true => step::address(ctx.reg_get(base_reg::<OP>(insn)), insn),
         // the frame is the bytes below r10
         false => ctx.regs[FP].wrapping_sub(1),
     };
-    let (mut code, mut ip, mut slot) = (code, ip, slot);
+    let (mut code, mut ip, mut rests, mut slot) = (code, ip, rests, slot);
     if interp.is_promoted() {
         let size = const { OpCode(OP).mem_size().bytes() as u64 };
         let (lo, hi) = interp.promo_range();
@@ -548,8 +547,8 @@ extern "rust-preserve-none" fn miss<M: Memory, H: Host<M>, const OP: u8, const D
                 .windows
                 .take_checked(ctx.memory, around, OpCode(OP).mem_size(), lo, hi);
         if need_bail {
-            (code, ip) = interp.bail_promoted(ctx, code, ip);
-            // SAFETY: `ip` points at the same in-bounds pc in the unpromoted stream.
+            (code, ip, rests) = interp.bail_promoted(ctx, code, ip);
+            // SAFETY: `ip` points at the same in-bounds pc in the uncompacted stream.
             slot = unsafe { ip.get() };
             interp
                 .windows
@@ -583,27 +582,27 @@ pub extern "rust-preserve-none" fn byte_load_miss<M: Memory, H: Host<M>>(
     let dst = unsafe { slot.reg0() };
     let base = unsafe { slot.reg1() };
     let off = i64::from(slot.byte3() as i8);
-    let addr = ctx.regs.get(base).wrapping_add_signed(off);
-    let (mut code, mut ip) = (code, ip);
+    let addr = ctx.reg_get(base).wrapping_add_signed(off);
+    let (mut code, mut ip, mut rests) = (code, ip, rests);
 
     if let Some(loaded) = interp
         .windows
         .spare
         .run(OpCode(LDX_B), const { kind(OpCode(LDX_B)) }, addr, 0)
     {
-        ctx.regs.set(dst, loaded);
+        ctx.reg_set(dst, loaded);
         become_next!(ctx, code, ip, interp, rests)
     }
 
     if interp.promo_overlaps(addr, 1) {
-        (code, ip) = interp.bail_promoted(ctx, code, ip);
+        (code, ip, rests) = interp.bail_promoted(ctx, code, ip);
     }
     if let Some(loaded) = interp
         .windows
         .stack
         .run(OpCode(LDX_B), const { kind(OpCode(LDX_B)) }, addr, 0)
     {
-        ctx.regs.set(dst, loaded);
+        ctx.reg_set(dst, loaded);
         become_next!(ctx, code, ip, interp, rests)
     }
 
@@ -612,7 +611,7 @@ pub extern "rust-preserve-none" fn byte_load_miss<M: Memory, H: Host<M>>(
         let need_bail =
             range_overlaps(addr, 1, lo, hi) || interp.windows.take_checked(ctx.memory, addr, MemSize::Byte, lo, hi);
         if need_bail {
-            (code, ip) = interp.bail_promoted(ctx, code, ip);
+            (code, ip, rests) = interp.bail_promoted(ctx, code, ip);
             interp.windows.take::<M, true>(ctx.memory, addr, MemSize::Byte);
         }
     } else {
@@ -621,7 +620,7 @@ pub extern "rust-preserve-none" fn byte_load_miss<M: Memory, H: Host<M>>(
 
     match ctx.memory.load_u8(addr) {
         Ok(byte) => {
-            ctx.regs.set(dst, u64::from(byte));
+            ctx.reg_set(dst, u64::from(byte));
             become_next!(ctx, code, ip, interp, rests)
         }
         Err(err) => interp.stop.at(ip, Reason::MemoryFault(err)),

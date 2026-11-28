@@ -31,7 +31,6 @@
 
 use std::fmt::{self, Debug, Formatter};
 
-use crate::bytes::{MOV32_REG, MOV64_REG};
 use crate::context::{ARCH_REGS, TOTAL_REGS, VIRT_REGS};
 use crate::opcode::{AluOpc, Class, JmpOpc, MemMode, OpCode, Source, LD_IMM64};
 use crate::{bytes, rewrite, Instruction};
@@ -236,17 +235,6 @@ impl Slot {
     pub fn with_offset(mut self, offset: i16) -> Self {
         self.offset = offset;
         self
-    }
-
-    /// Portable `mov64`/`mov32 dst, src` slot accepting architectural or virtual registers.
-    #[inline(always)]
-    pub fn mov_reg(bits64: bool, dst: Reg, src: Reg) -> Self {
-        Self {
-            byte: if bits64 { MOV64_REG } else { MOV32_REG },
-            regs: dst.get(),
-            offset: 0,
-            imm: [0, 0, 0, src.get()],
-        }
     }
 
     /// Portable `mov64`/`mov32 dst, imm` slot accepting architectural or virtual registers.

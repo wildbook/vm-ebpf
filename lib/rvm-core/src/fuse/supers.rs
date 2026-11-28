@@ -304,12 +304,6 @@ impl Super {
         self.opcode(1 + self.is_data(1) as usize)
     }
 
-    /// Whether any instruction in the sequence addresses through `fp` (r10).
-    #[inline(always)]
-    pub const fn has_fp(self) -> bool {
-        self.fixed != 0
-    }
-
     /// Whether the load or store at slot `k` of the sequence addresses through `fp` (r10).
     pub const fn is_fp_access(self, k: usize) -> bool {
         matches!(self.parts[k].base(), Field::Fp)

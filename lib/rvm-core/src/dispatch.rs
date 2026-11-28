@@ -75,7 +75,9 @@ macro_rules! become_at_pc {
     ($ctx:expr, $code:expr, $pc:expr, $interp:expr, $rests:expr) => {{
         let pc = $pc;
         match $crate::dispatch::fetch_checked::<M, H, F>($code, pc, $interp, $rests) {
-            Some((next, slot, ip)) => become next($ctx, $code, ip, $interp, $rests, $crate::dispatch::SPARE, slot),
+            Some((next, slot, ip, code, rests)) => {
+                become next($ctx, code, ip, $interp, rests, $crate::dispatch::SPARE, slot)
+            }
             None => return $interp.stop.at_pc(pc, $crate::Reason::BadPc),
         }
     }};
@@ -232,26 +234,45 @@ const fn by_class<M: Memory, H: Host<M>, F: Fuel, const OP: u8>() -> Handler<M, 
     }
 }
 
-/// The handler, slot and ip at `pc`, which no proof covers, as the handler enters the block there ([`Fuel::enter`]).
-/// `None` if the code has no slot at `pc`.
+/// The handler, slot, ip, and active stream at `pc`, which no proof covers, as the handler enters the block there
+/// ([`Fuel::enter`]). `None` if the code has no slot at `pc`.
 #[inline(always)]
-pub fn fetch_checked<M: Memory, H: Host<M>, F: Fuel>(
-    code: Slots,
+pub fn fetch_checked<'a, M: Memory, H: Host<M>, F: Fuel>(
+    code: Slots<'a>,
     pc: u64,
     interp: &mut Interpreter<M, H>,
     rests: RestsPtr,
-) -> Option<Checked<M, H>> {
+) -> Option<Checked<'a, M, H>> {
     if pc >= code.total_len() as u64 {
         return None;
     }
-    let ip = Ip::at(code, pc);
+    let Some(ip) = code.ip_at(pc) else {
+        core::hint::cold_path();
+        return Some(fetch_checked_uncompacted::<M, H, F>(code, pc, interp));
+    };
     let paid = F::enter(interp, code, ip, rests);
-    // SAFETY: `pc < code.total_len()`, so `ip` lies in `code`.
+    // SAFETY: `ip` came from `code.ip_at(pc)` and lies in `code`.
     let (next, slot) = unsafe { ip.fetch::<M, H>() };
     // a `cmov`, as a branch would take a jump on the common side
     let next = core::hint::select_unpredictable(paid, next, F::step::<M, H> as Handler<M, H>);
-    Some((next, slot, ip))
+    Some((next, slot, ip, code, rests))
 }
 
-/// The handler, slot and ip at the pc [`fetch_checked`] checked.
-pub type Checked<M, H> = (Handler<M, H>, Slot, Ip);
+#[cold]
+#[inline(never)]
+fn fetch_checked_uncompacted<'a, M: Memory, H: Host<M>, F: Fuel>(
+    code: Slots<'a>,
+    pc: u64,
+    interp: &mut Interpreter<M, H>,
+) -> Checked<'a, M, H> {
+    let (uncompacted, rests) = interp.switch_to_uncompacted(code);
+    let ip = Ip::at(uncompacted, pc);
+    let paid = F::enter(interp, uncompacted, ip, rests);
+    // SAFETY: `pc < code.total_len()` and `uncompacted` has 1:1 slots.
+    let (next, slot) = unsafe { ip.fetch::<M, H>() };
+    let next = core::hint::select_unpredictable(paid, next, F::step::<M, H> as Handler<M, H>);
+    (next, slot, ip, uncompacted, rests)
+}
+
+/// The handler, slot, ip, stream, and rests pointer at the pc [`fetch_checked`] checked.
+pub type Checked<'a, M, H> = (Handler<M, H>, Slot, Ip, Slots<'a>, RestsPtr);
